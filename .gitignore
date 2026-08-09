@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+
+# Generated Glaze output and local agent context
+.glaze/
+.glaze-core
+.glaze-core/
+.glaze_memory/
+.mcp.json
+.icon-hash
+tmp/
+
+# Local visual brainstorming artifacts
+.superpowers/
+
+# Build caches and logs
+/build/
+*.tsbuildinfo
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
