@@ -126,6 +126,19 @@ export class NativeBridgeRequestError extends Error {
 }
 
 /**
+ * Thrown to reject every request still pending when `disconnect()` is
+ * called. Distinct from a timeout or a native-host-reported error: the
+ * request was never actually settled by the native host, it was aborted
+ * locally because this bridge is shutting down.
+ */
+export class NativeBridgeDisconnectedError extends Error {
+  constructor(method: BridgeMethod) {
+    super(`Bridge request for method "${method}" was aborted because the bridge disconnected`);
+    this.name = "NativeBridgeDisconnectedError";
+  }
+}
+
+/**
  * Thrown when a response's `result` does not decode into the shape the
  * pending request expects (e.g. a malformed/partial `AppSnapshot`, or a
  * non-null result for a void method). This is distinct from
@@ -144,6 +157,8 @@ export class NativeBridgeProtocolError extends Error {
 type DecodeResult<T> = { ok: true; value: T } | { ok: false };
 
 interface PendingRequest<T = unknown> {
+  /** The method this request was sent for — used for timeout/disconnect error messages. */
+  method: BridgeMethod;
   /** Validates/decodes a raw `result` value into this request's expected result type. */
   decode: (result: unknown) => DecodeResult<T>;
   resolve: (value: T) => void;
@@ -285,35 +300,78 @@ export function createStandaloneRendererBridge(
       }, REQUEST_TIMEOUT_MS);
 
       pending.set(id, {
+        method,
         decode: decode as (result: unknown) => DecodeResult<unknown>,
         resolve: resolve as (value: unknown) => void,
         reject,
         timeoutHandle,
       });
-      port.postMessage(request);
+
+      try {
+        port.postMessage(request);
+      } catch (error) {
+        // `postMessage` failed synchronously (e.g. the native transport
+        // channel is already closed). The pending entry and its timer must
+        // not be left dangling — remove/clear them here and reject this
+        // call's own promise instead of leaking a request that will never
+        // be correlated to a response.
+        pending.delete(id);
+        scheduler.clearTimeout(timeoutHandle);
+        reject(
+          new NativeBridgeProtocolError(
+            `Bridge failed to send request for method "${method}": ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          ),
+        );
+      }
     });
   }
 
   function receive(message: unknown): void {
-    if (!isBridgeInboundMessage(message)) {
+    if (typeof message !== "object" || message === null) {
       return;
     }
+    const candidate = message as Record<string, unknown>;
 
-    if (message.kind === "event") {
-      if (message.type === "snapshot.changed") {
+    if (candidate.kind === "event") {
+      if (isBridgeInboundMessage(message) && message.kind === "event") {
         // isBridgeInboundMessage already validated message.snapshot is a
         // complete AppSnapshot via isAppSnapshot — malformed events never
         // reach here, so subscribers are never notified with a bad shape.
+        // Each listener gets its own deep clone: no listener-owned object
+        // is retained/shared here, so one listener mutating its delivered
+        // snapshot can never affect another listener or a later delivery.
         for (const listener of listeners) {
-          listener(message.snapshot);
+          listener(structuredClone(message.snapshot));
         }
       }
       return;
     }
 
-    const request = pending.get(message.id);
+    // Correlate by the message's own string id *before* validating the rest
+    // of the envelope. This way a malformed response for a *known* pending
+    // request fails that request immediately instead of silently being
+    // ignored and left to time out ten seconds later. Unknown ids (no
+    // matching pending request) are still ignored either way.
+    if (typeof candidate.id !== "string") {
+      return;
+    }
+
+    const request = pending.get(candidate.id);
     if (!request) {
       // Unknown or duplicate response id — ignore.
+      return;
+    }
+
+    if (!isBridgeInboundMessage(message) || message.kind !== "response") {
+      pending.delete(candidate.id);
+      scheduler.clearTimeout(request.timeoutHandle);
+      request.reject(
+        new NativeBridgeProtocolError(
+          `Bridge response envelope for request ${candidate.id} was malformed`,
+        ),
+      );
       return;
     }
 
@@ -373,6 +431,7 @@ export function createStandaloneRendererBridge(
     disconnect(): void {
       for (const request of pending.values()) {
         scheduler.clearTimeout(request.timeoutHandle);
+        request.reject(new NativeBridgeDisconnectedError(request.method));
       }
       pending.clear();
       listeners.clear();

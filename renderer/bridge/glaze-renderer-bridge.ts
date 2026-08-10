@@ -63,9 +63,76 @@ export function createGlazeRendererBridge(ipc: GlazeIpcFacade): RendererBridge {
   let current: AppSnapshot | null = null;
   const listeners = new Set<(snapshot: AppSnapshot) => void>();
 
-  function remember(snapshot: AppSnapshot): AppSnapshot {
-    current = snapshot;
-    return cloneSnapshot(snapshot);
+  /**
+   * Monotonic ordering for every async operation that can eventually apply
+   * a snapshot to `current` (a `getSnapshot`/mutation call, or a live
+   * agents/history notification). Each operation grabs its ticket via
+   * `nextSequence()` at the moment it *starts*, so `appliedSequence` can
+   * reject an update from an operation that started earlier but resolves
+   * later than one that has already been applied — an older concurrent
+   * fetch/mutation completion must never clobber a newer one.
+   */
+  let sequenceCounter = 0;
+  let appliedSequence = 0;
+
+  function nextSequence(): number {
+    sequenceCounter += 1;
+    return sequenceCounter;
+  }
+
+  /**
+   * A single-slot buffer per notification channel. Notifications that
+   * arrive while `current` is still null (i.e. the very first `getSnapshot`
+   * fetch is in flight) cannot be merged into a base snapshot yet, so they
+   * are held here — only the newest one per channel — and merged in as soon
+   * as a snapshot becomes available, instead of being silently dropped.
+   */
+  interface PendingNotification {
+    seq: number;
+    apply: (base: AppSnapshot) => AppSnapshot;
+  }
+  let pendingAgentsNotification: PendingNotification | null = null;
+  let pendingHistoryNotification: PendingNotification | null = null;
+
+  function drainPendingNotifications(): void {
+    if (current === null) {
+      return;
+    }
+    const entries = [pendingAgentsNotification, pendingHistoryNotification].filter(
+      (entry): entry is PendingNotification => entry !== null,
+    );
+    if (entries.length === 0) {
+      return;
+    }
+    entries.sort((a, b) => a.seq - b.seq);
+    pendingAgentsNotification = null;
+    pendingHistoryNotification = null;
+    for (const entry of entries) {
+      if (entry.seq >= appliedSequence) {
+        appliedSequence = entry.seq;
+        current = entry.apply(current);
+      }
+    }
+  }
+
+  /**
+   * Applies `snapshot` as the new current state unless a newer update
+   * (higher sequence number) has already been applied, then drains any
+   * notifications buffered while there was no current snapshot yet.
+   * Always returns a clone of whatever ends up being the freshest known
+   * snapshot — even if this particular call's own result was stale and
+   * therefore not applied.
+   */
+  function commit(snapshot: AppSnapshot, seq: number): AppSnapshot {
+    if (current === null || seq >= appliedSequence) {
+      appliedSequence = seq;
+      current = snapshot;
+    }
+    drainPendingNotifications();
+    // Invariant: `current` cannot still be null here. `appliedSequence`
+    // starts at 0 and every sequence number is >= 1, so the branch above
+    // always executes (and sets `current`) the first time this runs.
+    return cloneSnapshot(current!);
   }
 
   function notifyListeners(snapshot: AppSnapshot): void {
@@ -96,47 +163,52 @@ export function createGlazeRendererBridge(ipc: GlazeIpcFacade): RendererBridge {
   }
 
   const unsubscribeAgents = ipc.onNotification("agents:state-changed", (params) => {
-    if (!current) {
+    const monitor = params as AgentMonitorState;
+    const seq = nextSequence();
+    if (current === null) {
+      // No base snapshot exists yet (the initial getSnapshot fetch is still
+      // in flight) — buffer this notification instead of dropping it.
+      pendingAgentsNotification = { seq, apply: (base) => ({ ...base, monitor }) };
       return;
     }
 
-    const merged: AppSnapshot = {
-      ...current,
-      monitor: params as AgentMonitorState,
-    };
-    notifyListeners(remember(merged));
+    const merged: AppSnapshot = { ...current, monitor };
+    notifyListeners(commit(merged, seq));
   });
 
   const unsubscribeHistory = ipc.onNotification("history:changed", (params) => {
-    if (!current) {
+    const history = params as HistoryStats;
+    const seq = nextSequence();
+    if (current === null) {
+      pendingHistoryNotification = { seq, apply: (base) => ({ ...base, history }) };
       return;
     }
 
-    const merged: AppSnapshot = {
-      ...current,
-      history: params as HistoryStats,
-    };
-    notifyListeners(remember(merged));
+    const merged: AppSnapshot = { ...current, history };
+    notifyListeners(commit(merged, seq));
   });
 
   return {
     async getSnapshot(): Promise<AppSnapshot> {
+      const seq = nextSequence();
       const snapshot = await fetchSnapshot();
-      return remember(snapshot);
+      return commit(snapshot, seq);
     },
 
     async setKeepAwakeMode(mode: KeepAwakeMode): Promise<AppSnapshot> {
+      const seq = nextSequence();
       const monitor = await ipc.invoke<AgentMonitorState>("agents:setKeepAwakeMode", { mode });
       const base = current ?? (await fetchSnapshot());
       const merged: AppSnapshot = { ...base, monitor };
-      return remember(merged);
+      return commit(merged, seq);
     },
 
     async clearHistory(): Promise<AppSnapshot> {
+      const seq = nextSequence();
       const history = await ipc.invoke<HistoryStats>("history:clear");
       const base = current ?? (await fetchSnapshot());
       const merged: AppSnapshot = { ...base, history };
-      return remember(merged);
+      return commit(merged, seq);
     },
 
     subscribe(listener: (snapshot: AppSnapshot) => void): () => void {
@@ -149,8 +221,9 @@ export function createGlazeRendererBridge(ipc: GlazeIpcFacade): RendererBridge {
     async requestUpdateCheck(): Promise<AppSnapshot> {
       // Update checks are unavailable until Task 11 wires the real update
       // channel; return the current known-good snapshot unchanged.
+      const seq = nextSequence();
       const base = current ?? (await fetchSnapshot());
-      return remember(base);
+      return commit(base, seq);
     },
 
     async openCurrentRelease(): Promise<void> {

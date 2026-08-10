@@ -21,8 +21,22 @@ import type {
  * checks; every guard is a genuine `unknown`-narrowing type predicate.
  */
 
+/**
+ * Accepts only genuine plain objects: object literals (`Object.prototype`)
+ * and objects created with `Object.create(null)`. Class instances and any
+ * other custom-prototype object are rejected, since a native host payload
+ * claiming to be e.g. an `AppSnapshot` must not be trusted just because
+ * `typeof value === "object"` — that would also match arbitrary class
+ * instances whose own fields happen to look right but whose prototype
+ * carries untrusted behavior (or whose fields are actually inherited, not
+ * own, via a crafted prototype chain).
+ */
 function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const proto = Object.getPrototypeOf(value) as object | null;
+  return proto === Object.prototype || proto === null;
 }
 
 function isFiniteNumber(value: unknown): value is number {
@@ -45,13 +59,35 @@ function isNullableString(value: unknown): value is string | null {
   return value === null || isString(value);
 }
 
-/** Optional-field helper: valid if the key is absent, or present and passes `check`. */
+/**
+ * Required-field helper: valid only if `key` is an *own* property of
+ * `candidate` (via `Object.hasOwn`, never inherited through the prototype
+ * chain) and its value passes `check`. Using `Object.hasOwn` instead of the
+ * `in` operator or direct property access means a field only reachable via
+ * `candidate`'s prototype (e.g. a crafted `Object.create(proto)` payload, or
+ * prototype pollution on `Object.prototype` itself) is never mistaken for a
+ * genuinely-present field.
+ */
+function isRequired<T>(
+  candidate: Record<string, unknown>,
+  key: string,
+  check: (value: unknown) => value is T,
+): boolean {
+  return Object.hasOwn(candidate, key) && check(candidate[key]);
+}
+
+/**
+ * Optional-field helper: valid if the key is not an *own* property of
+ * `candidate` (an inherited/prototype-only value is treated as if the field
+ * were absent, not read or validated), or if it is an own property and
+ * passes `check`.
+ */
 function isOptional<T>(
   candidate: Record<string, unknown>,
   key: string,
   check: (value: unknown) => value is T,
 ): boolean {
-  return !(key in candidate) || check(candidate[key]);
+  return !Object.hasOwn(candidate, key) || check(candidate[key]);
 }
 
 function isKeepAwakeMode(value: unknown): value is KeepAwakeMode {
@@ -67,13 +103,13 @@ function isActiveAgent(value: unknown): value is ActiveAgent {
     return false;
   }
   return (
-    isString(value.id) &&
-    isString(value.name) &&
-    isString(value.detail) &&
-    isAgentActivitySource(value.source) &&
+    isRequired(value, "id", isString) &&
+    isRequired(value, "name", isString) &&
+    isRequired(value, "detail", isString) &&
+    isRequired(value, "source", isAgentActivitySource) &&
     isOptional(value, "pid", isFiniteNumber) &&
     isOptional(value, "cpuPercent", isFiniteNumber) &&
-    isFiniteNumber(value.lastActivityAt)
+    isRequired(value, "lastActivityAt", isFiniteNumber)
   );
 }
 
@@ -86,11 +122,11 @@ function isAgentMonitorState(value: unknown): value is AgentMonitorState {
     return false;
   }
   return (
-    isBoolean(value.active) &&
-    isBoolean(value.keepingAwake) &&
-    isKeepAwakeMode(value.keepAwakeMode) &&
-    isActiveAgentArray(value.agents) &&
-    isFiniteNumber(value.lastScanAt)
+    isRequired(value, "active", isBoolean) &&
+    isRequired(value, "keepingAwake", isBoolean) &&
+    isRequired(value, "keepAwakeMode", isKeepAwakeMode) &&
+    isRequired(value, "agents", isActiveAgentArray) &&
+    isRequired(value, "lastScanAt", isFiniteNumber)
   );
 }
 
@@ -98,7 +134,11 @@ function isAgentUsage(value: unknown): value is AgentUsage {
   if (!isPlainObject(value)) {
     return false;
   }
-  return isString(value.id) && isString(value.name) && isFiniteNumber(value.durationMs);
+  return (
+    isRequired(value, "id", isString) &&
+    isRequired(value, "name", isString) &&
+    isRequired(value, "durationMs", isFiniteNumber)
+  );
 }
 
 function isAgentUsageArray(value: unknown): value is AgentUsage[] {
@@ -110,12 +150,12 @@ function isAwakeSession(value: unknown): value is AwakeSession {
     return false;
   }
   return (
-    isString(value.id) &&
-    isFiniteNumber(value.startedAt) &&
-    isNullableFiniteNumber(value.endedAt) &&
-    isFiniteNumber(value.durationMs) &&
-    isKeepAwakeMode(value.mode) &&
-    isAgentUsageArray(value.agents)
+    isRequired(value, "id", isString) &&
+    isRequired(value, "startedAt", isFiniteNumber) &&
+    isRequired(value, "endedAt", isNullableFiniteNumber) &&
+    isRequired(value, "durationMs", isFiniteNumber) &&
+    isRequired(value, "mode", isKeepAwakeMode) &&
+    isRequired(value, "agents", isAgentUsageArray)
   );
 }
 
@@ -132,12 +172,12 @@ function isHistoryStats(value: unknown): value is HistoryStats {
     return false;
   }
   return (
-    isFiniteNumber(value.totalAwakeMs) &&
-    isFiniteNumber(value.todayAwakeMs) &&
-    isFiniteNumber(value.sessionCount) &&
-    isAgentUsageArray(value.perAgent) &&
-    isNullableAwakeSession(value.currentSession) &&
-    isAwakeSessionArray(value.recentSessions)
+    isRequired(value, "totalAwakeMs", isFiniteNumber) &&
+    isRequired(value, "todayAwakeMs", isFiniteNumber) &&
+    isRequired(value, "sessionCount", isFiniteNumber) &&
+    isRequired(value, "perAgent", isAgentUsageArray) &&
+    isRequired(value, "currentSession", isNullableAwakeSession) &&
+    isRequired(value, "recentSessions", isAwakeSessionArray)
   );
 }
 
@@ -146,10 +186,10 @@ function isUpdateState(value: unknown): value is UpdateState {
     return false;
   }
   return (
-    isBoolean(value.checking) &&
-    isNullableString(value.availableVersion) &&
-    isNullableString(value.releaseURL) &&
-    isNullableFiniteNumber(value.lastCheckedAt)
+    isRequired(value, "checking", isBoolean) &&
+    isRequired(value, "availableVersion", isNullableString) &&
+    isRequired(value, "releaseURL", isNullableString) &&
+    isRequired(value, "lastCheckedAt", isNullableFiniteNumber)
   );
 }
 
@@ -157,7 +197,11 @@ function isDiagnostic(value: unknown): value is Diagnostic {
   if (!isPlainObject(value)) {
     return false;
   }
-  return isString(value.id) && isString(value.message) && isFiniteNumber(value.occurredAt);
+  return (
+    isRequired(value, "id", isString) &&
+    isRequired(value, "message", isString) &&
+    isRequired(value, "occurredAt", isFiniteNumber)
+  );
 }
 
 function isDiagnosticArray(value: unknown): value is Diagnostic[] {
@@ -170,10 +214,10 @@ export function isAppSnapshot(value: unknown): value is AppSnapshot {
     return false;
   }
   return (
-    isAgentMonitorState(value.monitor) &&
-    isHistoryStats(value.history) &&
-    isUpdateState(value.update) &&
-    isDiagnosticArray(value.diagnostics) &&
-    isString(value.appVersion)
+    isRequired(value, "monitor", isAgentMonitorState) &&
+    isRequired(value, "history", isHistoryStats) &&
+    isRequired(value, "update", isUpdateState) &&
+    isRequired(value, "diagnostics", isDiagnosticArray) &&
+    isRequired(value, "appVersion", isString)
   );
 }

@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   createStandaloneRendererBridge,
+  NativeBridgeDisconnectedError,
   NativeBridgeProtocolError,
   NativeBridgeRequestError,
   type BridgePort,
@@ -251,6 +252,108 @@ test("requests time out after ten seconds using the injected scheduler", async (
   await assert.rejects(resultPromise, /timed out/i);
 });
 
+// --- Finding 3: subscribers get independent deep-cloned snapshots, never a shared object. ---
+
+test("each listener receives its own deep-cloned snapshot: mutating listener A's copy cannot affect listener B", () => {
+  const { port } = createFakePort();
+  const bridge = createStandaloneRendererBridge(port);
+
+  const receivedByA: AppSnapshot[] = [];
+  const receivedByB: AppSnapshot[] = [];
+  bridge.subscribe((snapshot) => receivedByA.push(snapshot));
+  bridge.subscribe((snapshot) => receivedByB.push(snapshot));
+
+  const snapshot = makeFullSnapshot();
+  bridge.receive({
+    version: BRIDGE_VERSION,
+    kind: "event",
+    type: "snapshot.changed",
+    snapshot,
+  });
+
+  assert.equal(receivedByA.length, 1);
+  assert.equal(receivedByB.length, 1);
+
+  // Not the same object reference as each other, nor as the original input.
+  assert.notEqual(receivedByA[0], receivedByB[0]);
+  assert.notEqual(receivedByA[0], snapshot);
+  assert.notEqual(receivedByA[0].monitor, receivedByB[0].monitor);
+  assert.notEqual(receivedByA[0].monitor.agents, receivedByB[0].monitor.agents);
+
+  // Mutating A's delivered snapshot (including nested arrays/objects) must
+  // not be visible to B's copy or to the original input snapshot.
+  receivedByA[0].appVersion = "mutated";
+  receivedByA[0].monitor.agents.push({
+    id: "injected",
+    name: "Injected",
+    detail: "should not appear elsewhere",
+    source: "process",
+    lastActivityAt: 0,
+  });
+  receivedByA[0].history.recentSessions.push({
+    id: "injected-session",
+    startedAt: 0,
+    endedAt: null,
+    durationMs: 0,
+    mode: "system",
+    agents: [],
+  });
+
+  assert.equal(receivedByB[0].appVersion, "1.0.0");
+  assert.equal(receivedByB[0].monitor.agents.length, snapshot.monitor.agents.length);
+  assert.equal(receivedByB[0].history.recentSessions.length, snapshot.history.recentSessions.length);
+  assert.equal(snapshot.monitor.agents.length, 2);
+  assert.equal(snapshot.history.recentSessions.length, 1);
+});
+
+test("a listener mutating its delivered snapshot cannot affect a later notification's snapshot", () => {
+  const { port } = createFakePort();
+  const bridge = createStandaloneRendererBridge(port);
+
+  const received: AppSnapshot[] = [];
+  // Capture the agent count *at delivery time*, before this same listener
+  // invocation mutates its own copy — this proves the delivered snapshot
+  // was independently cloned from the input, not contaminated by whatever
+  // a previous delivery's listener mutation left behind.
+  const agentCountsAtDelivery: number[] = [];
+  bridge.subscribe((snapshot) => {
+    received.push(snapshot);
+    agentCountsAtDelivery.push(snapshot.monitor.agents.length);
+    snapshot.monitor.agents.push({
+      id: "mutated-in-listener",
+      name: "x",
+      detail: "x",
+      source: "process",
+      lastActivityAt: 0,
+    });
+  });
+
+  const firstSnapshot = makeFullSnapshot();
+  bridge.receive({
+    version: BRIDGE_VERSION,
+    kind: "event",
+    type: "snapshot.changed",
+    snapshot: firstSnapshot,
+  });
+
+  const secondSnapshot = makeFullSnapshot();
+  bridge.receive({
+    version: BRIDGE_VERSION,
+    kind: "event",
+    type: "snapshot.changed",
+    snapshot: secondSnapshot,
+  });
+
+  assert.equal(received.length, 2);
+  // First delivery starts from the first input's own agent count.
+  assert.equal(agentCountsAtDelivery[0], firstSnapshot.monitor.agents.length);
+  // Second delivery must reflect the fresh second input's own agent count,
+  // not the count left behind by the first delivery's listener mutation.
+  assert.equal(agentCountsAtDelivery[1], secondSnapshot.monitor.agents.length);
+  // Each delivered snapshot ends up with exactly one listener-added agent.
+  assert.equal(received[0].monitor.agents.length, firstSnapshot.monitor.agents.length + 1);
+  assert.equal(received[1].monitor.agents.length, secondSnapshot.monitor.agents.length + 1);
+});
 test("snapshot.changed events reach subscribers and unsubscribe stops delivery", () => {
   const { port } = createFakePort();
   const bridge = createStandaloneRendererBridge(port);
@@ -699,4 +802,207 @@ test("a malformed snapshot.changed event is ignored: no subscriber is notified",
 
   assert.equal(received.length, 1);
   assert.deepEqual(received[0], validSnapshot);
+});
+
+// --- Finding 1: disconnect() rejects pending requests; sync postMessage failures don't leak. ---
+
+test("disconnect rejects every pending request with NativeBridgeDisconnectedError and clears their timers", async () => {
+  const { port } = createFakePort();
+  const fakeScheduler = createFakeScheduler();
+  const bridge = createStandaloneRendererBridge(port, fakeScheduler.scheduler);
+
+  const snapshotPromise = bridge.getSnapshot();
+  const historyPromise = bridge.clearHistory();
+
+  assert.equal(fakeScheduler.scheduledDurations.length, 2);
+
+  bridge.disconnect();
+
+  await assert.rejects(snapshotPromise, (error: unknown) => {
+    assert.ok(error instanceof NativeBridgeDisconnectedError);
+    return true;
+  });
+  await assert.rejects(historyPromise, (error: unknown) => {
+    assert.ok(error instanceof NativeBridgeDisconnectedError);
+    return true;
+  });
+
+  // Both pending timers must have been cleared, not merely abandoned.
+  assert.equal(fakeScheduler.scheduledDurations.length, 0);
+});
+
+test("disconnect with no pending requests does not throw and still clears listeners", () => {
+  const { port } = createFakePort();
+  const bridge = createStandaloneRendererBridge(port);
+
+  const received: AppSnapshot[] = [];
+  bridge.subscribe((snapshot) => received.push(snapshot));
+
+  assert.doesNotThrow(() => bridge.disconnect());
+
+  bridge.receive({
+    version: BRIDGE_VERSION,
+    kind: "event",
+    type: "snapshot.changed",
+    snapshot: makeSnapshot(),
+  });
+  assert.equal(received.length, 0);
+});
+
+test("after disconnect, a late response for a formerly-pending id is ignored rather than throwing", async () => {
+  const { port, messages } = createFakePort();
+  const fakeScheduler = createFakeScheduler();
+  const bridge = createStandaloneRendererBridge(port, fakeScheduler.scheduler);
+
+  const resultPromise = bridge.getSnapshot();
+  const request = messages[0];
+  resultPromise.catch(() => {
+    // Expected: disconnect() rejects this below.
+  });
+
+  bridge.disconnect();
+
+  assert.doesNotThrow(() => {
+    bridge.receive({
+      id: request.id,
+      version: BRIDGE_VERSION,
+      kind: "response",
+      ok: true,
+      result: makeSnapshot(),
+    });
+  });
+});
+
+test("a synchronous postMessage throw removes the pending request, clears its timer, and rejects with a protocol error", async () => {
+  const sentMessages: Array<Record<string, unknown>> = [];
+  const throwingPort: BridgePort = {
+    postMessage(message): void {
+      sentMessages.push(message as unknown as Record<string, unknown>);
+      throw new Error("channel closed");
+    },
+  };
+  const fakeScheduler = createFakeScheduler();
+  const bridge = createStandaloneRendererBridge(throwingPort, fakeScheduler.scheduler);
+
+  const resultPromise = bridge.getSnapshot();
+
+  await assert.rejects(resultPromise, (error: unknown) => {
+    assert.ok(error instanceof NativeBridgeProtocolError);
+    return true;
+  });
+
+  // No dangling timer for the failed send.
+  assert.equal(fakeScheduler.scheduledDurations.length, 0);
+
+  // The pending entry must have been removed: a late response for that id
+  // (if the native host somehow still delivered one) is a no-op, not a
+  // second settlement attempt.
+  const sentId = sentMessages[0].id as string;
+  assert.doesNotThrow(() => {
+    bridge.receive({
+      id: sentId,
+      version: BRIDGE_VERSION,
+      kind: "response",
+      ok: true,
+      result: makeSnapshot(),
+    });
+  });
+});
+
+// --- Finding 2: malformed correlated responses reject immediately instead of timing out. ---
+
+test("a malformed response envelope (missing ok) for a known pending id rejects immediately with NativeBridgeProtocolError", async () => {
+  const { port, messages } = createFakePort();
+  const fakeScheduler = createFakeScheduler();
+  const bridge = createStandaloneRendererBridge(port, fakeScheduler.scheduler);
+
+  const resultPromise = bridge.getSnapshot();
+  const request = messages[0];
+
+  bridge.receive({
+    id: request.id,
+    version: BRIDGE_VERSION,
+    kind: "response",
+    // `ok` is missing entirely — malformed envelope for a *known* id.
+    result: makeSnapshot(),
+  });
+
+  await assert.rejects(resultPromise, (error: unknown) => {
+    assert.ok(error instanceof NativeBridgeProtocolError);
+    return true;
+  });
+
+  // Rejected immediately, not via the timeout path — no timer should remain.
+  assert.equal(fakeScheduler.scheduledDurations.length, 0);
+});
+
+test("a response for a known pending id with the wrong protocol version rejects immediately with NativeBridgeProtocolError", async () => {
+  const { port, messages } = createFakePort();
+  const fakeScheduler = createFakeScheduler();
+  const bridge = createStandaloneRendererBridge(port, fakeScheduler.scheduler);
+
+  const resultPromise = bridge.getSnapshot();
+  const request = messages[0];
+
+  bridge.receive({
+    id: request.id,
+    version: "not-the-real-version",
+    kind: "response",
+    ok: true,
+    result: makeSnapshot(),
+  });
+
+  await assert.rejects(resultPromise, (error: unknown) => {
+    assert.ok(error instanceof NativeBridgeProtocolError);
+    return true;
+  });
+  assert.equal(fakeScheduler.scheduledDurations.length, 0);
+});
+
+test("a malformed error envelope (ok: false but missing error payload) for a known pending id rejects immediately with NativeBridgeProtocolError", async () => {
+  const { port, messages } = createFakePort();
+  const fakeScheduler = createFakeScheduler();
+  const bridge = createStandaloneRendererBridge(port, fakeScheduler.scheduler);
+
+  const resultPromise = bridge.getSnapshot();
+  const request = messages[0];
+
+  bridge.receive({
+    id: request.id,
+    version: BRIDGE_VERSION,
+    kind: "response",
+    ok: false,
+    // `error` is missing entirely.
+  });
+
+  await assert.rejects(resultPromise, (error: unknown) => {
+    assert.ok(error instanceof NativeBridgeProtocolError);
+    return true;
+  });
+  assert.equal(fakeScheduler.scheduledDurations.length, 0);
+});
+
+test("an unknown id with a malformed envelope is still ignored, not treated as a match", () => {
+  const { port, messages } = createFakePort();
+  const fakeScheduler = createFakeScheduler();
+  const bridge = createStandaloneRendererBridge(port, fakeScheduler.scheduler);
+
+  const resultPromise = bridge.getSnapshot();
+  resultPromise.catch(() => {
+    // Ignore: intentionally left unresolved by this test.
+  });
+  assert.equal(messages.length, 1);
+
+  assert.doesNotThrow(() => {
+    bridge.receive({
+      id: "totally-unrelated-id",
+      version: BRIDGE_VERSION,
+      kind: "response",
+      // Malformed: missing `ok`.
+    });
+  });
+
+  // The real pending request's timer must still be scheduled — it was
+  // untouched by the unrelated malformed message.
+  assert.equal(fakeScheduler.scheduledDurations.length, 1);
 });
