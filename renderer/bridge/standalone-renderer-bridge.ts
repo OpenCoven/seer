@@ -10,22 +10,50 @@ export type BridgeMethod =
   | "updates.open"
   | "app.quit";
 
-/** Minimal transport this adapter needs — a `window.seerNative`-shaped port. */
-export interface BridgePort {
-  postMessage(message: unknown): void;
-}
-
 /** Error payload sent back by the native host for a failed request. */
 export interface NativeBridgeErrorPayload {
   code: string;
   message: string;
 }
 
-interface BridgeRequest<TPayload = unknown> {
-  id: string;
-  version: typeof BRIDGE_VERSION;
-  method: BridgeMethod;
-  payload: TPayload;
+/** Per-method request payload shapes. Parameterless methods carry `{}`. */
+interface BridgeMethodPayloadMap {
+  "snapshot.get": Record<string, never>;
+  "keepAwakeMode.set": { mode: KeepAwakeMode };
+  "history.clear": Record<string, never>;
+  "updates.check": Record<string, never>;
+  "updates.open": Record<string, never>;
+  "app.quit": Record<string, never>;
+}
+
+/** Per-method result shapes returned inside a successful response. */
+interface BridgeMethodResultMap {
+  "snapshot.get": AppSnapshot;
+  "keepAwakeMode.set": AppSnapshot;
+  "history.clear": AppSnapshot;
+  "updates.check": AppSnapshot;
+  "updates.open": void;
+  "app.quit": void;
+}
+
+/**
+ * Closed discriminated union of every request shape this adapter can send,
+ * one member per `BridgeMethod`, each with its own `payload` type. There is
+ * no `unknown`/generic-default payload — every method's wire shape is fully
+ * known at compile time.
+ */
+type BridgeRequest = {
+  [M in BridgeMethod]: {
+    id: string;
+    version: typeof BRIDGE_VERSION;
+    method: M;
+    payload: BridgeMethodPayloadMap[M];
+  };
+}[BridgeMethod];
+
+/** Minimal transport this adapter needs — a `window.seerNative`-shaped port. */
+export interface BridgePort {
+  postMessage(message: BridgeRequest): void;
 }
 
 interface BridgeSuccessResponse {
@@ -53,6 +81,14 @@ interface BridgeSnapshotChangedEvent {
   snapshot: AppSnapshot;
 }
 
+/**
+ * Closed discriminated union of every inbound message shape `receive` can be
+ * fed: a response (success or error, keyed on `ok`) or a known event (keyed
+ * on `type`). `receive` still accepts `unknown` at its boundary and narrows
+ * down to this union via a runtime guard, so malformed/unrecognized
+ * postMessage payloads from the native host are defensively ignored instead
+ * of widening this contract.
+ */
 type BridgeInboundMessage = BridgeResponse | BridgeSnapshotChangedEvent;
 
 /** Injectable timer so timeout behavior is testable without waiting 10s. */
@@ -90,14 +126,62 @@ export interface StandaloneRendererBridge extends RendererBridge {
   receive(message: unknown): void;
 }
 
-function isBridgeInboundMessage(message: unknown): message is BridgeInboundMessage {
+function isBridgeSuccessResponse(candidate: Record<string, unknown>): boolean {
   return (
-    typeof message === "object" &&
-    message !== null &&
-    "version" in message &&
-    (message as { version: unknown }).version === BRIDGE_VERSION &&
-    "kind" in message
+    candidate.kind === "response" &&
+    typeof candidate.id === "string" &&
+    candidate.ok === true &&
+    "result" in candidate
   );
+}
+
+function isBridgeErrorResponse(candidate: Record<string, unknown>): boolean {
+  if (candidate.kind !== "response" || typeof candidate.id !== "string" || candidate.ok !== false) {
+    return false;
+  }
+  const error = candidate.error as Partial<NativeBridgeErrorPayload> | undefined;
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    typeof error.code === "string" &&
+    typeof error.message === "string"
+  );
+}
+
+function isBridgeSnapshotChangedEvent(candidate: Record<string, unknown>): boolean {
+  return (
+    candidate.kind === "event" &&
+    candidate.type === "snapshot.changed" &&
+    typeof candidate.snapshot === "object" &&
+    candidate.snapshot !== null
+  );
+}
+
+/**
+ * Runtime guard narrowing an arbitrary inbound postMessage payload down to
+ * the closed `BridgeInboundMessage` union. Every field required by the
+ * discriminant (`kind`, then `ok`/`type`) is checked, so malformed or
+ * unrecognized messages from the native host are ignored rather than
+ * crashing the renderer or being (mis)trusted as one of the known shapes.
+ */
+function isBridgeInboundMessage(message: unknown): message is BridgeInboundMessage {
+  if (typeof message !== "object" || message === null) {
+    return false;
+  }
+
+  const candidate = message as Record<string, unknown>;
+  if (candidate.version !== BRIDGE_VERSION) {
+    return false;
+  }
+
+  switch (candidate.kind) {
+    case "response":
+      return isBridgeSuccessResponse(candidate) || isBridgeErrorResponse(candidate);
+    case "event":
+      return isBridgeSnapshotChangedEvent(candidate);
+    default:
+      return false;
+  }
 }
 
 /**
@@ -113,14 +197,22 @@ export function createStandaloneRendererBridge(
   const pending = new Map<string, PendingRequest>();
   const listeners = new Set<(snapshot: AppSnapshot) => void>();
 
-  function send<TPayload>(method: BridgeMethod, payload: TPayload): Promise<unknown> {
+  function send<M extends BridgeMethod>(
+    method: M,
+    payload: BridgeMethodPayloadMap[M],
+  ): Promise<BridgeMethodResultMap[M]> {
     const id = crypto.randomUUID();
-    const request: BridgeRequest<TPayload> = {
+    // TypeScript cannot verify that a generic `{ method: M; payload:
+    // BridgeMethodPayloadMap[M] }` matches the mapped-union `BridgeRequest`
+    // without narrowing on the literal `M`, even though every call site is
+    // statically well-typed (method/payload always agree via the map). The
+    // cast is safe by construction.
+    const request = {
       id,
       version: BRIDGE_VERSION,
       method,
       payload,
-    };
+    } as BridgeRequest;
 
     return new Promise((resolve, reject) => {
       const timeoutHandle = scheduler.setTimeout(() => {
@@ -128,7 +220,11 @@ export function createStandaloneRendererBridge(
         reject(new Error(`Bridge request timed out after ${REQUEST_TIMEOUT_MS}ms: ${method}`));
       }, REQUEST_TIMEOUT_MS);
 
-      pending.set(id, { resolve, reject, timeoutHandle });
+      pending.set(id, {
+        resolve: resolve as (value: unknown) => void,
+        reject,
+        timeoutHandle,
+      });
       port.postMessage(request);
     });
   }
@@ -165,15 +261,15 @@ export function createStandaloneRendererBridge(
 
   return {
     async getSnapshot(): Promise<AppSnapshot> {
-      return (await send("snapshot.get", undefined)) as AppSnapshot;
+      return await send("snapshot.get", {});
     },
 
     async setKeepAwakeMode(mode: KeepAwakeMode): Promise<AppSnapshot> {
-      return (await send("keepAwakeMode.set", { mode })) as AppSnapshot;
+      return await send("keepAwakeMode.set", { mode });
     },
 
     async clearHistory(): Promise<AppSnapshot> {
-      return (await send("history.clear", undefined)) as AppSnapshot;
+      return await send("history.clear", {});
     },
 
     subscribe(listener: (snapshot: AppSnapshot) => void): () => void {
@@ -184,15 +280,15 @@ export function createStandaloneRendererBridge(
     },
 
     async requestUpdateCheck(): Promise<AppSnapshot> {
-      return (await send("updates.check", undefined)) as AppSnapshot;
+      return await send("updates.check", {});
     },
 
     async openCurrentRelease(): Promise<void> {
-      await send("updates.open", undefined);
+      await send("updates.open", {});
     },
 
     async quit(): Promise<void> {
-      await send("app.quit", undefined);
+      await send("app.quit", {});
     },
 
     disconnect(): void {

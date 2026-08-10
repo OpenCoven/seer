@@ -102,6 +102,73 @@ test("getSnapshot posts a request with BRIDGE_VERSION and method snapshot.get, c
   assert.deepEqual(result, snapshot);
 });
 
+test("every parameterless method posts payload: {} rather than undefined", async () => {
+  const cases: Array<{
+    method: string;
+    invoke: (bridge: ReturnType<typeof createStandaloneRendererBridge>) => Promise<unknown>;
+    result: unknown;
+  }> = [
+    { method: "snapshot.get", invoke: (bridge) => bridge.getSnapshot(), result: makeSnapshot() },
+    { method: "history.clear", invoke: (bridge) => bridge.clearHistory(), result: makeSnapshot() },
+    {
+      method: "updates.check",
+      invoke: (bridge) => bridge.requestUpdateCheck(),
+      result: makeSnapshot(),
+    },
+    {
+      method: "updates.open",
+      invoke: (bridge) => bridge.openCurrentRelease(),
+      result: undefined,
+    },
+    { method: "app.quit", invoke: (bridge) => bridge.quit(), result: undefined },
+  ];
+
+  for (const { method, invoke, result } of cases) {
+    const { port, messages } = createFakePort();
+    const bridge = createStandaloneRendererBridge(port);
+
+    const resultPromise = invoke(bridge);
+    assert.equal(messages.length, 1, `expected exactly one request for ${method}`);
+    const request = messages[0];
+    assert.equal(request.method, method);
+    assert.deepEqual(request.payload, {}, `expected payload: {} for ${method}`);
+
+    bridge.receive({
+      id: request.id,
+      version: BRIDGE_VERSION,
+      kind: "response",
+      ok: true,
+      result,
+    });
+
+    await resultPromise;
+  }
+});
+
+test("setKeepAwakeMode posts payload: { mode } exactly", async () => {
+  const { port, messages } = createFakePort();
+  const bridge = createStandaloneRendererBridge(port);
+
+  const snapshot = makeSnapshot();
+  const resultPromise = bridge.setKeepAwakeMode("display");
+
+  assert.equal(messages.length, 1);
+  const request = messages[0];
+  assert.equal(request.method, "keepAwakeMode.set");
+  assert.deepEqual(request.payload, { mode: "display" });
+
+  bridge.receive({
+    id: request.id,
+    version: BRIDGE_VERSION,
+    kind: "response",
+    ok: true,
+    result: snapshot,
+  });
+
+  const result = await resultPromise;
+  assert.deepEqual(result, snapshot);
+});
+
 test("a native typed error response rejects with NativeBridgeRequestError", async () => {
   const { port, messages } = createFakePort();
   const bridge = createStandaloneRendererBridge(port);
@@ -213,4 +280,41 @@ test("snapshot.changed events reach subscribers and unsubscribe stops delivery",
   });
 
   assert.equal(received.length, 1);
+});
+
+test("receive defensively ignores malformed or unknown messages without throwing", () => {
+  const { port } = createFakePort();
+  const fakeScheduler = createFakeScheduler();
+  const bridge = createStandaloneRendererBridge(port, fakeScheduler.scheduler);
+
+  const received: AppSnapshot[] = [];
+  bridge.subscribe((snapshot) => {
+    received.push(snapshot);
+  });
+
+  const resultPromise = bridge.getSnapshot();
+  resultPromise.catch(() => {
+    // Ignore: this promise is intentionally left unresolved by this test.
+  });
+
+  const malformedMessages: unknown[] = [
+    null,
+    undefined,
+    "not an object",
+    42,
+    {},
+    { version: BRIDGE_VERSION }, // missing kind
+    { kind: "response", ok: true, id: "x", result: {} }, // wrong/missing version
+    { version: BRIDGE_VERSION, kind: "bogus" }, // unknown kind
+    { version: BRIDGE_VERSION, kind: "event", type: "bogus.event" }, // unknown event type
+    { version: BRIDGE_VERSION, kind: "response", id: "x" }, // missing ok
+    { version: BRIDGE_VERSION, kind: "event", type: "snapshot.changed" }, // missing snapshot
+  ];
+
+  for (const message of malformedMessages) {
+    assert.doesNotThrow(() => bridge.receive(message));
+  }
+
+  assert.equal(received.length, 0);
+  fakeScheduler.fireAll();
 });
