@@ -591,6 +591,7 @@ fileprivate enum VersionProbing {
         let mantissaDigits = Array(integerPart) + Array(fractionPart)
         let mantissaIsZero = mantissaDigits.allSatisfy { $0 == "0" }
         let fractionDigitCount = fractionPart.count
+        let currentVersionDigits = Array(String(currentVersion))
 
         let integerDigits: [Character]
         if exponentDigits.count > maxParsableExponentDigitCount {
@@ -611,12 +612,43 @@ fileprivate enum VersionProbing {
             return .future(token)
         }
 
+        // `exponentDigits.count <= maxParsableExponentDigitCount` guarantees
+        // this parses without overflow (18 digits maxes out well under
+        // `Int64.max`'s 19 digits), but the resulting `Int` can still be as
+        // large as ~10^18 — nowhere near enough to safely drive an
+        // allocation below.
         let exponentValue = exponentDigits.isEmpty ? 0 : (Int(exponentDigits) ?? 0)
         let signedExponent = exponentIsNegative ? -exponentValue : exponentValue
         let shift = signedExponent - fractionDigitCount
 
         if shift >= 0 {
-            integerDigits = mantissaDigits + Array(repeating: Character("0"), count: shift)
+            if mantissaIsZero {
+                // 0 * 10^shift is exactly zero; versions start at 1.
+                return .invalid
+            }
+            // Never materialize `shift` trailing zeros here: `shift` can
+            // still be ~10^18 even though it fits in `Int`, so appending
+            // that many characters would itself be an allocation
+            // proportional to the exponent's magnitude — exactly the bug
+            // this guards against. Instead, decide symbolically: trimming
+            // `mantissaDigits`'s leading zeros is bounded only by the
+            // digit bytes actually read from disk (not by `shift`), and
+            // every digit `shift` appends is a trailing zero, so the
+            // final integer's digit count is exactly
+            // `significantDigits.count + shift` — no materialization
+            // needed to compare that count against `currentVersion`'s.
+            let significantDigits = trimLeadingZeros(mantissaDigits)
+            let finalDigitCount = significantDigits.count + shift
+            if finalDigitCount > currentVersionDigits.count {
+                return .future(token)
+            }
+            if finalDigitCount < currentVersionDigits.count {
+                return .invalid
+            }
+            // Digit counts tie exactly, so `shift` must be small (bounded
+            // by `currentVersionDigits.count`, a tiny fixed constant) —
+            // materializing to compare digit-for-digit is safe here.
+            integerDigits = significantDigits + Array(repeating: Character("0"), count: shift)
         } else {
             let shiftMagnitude = -shift
             guard shiftMagnitude < mantissaDigits.count else {
@@ -641,7 +673,6 @@ fileprivate enum VersionProbing {
             return .invalid
         }
 
-        let currentVersionDigits = Array(String(currentVersion))
         if normalized.count != currentVersionDigits.count {
             return normalized.count > currentVersionDigits.count ? .future(token) : .invalid
         }

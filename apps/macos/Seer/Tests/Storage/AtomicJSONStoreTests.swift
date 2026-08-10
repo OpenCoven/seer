@@ -877,6 +877,191 @@ final class AtomicJSONStoreTests: XCTestCase {
         XCTAssertFalse(names.contains { $0.contains("corrupt") })
     }
 
+    // MARK: 20. Exponent magnitude must never drive allocation size.
+    //
+    // A naive classifier that materializes `shift` trailing zeros before
+    // comparing digit counts allocates an array proportional to the
+    // exponent's *value* (not its digit count), so an 18-digit exponent
+    // (which still fits comfortably in `Int64`) can still request an
+    // ~10^18-element array and OOM/hang. These cases must classify in
+    // bounded time/memory regardless of how large the exponent's value is.
+
+    func testHugeIntegralPositiveExponentIsUnsupportedReadOnlyAndDoesNotHang() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        // Exactly 18 exponent digits: parses into `Int` without overflow,
+        // but a naive `Array(repeating: "0", count: shift)` would still
+        // try to allocate ~10^18 elements.
+        let hugeExponentBytes = Data("""
+        {"version":1e999999999999999999}
+        """.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: hugeExponentBytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        let start = DispatchTime.now()
+        let result = await store.load()
+        let elapsedSeconds = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000_000
+
+        XCTAssertLessThan(elapsedSeconds, 5.0, "classification must not scale with exponent magnitude")
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertEqual(result.diagnostic?.id, StorageDiagnosticID.unsupportedVersion)
+        XCTAssertFalse(result.writesEnabled)
+
+        let preserved = await fileSystem.contents(at: settingsURL)
+        XCTAssertEqual(preserved, hugeExponentBytes, "bytes must be preserved, not quarantined")
+        let names = await fileSystem.fileNames(inDirectoryOf: settingsURL)
+        XCTAssertFalse(names.contains { $0.contains("corrupt") })
+    }
+
+    func testHugeNegativeExponentIsInvalidSchemaQuarantinesAndDoesNotHang() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        let hugeNegativeExponentBytes = Data("""
+        {"version":1e-999999999999999999}
+        """.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: hugeNegativeExponentBytes)
+        let clock = FixedClock(fixedMilliseconds: 1_700_000_000_000)
+        let store = makeStore(fileSystem: fileSystem, clock: clock)
+
+        let start = DispatchTime.now()
+        let result = await store.load()
+        let elapsedSeconds = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000_000
+
+        XCTAssertLessThan(elapsedSeconds, 5.0, "classification must not scale with exponent magnitude")
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertEqual(result.diagnostic?.id, StorageDiagnosticID.corrupt)
+        XCTAssertTrue(result.writesEnabled)
+
+        let originalGone = await fileSystem.contents(at: settingsURL)
+        XCTAssertNil(originalGone)
+    }
+
+    func testExponentWithThousandsOfDigitsPositiveIsUnsupportedAndDoesNotHang() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        let thousandsOfDigits = String(repeating: "9", count: 4000)
+        let bytes = Data("""
+        {"version":1e\(thousandsOfDigits)}
+        """.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: bytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        let start = DispatchTime.now()
+        let result = await store.load()
+        let elapsedSeconds = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000_000
+
+        XCTAssertLessThan(elapsedSeconds, 5.0)
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertEqual(result.diagnostic?.id, StorageDiagnosticID.unsupportedVersion)
+        XCTAssertFalse(result.writesEnabled)
+    }
+
+    func testExponentWithThousandsOfDigitsNegativeIsInvalidAndDoesNotHang() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        let thousandsOfDigits = String(repeating: "9", count: 4000)
+        let bytes = Data("""
+        {"version":1e-\(thousandsOfDigits)}
+        """.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: bytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        let start = DispatchTime.now()
+        let result = await store.load()
+        let elapsedSeconds = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000_000
+
+        XCTAssertLessThan(elapsedSeconds, 5.0)
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertEqual(result.diagnostic?.id, StorageDiagnosticID.corrupt)
+        XCTAssertTrue(result.writesEnabled)
+    }
+
+    func testScientificExactCurrentVersionZeroExponentLoadsUnchanged() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        let document = SettingsDocument(version: 1, keepAwakeMode: .system, includePrereleaseUpdates: false)
+        let bytes = Data("""
+        {"version":1e0,"keepAwakeMode":"system","includePrereleaseUpdates":false}
+        """.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: bytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, document)
+        XCTAssertNil(result.diagnostic)
+        XCTAssertTrue(result.writesEnabled)
+    }
+
+    func testScientificExactCurrentVersionShiftedMantissaLoadsUnchanged() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        let document = SettingsDocument(version: 1, keepAwakeMode: .system, includePrereleaseUpdates: false)
+        // 10e-1 == 1, the current version — exercises the negative-shift
+        // (fractional-exponent) branch resolving to an exact integer.
+        let bytes = Data("""
+        {"version":10e-1,"keepAwakeMode":"system","includePrereleaseUpdates":false}
+        """.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: bytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, document)
+        XCTAssertNil(result.diagnostic)
+        XCTAssertTrue(result.writesEnabled)
+    }
+
+    func testScientificExactCurrentVersionLargerShiftedMantissaLoadsUnchanged() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        let document = SettingsDocument(version: 1, keepAwakeMode: .system, includePrereleaseUpdates: false)
+        // 100e-2 == 1, the current version.
+        let bytes = Data("""
+        {"version":100e-2,"keepAwakeMode":"system","includePrereleaseUpdates":false}
+        """.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: bytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, document)
+        XCTAssertNil(result.diagnostic)
+        XCTAssertTrue(result.writesEnabled)
+    }
+
+    func testScientificFutureVersionZeroExponentIsUnsupportedReadOnly() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        let bytes = Data("""
+        {"version":2e0,"someNewField":"unknown-to-us"}
+        """.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: bytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertEqual(result.diagnostic?.id, StorageDiagnosticID.unsupportedVersion)
+        XCTAssertFalse(result.writesEnabled)
+
+        let preserved = await fileSystem.contents(at: settingsURL)
+        XCTAssertEqual(preserved, bytes)
+    }
+
+    func testScientificFractionalVersionIsInvalidSchemaNotUnsupported() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        // 1e-1 == 0.1, a non-integral version — invalid schema, not
+        // unsupported-future, and must not be confused with the
+        // huge-negative-exponent case above.
+        let bytes = Data("""
+        {"version":1e-1}
+        """.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: bytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertEqual(result.diagnostic?.id, StorageDiagnosticID.corrupt)
+        XCTAssertTrue(result.writesEnabled)
+
+        let originalGone = await fileSystem.contents(at: settingsURL)
+        XCTAssertNil(originalGone)
+    }
+
     // MARK: 13. Path resolver uses injected base URL exactly
 
     func testSettingsFileURLUsesInjectedBaseURLExactly() throws {
