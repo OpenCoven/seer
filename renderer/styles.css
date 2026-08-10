@@ -1,10 +1,56 @@
 /*
- * Glaze framework styles (@import "@glaze/core/..." and @import "tailwindcss")
- * are automatically injected before this file during build and dev.
- * Add your custom styles and @source directives below.
+ * Shared renderer styles for both the Glaze panel and the standalone macOS
+ * window. This file is self-contained on purpose: it explicitly imports
+ * Tailwind and the small set of Seer-owned design tokens both builds need,
+ * rather than depending on Glaze's build pipeline to auto-inject anything
+ * (no `@glaze/core` styles are imported here).
  */
+@import "tailwindcss";
+@import "@radix-ui/colors/gray.css";
+@import "@radix-ui/colors/gray-dark.css";
+@import "@radix-ui/colors/gray-alpha.css";
+@import "@radix-ui/colors/gray-dark-alpha.css";
+@import "@radix-ui/colors/green.css";
+@import "@radix-ui/colors/green-dark.css";
 
 /* Tell Tailwind to scan all local renderer window files for class names */
 @source "./**/*.{ts,tsx}";
 @source not "./preload.ts";
 @source not "./dev/**/*";
+
+/*
+ * Seer's small semantic token set, mapped into Tailwind's `--color-*`
+ * namespace so `bg-control`, `bg-control-subtle`, `text-secondary`,
+ * `text-tertiary`, and `text-green` utilities exist in both builds. `inline`
+ * keeps each utility referencing the underlying Radix variable directly (see
+ * https://tailwindcss.com/docs/theme#referencing-other-variables) so the
+ * `.dark` overrides supplied by the Radix dark stylesheets above keep working.
+ */
+@theme inline {
+  --color-control-subtle: var(--gray-a3);
+  --color-control: var(--gray-a5);
+  --color-secondary: var(--gray-11);
+  --color-tertiary: var(--gray-9);
+  --color-green: var(--green-9);
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    background: transparent;
+  }
+
+  :root {
+    color-scheme: light;
+  }
+
+  .dark {
+    color-scheme: dark;
+  }
+}
+
+/* Reserves space for the native window's draggable title bar region. */
+.drag-region {
+  -webkit-app-region: drag;
+}

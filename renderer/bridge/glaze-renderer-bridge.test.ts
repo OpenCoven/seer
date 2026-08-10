@@ -62,6 +62,8 @@ function createFakeIpc(options: FakeIpcOptions = {}) {
           return makeHistory() as unknown as T;
         case "app:quit":
           return undefined as unknown as T;
+        case "window:hidePanel":
+          return undefined as unknown as T;
         default:
           throw new Error(`Unexpected channel: ${channel}`);
       }
@@ -196,6 +198,16 @@ test("disconnect invokes ipc disconnect", () => {
   bridge.disconnect();
 
   assert.equal(fake.disconnectCalls, 1);
+});
+
+test("hidePanel invokes window:hidePanel exactly once with no arguments", async () => {
+  const fake = createFakeIpc();
+  const bridge = createGlazeRendererBridge(fake.ipc);
+
+  await bridge.hidePanel();
+
+  assert.deepEqual(fake.invokedChannels, ["window:hidePanel"]);
+  assert.deepEqual(fake.invokeArgs["window:hidePanel"], []);
 });
 
 // --- Finding 4: initial getSnapshot cannot clobber newer notifications/mutations. ---

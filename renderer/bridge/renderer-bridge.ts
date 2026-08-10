@@ -14,5 +14,7 @@ export interface RendererBridge {
   requestUpdateCheck(): Promise<AppSnapshot>;
   openCurrentRelease(): Promise<void>;
   quit(): Promise<void>;
+  /** Hides the panel window. The product-level operation behind Escape. */
+  hidePanel(): Promise<void>;
   disconnect(): void;
 }

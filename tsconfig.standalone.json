@@ -1,0 +1,30 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "paths": {
+      "@renderer/*": ["./renderer/*"],
+      "@shared/*": ["./renderer/shared/*"],
+      "*": ["./node_modules/@types/*", "./node_modules/*"]
+    }
+  },
+  "include": [
+    "renderer/bridge",
+    "renderer/components",
+    "renderer/lib",
+    "renderer/main/app.tsx",
+    "renderer/main/history-view.tsx",
+    "renderer/main/home-view.tsx",
+    "renderer/main/root-view.tsx",
+    "renderer/main/router.tsx",
+    "renderer/standalone",
+    "renderer/ui",
+    "renderer/vite-env.d.ts",
+    "vite.standalone.config.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "renderer/preload.ts",
+    "renderer/main/index.tsx",
+    "renderer/dev"
+  ]
+}

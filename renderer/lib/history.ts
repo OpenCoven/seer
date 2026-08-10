@@ -11,14 +11,6 @@ export const EMPTY_STATS: HistoryStats = {
   recentSessions: [],
 };
 
-export async function fetchHistoryStats(): Promise<HistoryStats> {
-  return await window.glazeAPI.glaze.ipc.invoke<HistoryStats>("history:getStats");
-}
-
-export async function clearHistory(): Promise<HistoryStats> {
-  return await window.glazeAPI.glaze.ipc.invoke<HistoryStats>("history:clear");
-}
-
 /** "38s", "12m", "2h 14m" — compact, at most two units. */
 export function formatDuration(ms: number): string {
   const totalSeconds = Math.max(0, Math.round(ms / 1000));

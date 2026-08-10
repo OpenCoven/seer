@@ -234,6 +234,10 @@ export function createGlazeRendererBridge(ipc: GlazeIpcFacade): RendererBridge {
       await ipc.invoke("app:quit");
     },
 
+    async hidePanel(): Promise<void> {
+      await ipc.invoke("window:hidePanel");
+    },
+
     disconnect(): void {
       unsubscribeAgents();
       unsubscribeHistory();

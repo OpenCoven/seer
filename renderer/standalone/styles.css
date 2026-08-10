@@ -1,0 +1,29 @@
+/*
+ * Entry stylesheet for the standalone renderer bundle. Pulls in Tailwind and
+ * the shared Seer design tokens, then layers on the handful of concerns that
+ * are specific to running as a bare native window (no Glaze chrome/backdrop
+ * to supply them): a native system font stack, a `color-scheme` that follows
+ * the OS appearance, and a fully transparent document background.
+ */
+@import "tailwindcss";
+@import "../styles.css";
+
+@layer base {
+  html,
+  body,
+  #root {
+    background: transparent;
+  }
+
+  body {
+    font-family:
+      -apple-system,
+      BlinkMacSystemFont,
+      "Segoe UI",
+      Roboto,
+      Helvetica,
+      Arial,
+      sans-serif;
+    color-scheme: light dark;
+  }
+}

@@ -9,7 +9,8 @@ export type BridgeMethod =
   | "history.clear"
   | "updates.check"
   | "updates.open"
-  | "app.quit";
+  | "app.quit"
+  | "panel.hide";
 
 /** Error payload sent back by the native host for a failed request. */
 export interface NativeBridgeErrorPayload {
@@ -25,6 +26,7 @@ interface BridgeMethodPayloadMap {
   "updates.check": Record<string, never>;
   "updates.open": Record<string, never>;
   "app.quit": Record<string, never>;
+  "panel.hide": Record<string, never>;
 }
 
 /** Per-method result shapes returned inside a successful response. */
@@ -35,6 +37,7 @@ interface BridgeMethodResultMap {
   "updates.check": AppSnapshot;
   "updates.open": void;
   "app.quit": void;
+  "panel.hide": void;
 }
 
 /**
@@ -192,6 +195,7 @@ const resultDecoders: {
   "updates.check": decodeAppSnapshotResult,
   "updates.open": decodeVoidResult,
   "app.quit": decodeVoidResult,
+  "panel.hide": decodeVoidResult,
 };
 
 export interface StandaloneRendererBridge extends RendererBridge {
@@ -426,6 +430,10 @@ export function createStandaloneRendererBridge(
 
     async quit(): Promise<void> {
       await send("app.quit", {});
+    },
+
+    async hidePanel(): Promise<void> {
+      await send("panel.hide", {});
     },
 
     disconnect(): void {

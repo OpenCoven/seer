@@ -1,30 +1,24 @@
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { Bot, Coffee, Moon } from "lucide-react";
+
+import { useRendererBridge } from "../bridge/renderer-bridge-context";
+import type { ActiveAgent, KeepAwakeMode } from "../bridge/types";
+import { PanelTabs } from "../components/panel-tabs";
+import { EMPTY_STATE } from "../lib/agents";
 import {
   Badge,
   Button,
   EmptyState,
-  Field,
-  FieldGroup,
-  FieldSet,
   List,
-  ScrollArea,
+  ScrollPanel,
   SegmentedControl,
   SegmentedControlItem,
   Text,
   Toolbar,
   ToolbarActions,
   ToolbarContent,
-} from "@glaze/core/components";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Bot, Coffee, Moon } from "lucide-react";
-
-import { PanelTabs } from "../components/panel-tabs";
-import {
-  EMPTY_STATE,
-  fetchAgentState,
-  updateKeepAwakeMode,
-  type ActiveAgent,
-  type KeepAwakeMode,
-} from "../lib/agents";
+} from "../ui/primitives";
+import { useAppSnapshot, writeAppSnapshot } from "./root-view";
 
 function sourceLabel(source: ActiveAgent["source"]): string {
   if (source === "both") return "Process + session";
@@ -32,25 +26,25 @@ function sourceLabel(source: ActiveAgent["source"]): string {
   return "Session";
 }
 
+export { sourceLabel };
+
 export function HomeView() {
+  const bridge = useRendererBridge();
   const queryClient = useQueryClient();
-  const { data: state = EMPTY_STATE, isLoading } = useQuery({
-    queryKey: ["agentState"],
-    queryFn: fetchAgentState,
-  });
+  const { data: snapshot, isLoading } = useAppSnapshot();
+  const state = snapshot?.monitor ?? EMPTY_STATE;
 
   const modeMutation = useMutation({
-    mutationFn: (mode: KeepAwakeMode) => updateKeepAwakeMode(mode),
-    onSuccess: (next) => queryClient.setQueryData(["agentState"], next),
+    mutationFn: (mode: KeepAwakeMode) => bridge.setKeepAwakeMode(mode),
+    onSuccess: (next) => writeAppSnapshot(queryClient, next),
   });
 
-  const handleModeChange = (value: string) => {
-    if (value !== "system" && value !== "display") return;
-    modeMutation.mutate(value);
+  const handleModeChange = (mode: KeepAwakeMode) => {
+    modeMutation.mutate(mode);
   };
 
   const handleQuit = () => {
-    void window.glazeAPI.glaze.ipc.invoke("app:quit");
+    void bridge.quit();
   };
 
   const agents = state.agents;
@@ -60,7 +54,7 @@ export function HomeView() {
     : "Sleep allowed when no agents are working";
 
   return (
-    <ScrollArea
+    <ScrollPanel
       className="h-full"
       toolbar={
         <Toolbar>
@@ -99,22 +93,28 @@ export function HomeView() {
           </div>
         </div>
 
-        <FieldSet title="Keep awake prevents">
-          <FieldGroup>
-            <Field orientation="vertical" description="Display mode also keeps the screen on.">
-              <SegmentedControl
-                value={state.keepAwakeMode}
-                onValueChange={handleModeChange}
-                aria-label="Keep awake mode"
-                size="small"
-                className="w-full"
-              >
-                <SegmentedControlItem value="system">System</SegmentedControlItem>
-                <SegmentedControlItem value="display">System + Display</SegmentedControlItem>
-              </SegmentedControl>
-            </Field>
-          </FieldGroup>
-        </FieldSet>
+        <div className="flex flex-col gap-2 rounded-xl bg-control-subtle px-3 py-3">
+          <Text variant="small-strong" color="secondary">
+            Keep awake prevents
+          </Text>
+          <SegmentedControl aria-label="Keep awake mode" className="w-full">
+            <SegmentedControlItem
+              selected={state.keepAwakeMode === "system"}
+              onSelect={() => handleModeChange("system")}
+            >
+              System
+            </SegmentedControlItem>
+            <SegmentedControlItem
+              selected={state.keepAwakeMode === "display"}
+              onSelect={() => handleModeChange("display")}
+            >
+              System + Display
+            </SegmentedControlItem>
+          </SegmentedControl>
+          <Text variant="mini" color="tertiary">
+            Display mode also keeps the screen on.
+          </Text>
+        </div>
 
         <div className="flex flex-col gap-2">
           <Text variant="small-strong" color="secondary">
@@ -136,9 +136,9 @@ export function HomeView() {
             </div>
           ) : (
             <div className="overflow-hidden rounded-xl bg-control-subtle">
-              <List.Root items={agents} getItemKey={(agent) => agent.id}>
+              <List.Root>
                 {agents.map((agent) => (
-                  <List.Item key={agent.id} item={agent}>
+                  <List.Item key={agent.id}>
                     <List.ItemIcon>
                       <Bot className="size-4 text-secondary" />
                     </List.ItemIcon>
@@ -158,6 +158,6 @@ export function HomeView() {
           )}
         </div>
       </div>
-    </ScrollArea>
+    </ScrollPanel>
   );
 }

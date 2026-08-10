@@ -123,6 +123,7 @@ test("every parameterless method posts payload: {} rather than undefined", async
       result: null,
     },
     { method: "app.quit", invoke: (bridge) => bridge.quit(), result: null },
+    { method: "panel.hide", invoke: (bridge) => bridge.hidePanel(), result: null },
   ];
 
   for (const { method, invoke, result } of cases) {
@@ -765,6 +766,29 @@ test("void methods accept only result: null as success; undefined/absent/object 
     objResultPromise,
     (error: unknown) => error instanceof NativeBridgeProtocolError,
   );
+});
+
+test("hidePanel posts method panel.hide with exact closed payload {} and resolves only on result: null", async () => {
+  const { port, messages } = createFakePort();
+  const bridge = createStandaloneRendererBridge(port);
+
+  const resultPromise = bridge.hidePanel();
+
+  assert.equal(messages.length, 1);
+  const request = messages[0];
+  assert.equal(request.method, "panel.hide");
+  assert.deepEqual(request.payload, {});
+  assert.deepEqual(Object.keys(request.payload as Record<string, unknown>), []);
+
+  bridge.receive({
+    id: request.id,
+    version: BRIDGE_VERSION,
+    kind: "response",
+    ok: true,
+    result: null,
+  });
+
+  assert.equal(await resultPromise, undefined);
 });
 
 test("a malformed snapshot.changed event is ignored: no subscriber is notified", () => {
