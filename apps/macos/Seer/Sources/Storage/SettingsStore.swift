@@ -80,6 +80,12 @@ public actor SettingsStore {
     public private(set) var current: SettingsDocument
     public private(set) var lastDiagnostic: Diagnostic?
 
+    /// Whether `store.load()` has completed at least once for this
+    /// instance. Mutators check this (via `ensureLoaded()`) so a caller
+    /// can mutate `SettingsStore` directly without a separate `load()`
+    /// call first.
+    private var hasLoaded = false
+
     /// Serializes every public `load()`/mutator call through its full
     /// awaited underlying `AtomicJSONStore` round trip and `current`/
     /// `lastDiagnostic` publication, in FIFO invocation order. Without
@@ -112,7 +118,22 @@ public actor SettingsStore {
         let result = await store.load()
         current = result.value
         lastDiagnostic = result.diagnostic
+        hasLoaded = true
         return result
+    }
+
+    /// Performs `load()`'s underlying work exactly once, if it has never
+    /// run, *without* acquiring `gate` again — every caller of this is
+    /// already running inside a `gate`-guarded mutator, and `gate` is not
+    /// reentrant, so acquiring it a second time here would deadlock. This
+    /// lets a mutator be called directly with no prior explicit `load()`
+    /// call, while still correctly treating an existing on-disk
+    /// future/unreadable file as read-only — the subsequent
+    /// `store.save(...)` throws `StorageError.writesDisabled` in that case
+    /// — instead of silently overwriting it.
+    private func ensureLoaded() async {
+        guard !hasLoaded else { return }
+        _ = await performLoad()
     }
 
     public func setKeepAwakeMode(_ mode: KeepAwakeMode) async throws {
@@ -127,6 +148,7 @@ public actor SettingsStore {
     }
 
     private func performSetKeepAwakeMode(_ mode: KeepAwakeMode) async throws {
+        await ensureLoaded()
         var updated = current
         updated.keepAwakeMode = mode
         try await store.save(updated)
@@ -145,6 +167,7 @@ public actor SettingsStore {
     }
 
     private func performSetIncludePrereleaseUpdates(_ value: Bool) async throws {
+        await ensureLoaded()
         var updated = current
         updated.includePrereleaseUpdates = value
         try await store.save(updated)

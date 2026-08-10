@@ -1,4 +1,5 @@
 import XCTest
+import os
 @testable import Seer
 
 /// In-memory `SettingsFileSystem` test double. An `actor` so it can be
@@ -14,6 +15,64 @@ actor InMemorySettingsFileSystem: SettingsFileSystem {
     var failNextWrite: Error?
     var failNextReplace: Error?
     var failNextMove: Error?
+    var failNextLock: Error?
+    var failNextDirectorySync: Error?
+    var failNextFileSize: Error?
+
+    /// Overrides the size reported by `fileSize(at:)` for the seeded file
+    /// at a given path, independent of `files[path]`'s actual byte count —
+    /// lets boundary/oversized-file tests exercise the exact-size and
+    /// exact-size-plus-one cases cheaply, without materializing a real
+    /// 1&nbsp;MiB (or larger) `Data` value.
+    private var sizeOverrides: [String: Int64] = [:]
+
+    func setSizeOverride(_ size: Int64, at url: URL) {
+        sizeOverrides[url.path] = size
+    }
+
+    // MARK: - Advisory lock coordination
+    //
+    // Mirrors the production `flock`-backed lock's exclusivity at the
+    // in-memory level so tests can exercise two separate
+    // `AtomicJSONStore` instances (or two overlapping load/save calls on
+    // the same instance's underlying store) sharing one
+    // `InMemorySettingsFileSystem` and observe the second genuinely
+    // suspend until the first releases, exactly like two processes
+    // contending for the same sibling lock file would.
+    private var lockedPaths: Set<String> = []
+    private var lockWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+
+    func acquireLock(for url: URL) async throws -> any SettingsFileLock {
+        callLog.append("acquireLock")
+        if let error = failNextLock {
+            failNextLock = nil
+            throw error
+        }
+        let path = url.path
+        while lockedPaths.contains(path) {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                lockWaiters[path, default: []].append(continuation)
+            }
+        }
+        lockedPaths.insert(path)
+        return FakeSettingsFileLock(path: path, owner: self)
+    }
+
+    fileprivate func releaseLock(at path: String) {
+        callLog.append("unlock")
+        lockedPaths.remove(path)
+        guard var waiters = lockWaiters[path], !waiters.isEmpty else {
+            lockWaiters.removeValue(forKey: path)
+            return
+        }
+        let next = waiters.removeFirst()
+        lockWaiters[path] = waiters
+        next.resume()
+    }
+
+    func isLocked(at url: URL) -> Bool {
+        lockedPaths.contains(url.path)
+    }
 
     // MARK: - Controlled suspension hooks (ordering tests)
     //
@@ -27,9 +86,19 @@ actor InMemorySettingsFileSystem: SettingsFileSystem {
     private var armedSuspensions: Set<String> = []
     private var pendingSuspensions: [String: CheckedContinuation<Void, Never>] = [:]
     private(set) var enteredSuspensions: Set<String> = []
+    /// Which call occurrence (1-based) of a given armed suspension name
+    /// should actually suspend, e.g. so a test can let the *first*
+    /// `readFile` (the initial corrupt-file probe) run to completion and
+    /// only suspend the *second* `readFile` (quarantine's just-in-time
+    /// re-read) to inject a simulated concurrent writer in between.
+    /// Defaults to `1`, preserving every existing call site's behavior of
+    /// suspending on the first call.
+    private var suspensionTargetOccurrence: [String: Int] = [:]
+    private var suspensionCallOccurrences: [String: Int] = [:]
 
-    func armSuspension(_ name: String) {
+    func armSuspension(_ name: String, onOccurrence occurrence: Int = 1) {
         armedSuspensions.insert(name)
+        suspensionTargetOccurrence[name] = occurrence
     }
 
     func waitUntilEntered(_ name: String) async {
@@ -49,6 +118,11 @@ actor InMemorySettingsFileSystem: SettingsFileSystem {
         guard armedSuspensions.contains(name) else {
             return
         }
+        suspensionCallOccurrences[name, default: 0] += 1
+        let targetOccurrence = suspensionTargetOccurrence[name] ?? 1
+        guard suspensionCallOccurrences[name] == targetOccurrence else {
+            return
+        }
         armedSuspensions.remove(name)
         enteredSuspensions.insert(name)
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
@@ -58,6 +132,21 @@ actor InMemorySettingsFileSystem: SettingsFileSystem {
 
     func seedFile(at url: URL, contents: Data) {
         files[url.path] = contents
+    }
+
+    /// Directly replaces the seeded contents at `url`, bypassing the lock
+    /// and `moveItem`/`replaceItem` entirely — simulates a
+    /// non-cooperating writer (another process ignoring the advisory
+    /// lock) mutating the file out from under an in-flight load.
+    func simulateConcurrentReplace(at url: URL, contents: Data) {
+        files[url.path] = contents
+    }
+
+    /// Directly removes the seeded contents at `url`, bypassing the lock —
+    /// simulates a non-cooperating writer deleting the file out from
+    /// under an in-flight load.
+    func simulateConcurrentRemoval(at url: URL) {
+        files.removeValue(forKey: url.path)
     }
 
     func contents(at url: URL) -> Data? {
@@ -82,6 +171,21 @@ actor InMemorySettingsFileSystem: SettingsFileSystem {
 
     func fileExists(at url: URL) async -> Bool {
         files[url.path] != nil
+    }
+
+    func fileSize(at url: URL) async throws -> Int64 {
+        callLog.append("fileSize")
+        if let error = failNextFileSize {
+            failNextFileSize = nil
+            throw error
+        }
+        if let override = sizeOverrides[url.path] {
+            return override
+        }
+        guard let data = files[url.path] else {
+            throw SettingsFileSystemError.fileNotFound
+        }
+        return Int64(data.count)
     }
 
     func readFile(at url: URL) async throws -> Data {
@@ -120,6 +224,14 @@ actor InMemorySettingsFileSystem: SettingsFileSystem {
         files.removeValue(forKey: source.path)
     }
 
+    func synchronizeDirectory(for url: URL) async throws {
+        callLog.append("synchronizeDirectory")
+        if let error = failNextDirectorySync {
+            failNextDirectorySync = nil
+            throw error
+        }
+    }
+
     func moveItem(at source: URL, to destination: URL) async throws {
         callLog.append("moveItem")
         if let error = failNextMove {
@@ -142,6 +254,35 @@ actor InMemorySettingsFileSystem: SettingsFileSystem {
             throw SettingsFileSystemError.fileNotFound
         }
         files.removeValue(forKey: url.path)
+    }
+}
+
+/// Test-double lock token for `InMemorySettingsFileSystem`, mirroring
+/// `DarwinFileLock`'s idempotent-release contract. `unlock()` proxies back
+/// into the owning actor to release its in-memory lock bookkeeping and
+/// wake the next queued waiter, if any.
+final class FakeSettingsFileLock: SettingsFileLock, @unchecked Sendable {
+    private let path: String
+    private weak var owner: InMemorySettingsFileSystem?
+    // `OSAllocatedUnfairLock` (not `NSLock`) because `NSLock.lock()`/
+    // `unlock()` are unavailable from `async` contexts under Swift 6's
+    // strict concurrency checking, and this type's own `unlock()` is
+    // `async`.
+    private let state = OSAllocatedUnfairLock(initialState: false)
+
+    init(path: String, owner: InMemorySettingsFileSystem) {
+        self.path = path
+        self.owner = owner
+    }
+
+    func unlock() async {
+        let alreadyReleased = state.withLock { isReleased in
+            let was = isReleased
+            isReleased = true
+            return was
+        }
+        guard !alreadyReleased else { return }
+        await owner?.releaseLock(at: path)
     }
 }
 
@@ -1545,6 +1686,376 @@ final class AtomicJSONStoreTests: XCTestCase {
 
         XCTAssertTrue(offendingFiles.isEmpty, "found Glaze/old-path references in: \(offendingFiles)")
     }
+
+    // MARK: 15. Save before any load throws `notLoaded` and performs no I/O
+
+    func testSaveBeforeLoadThrowsNotLoadedAndPerformsNoIO() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        let store = makeStore(fileSystem: fileSystem)
+
+        do {
+            try await store.save(SettingsDocument.defaultValue)
+            XCTFail("expected StorageError.notLoaded")
+        } catch StorageError.notLoaded {
+            // expected
+        } catch {
+            XCTFail("expected StorageError.notLoaded, got \(error)")
+        }
+
+        let log = await fileSystem.callLog
+        XCTAssertTrue(log.isEmpty, "a save before any completed load must not perform any I/O at all, including locking")
+    }
+
+    // MARK: 16. Cross-instance lock: a second store instance genuinely waits
+
+    func testSecondStoreInstanceSaveWaitsForFirstsLockToRelease() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let storeA = makeStore(fileSystem: fileSystem)
+        let storeB = makeStore(fileSystem: fileSystem)
+        _ = await storeA.load()
+        _ = await storeB.load()
+
+        await fileSystem.armSuspension("writeFileAndSynchronize")
+
+        let taskA = Task {
+            try await storeA.save(SettingsDocument(version: 1, keepAwakeMode: .display, includePrereleaseUpdates: false))
+        }
+        await fileSystem.waitUntilEntered("writeFileAndSynchronize")
+
+        // storeA is suspended mid-write, holding the cross-instance lock.
+        // storeB is a wholly independent actor with its own FIFO gate, so
+        // only the shared advisory lock (not any in-process gate) can be
+        // responsible for blocking it here.
+        let taskB = Task {
+            try await storeB.save(SettingsDocument(version: 1, keepAwakeMode: .system, includePrereleaseUpdates: true))
+        }
+
+        for _ in 0..<50 {
+            await Task.yield()
+        }
+        let lockedWhileABlocked = await fileSystem.isLocked(at: settingsURL)
+        XCTAssertTrue(lockedWhileABlocked, "the lock must still be held while storeA's write is suspended")
+        let logWhileBlocked = await fileSystem.callLog
+        XCTAssertEqual(
+            logWhileBlocked.filter { $0.hasPrefix("writeFileAndSynchronize") }.count, 1,
+            "storeB must not enter its own write while storeA still holds the cross-instance lock"
+        )
+
+        await fileSystem.resumeSuspension("writeFileAndSynchronize")
+        try await taskA.value
+        try await taskB.value
+
+        let lockedAfter = await fileSystem.isLocked(at: settingsURL)
+        XCTAssertFalse(lockedAfter, "the lock must be released once both saves complete")
+
+        let decoder = JSONDecoder()
+        let finalBytes = await fileSystem.contents(at: settingsURL)
+        let decoded = try decoder.decode(SettingsDocument.self, from: finalBytes!)
+        XCTAssertEqual(decoded.keepAwakeMode, .system, "storeB's save, which waited for the lock, must be the final content")
+    }
+
+    // MARK: 17. Lock releases on every load/save error exit path
+
+    func testLockReleasesAfterLoadLockAcquisitionFailure() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        await fileSystem.setFailNextLock(SettingsFileSystemError.other("lock failed"))
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertFalse(result.writesEnabled)
+        let locked = await fileSystem.isLocked(at: settingsURL)
+        XCTAssertFalse(locked, "a lock the store never actually acquired must not be reported as held")
+    }
+
+    func testLockReleasesAfterLoadReadFailure() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        await fileSystem.seedFile(at: settingsURL, contents: encode(SettingsDocument.defaultValue))
+        await fileSystem.setFailNextRead(SettingsFileSystemError.other("permission denied"))
+        let store = makeStore(fileSystem: fileSystem)
+
+        _ = await store.load()
+
+        let locked = await fileSystem.isLocked(at: settingsURL)
+        XCTAssertFalse(locked, "the lock must be released even when the read fails")
+    }
+
+    func testLockReleasesAfterSaveWriteFailure() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let store = makeStore(fileSystem: fileSystem)
+        _ = await store.load()
+        await fileSystem.setFailNextWrite(SettingsFileSystemError.other("boom"))
+
+        do {
+            try await store.save(SettingsDocument(version: 1, keepAwakeMode: .display, includePrereleaseUpdates: true))
+            XCTFail("expected failure")
+        } catch StorageError.writeFailed {
+            // expected
+        }
+
+        let locked = await fileSystem.isLocked(at: settingsURL)
+        XCTAssertFalse(locked, "the lock must be released even when the write fails")
+    }
+
+    func testLockReleasesAfterSaveLockAcquisitionFailure() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let store = makeStore(fileSystem: fileSystem)
+        _ = await store.load()
+        await fileSystem.setFailNextLock(SettingsFileSystemError.other("lock failed"))
+
+        do {
+            try await store.save(SettingsDocument(version: 1, keepAwakeMode: .display, includePrereleaseUpdates: true))
+            XCTFail("expected StorageError.writeFailed")
+        } catch StorageError.writeFailed {
+            // expected
+        } catch {
+            XCTFail("expected StorageError.writeFailed, got \(error)")
+        }
+
+        let locked = await fileSystem.isLocked(at: settingsURL)
+        XCTAssertFalse(locked, "a lock the store never actually acquired must not be reported as held")
+    }
+
+    func testLockReleasesAfterDirectorySyncFailure() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let store = makeStore(fileSystem: fileSystem)
+        _ = await store.load()
+        await fileSystem.setFailNextDirectorySync(SettingsFileSystemError.other("directory fsync failed"))
+
+        do {
+            try await store.save(SettingsDocument(version: 1, keepAwakeMode: .display, includePrereleaseUpdates: true))
+            XCTFail("expected StorageError.durabilityUncertain")
+        } catch StorageError.durabilityUncertain {
+            // expected
+        }
+
+        let locked = await fileSystem.isLocked(at: settingsURL)
+        XCTAssertFalse(locked, "the lock must be released even when directory synchronization fails")
+    }
+
+    // MARK: 18. Quarantine's just-in-time re-read detects a non-cooperating
+    // writer that replaced the file between the original corrupt-file read
+    // and the quarantine move, and preserves the newer content untouched.
+
+    func testQuarantineRereadDetectsConcurrentReplacementAndPreservesNewFile() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        let corruptBytes = Data("{ not valid json".utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: corruptBytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        // The first `readFile` call is the initial corrupt-file probe; the
+        // second is quarantine's just-in-time re-read immediately before
+        // moving the file aside. Suspend only the second so a simulated
+        // non-cooperating writer can replace the file in between.
+        await fileSystem.armSuspension("readFile", onOccurrence: 2)
+
+        let loadTask = Task {
+            await store.load()
+        }
+        await fileSystem.waitUntilEntered("readFile")
+
+        let replacementBytes = Data("""
+        {"version":1,"keepAwakeMode":"display","includePrereleaseUpdates":true}
+        """.utf8)
+        await fileSystem.simulateConcurrentReplace(at: settingsURL, contents: replacementBytes)
+
+        await fileSystem.resumeSuspension("readFile")
+        let result = await loadTask.value
+
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertEqual(result.diagnostic?.id, StorageDiagnosticID.concurrentChange)
+        XCTAssertFalse(result.writesEnabled)
+
+        let preserved = await fileSystem.contents(at: settingsURL)
+        XCTAssertEqual(preserved, replacementBytes, "the non-cooperating writer's newer content must be preserved, not quarantined or clobbered")
+        let names = await fileSystem.fileNames(inDirectoryOf: settingsURL)
+        XCTAssertFalse(names.contains { $0.contains("corrupt") }, "no quarantine move should have happened")
+    }
+
+    func testQuarantineRereadDetectsConcurrentRemovalAndLeavesWritesDisabled() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        let corruptBytes = Data("{ not valid json".utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: corruptBytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        await fileSystem.armSuspension("readFile", onOccurrence: 2)
+
+        let loadTask = Task {
+            await store.load()
+        }
+        await fileSystem.waitUntilEntered("readFile")
+
+        await fileSystem.simulateConcurrentRemoval(at: settingsURL)
+
+        await fileSystem.resumeSuspension("readFile")
+        let result = await loadTask.value
+
+        XCTAssertEqual(result.diagnostic?.id, StorageDiagnosticID.concurrentChange)
+        XCTAssertFalse(result.writesEnabled)
+        let names = await fileSystem.fileNames(inDirectoryOf: settingsURL)
+        XCTAssertFalse(names.contains { $0.contains("corrupt") }, "no quarantine move should have happened when the file vanished out from under the load")
+    }
+
+    // MARK: 19. Durability event ordering: lock -> write+sync -> replace ->
+    // directory sync -> unlock.
+
+    func testSaveEventOrderIsLockThenWriteThenReplaceThenDirectorySyncThenUnlock() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let store = makeStore(fileSystem: fileSystem)
+        _ = await store.load()
+
+        let baseline = await fileSystem.callLog.count
+        try await store.save(SettingsDocument(version: 1, keepAwakeMode: .display, includePrereleaseUpdates: true))
+
+        let log = await fileSystem.callLog
+        let saveLog = Array(log[baseline...])
+
+        guard
+            let lockIndex = saveLog.firstIndex(of: "acquireLock"),
+            let writeIndex = saveLog.firstIndex(where: { $0.hasPrefix("writeFileAndSynchronize:") }),
+            let replaceIndex = saveLog.firstIndex(of: "replaceItem"),
+            let directorySyncIndex = saveLog.firstIndex(of: "synchronizeDirectory"),
+            let unlockIndex = saveLog.firstIndex(of: "unlock")
+        else {
+            XCTFail("expected every durability event to be recorded during save: \(saveLog)")
+            return
+        }
+
+        XCTAssertLessThan(lockIndex, writeIndex, "the lock must be acquired before the temp file is written")
+        XCTAssertLessThan(writeIndex, replaceIndex, "the temp file must be written and fully synchronized before the atomic replace")
+        XCTAssertLessThan(replaceIndex, directorySyncIndex, "the containing directory must be synchronized only after the atomic replace")
+        XCTAssertLessThan(directorySyncIndex, unlockIndex, "the lock must be released only after every durability step, including the directory sync")
+    }
+
+    // MARK: 20. Directory sync failure throws a typed commit-uncertain error,
+    // never plain success, even though the rename itself already succeeded.
+
+    func testDirectorySyncFailureThrowsDurabilityUncertainWithNewContentAlreadyReplaced() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let store = makeStore(fileSystem: fileSystem)
+        _ = await store.load()
+        await fileSystem.setFailNextDirectorySync(SettingsFileSystemError.other("directory fsync failed"))
+
+        let document = SettingsDocument(version: 1, keepAwakeMode: .display, includePrereleaseUpdates: true)
+        do {
+            try await store.save(document)
+            XCTFail("expected StorageError.durabilityUncertain, never plain success")
+        } catch StorageError.durabilityUncertain {
+            // expected
+        } catch {
+            XCTFail("expected StorageError.durabilityUncertain, got \(error)")
+        }
+
+        // The rename/replace itself already succeeded — the new content is
+        // on disk — even though directory-entry durability is unconfirmed.
+        let decoder = JSONDecoder()
+        let savedBytes = await fileSystem.contents(at: settingsURL)
+        let decoded = try decoder.decode(SettingsDocument.self, from: savedBytes!)
+        XCTAssertEqual(decoded, document)
+
+        let names = await fileSystem.fileNames(inDirectoryOf: settingsURL)
+        XCTAssertEqual(names, ["settings.json"], "no orphaned temp file should remain")
+    }
+
+    // MARK: 21. Size ceiling: exact boundary is read normally; one byte over
+    // is preserved read-only without ever being read, quarantined, or
+    // written; an oversized save is rejected before any temp file exists.
+
+    func testFileSizeExactlyAtCeilingIsReadNormally() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        let document = SettingsDocument(version: 1, keepAwakeMode: .display, includePrereleaseUpdates: true)
+        await fileSystem.seedFile(at: settingsURL, contents: encode(document))
+        await fileSystem.setSizeOverride(AtomicJSONStore<SettingsDocument>.maxDocumentBytes, at: settingsURL)
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, document)
+        XCTAssertNil(result.diagnostic)
+        XCTAssertTrue(result.writesEnabled)
+        let log = await fileSystem.callLog
+        XCTAssertTrue(log.contains("readFile"), "a file exactly at the ceiling must still be read")
+    }
+
+    func testFileSizeOneByteOverCeilingIsPreservedReadOnlyWithoutReadQuarantineOrWrite() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        let existingBytes = encode(SettingsDocument.defaultValue)
+        await fileSystem.seedFile(at: settingsURL, contents: existingBytes)
+        await fileSystem.setSizeOverride(AtomicJSONStore<SettingsDocument>.maxDocumentBytes + 1, at: settingsURL)
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertEqual(result.diagnostic?.id, StorageDiagnosticID.tooLarge)
+        XCTAssertFalse(result.writesEnabled)
+
+        let log = await fileSystem.callLog
+        XCTAssertFalse(log.contains("readFile"), "an oversized file must never be read")
+        XCTAssertFalse(log.contains("moveItem"), "an oversized file must never be quarantined")
+        XCTAssertFalse(log.contains { $0.hasPrefix("writeFileAndSynchronize") }, "an oversized file must never be written")
+
+        let preserved = await fileSystem.contents(at: settingsURL)
+        XCTAssertEqual(preserved, existingBytes, "the oversized file must be preserved byte-for-byte")
+    }
+
+    func testIndeterminateFileSizeFallsThroughToOrdinaryReadPath() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        let document = SettingsDocument(version: 1, keepAwakeMode: .display, includePrereleaseUpdates: true)
+        await fileSystem.seedFile(at: settingsURL, contents: encode(document))
+        // A `fileSize` failure that isn't `fileNotFound` (e.g. a transient
+        // stat-level permission error) must not be treated as "too large"
+        // or "missing" — it must fall through to the ordinary read path,
+        // whose own success/failure classification is unchanged.
+        await fileSystem.setFailNextFileSize(SettingsFileSystemError.other("stat permission error"))
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, document)
+        XCTAssertNil(result.diagnostic)
+        XCTAssertTrue(result.writesEnabled)
+        let log = await fileSystem.callLog
+        XCTAssertTrue(log.contains("readFile"), "an indeterminate file-size check must still fall through to reading the file")
+    }
+
+    func testOversizedSaveIsRejectedBeforeAnyTempFileIsCreated() async throws {
+        let largeDocumentURL = URL(fileURLWithPath: "/Seer-Test-Root/ai.opencoven.seer/large.json")
+        let fileSystem = InMemorySettingsFileSystem()
+        let clock = FixedClock(fixedMilliseconds: 1_700_000_000_000)
+        let store = AtomicJSONStore<LargeTestDocument>(fileURL: largeDocumentURL, fileSystem: fileSystem, clock: clock)
+        _ = await store.load()
+
+        let oversizedPayload = String(repeating: "a", count: Int(AtomicJSONStore<LargeTestDocument>.maxDocumentBytes) + 1)
+        let document = LargeTestDocument(version: 1, payload: oversizedPayload)
+
+        do {
+            try await store.save(document)
+            XCTFail("expected StorageError.payloadTooLarge")
+        } catch StorageError.payloadTooLarge {
+            // expected
+        } catch {
+            XCTFail("expected StorageError.payloadTooLarge, got \(error)")
+        }
+
+        let log = await fileSystem.callLog
+        XCTAssertFalse(log.contains { $0.hasPrefix("writeFileAndSynchronize") }, "an oversized save must never create a temp file")
+        XCTAssertFalse(log.contains("replaceItem"))
+        let names = await fileSystem.fileNames(inDirectoryOf: largeDocumentURL)
+        XCTAssertTrue(names.isEmpty, "no file should exist for a rejected oversized save")
+    }
+}
+
+/// A minimal `VersionedDocument` whose encoded size can be driven arbitrarily
+/// large via `payload`, used only to exercise the encoded-payload-too-large
+/// save path — `SettingsDocument`'s own fixed, flat schema (an enum and a
+/// bool) can never legitimately encode past a few dozen bytes.
+private struct LargeTestDocument: VersionedDocument {
+    static let currentVersion = 1
+    static let defaultValue = LargeTestDocument(version: 1, payload: "")
+
+    var version: Int
+    var payload: String
 }
 
 extension InMemorySettingsFileSystem {
@@ -1562,5 +2073,17 @@ extension InMemorySettingsFileSystem {
 
     func setFailNextMove(_ error: Error) {
         failNextMove = error
+    }
+
+    func setFailNextLock(_ error: Error) {
+        failNextLock = error
+    }
+
+    func setFailNextDirectorySync(_ error: Error) {
+        failNextDirectorySync = error
+    }
+
+    func setFailNextFileSize(_ error: Error) {
+        failNextFileSize = error
     }
 }

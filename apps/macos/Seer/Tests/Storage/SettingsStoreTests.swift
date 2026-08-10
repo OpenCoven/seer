@@ -227,4 +227,46 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertEqual(current.keepAwakeMode, .system, "A's failed mutation must not be reflected")
         XCTAssertTrue(current.includePrereleaseUpdates, "B's mutation must still apply")
     }
+
+    // MARK: 15. A mutator called with no prior explicit `load()` performs its
+    // own internal load first (inside the same FIFO gate), so a missing file
+    // is loaded as defaults and saved, while an existing future-version file
+    // is correctly honored as read-only rather than silently overwritten.
+
+    func testMutationWithoutPriorExplicitLoadLoadsDefaultsThenSavesWhenFileIsMissing() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let store = makeSettingsStore(fileSystem: fileSystem)
+
+        try await store.setKeepAwakeMode(.display)
+
+        let current = await store.current
+        XCTAssertEqual(current.keepAwakeMode, .display)
+
+        let decoder = JSONDecoder()
+        let savedBytes = await fileSystem.contents(at: settingsURL)
+        let decoded = try decoder.decode(SettingsDocument.self, from: savedBytes!)
+        XCTAssertEqual(decoded.keepAwakeMode, .display)
+    }
+
+    func testMutationWithoutPriorExplicitLoadHonorsExistingFutureVersionFileAsReadOnly() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let futureBytes = Data("""
+        {"version":999}
+        """.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: futureBytes)
+        let store = makeSettingsStore(fileSystem: fileSystem)
+
+        do {
+            try await store.setKeepAwakeMode(.display)
+            XCTFail("expected StorageError.writesDisabled")
+        } catch StorageError.writesDisabled {
+            // expected
+        }
+
+        let preserved = await fileSystem.contents(at: settingsURL)
+        XCTAssertEqual(preserved, futureBytes, "a future-version file must never be overwritten by a mutation with no prior explicit load()")
+
+        let current = await store.current
+        XCTAssertEqual(current, SettingsDocument.defaultValue, "the in-memory cache must reflect the internal load's defaults, not silently claim the mutation applied")
+    }
 }
