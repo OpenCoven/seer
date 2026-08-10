@@ -233,4 +233,202 @@ final class ModelsTests: XCTestCase {
         let clock = FixedClock(fixedMilliseconds: 1_700_000_000_000)
         XCTAssertEqual(clock.nowMilliseconds(), 1_700_000_000_000)
     }
+
+    // MARK: - Required nullable wire fields
+
+    /// The TS wire contract requires these fields to always be present as a
+    /// key, with an explicit JSON `null` standing in for "no value" — never
+    /// an omitted key. Swift's synthesized `Optional` `Codable` conformance
+    /// does not enforce this (it happily omits `nil` on encode and accepts
+    /// a missing key on decode), so these types must implement explicit
+    /// `CodingKeys` + `init(from:)`/`encode(to:)`.
+    func testEmptySnapshotJSONContainsAllRequiredNullableKeysAsExplicitNull() throws {
+        let empty = AppSnapshot.empty(version: "9.9.9")
+        let data = try JSONEncoder.seer.encode(empty)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+        let history = try XCTUnwrap(json["history"] as? [String: Any])
+        XCTAssertTrue(history.keys.contains("currentSession"))
+        XCTAssertTrue(history["currentSession"] is NSNull)
+
+        let update = try XCTUnwrap(json["update"] as? [String: Any])
+        XCTAssertTrue(update.keys.contains("availableVersion"))
+        XCTAssertTrue(update["availableVersion"] is NSNull)
+        XCTAssertTrue(update.keys.contains("releaseURL"))
+        XCTAssertTrue(update["releaseURL"] is NSNull)
+        XCTAssertTrue(update.keys.contains("lastCheckedAt"))
+        XCTAssertTrue(update["lastCheckedAt"] is NSNull)
+    }
+
+    func testAwakeSessionEndedAtEncodesExplicitNullWhenNil() throws {
+        let session = AwakeSession(
+            id: "session-nil",
+            startedAt: 1,
+            endedAt: nil,
+            durationMs: 1,
+            mode: .system,
+            agents: []
+        )
+        let data = try JSONEncoder.seer.encode(session)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertTrue(json.keys.contains("endedAt"))
+        XCTAssertTrue(json["endedAt"] is NSNull)
+    }
+
+    func testLiteralNullRoundTripsForAllRequiredNullableFields() throws {
+        let json = """
+        {
+          "monitor": {
+            "active": false,
+            "keepingAwake": false,
+            "keepAwakeMode": "system",
+            "agents": [],
+            "lastScanAt": 0
+          },
+          "history": {
+            "totalAwakeMs": 0,
+            "todayAwakeMs": 0,
+            "sessionCount": 0,
+            "perAgent": [],
+            "currentSession": null,
+            "recentSessions": [
+              {
+                "id": "session-null-ended",
+                "startedAt": 1,
+                "endedAt": null,
+                "durationMs": 1,
+                "mode": "system",
+                "agents": []
+              }
+            ]
+          },
+          "update": {
+            "checking": false,
+            "availableVersion": null,
+            "releaseURL": null,
+            "lastCheckedAt": null
+          },
+          "diagnostics": [],
+          "appVersion": "0.0.0"
+        }
+        """
+        let data = Data(json.utf8)
+        let decoded = try JSONDecoder.seer.decode(AppSnapshot.self, from: data)
+        XCTAssertNil(decoded.history.currentSession)
+        XCTAssertNil(decoded.history.recentSessions[0].endedAt)
+        XCTAssertNil(decoded.update.availableVersion)
+        XCTAssertNil(decoded.update.releaseURL)
+        XCTAssertNil(decoded.update.lastCheckedAt)
+
+        // Round-trip: re-encoding must still emit explicit nulls, not omit
+        // the keys.
+        let reEncoded = try JSONEncoder.seer.encode(decoded)
+        let reJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: reEncoded) as? [String: Any])
+        let history = try XCTUnwrap(reJSON["history"] as? [String: Any])
+        XCTAssertTrue(history["currentSession"] is NSNull)
+        let update = try XCTUnwrap(reJSON["update"] as? [String: Any])
+        XCTAssertTrue(update["availableVersion"] is NSNull)
+        XCTAssertTrue(update["releaseURL"] is NSNull)
+        XCTAssertTrue(update["lastCheckedAt"] is NSNull)
+    }
+
+    private func awakeSessionJSONObject(omitting key: String? = nil) -> [String: Any] {
+        var object: [String: Any] = [
+            "id": "session-1",
+            "startedAt": 1,
+            "endedAt": NSNull(),
+            "durationMs": 1,
+            "mode": "system",
+            "agents": [[String: Any]](),
+        ]
+        if let key {
+            object.removeValue(forKey: key)
+        }
+        return object
+    }
+
+    private func updateStateJSONObject(omitting key: String? = nil) -> [String: Any] {
+        var object: [String: Any] = [
+            "checking": false,
+            "availableVersion": NSNull(),
+            "releaseURL": NSNull(),
+            "lastCheckedAt": NSNull(),
+        ]
+        if let key {
+            object.removeValue(forKey: key)
+        }
+        return object
+    }
+
+    func testDecodingAwakeSessionFailsWhenEndedAtKeyIsMissing() throws {
+        let object = awakeSessionJSONObject(omitting: "endedAt")
+        let data = try JSONSerialization.data(withJSONObject: object)
+        XCTAssertThrowsError(try JSONDecoder.seer.decode(AwakeSession.self, from: data)) { error in
+            guard case DecodingError.keyNotFound = error else {
+                return XCTFail("Expected DecodingError.keyNotFound, got \(error)")
+            }
+        }
+    }
+
+    func testDecodingHistoryStatsFailsWhenCurrentSessionKeyIsMissing() throws {
+        let object: [String: Any] = [
+            "totalAwakeMs": 0,
+            "todayAwakeMs": 0,
+            "sessionCount": 0,
+            "perAgent": [[String: Any]](),
+            "recentSessions": [[String: Any]](),
+        ]
+        let data = try JSONSerialization.data(withJSONObject: object)
+        XCTAssertThrowsError(try JSONDecoder.seer.decode(HistoryStats.self, from: data)) { error in
+            guard case DecodingError.keyNotFound = error else {
+                return XCTFail("Expected DecodingError.keyNotFound, got \(error)")
+            }
+        }
+    }
+
+    func testDecodingUpdateStateFailsWhenAvailableVersionKeyIsMissing() throws {
+        let object = updateStateJSONObject(omitting: "availableVersion")
+        let data = try JSONSerialization.data(withJSONObject: object)
+        XCTAssertThrowsError(try JSONDecoder.seer.decode(UpdateState.self, from: data)) { error in
+            guard case DecodingError.keyNotFound = error else {
+                return XCTFail("Expected DecodingError.keyNotFound, got \(error)")
+            }
+        }
+    }
+
+    func testDecodingUpdateStateFailsWhenReleaseURLKeyIsMissing() throws {
+        let object = updateStateJSONObject(omitting: "releaseURL")
+        let data = try JSONSerialization.data(withJSONObject: object)
+        XCTAssertThrowsError(try JSONDecoder.seer.decode(UpdateState.self, from: data)) { error in
+            guard case DecodingError.keyNotFound = error else {
+                return XCTFail("Expected DecodingError.keyNotFound, got \(error)")
+            }
+        }
+    }
+
+    func testDecodingUpdateStateFailsWhenLastCheckedAtKeyIsMissing() throws {
+        let object = updateStateJSONObject(omitting: "lastCheckedAt")
+        let data = try JSONSerialization.data(withJSONObject: object)
+        XCTAssertThrowsError(try JSONDecoder.seer.decode(UpdateState.self, from: data)) { error in
+            guard case DecodingError.keyNotFound = error else {
+                return XCTFail("Expected DecodingError.keyNotFound, got \(error)")
+            }
+        }
+    }
+
+    // MARK: - Genuinely optional ActiveAgent fields remain absent-tolerant
+
+    func testActiveAgentPidAndCpuPercentMayBeAbsent() throws {
+        let object: [String: Any] = [
+            "id": "agent-2",
+            "name": "Codex",
+            "detail": "idle",
+            "source": "process",
+            "lastActivityAt": 1,
+        ]
+        let data = try JSONSerialization.data(withJSONObject: object)
+        let decoded = try JSONDecoder.seer.decode(ActiveAgent.self, from: data)
+        XCTAssertNil(decoded.pid)
+        XCTAssertNil(decoded.cpuPercent)
+    }
 }

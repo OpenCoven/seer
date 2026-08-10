@@ -110,6 +110,30 @@ public struct AwakeSession: Codable, Equatable, Sendable {
         self.mode = mode
         self.agents = agents
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, startedAt, endedAt, durationMs, mode, agents
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        startedAt = try container.decode(Int64.self, forKey: .startedAt)
+        endedAt = try container.decodeRequiredNullable(Int64.self, forKey: .endedAt)
+        durationMs = try container.decode(Int64.self, forKey: .durationMs)
+        mode = try container.decode(KeepAwakeMode.self, forKey: .mode)
+        agents = try container.decode([AgentUsage].self, forKey: .agents)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(startedAt, forKey: .startedAt)
+        try container.encodeRequiredNullable(endedAt, forKey: .endedAt)
+        try container.encode(durationMs, forKey: .durationMs)
+        try container.encode(mode, forKey: .mode)
+        try container.encode(agents, forKey: .agents)
+    }
 }
 
 /// Mirrors `HistoryStats` in `renderer/bridge/types.ts`.
@@ -136,6 +160,30 @@ public struct HistoryStats: Codable, Equatable, Sendable {
         self.currentSession = currentSession
         self.recentSessions = recentSessions
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case totalAwakeMs, todayAwakeMs, sessionCount, perAgent, currentSession, recentSessions
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        totalAwakeMs = try container.decode(Int64.self, forKey: .totalAwakeMs)
+        todayAwakeMs = try container.decode(Int64.self, forKey: .todayAwakeMs)
+        sessionCount = try container.decode(Int.self, forKey: .sessionCount)
+        perAgent = try container.decode([AgentUsage].self, forKey: .perAgent)
+        currentSession = try container.decodeRequiredNullable(AwakeSession.self, forKey: .currentSession)
+        recentSessions = try container.decode([AwakeSession].self, forKey: .recentSessions)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(totalAwakeMs, forKey: .totalAwakeMs)
+        try container.encode(todayAwakeMs, forKey: .todayAwakeMs)
+        try container.encode(sessionCount, forKey: .sessionCount)
+        try container.encode(perAgent, forKey: .perAgent)
+        try container.encodeRequiredNullable(currentSession, forKey: .currentSession)
+        try container.encode(recentSessions, forKey: .recentSessions)
+    }
 }
 
 /// Mirrors `UpdateState` in `renderer/bridge/types.ts`. `releaseURL` is kept
@@ -158,6 +206,26 @@ public struct UpdateState: Codable, Equatable, Sendable {
         self.availableVersion = availableVersion
         self.releaseURL = releaseURL
         self.lastCheckedAt = lastCheckedAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case checking, availableVersion, releaseURL, lastCheckedAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        checking = try container.decode(Bool.self, forKey: .checking)
+        availableVersion = try container.decodeRequiredNullable(String.self, forKey: .availableVersion)
+        releaseURL = try container.decodeRequiredNullable(String.self, forKey: .releaseURL)
+        lastCheckedAt = try container.decodeRequiredNullable(Int64.self, forKey: .lastCheckedAt)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(checking, forKey: .checking)
+        try container.encodeRequiredNullable(availableVersion, forKey: .availableVersion)
+        try container.encodeRequiredNullable(releaseURL, forKey: .releaseURL)
+        try container.encodeRequiredNullable(lastCheckedAt, forKey: .lastCheckedAt)
     }
 }
 
@@ -248,5 +316,39 @@ public extension JSONDecoder {
     /// (no `Date` conversion).
     static var seer: JSONDecoder {
         JSONDecoder()
+    }
+}
+
+extension KeyedDecodingContainer {
+    /// Decodes a field that is required-but-nullable on the wire: the key
+    /// must be present in the JSON payload — with either a value or an
+    /// explicit `null` — matching the strict TS wire contract where these
+    /// fields are always serialized (e.g. `endedAt: string | null`, never
+    /// optional/absent). This differs from Swift's synthesized `Optional`
+    /// decoding, which silently treats a missing key the same as `null`.
+    func decodeRequiredNullable<T: Decodable>(_ type: T.Type, forKey key: K) throws -> T? {
+        guard contains(key) else {
+            throw DecodingError.keyNotFound(
+                key,
+                DecodingError.Context(
+                    codingPath: codingPath,
+                    debugDescription: "No value associated with key \(key.stringValue) — this field is required and must be present as JSON null when there is no value, not omitted."
+                )
+            )
+        }
+        return try decodeIfPresent(type, forKey: key)
+    }
+}
+
+extension KeyedEncodingContainer {
+    /// Encodes a field that is required-but-nullable on the wire: writes an
+    /// explicit JSON `null` when the value is `nil`, rather than omitting
+    /// the key, matching the strict TS wire contract.
+    mutating func encodeRequiredNullable<T: Encodable>(_ value: T?, forKey key: K) throws {
+        if let value {
+            try encode(value, forKey: key)
+        } else {
+            try encodeNil(forKey: key)
+        }
     }
 }

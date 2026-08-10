@@ -1,19 +1,16 @@
 import Cocoa
 
-/// Application entry point. Constructs the shared `NSApplication`, installs
-/// `AppDelegate`, forces an accessory (menu-bar-only, no Dock icon) activation
-/// policy — matching the Glaze host's `appConfig.macOS.activationPolicy`
-/// setting in `package.json` — and runs the main event loop.
+/// Application entry point. Builds an `ApplicationRuntime` owning the
+/// `AppDelegate` and runs it for the lifetime of the process. `runtime` is
+/// kept alive via `withExtendedLifetime` around the (never-returning) call
+/// to `run()`, guaranteeing `AppDelegate` — which `NSApplication.delegate`
+/// only references weakly — is retained for as long as the app is running.
 @MainActor
 private func runApp() -> Never {
-    let application = NSApplication.shared
-    let delegate = AppDelegate()
-    application.delegate = delegate
-    application.setActivationPolicy(.accessory)
-    application.run()
-    // `NSApplication.run()` blocks until the app terminates but is not
-    // itself typed as `Never`; this is unreachable in practice.
-    fatalError("NSApplication.run() returned unexpectedly")
+    let runtime = ApplicationRuntime(delegate: AppDelegate())
+    withExtendedLifetime(runtime) {
+        runtime.run()
+    }
 }
 
 runApp()
