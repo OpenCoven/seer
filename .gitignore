@@ -18,6 +18,19 @@ tmp/
 *.tsbuildinfo
 *.log
 
+# Generated Xcode project and native build/release outputs (the macOS app is
+# scaffolded via `xcodegen generate`; only its source/config/tests are
+# tracked, never the generated project or build products)
+apps/macos/Seer/Seer.xcodeproj/
+apps/macos/**/DerivedData/
+DerivedData/
+build/macos/
+*.xcarchive
+*.dmg
+apps/macos/**/notarization/
+apps/macos/**/release-staging/
+apps/macos/**/*.notarization.log
+
 # OS files
 .DS_Store
 Thumbs.db
