@@ -1,4 +1,5 @@
 import type { RendererBridge } from "./renderer-bridge";
+import { isAppSnapshot } from "./standalone-wire-schema";
 import { BRIDGE_VERSION, type AppSnapshot, type KeepAwakeMode } from "./types";
 
 /** Closed set of methods the standalone native host understands. */
@@ -56,6 +57,15 @@ export interface BridgePort {
   postMessage(message: BridgeRequest): void;
 }
 
+/**
+ * A success response envelope. Note there is deliberately no `method` field:
+ * the response is correlated to its request purely by `id`, and the expected
+ * `result` shape is validated using the decoder stored on that `id`'s pending
+ * request (see `PendingRequest.decode` / `resultDecoders`) rather than by
+ * trusting a method name the native host could echo back incorrectly.
+ * `result` stays `unknown` at this envelope layer — it is decoded/validated
+ * per-request in `receive` before ever being handed to calling code.
+ */
 interface BridgeSuccessResponse {
   id: string;
   version: typeof BRIDGE_VERSION;
@@ -115,11 +125,59 @@ export class NativeBridgeRequestError extends Error {
   }
 }
 
-interface PendingRequest {
-  resolve: (value: unknown) => void;
+/**
+ * Thrown when a response's `result` does not decode into the shape the
+ * pending request expects (e.g. a malformed/partial `AppSnapshot`, or a
+ * non-null result for a void method). This is distinct from
+ * `NativeBridgeRequestError`, which represents a typed error the native host
+ * itself reported — this error means the native host sent a *success*
+ * response whose payload we cannot trust.
+ */
+export class NativeBridgeProtocolError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "NativeBridgeProtocolError";
+  }
+}
+
+/** Outcome of decoding a raw `result` value against a pending request's expected shape. */
+type DecodeResult<T> = { ok: true; value: T } | { ok: false };
+
+interface PendingRequest<T = unknown> {
+  /** Validates/decodes a raw `result` value into this request's expected result type. */
+  decode: (result: unknown) => DecodeResult<T>;
+  resolve: (value: T) => void;
   reject: (error: unknown) => void;
   timeoutHandle: unknown;
 }
+
+/**
+ * Wire convention for void-returning methods (`updates.open`, `app.quit`):
+ * a successful response's `result` must be exactly `null` — not `undefined`,
+ * not an object, not absent. `null` is chosen (over an absent/`undefined`
+ * field) for JSON interoperability, since `undefined` cannot round-trip
+ * through JSON. Both the implementation and its tests treat this as the one
+ * valid encoding of "no result".
+ */
+function decodeVoidResult(result: unknown): DecodeResult<void> {
+  return result === null ? { ok: true, value: undefined } : { ok: false };
+}
+
+function decodeAppSnapshotResult(result: unknown): DecodeResult<AppSnapshot> {
+  return isAppSnapshot(result) ? { ok: true, value: result } : { ok: false };
+}
+
+/** Per-method result decoder, selected by `send` based on the method being called. */
+const resultDecoders: {
+  [M in BridgeMethod]: (result: unknown) => DecodeResult<BridgeMethodResultMap[M]>;
+} = {
+  "snapshot.get": decodeAppSnapshotResult,
+  "keepAwakeMode.set": decodeAppSnapshotResult,
+  "history.clear": decodeAppSnapshotResult,
+  "updates.check": decodeAppSnapshotResult,
+  "updates.open": decodeVoidResult,
+  "app.quit": decodeVoidResult,
+};
 
 export interface StandaloneRendererBridge extends RendererBridge {
   /** Feed an inbound postMessage payload from the native host into the bridge. */
@@ -152,8 +210,7 @@ function isBridgeSnapshotChangedEvent(candidate: Record<string, unknown>): boole
   return (
     candidate.kind === "event" &&
     candidate.type === "snapshot.changed" &&
-    typeof candidate.snapshot === "object" &&
-    candidate.snapshot !== null
+    isAppSnapshot(candidate.snapshot)
   );
 }
 
@@ -194,7 +251,7 @@ export function createStandaloneRendererBridge(
   port: BridgePort,
   scheduler: BridgeScheduler = defaultScheduler,
 ): StandaloneRendererBridge {
-  const pending = new Map<string, PendingRequest>();
+  const pending = new Map<string, PendingRequest<unknown>>();
   const listeners = new Set<(snapshot: AppSnapshot) => void>();
 
   function send<M extends BridgeMethod>(
@@ -214,6 +271,13 @@ export function createStandaloneRendererBridge(
       payload,
     } as BridgeRequest;
 
+    // Stored on the pending entry so `receive` can validate/decode a
+    // response's `result` against exactly the shape this call expects,
+    // without the response itself needing to carry a `method` field.
+    const decode = resultDecoders[method] as (result: unknown) => DecodeResult<
+      BridgeMethodResultMap[M]
+    >;
+
     return new Promise((resolve, reject) => {
       const timeoutHandle = scheduler.setTimeout(() => {
         pending.delete(id);
@@ -221,6 +285,7 @@ export function createStandaloneRendererBridge(
       }, REQUEST_TIMEOUT_MS);
 
       pending.set(id, {
+        decode: decode as (result: unknown) => DecodeResult<unknown>,
         resolve: resolve as (value: unknown) => void,
         reject,
         timeoutHandle,
@@ -236,6 +301,9 @@ export function createStandaloneRendererBridge(
 
     if (message.kind === "event") {
       if (message.type === "snapshot.changed") {
+        // isBridgeInboundMessage already validated message.snapshot is a
+        // complete AppSnapshot via isAppSnapshot — malformed events never
+        // reach here, so subscribers are never notified with a bad shape.
         for (const listener of listeners) {
           listener(message.snapshot);
         }
@@ -252,11 +320,22 @@ export function createStandaloneRendererBridge(
     pending.delete(message.id);
     scheduler.clearTimeout(request.timeoutHandle);
 
-    if (message.ok) {
-      request.resolve(message.result);
-    } else {
+    if (!message.ok) {
       request.reject(new NativeBridgeRequestError(message.error));
+      return;
     }
+
+    const decoded = request.decode(message.result);
+    if (!decoded.ok) {
+      request.reject(
+        new NativeBridgeProtocolError(
+          `Bridge response result for request ${message.id} did not match the expected shape`,
+        ),
+      );
+      return;
+    }
+
+    request.resolve(decoded.value);
   }
 
   return {
