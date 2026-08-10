@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -18,23 +18,26 @@ const EXCLUDED_SOURCE_FILES = new Set([
 
 const EXCLUDED_SOURCE_DIRS = ["renderer/dev"];
 
+/** Source extensions scanned for forbidden Glaze references — CSS is included alongside TS/TSX. */
+const SOURCE_FILE_PATTERN = /\.(ts|tsx|css)$/;
+
 const FORBIDDEN_PATTERNS = [/@glaze\/core/, /glaze-core:/, /window\.glazeAPI/];
 
-function walk(directory, out = []) {
+function walk(directory, out = [], root = repoRoot) {
   for (const entry of readdirSync(directory, { withFileTypes: true })) {
     const fullPath = join(directory, entry.name);
-    const relPath = relative(repoRoot, fullPath);
+    const relPath = relative(root, fullPath);
 
     if (EXCLUDED_SOURCE_DIRS.some((dir) => relPath === dir || relPath.startsWith(`${dir}/`))) {
       continue;
     }
 
     if (entry.isDirectory()) {
-      walk(fullPath, out);
+      walk(fullPath, out, root);
       continue;
     }
 
-    if (!/\.(ts|tsx)$/.test(entry.name)) {
+    if (!SOURCE_FILE_PATTERN.test(entry.name)) {
       continue;
     }
     if (EXCLUDED_SOURCE_FILES.has(relPath)) {
@@ -45,21 +48,55 @@ function walk(directory, out = []) {
   return out;
 }
 
-test("shared/standalone renderer source contains no Glaze imports or globals", () => {
-  const files = walk(join(repoRoot, "renderer"));
-  assert.ok(files.length > 0, "expected to find renderer source files to scan");
-
+/** Scans `files` (relative to `root`) for any of `FORBIDDEN_PATTERNS`, returning offender strings. */
+function scanForbiddenPatterns(files, root = repoRoot) {
   const offenders = [];
   for (const relPath of files) {
-    const source = readFileSync(join(repoRoot, relPath), "utf8");
+    const source = readFileSync(join(root, relPath), "utf8");
     for (const pattern of FORBIDDEN_PATTERNS) {
       if (pattern.test(source)) {
         offenders.push(`${relPath} matches ${pattern}`);
       }
     }
   }
+  return offenders;
+}
+
+test("shared/standalone renderer source contains no Glaze imports or globals", () => {
+  const files = walk(join(repoRoot, "renderer"));
+  assert.ok(files.length > 0, "expected to find renderer source files to scan");
+  assert.ok(
+    files.some((file) => file.endsWith(".css")),
+    "expected the source boundary scan to include .css files",
+  );
+
+  const offenders = scanForbiddenPatterns(files);
 
   assert.deepEqual(offenders, []);
+});
+
+test("the source boundary scan rejects Glaze references found in CSS, not just TS/TSX", () => {
+  // Proves CSS is genuinely included in the scan (not just .ts/.tsx) by
+  // planting a transient fixture file with a forbidden pattern, confirming
+  // it is flagged, then removing it so no forbidden source persists.
+  const fixtureDir = join(repoRoot, "renderer", "standalone", "__css-scan-fixture__");
+  const fixtureFile = join(fixtureDir, "forbidden.css");
+  mkdirSync(fixtureDir, { recursive: true });
+  writeFileSync(fixtureFile, "body { color: red; } /* window.glazeAPI */\n");
+
+  try {
+    const files = walk(join(repoRoot, "renderer"));
+    const relFixture = relative(repoRoot, fixtureFile);
+    assert.ok(files.includes(relFixture), "expected the CSS fixture to be picked up by the scan");
+
+    const offenders = scanForbiddenPatterns(files);
+    assert.ok(
+      offenders.some((offender) => offender.startsWith(relFixture)),
+      "expected the CSS fixture's forbidden Glaze reference to be flagged",
+    );
+  } finally {
+    rmSync(fixtureDir, { recursive: true, force: true });
+  }
 });
 
 test("the standalone renderer builds a production bundle with no Glaze references", (t) => {

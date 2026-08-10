@@ -19,7 +19,9 @@
     "renderer/standalone",
     "renderer/ui",
     "renderer/vite-env.d.ts",
-    "vite.standalone.config.ts"
+    "vite.standalone.config.ts",
+    "main/services/agent-detection-policy.ts",
+    "main/services/update-check.ts"
   ],
   "exclude": [
     "node_modules",

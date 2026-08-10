@@ -344,6 +344,130 @@ test("an older concurrent getSnapshot completion cannot overwrite a newer comple
   assert.equal(staleSnapshot.monitor.keepAwakeMode, "display");
 });
 
+// --- Finding 5: agent ticks must keep History live, not just the monitor. ---
+
+test("an agents:state-changed notification emits an immediate merged snapshot, then asynchronously refreshes history and emits it as a second snapshot", async () => {
+  const fake = createControllableIpc();
+  const bridge = createGlazeRendererBridge(fake.ipc);
+  const received: Array<Awaited<ReturnType<typeof bridge.getSnapshot>>> = [];
+  bridge.subscribe((snapshot) => received.push(snapshot));
+
+  const snapshotPromise = bridge.getSnapshot();
+  fake.resolveCall("agents:getState", 0, makeMonitor({ keepAwakeMode: "system" }));
+  fake.resolveCall("history:getStats", 0, makeHistory({ totalAwakeMs: 1000 }));
+  fake.resolveCall("app:getInfo", 0, { name: "Seer", version: "1.0.0", environment: "test" });
+  await snapshotPromise;
+
+  // An agent scan tick: the monitor changes (e.g. the in-progress awake
+  // session's live duration ticked), which must both update immediately and
+  // kick off a fresh `history:getStats` fetch in the background.
+  const tickedMonitor = makeMonitor({ active: true, keepingAwake: true });
+  fake.fireNotification("agents:state-changed", tickedMonitor);
+
+  // The immediate merge with the new monitor must be delivered synchronously.
+  assert.equal(received.length, 1);
+  assert.equal(received[0].monitor.active, true);
+  assert.equal(received[0].history.totalAwakeMs, 1000, "history unchanged until the refresh resolves");
+
+  // The background `history:getStats` refresh resolves with fresher stats.
+  fake.resolveCall("history:getStats", 1, makeHistory({ totalAwakeMs: 5000 }));
+  await Promise.resolve();
+  await Promise.resolve();
+
+  assert.equal(received.length, 2, "the async history refresh must emit a second snapshot");
+  assert.equal(received[1].history.totalAwakeMs, 5000);
+  assert.equal(received[1].monitor.active, true, "the ticked monitor must still be present");
+});
+
+test("a stale history refresh triggered by an agent tick cannot overwrite a newer clearHistory result", async () => {
+  const fake = createControllableIpc();
+  const bridge = createGlazeRendererBridge(fake.ipc);
+  const received: Array<Awaited<ReturnType<typeof bridge.getSnapshot>>> = [];
+  bridge.subscribe((snapshot) => received.push(snapshot));
+
+  const snapshotPromise = bridge.getSnapshot();
+  fake.resolveCall("agents:getState", 0, makeMonitor());
+  fake.resolveCall("history:getStats", 0, makeHistory({ totalAwakeMs: 1000 }));
+  fake.resolveCall("app:getInfo", 0, { name: "Seer", version: "1.0.0", environment: "test" });
+  await snapshotPromise;
+
+  // The agent tick fires, kicking off a background history refresh whose
+  // `history:getStats` call is left pending.
+  fake.fireNotification("agents:state-changed", makeMonitor({ active: true }));
+
+  // Before that refresh resolves, the user clears history — a newer
+  // operation that must win regardless of completion order.
+  const clearPromise = bridge.clearHistory();
+  fake.resolveCall("history:clear", 0, makeHistory({ totalAwakeMs: 0 }));
+  const cleared = await clearPromise;
+  assert.equal(cleared.history.totalAwakeMs, 0);
+
+  // Now the stale background refresh (from before the clear) finally
+  // resolves with data that predates the clear.
+  fake.resolveCall("history:getStats", 1, makeHistory({ totalAwakeMs: 9999 }));
+  await Promise.resolve();
+  await Promise.resolve();
+
+  const finalSnapshot = received[received.length - 1];
+  assert.equal(finalSnapshot.history.totalAwakeMs, 0, "the stale refresh must never have won");
+});
+
+test("a stale history refresh triggered by an agent tick cannot overwrite a newer history:changed notification", async () => {
+  const fake = createControllableIpc();
+  const bridge = createGlazeRendererBridge(fake.ipc);
+  const received: Array<Awaited<ReturnType<typeof bridge.getSnapshot>>> = [];
+  bridge.subscribe((snapshot) => received.push(snapshot));
+
+  const snapshotPromise = bridge.getSnapshot();
+  fake.resolveCall("agents:getState", 0, makeMonitor());
+  fake.resolveCall("history:getStats", 0, makeHistory({ totalAwakeMs: 1000 }));
+  fake.resolveCall("app:getInfo", 0, { name: "Seer", version: "1.0.0", environment: "test" });
+  await snapshotPromise;
+
+  // Agent tick kicks off a background history refresh (left pending).
+  fake.fireNotification("agents:state-changed", makeMonitor({ active: true }));
+
+  // A newer, independent history:changed notification arrives and is
+  // applied immediately (e.g. the native host pushed a fresh stat set).
+  fake.fireNotification("history:changed", makeHistory({ totalAwakeMs: 42 }));
+
+  const lastReceivedBeforeStaleResolve = received[received.length - 1];
+  assert.equal(lastReceivedBeforeStaleResolve.history.totalAwakeMs, 42);
+
+  // The stale background refresh from the agent tick resolves last, with
+  // now-outdated data.
+  fake.resolveCall("history:getStats", 1, makeHistory({ totalAwakeMs: 9999 }));
+  await Promise.resolve();
+  await Promise.resolve();
+
+  const finalSnapshot = received[received.length - 1];
+  assert.equal(finalSnapshot.history.totalAwakeMs, 42, "the stale refresh must never have won");
+});
+
+test("unsubscribing before a pending agent-tick history refresh resolves prevents further emissions to that listener", async () => {
+  const fake = createControllableIpc();
+  const bridge = createGlazeRendererBridge(fake.ipc);
+  const received: Array<Awaited<ReturnType<typeof bridge.getSnapshot>>> = [];
+  const unsubscribe = bridge.subscribe((snapshot) => received.push(snapshot));
+
+  const snapshotPromise = bridge.getSnapshot();
+  fake.resolveCall("agents:getState", 0, makeMonitor());
+  fake.resolveCall("history:getStats", 0, makeHistory());
+  fake.resolveCall("app:getInfo", 0, { name: "Seer", version: "1.0.0", environment: "test" });
+  await snapshotPromise;
+
+  fake.fireNotification("agents:state-changed", makeMonitor({ active: true }));
+  assert.equal(received.length, 1);
+
+  unsubscribe();
+
+  fake.resolveCall("history:getStats", 1, makeHistory({ totalAwakeMs: 777 }));
+  await Promise.resolve();
+  await Promise.resolve();
+
+  assert.equal(received.length, 1, "no emissions must reach a listener after it unsubscribes");
+});
+
 test("an older concurrent getSnapshot completion does not clobber a newer completed getSnapshot", async () => {
   const fake = createControllableIpc();
   const bridge = createGlazeRendererBridge(fake.ipc);

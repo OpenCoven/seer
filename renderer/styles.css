@@ -2,8 +2,8 @@
  * Shared renderer styles for both the Glaze panel and the standalone macOS
  * window. This file is self-contained on purpose: it explicitly imports
  * Tailwind and the small set of Seer-owned design tokens both builds need,
- * rather than depending on Glaze's build pipeline to auto-inject anything
- * (no `@glaze/core` styles are imported here).
+ * rather than depending on the Glaze host's build pipeline to auto-inject
+ * anything (no styles from the Glaze package are imported here).
  */
 @import "tailwindcss";
 @import "@radix-ui/colors/gray.css";

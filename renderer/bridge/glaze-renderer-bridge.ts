@@ -174,6 +174,20 @@ export function createGlazeRendererBridge(ipc: GlazeIpcFacade): RendererBridge {
 
     const merged: AppSnapshot = { ...current, monitor };
     notifyListeners(commit(merged, seq));
+
+    // An agent scan tick can correspond to an in-progress awake session's
+    // live duration ticking upward (the old RootView invalidated its
+    // History view on every `agents:state-changed` for exactly this
+    // reason). Refresh history stats in the background and emit a second
+    // full snapshot once they arrive, using a fresh sequence ticket so a
+    // slow refresh can never clobber a newer mutation/notification/fetch
+    // that lands before it resolves.
+    const historySeq = nextSequence();
+    void ipc.invoke<HistoryStats>("history:getStats").then((history) => {
+      const base = current ?? merged;
+      const refreshed: AppSnapshot = { ...base, history };
+      notifyListeners(commit(refreshed, historySeq));
+    });
   });
 
   const unsubscribeHistory = ipc.onNotification("history:changed", (params) => {
