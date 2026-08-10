@@ -1299,6 +1299,204 @@ final class AtomicJSONStoreTests: XCTestCase {
         XCTAssertTrue(result.writesEnabled)
     }
 
+    // MARK: 24. A future schema's own arbitrary-size sibling numbers must
+    // never make an otherwise well-formed document look corrupt: structural
+    // validation must use the bounded scanner (which accepts JSON numbers of
+    // any digit/exponent size without materializing them), not
+    // `JSONSerialization` (which throws on any number overflowing `Double`,
+    // e.g. `1e309`, regardless of whether it is the version field).
+
+    func testFutureVersionWithHugeSiblingExponentAndNestedHugeNumbersIsUnsupportedPreserved() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        let fiveHundredDigitInteger = "1" + String(repeating: "0", count: 499)
+        // "version":2 (future, since current is 1) alongside an unrelated
+        // sibling field whose own value overflows `Double` — this is
+        // exactly the shape `JSONSerialization` cannot structurally
+        // validate, even though the document is perfectly well-formed
+        // JSON. A nested object also carries a 500-digit integer and a
+        // 500-exponent-digit number to prove *any* number anywhere in the
+        // document, not just top-level siblings, must be tolerated.
+        let bytes = Data("""
+        {"version":2,"future":1e309,"nested":{"big":\(fiveHundredDigitInteger),"exp":1e\(String(repeating: "9", count: 500))}}
+        """.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: bytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertEqual(result.diagnostic?.id, StorageDiagnosticID.unsupportedVersion)
+        XCTAssertFalse(result.writesEnabled)
+
+        let preserved = await fileSystem.contents(at: settingsURL)
+        XCTAssertEqual(preserved, bytes, "a structurally valid future document must be preserved byte-for-byte")
+        let names = await fileSystem.fileNames(inDirectoryOf: settingsURL)
+        XCTAssertFalse(names.contains { $0.contains("corrupt") })
+    }
+
+    func testFutureVersionWithHugeNumericArrayStringAndObjectValuesIsUnsupportedPreserved() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        let hugeDigits = String(repeating: "9", count: 500)
+        // Every JSON value kind this build doesn't understand yet — an
+        // array mixing huge exponents and huge integers, an ordinary
+        // string, and a deeply-valued (but shallow-nested) object — must
+        // all be accepted structurally for a future schema version without
+        // decoding any of it.
+        let bytes = Data("""
+        {"version":2,"arr":[1e309,\(hugeDigits),-1e309],"str":"a normal string","obj":{"x":1e400,"y":{"z":\(hugeDigits)}}}
+        """.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: bytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertEqual(result.diagnostic?.id, StorageDiagnosticID.unsupportedVersion)
+        XCTAssertFalse(result.writesEnabled)
+
+        let preserved = await fileSystem.contents(at: settingsURL)
+        XCTAssertEqual(preserved, bytes)
+        let names = await fileSystem.fileNames(inDirectoryOf: settingsURL)
+        XCTAssertFalse(names.contains { $0.contains("corrupt") })
+    }
+
+    func testFutureVersionWithMalformedHugeSiblingNumberStillQuarantines() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        // The sibling number token itself is malformed (a second decimal
+        // point is not part of the JSON number grammar), even though the
+        // top-level "version" is a valid future value. The structural
+        // scan of the *whole* document must catch this and route it to the
+        // ordinary corrupt/quarantine path, not unsupported-version.
+        let bytes = Data(#"{"version":2,"future":1e309.5}"#.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: bytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertEqual(result.diagnostic?.id, StorageDiagnosticID.corrupt)
+        XCTAssertTrue(result.writesEnabled)
+    }
+
+    func testFutureVersionWithTrailingGarbageAfterValidDocumentQuarantines() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        // A structurally complete, well-formed top-level object followed
+        // by trailing bytes that are not whitespace. Exactly one complete
+        // top-level JSON value must be required, with trailing tokens
+        // rejected rather than silently ignored.
+        let bytes = Data(#"{"version":2,"future":1e309} garbage"#.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: bytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertEqual(result.diagnostic?.id, StorageDiagnosticID.corrupt)
+        XCTAssertTrue(result.writesEnabled)
+    }
+
+    func testFutureVersionWithBadCommaAndColonSyntaxQuarantines() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        // Missing colon before the huge sibling value's key/value
+        // separator, alongside a valid future version.
+        let missingColonBytes = Data(#"{"version":2,"future" 1e309}"#.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: missingColonBytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertEqual(result.diagnostic?.id, StorageDiagnosticID.corrupt)
+        XCTAssertTrue(result.writesEnabled)
+    }
+
+    func testFutureVersionWithDoubleCommaSyntaxQuarantines() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        let bytes = Data(#"{"version":2,,"future":1e309}"#.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: bytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertEqual(result.diagnostic?.id, StorageDiagnosticID.corrupt)
+        XCTAssertTrue(result.writesEnabled)
+    }
+
+    func testFutureVersionWithUnclosedNestedObjectQuarantines() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        // A future version alongside a nested object that never closes,
+        // trailing off mid-huge-number.
+        let bytes = Data(#"{"version":2,"outer":{"inner":1e309"#.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: bytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertEqual(result.diagnostic?.id, StorageDiagnosticID.corrupt)
+        XCTAssertTrue(result.writesEnabled)
+    }
+
+    func testCurrentVersionWithOrdinaryFieldsStillLoadsUnchangedAfterScannerReplacement() async {
+        // Regression guard: replacing the structural validator must not
+        // change the well-trodden current-version success path.
+        let fileSystem = InMemorySettingsFileSystem()
+        let document = SettingsDocument(version: 1, keepAwakeMode: .display, includePrereleaseUpdates: true)
+        await fileSystem.seedFile(at: settingsURL, contents: encode(document))
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, document)
+        XCTAssertNil(result.diagnostic)
+        XCTAssertTrue(result.writesEnabled)
+    }
+
+    func testAdversarialFutureVersionSuiteRepeatsUnderTimeoutWithoutHangingOrCrashing() async {
+        // Repeats a representative sample of the adversarial future-version
+        // documents above many times, asserting the whole batch completes
+        // well within a generous bound — guarding against any accidental
+        // reintroduction of quadratic behavior or hangs in the scanner.
+        let hugeDigits = String(repeating: "9", count: 500)
+        let documents = [
+            Data("""
+            {"version":2,"future":1e309,"nested":{"big":\(hugeDigits),"exp":1e\(hugeDigits)}}
+            """.utf8),
+            Data("""
+            {"version":2,"arr":[1e309,\(hugeDigits),-1e309],"str":"a normal string","obj":{"x":1e400,"y":{"z":\(hugeDigits)}}}
+            """.utf8),
+            Data(#"{"version":2,"future":1e309.5}"#.utf8),
+            Data(#"{"version":2,"future":1e309} garbage"#.utf8),
+            Data(#"{"version":2,"future" 1e309}"#.utf8),
+            Data(#"{"version":2,,"future":1e309}"#.utf8),
+            Data(#"{"version":2,"outer":{"inner":1e309"#.utf8)
+        ]
+        let expectedDiagnosticIDs = [
+            StorageDiagnosticID.unsupportedVersion,
+            StorageDiagnosticID.unsupportedVersion,
+            StorageDiagnosticID.corrupt,
+            StorageDiagnosticID.corrupt,
+            StorageDiagnosticID.corrupt,
+            StorageDiagnosticID.corrupt,
+            StorageDiagnosticID.corrupt
+        ]
+
+        let start = DispatchTime.now()
+        for _ in 0..<25 {
+            for (bytes, expectedID) in zip(documents, expectedDiagnosticIDs) {
+                let fileSystem = InMemorySettingsFileSystem()
+                await fileSystem.seedFile(at: settingsURL, contents: bytes)
+                let store = makeStore(fileSystem: fileSystem)
+                let result = await store.load()
+                XCTAssertEqual(result.diagnostic?.id, expectedID)
+            }
+        }
+        let elapsedSeconds = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000_000
+
+        XCTAssertLessThan(elapsedSeconds, 15.0, "repeating the adversarial future-version suite must stay well within a bounded timeout")
+    }
+
     // MARK: 13. Path resolver uses injected base URL exactly
 
     func testSettingsFileURLUsesInjectedBaseURLExactly() throws {

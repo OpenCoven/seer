@@ -263,19 +263,40 @@ fileprivate enum VersionProbing {
         case invalid
     }
 
-    /// Replaces the version number token with the single representable
-    /// byte `0` and feeds the sanitized bytes to `JSONSerialization`,
-    /// so a version token this build can't materialize as `Double`/`Int`
-    /// never prevents validating the well-formedness of everything else
-    /// in the document.
-    static func isStructurallyValid(bytes: [UInt8], versionTokenRange range: Range<Int>) -> Bool {
-        var sanitized = [UInt8]()
-        sanitized.reserveCapacity(bytes.count - (range.upperBound - range.lowerBound) + 1)
-        sanitized.append(contentsOf: bytes[bytes.startIndex..<range.lowerBound])
-        sanitized.append(UInt8(ascii: "0"))
-        sanitized.append(contentsOf: bytes[range.upperBound...])
-        let sanitizedData = Data(sanitized)
-        return (try? JSONSerialization.jsonObject(with: sanitizedData, options: [.fragmentsAllowed])) != nil
+    /// Validates that `bytes` contains exactly one complete, well-formed
+    /// top-level JSON value — consuming any trailing whitespace and
+    /// rejecting anything else left over — using the same bounded,
+    /// non-materializing scanner (`skipJSONValue`) that locates the
+    /// top-level `version` token.
+    ///
+    /// Deliberately does not hand `bytes` to `JSONSerialization`:
+    /// `JSONSerialization` itself throws when *any* JSON number in the
+    /// document (not just the version field) overflows `Double` (e.g.
+    /// `1e309`, or a several-hundred-digit integer), which would otherwise
+    /// misreport a perfectly well-formed "future version" document — one
+    /// that may legitimately contain other arbitrarily large numbers this
+    /// build has no reason to decode — as corrupt. `skipJSONValue` and
+    /// `scanNumberToken` accept a strict JSON number of any digit/exponent
+    /// size anywhere in the document without ever materializing it as
+    /// `Double`/`Int`.
+    static func isStructurallyValidDocument(bytes: [UInt8]) -> Bool {
+        let start = skipWhitespace(bytes, from: 0)
+        // Start at depth `-1`, not `0`: `scanTopLevelVersionToken` never
+        // calls `skipJSONValue` on the top-level object itself (it walks
+        // the object's members with its own inline loop), only on each
+        // member's *value*, and always with a fresh `depth: 0` budget for
+        // that value regardless of how many sibling fields precede it.
+        // Feeding the whole document — starting at its outermost `{` —
+        // through `skipJSONValue` at `depth: 0` would count that outer
+        // brace as one level of nesting, shrinking every top-level field's
+        // own nesting budget by one and silently lowering the effective
+        // depth limit for documents this whole-document check validates
+        // versus documents `scanTopLevelVersionToken` merely skips through.
+        // `-1` keeps the two paths' depth accounting identical: the
+        // top-level object costs nothing, and each field's value still
+        // gets the full `maxNestingDepth` budget.
+        guard let end = skipJSONValue(bytes, from: start, depth: -1) else { return false }
+        return skipWhitespace(bytes, from: end) == bytes.count
     }
 
     // MARK: - Lexical top-level `version` scan
@@ -814,19 +835,21 @@ public actor AtomicJSONStore<Document: VersionedDocument> {
 
     /// Inspects the top-level `version` field of `data` as raw JSON,
     /// without decoding the full document, so a future schema (which may
-    /// have fields this build doesn't understand) can be safely detected
-    /// and preserved untouched rather than misread as corrupt.
+    /// have fields this build doesn't understand, including other
+    /// arbitrarily large numbers) can be safely detected and preserved
+    /// untouched rather than misread as corrupt.
     ///
-    /// Deliberately does not hand `data` to `JSONSerialization` while an
-    /// arbitrarily large version number token is still present:
-    /// `JSONSerialization` itself throws when a JSON number overflows
-    /// `Double` (e.g. `1e309`), which would otherwise misreport a
-    /// perfectly well-formed "future version" document as corrupt. Instead
-    /// this lexically locates the top-level `version` number token by byte
-    /// offset, classifies its magnitude using decimal-string arithmetic
-    /// (never materializing it as `Double`/`Int`), and separately
-    /// structurally validates the rest of the document by substituting a
-    /// representable `0` for that one token before parsing.
+    /// Deliberately does not hand `data` to `JSONSerialization` at all:
+    /// `JSONSerialization` itself throws when *any* JSON number in the
+    /// document overflows `Double` (e.g. `1e309`), not just the version
+    /// field, which would otherwise misreport a perfectly well-formed
+    /// "future version" document — one that may legitimately contain other
+    /// huge numbers this build has no reason to decode — as corrupt.
+    /// Instead this lexically locates the top-level `version` number token
+    /// by byte offset, classifies its magnitude using decimal-string
+    /// arithmetic (never materializing it as `Double`/`Int`), and
+    /// separately structurally validates the *entire* document with the
+    /// same bounded, non-materializing scanner (`isStructurallyValidDocument`).
     private func probeVersion(in data: Data) -> VersionProbing.Result {
         let bytes = [UInt8](data)
         switch VersionProbing.scanTopLevelVersionToken(in: bytes) {
@@ -834,7 +857,7 @@ public actor AtomicJSONStore<Document: VersionedDocument> {
             return .invalid
 
         case .numberToken(let range):
-            guard VersionProbing.isStructurallyValid(bytes: bytes, versionTokenRange: range) else {
+            guard VersionProbing.isStructurallyValidDocument(bytes: bytes) else {
                 return .invalid
             }
             let token = String(decoding: bytes[range], as: UTF8.self)
