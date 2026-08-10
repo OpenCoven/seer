@@ -61,6 +61,7 @@ function cloneSnapshot(snapshot: AppSnapshot): AppSnapshot {
  */
 export function createGlazeRendererBridge(ipc: GlazeIpcFacade): RendererBridge {
   let current: AppSnapshot | null = null;
+  let disconnected = false;
   const listeners = new Set<(snapshot: AppSnapshot) => void>();
 
   /**
@@ -78,6 +79,41 @@ export function createGlazeRendererBridge(ipc: GlazeIpcFacade): RendererBridge {
   function nextSequence(): number {
     sequenceCounter += 1;
     return sequenceCounter;
+  }
+
+  /**
+   * Independent generation counter for the `history` field specifically,
+   * deliberately separate from `sequenceCounter`/`appliedSequence` above. An
+   * agent scan tick kicks off a background `history:getStats` refresh (see
+   * the `agents:state-changed` handler below); if that refresh's own
+   * freshness were judged against the *general* sequence, a later, purely
+   * monitor-only tick (which never changes `history` at all) would bump
+   * `appliedSequence` past the refresh's ticket and make it look stale
+   * relative to data that never actually changed. Tracking history
+   * freshness in its own generation means only another history refresh, a
+   * mutation that changes history (`clearHistory`), or a `history:changed`
+   * notification can ever supersede a still in-flight refresh.
+   */
+  let historyGenCounter = 0;
+  let appliedHistoryGen = 0;
+
+  function nextHistoryGen(): number {
+    historyGenCounter += 1;
+    return historyGenCounter;
+  }
+
+  /**
+   * Decides which `HistoryStats` value belongs in the next snapshot:
+   * `candidate` if `gen` is at least as new as the last history update that
+   * was actually applied, or the current known-good history otherwise
+   * (never `undefined` — once `current` exists it always has a `history`).
+   */
+  function resolveHistory(candidate: HistoryStats, gen: number): HistoryStats {
+    if (current === null || gen >= appliedHistoryGen) {
+      appliedHistoryGen = gen;
+      return candidate;
+    }
+    return current.history;
   }
 
   /**
@@ -136,6 +172,11 @@ export function createGlazeRendererBridge(ipc: GlazeIpcFacade): RendererBridge {
   }
 
   function notifyListeners(snapshot: AppSnapshot): void {
+    if (disconnected) {
+      // Disconnected: no listener should ever observe another emission,
+      // even if something raced its way to calling this after teardown.
+      return;
+    }
     for (const listener of listeners) {
       listener(cloneSnapshot(snapshot));
     }
@@ -162,6 +203,26 @@ export function createGlazeRendererBridge(ipc: GlazeIpcFacade): RendererBridge {
     };
   }
 
+  /**
+   * Returns the current known-good snapshot, or bootstraps one via
+   * `fetchSnapshot` if none exists yet. Used by mutations/`requestUpdateCheck`
+   * that need *some* base snapshot to merge their own result into. The
+   * bootstrap fetch's `history` is still routed through `resolveHistory` (with
+   * its own generation ticket grabbed before the fetch) so it participates
+   * correctly in history-freshness arbitration alongside any concurrent
+   * refresh/notification, exactly like every other path that can produce a
+   * `history` value.
+   */
+  async function ensureBase(): Promise<AppSnapshot> {
+    if (current !== null) {
+      return current;
+    }
+    const historyGen = nextHistoryGen();
+    const fetched = await fetchSnapshot();
+    const history = resolveHistory(fetched.history, historyGen);
+    return { ...fetched, history };
+  }
+
   const unsubscribeAgents = ipc.onNotification("agents:state-changed", (params) => {
     const monitor = params as AgentMonitorState;
     const seq = nextSequence();
@@ -175,29 +236,59 @@ export function createGlazeRendererBridge(ipc: GlazeIpcFacade): RendererBridge {
     const merged: AppSnapshot = { ...current, monitor };
     notifyListeners(commit(merged, seq));
 
+    if (disconnected) {
+      return;
+    }
+
     // An agent scan tick can correspond to an in-progress awake session's
     // live duration ticking upward (the old RootView invalidated its
     // History view on every `agents:state-changed` for exactly this
     // reason). Refresh history stats in the background and emit a second
-    // full snapshot once they arrive, using a fresh sequence ticket so a
-    // slow refresh can never clobber a newer mutation/notification/fetch
-    // that lands before it resolves.
-    const historySeq = nextSequence();
-    void ipc.invoke<HistoryStats>("history:getStats").then((history) => {
-      const base = current ?? merged;
-      const refreshed: AppSnapshot = { ...base, history };
-      notifyListeners(commit(refreshed, historySeq));
-    });
+    // full snapshot once they arrive. This ticket is grabbed *now* (in its
+    // own independent `historyGen` space, not the general `sequenceCounter`
+    // above) so a later, purely monitor-only tick can never make this
+    // still-in-flight refresh look stale — only a newer refresh, a
+    // history-changing mutation, or a `history:changed` notification can.
+    const historyGen = nextHistoryGen();
+    ipc
+      .invoke<HistoryStats>("history:getStats")
+      .then((historyRaw) => {
+        if (disconnected) {
+          return;
+        }
+        // The *general* commit ticket is grabbed here, at resolution time —
+        // this refresh's non-history fields (whatever `current` looks like
+        // right now) are always the freshest available, so this commit
+        // should never be treated as stale on the general axis. Only
+        // `resolveHistory` (independent generation) decides whether the
+        // fetched history itself is still the freshest one.
+        const historySeq = nextSequence();
+        const history = resolveHistory(historyRaw, historyGen);
+        const base = current ?? merged;
+        const refreshed: AppSnapshot = { ...base, history };
+        notifyListeners(commit(refreshed, historySeq));
+      })
+      .catch(() => {
+        // Best-effort background refresh: a rejected `history:getStats`
+        // call must never surface as an unhandled rejection. The existing,
+        // still-valid history value is simply kept until a future
+        // refresh/mutation/notification succeeds.
+      });
   });
 
   const unsubscribeHistory = ipc.onNotification("history:changed", (params) => {
-    const history = params as HistoryStats;
+    const historyRaw = params as HistoryStats;
     const seq = nextSequence();
+    const historyGen = nextHistoryGen();
     if (current === null) {
-      pendingHistoryNotification = { seq, apply: (base) => ({ ...base, history }) };
+      pendingHistoryNotification = {
+        seq,
+        apply: (base) => ({ ...base, history: resolveHistory(historyRaw, historyGen) }),
+      };
       return;
     }
 
+    const history = resolveHistory(historyRaw, historyGen);
     const merged: AppSnapshot = { ...current, history };
     notifyListeners(commit(merged, seq));
   });
@@ -205,22 +296,26 @@ export function createGlazeRendererBridge(ipc: GlazeIpcFacade): RendererBridge {
   return {
     async getSnapshot(): Promise<AppSnapshot> {
       const seq = nextSequence();
+      const historyGen = nextHistoryGen();
       const snapshot = await fetchSnapshot();
-      return commit(snapshot, seq);
+      const history = resolveHistory(snapshot.history, historyGen);
+      return commit({ ...snapshot, history }, seq);
     },
 
     async setKeepAwakeMode(mode: KeepAwakeMode): Promise<AppSnapshot> {
       const seq = nextSequence();
       const monitor = await ipc.invoke<AgentMonitorState>("agents:setKeepAwakeMode", { mode });
-      const base = current ?? (await fetchSnapshot());
+      const base = await ensureBase();
       const merged: AppSnapshot = { ...base, monitor };
       return commit(merged, seq);
     },
 
     async clearHistory(): Promise<AppSnapshot> {
       const seq = nextSequence();
-      const history = await ipc.invoke<HistoryStats>("history:clear");
-      const base = current ?? (await fetchSnapshot());
+      const historyGen = nextHistoryGen();
+      const historyRaw = await ipc.invoke<HistoryStats>("history:clear");
+      const base = await ensureBase();
+      const history = resolveHistory(historyRaw, historyGen);
       const merged: AppSnapshot = { ...base, history };
       return commit(merged, seq);
     },
@@ -236,7 +331,7 @@ export function createGlazeRendererBridge(ipc: GlazeIpcFacade): RendererBridge {
       // Update checks are unavailable until Task 11 wires the real update
       // channel; return the current known-good snapshot unchanged.
       const seq = nextSequence();
-      const base = current ?? (await fetchSnapshot());
+      const base = await ensureBase();
       return commit(base, seq);
     },
 
@@ -253,6 +348,7 @@ export function createGlazeRendererBridge(ipc: GlazeIpcFacade): RendererBridge {
     },
 
     disconnect(): void {
+      disconnected = true;
       unsubscribeAgents();
       unsubscribeHistory();
       listeners.clear();

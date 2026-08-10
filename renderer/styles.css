@@ -54,3 +54,29 @@
 .drag-region {
   -webkit-app-region: drag;
 }
+
+/*
+ * Interactive controls nested inside a draggable region or toolbar must stay
+ * clickable — without this, the OS/WebView treats a click on them as a
+ * window-drag gesture and the click never reaches the control. `[data-toolbar]`
+ * is included alongside `.drag-region` so any toolbar-shaped container keeps
+ * this invariant even if it does not itself carry the `drag-region` class.
+ */
+.drag-region button,
+.drag-region [role="radio"],
+.drag-region [role="button"],
+.drag-region a[href],
+.drag-region input,
+.drag-region select,
+.drag-region textarea,
+.drag-region [tabindex],
+[data-toolbar] button,
+[data-toolbar] [role="radio"],
+[data-toolbar] [role="button"],
+[data-toolbar] a[href],
+[data-toolbar] input,
+[data-toolbar] select,
+[data-toolbar] textarea,
+[data-toolbar] [tabindex] {
+  -webkit-app-region: no-drag;
+}

@@ -3,9 +3,11 @@ import test from "node:test";
 
 import {
   createStandaloneRendererBridge,
+  defaultBridgeIdGenerator,
   NativeBridgeDisconnectedError,
   NativeBridgeProtocolError,
   NativeBridgeRequestError,
+  NativeBridgeTransportError,
   type BridgePort,
   type BridgeScheduler,
 } from "./standalone-renderer-bridge";
@@ -1029,4 +1031,109 @@ test("an unknown id with a malformed envelope is still ignored, not treated as a
   // The real pending request's timer must still be scheduled — it was
   // untouched by the unrelated malformed message.
   assert.equal(fakeScheduler.scheduledDurations.length, 1);
+});
+
+// --- Injectable request-id generator: `seer://` is not guaranteed to be a ---
+// --- secure context, so `crypto.randomUUID` can legitimately be absent.   ---
+
+/** Replaces `globalThis.crypto` for the duration of `fn`, then restores it. */
+async function withCrypto<T>(fakeCrypto: Partial<Crypto> | undefined, fn: () => T | Promise<T>): Promise<T> {
+  const original = Object.getOwnPropertyDescriptor(globalThis, "crypto");
+  Object.defineProperty(globalThis, "crypto", {
+    value: fakeCrypto,
+    configurable: true,
+    writable: true,
+  });
+  try {
+    return await fn();
+  } finally {
+    if (original) {
+      Object.defineProperty(globalThis, "crypto", original);
+    } else {
+      delete (globalThis as { crypto?: Crypto }).crypto;
+    }
+  }
+}
+
+test("a custom injected idGenerator is used for every request id posted", async () => {
+  const { port, messages } = createFakePort();
+  let calls = 0;
+  const bridge = createStandaloneRendererBridge(port, undefined, () => `fixed-id-${++calls}`);
+
+  const first = bridge.getSnapshot();
+  first.catch(() => {
+    // Ignore: intentionally left unresolved by this test.
+  });
+  const second = bridge.getSnapshot();
+  second.catch(() => {
+    // Ignore: intentionally left unresolved by this test.
+  });
+
+  assert.equal(messages[0].id, "fixed-id-1");
+  assert.equal(messages[1].id, "fixed-id-2");
+});
+
+test("defaultBridgeIdGenerator prefers crypto.randomUUID when it is callable", () => {
+  return withCrypto(
+    {
+      randomUUID: () => "11111111-1111-4111-8111-111111111111" as `${string}-${string}-${string}-${string}-${string}`,
+      getRandomValues: (): never => {
+        throw new Error("getRandomValues must not be used when randomUUID is callable");
+      },
+    },
+    () => {
+      assert.equal(defaultBridgeIdGenerator(), "11111111-1111-4111-8111-111111111111");
+    },
+  );
+});
+
+test("defaultBridgeIdGenerator falls back to crypto.getRandomValues (deterministic) when crypto.randomUUID is absent, producing a UUID-shaped v4 identifier", () => {
+  return withCrypto(
+    {
+      getRandomValues: <T extends ArrayBufferView | null>(array: T): T => {
+        // Deterministic byte sequence 0x00..0x0f so the resulting UUID is
+        // exactly reproducible and assertable.
+        const bytes = array as unknown as Uint8Array;
+        for (let i = 0; i < bytes.length; i += 1) {
+          bytes[i] = i;
+        }
+        return array;
+      },
+    },
+    () => {
+      const id = defaultBridgeIdGenerator();
+      // Version nibble forced to 4, variant nibble forced to 10xx per RFC
+      // 4122 §4.4, over the deterministic 0x00..0x0f input bytes.
+      assert.equal(id, "00010203-0405-4607-8809-0a0b0c0d0e0f");
+      assert.match(id, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    },
+  );
+});
+
+test("defaultBridgeIdGenerator throws NativeBridgeTransportError when neither crypto.randomUUID nor crypto.getRandomValues exists", () => {
+  return withCrypto(undefined, () => {
+    assert.throws(
+      () => defaultBridgeIdGenerator(),
+      (error: unknown) => error instanceof NativeBridgeTransportError,
+    );
+  });
+});
+
+test("total crypto absence rejects the call immediately and leaves no pending request or scheduled timer", () => {
+  const { port, messages } = createFakePort();
+  const fakeScheduler = createFakeScheduler();
+
+  return withCrypto(undefined, async () => {
+    const bridge = createStandaloneRendererBridge(port, fakeScheduler.scheduler);
+
+    await assert.rejects(bridge.getSnapshot(), (error: unknown) => {
+      assert.ok(error instanceof NativeBridgeTransportError);
+      return true;
+    });
+
+    // Nothing was posted, no timer was scheduled, and the failure was
+    // synchronous — no pending state was ever registered for this call.
+    assert.equal(messages.length, 0);
+    assert.equal(fakeScheduler.scheduledDurations.length, 0);
+  });
 });

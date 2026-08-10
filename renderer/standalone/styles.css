@@ -3,7 +3,12 @@
  * the shared Seer design tokens, then layers on the handful of concerns that
  * are specific to running as a bare native window (no Glaze chrome/backdrop
  * to supply them): a native system font stack, a `color-scheme` that follows
- * the OS appearance, and a fully transparent document background.
+ * the OS appearance, a fully transparent document background, and a shell
+ * that fills the native window exactly (`height: 100%` down to `#root`, no
+ * default `body` margin, `overflow: hidden` at the shell level) so the shell
+ * itself never scrolls or shows a margin gap around the transparent window —
+ * only `ScrollPanel`'s own content region (`overflow-y-auto`, see
+ * `renderer/ui/primitives.tsx`) owns scrolling.
  */
 @import "tailwindcss";
 @import "../styles.css";
@@ -12,10 +17,13 @@
   html,
   body,
   #root {
+    height: 100%;
     background: transparent;
   }
 
   body {
+    margin: 0;
+    overflow: hidden;
     font-family:
       -apple-system,
       BlinkMacSystemFont,

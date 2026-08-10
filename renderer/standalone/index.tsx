@@ -52,4 +52,11 @@ if (!rootElement) {
   throw new Error("Root element not found");
 }
 
-mountApp(rootElement, bridge);
+const dispose = mountApp(rootElement, bridge);
+
+// `pagehide` is real window teardown (not a React effect cleanup, which
+// StrictMode can invoke without the window actually going away) — the only
+// point where unmounting and disconnecting the bridge exactly once is
+// correct for the standalone build.
+window.addEventListener("pagehide", dispose);
+

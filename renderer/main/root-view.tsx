@@ -74,12 +74,6 @@ export function RootView() {
     };
   }, [bridge, queryClient]);
 
-  React.useEffect(() => {
-    return () => {
-      bridge.disconnect();
-    };
-  }, [bridge]);
-
   const diagnostics = selectDiagnostics(snapshot);
 
   return (

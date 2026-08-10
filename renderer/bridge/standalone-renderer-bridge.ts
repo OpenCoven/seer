@@ -156,6 +156,65 @@ export class NativeBridgeProtocolError extends Error {
   }
 }
 
+/**
+ * Thrown when this transport cannot generate a request id at all — neither
+ * `crypto.randomUUID` nor `crypto.getRandomValues` is callable in the current
+ * global scope. `seer://` pages are not guaranteed to be a secure context
+ * (unlike `https:`), so `crypto.randomUUID` in particular can legitimately be
+ * absent there. This is a transport-capability failure, not a malformed
+ * response, so it gets its own type distinct from `NativeBridgeProtocolError`.
+ */
+export class NativeBridgeTransportError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "NativeBridgeTransportError";
+  }
+}
+
+/** Injectable request-id generator so tests can supply deterministic ids. */
+export type BridgeIdGenerator = () => string;
+
+/** Renders 16 random bytes as an RFC 4122 §4.4 version-4 UUID string. */
+function uuidFromRandomBytes(bytes: Uint8Array): string {
+  // Per RFC 4122 §4.4: force the version (4) and variant (10xx) bits so the
+  // result is shaped exactly like a real v4 UUID, even though these bytes
+  // were not produced by `crypto.randomUUID` itself.
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+/**
+ * Default request-id generator. Prefers `crypto.randomUUID` (the common
+ * case), but `seer://` may not be a secure context, in which case
+ * `crypto.randomUUID` can be absent even though `crypto.getRandomValues`
+ * still is — so that is tried next, building a UUID-shaped v4 identifier by
+ * hand from its output. If neither is callable there is no source of
+ * randomness this transport can trust for an id, so it throws immediately
+ * rather than falling back to something predictable (e.g. a counter), which
+ * would risk correlating an unrelated response to the wrong pending request.
+ */
+export const defaultBridgeIdGenerator: BridgeIdGenerator = () => {
+  const cryptoObj: Crypto | undefined = globalThis.crypto;
+
+  if (typeof cryptoObj?.randomUUID === "function") {
+    return cryptoObj.randomUUID();
+  }
+
+  if (typeof cryptoObj?.getRandomValues === "function") {
+    const bytes = new Uint8Array(16);
+    cryptoObj.getRandomValues(bytes);
+    return uuidFromRandomBytes(bytes);
+  }
+
+  throw new NativeBridgeTransportError(
+    "Bridge cannot generate a request id: neither crypto.randomUUID nor " +
+      "crypto.getRandomValues is available in this context",
+  );
+};
+
 /** Outcome of decoding a raw `result` value against a pending request's expected shape. */
 type DecodeResult<T> = { ok: true; value: T } | { ok: false };
 
@@ -262,13 +321,15 @@ function isBridgeInboundMessage(message: unknown): message is BridgeInboundMessa
 
 /**
  * Builds the standalone RendererBridge transport: requests are posted through
- * `port.postMessage` with a `crypto.randomUUID()` id, BRIDGE_VERSION, method,
- * and payload; responses/events are fed back in via `receive`. No global is
- * exposed here — Task 3's entry point wires `window.seerNative` to this port.
+ * `port.postMessage` with a generated id (see `defaultBridgeIdGenerator`),
+ * BRIDGE_VERSION, method, and payload; responses/events are fed back in via
+ * `receive`. No global is exposed here — Task 3's entry point wires
+ * `window.seerNative` to this port.
  */
 export function createStandaloneRendererBridge(
   port: BridgePort,
   scheduler: BridgeScheduler = defaultScheduler,
+  generateId: BridgeIdGenerator = defaultBridgeIdGenerator,
 ): StandaloneRendererBridge {
   const pending = new Map<string, PendingRequest<unknown>>();
   const listeners = new Set<(snapshot: AppSnapshot) => void>();
@@ -277,7 +338,10 @@ export function createStandaloneRendererBridge(
     method: M,
     payload: BridgeMethodPayloadMap[M],
   ): Promise<BridgeMethodResultMap[M]> {
-    const id = crypto.randomUUID();
+    // Generated before any pending state exists for this call — if this
+    // throws (e.g. `defaultBridgeIdGenerator` finding no crypto source at
+    // all), no pending map entry or timeout timer is ever registered.
+    const id = generateId();
     // TypeScript cannot verify that a generic `{ method: M; payload:
     // BridgeMethodPayloadMap[M] }` matches the mapped-union `BridgeRequest`
     // without narrowing on the literal `M`, even though every call site is

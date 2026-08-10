@@ -15,9 +15,16 @@ if (!rootElement) {
 
 const bridge = createGlazeRendererBridge(window.glazeAPI.glaze.ipc);
 
-mountApp(rootElement, bridge);
+const dispose = mountApp(rootElement, bridge);
+
+// `pagehide` is real window teardown (not a React effect cleanup, which
+// StrictMode/HMR can invoke without the app actually going away) — the only
+// point besides HMR dispose where unmounting and disconnecting the bridge
+// exactly once is correct.
+window.addEventListener("pagehide", dispose);
 
 // Hot Module Replacement (HMR) support
 if (import.meta.hot) {
   import.meta.hot.accept();
+  import.meta.hot.dispose(dispose);
 }

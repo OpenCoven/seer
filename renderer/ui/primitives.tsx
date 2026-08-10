@@ -273,20 +273,114 @@ export const List = {
 // SegmentedControl
 // ---------------------------------------------------------------------------
 
+/**
+ * Pure: given the currently-focused item's index, the total number of items
+ * in the group, and a keydown event's `key`, returns the index that
+ * keyboard navigation should move focus/selection to — or `null` if `key`
+ * is not a navigation key this group handles (the caller should then let
+ * the event proceed as normal, e.g. Space/click on the native button).
+ * ArrowRight/ArrowDown move forward, ArrowLeft/ArrowUp move backward, both
+ * wrapping around the ends of the group; Home/End jump to the first/last
+ * item. Extracted as a standalone, dependency-free function so the roving
+ * "next index" logic is unit-testable without a DOM/React rendering
+ * environment.
+ */
+export function nextSegmentedControlIndex(
+  currentIndex: number,
+  itemCount: number,
+  key: string,
+): number | null {
+  if (itemCount <= 0) {
+    return null;
+  }
+  switch (key) {
+    case "ArrowRight":
+    case "ArrowDown":
+      return (currentIndex + 1 + itemCount) % itemCount;
+    case "ArrowLeft":
+    case "ArrowUp":
+      return (currentIndex - 1 + itemCount) % itemCount;
+    case "Home":
+      return 0;
+    case "End":
+      return itemCount - 1;
+    default:
+      return null;
+  }
+}
+
+interface SegmentedControlContextValue {
+  /** Registers an item's DOM node in group (mount) order; returns its unregister. */
+  registerItem: (node: HTMLButtonElement) => () => void;
+}
+
+const SegmentedControlContext = React.createContext<SegmentedControlContextValue | null>(null);
+
 export interface SegmentedControlProps extends React.HTMLAttributes<HTMLDivElement> {
   "aria-label": string;
 }
 
-export function SegmentedControl({ className, ...props }: SegmentedControlProps) {
+/**
+ * A `role="radiogroup"` of `SegmentedControlItem`s implementing the standard
+ * roving-tabindex pattern: exactly one item (the selected one) is Tab-
+ * reachable at a time, and ArrowLeft/Right/Up/Down/Home/End move both focus
+ * and selection among the items registered under this specific group
+ * instance (navigation never leaks across separate `SegmentedControl`s).
+ */
+export function SegmentedControl({ className, onKeyDown, ...props }: SegmentedControlProps) {
+  const itemsRef = React.useRef<HTMLButtonElement[]>([]);
+
+  const contextValue = React.useMemo<SegmentedControlContextValue>(
+    () => ({
+      registerItem: (node) => {
+        itemsRef.current = [...itemsRef.current, node];
+        return () => {
+          itemsRef.current = itemsRef.current.filter((item) => item !== node);
+        };
+      },
+    }),
+    [],
+  );
+
+  const handleKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    onKeyDown?.(event);
+    if (event.defaultPrevented) {
+      return;
+    }
+
+    const items = itemsRef.current;
+    const currentIndex = items.indexOf(event.target as HTMLButtonElement);
+    if (currentIndex === -1) {
+      return;
+    }
+
+    const nextIndex = nextSegmentedControlIndex(currentIndex, items.length, event.key);
+    if (nextIndex === null) {
+      return;
+    }
+
+    event.preventDefault();
+    const nextItem = items[nextIndex];
+    // Programmatic focus works on a `tabIndex={-1}` element even though it
+    // is not Tab-reachable — this is exactly the roving-tabindex pattern.
+    // `.click()` invokes the item's own `onClick` (wired to its `onSelect`),
+    // so the group's key handler never needs to know each item's callback.
+    nextItem.focus();
+    nextItem.click();
+  };
+
   return (
-    <div
-      role="radiogroup"
-      className={cx(
-        "inline-flex items-center gap-0.5 rounded-lg bg-control-subtle p-0.5",
-        className,
-      )}
-      {...props}
-    />
+    <SegmentedControlContext.Provider value={contextValue}>
+      <div
+        role="radiogroup"
+        onKeyDown={handleKeyDown}
+        className={cx(
+          "inline-flex items-center gap-0.5 rounded-lg bg-control-subtle p-0.5",
+          className,
+        )}
+        {...props}
+      />
+    </SegmentedControlContext.Provider>
   );
 }
 
@@ -296,6 +390,15 @@ export interface SegmentedControlItemProps
   onSelect: () => void;
 }
 
+/**
+ * A `role="radio"` segmented-control option. Registers itself with its
+ * owning `SegmentedControl` (for arrow-key navigation) and implements
+ * roving tabindex: the selected item is `tabIndex={0}` (Tab-reachable),
+ * every other item is `tabIndex={-1}` — the standard pattern so Tab moves
+ * focus *into and out of* the whole group in one stop, while arrow keys
+ * move focus *within* it. Native buttons stay usable by click or Space
+ * regardless of `tabIndex`, since neither depends on it.
+ */
 export function SegmentedControlItem({
   selected,
   onSelect,
@@ -303,11 +406,28 @@ export function SegmentedControlItem({
   type = "button",
   ...props
 }: SegmentedControlItemProps) {
+  const context = React.useContext(SegmentedControlContext);
+  const nodeRef = React.useRef<HTMLButtonElement | null>(null);
+
+  const setRef = (node: HTMLButtonElement | null) => {
+    nodeRef.current = node;
+  };
+
+  React.useEffect(() => {
+    const node = nodeRef.current;
+    if (!node || !context) {
+      return;
+    }
+    return context.registerItem(node);
+  }, [context]);
+
   return (
     <button
+      ref={setRef}
       type={type}
       role="radio"
       aria-checked={selected}
+      tabIndex={selected ? 0 : -1}
       data-selected={selected || undefined}
       onClick={onSelect}
       className={cx(

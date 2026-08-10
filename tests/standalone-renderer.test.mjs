@@ -1,9 +1,16 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+
+import {
+  FORBIDDEN_PATTERNS,
+  scanForbiddenPatterns,
+  walkSourceFiles,
+} from "./helpers/source-boundary-scan.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = dirname(here);
@@ -18,84 +25,103 @@ const EXCLUDED_SOURCE_FILES = new Set([
 
 const EXCLUDED_SOURCE_DIRS = ["renderer/dev"];
 
-/** Source extensions scanned for forbidden Glaze references — CSS is included alongside TS/TSX. */
-const SOURCE_FILE_PATTERN = /\.(ts|tsx|css)$/;
-
-const FORBIDDEN_PATTERNS = [/@glaze\/core/, /glaze-core:/, /window\.glazeAPI/];
-
-function walk(directory, out = [], root = repoRoot) {
-  for (const entry of readdirSync(directory, { withFileTypes: true })) {
-    const fullPath = join(directory, entry.name);
-    const relPath = relative(root, fullPath);
-
-    if (EXCLUDED_SOURCE_DIRS.some((dir) => relPath === dir || relPath.startsWith(`${dir}/`))) {
-      continue;
-    }
-
-    if (entry.isDirectory()) {
-      walk(fullPath, out, root);
-      continue;
-    }
-
-    if (!SOURCE_FILE_PATTERN.test(entry.name)) {
-      continue;
-    }
-    if (EXCLUDED_SOURCE_FILES.has(relPath)) {
-      continue;
-    }
-    out.push(relPath);
-  }
-  return out;
-}
-
-/** Scans `files` (relative to `root`) for any of `FORBIDDEN_PATTERNS`, returning offender strings. */
-function scanForbiddenPatterns(files, root = repoRoot) {
-  const offenders = [];
-  for (const relPath of files) {
-    const source = readFileSync(join(root, relPath), "utf8");
-    for (const pattern of FORBIDDEN_PATTERNS) {
-      if (pattern.test(source)) {
-        offenders.push(`${relPath} matches ${pattern}`);
-      }
-    }
-  }
-  return offenders;
-}
-
 test("shared/standalone renderer source contains no Glaze imports or globals", () => {
-  const files = walk(join(repoRoot, "renderer"));
+  const files = walkSourceFiles(join(repoRoot, "renderer"), {
+    root: repoRoot,
+    excludedDirs: EXCLUDED_SOURCE_DIRS,
+    excludedFiles: EXCLUDED_SOURCE_FILES,
+  });
   assert.ok(files.length > 0, "expected to find renderer source files to scan");
   assert.ok(
     files.some((file) => file.endsWith(".css")),
     "expected the source boundary scan to include .css files",
   );
 
-  const offenders = scanForbiddenPatterns(files);
+  const offenders = scanForbiddenPatterns(files, repoRoot);
 
   assert.deepEqual(offenders, []);
 });
 
+test("shared renderer CSS marks interactive controls inside drag regions/toolbars as no-drag", () => {
+  const css = readFileSync(join(repoRoot, "renderer", "styles.css"), "utf8");
+
+  // The draggable-region rule itself must still exist...
+  assert.match(css, /\.drag-region\s*\{[^}]*-webkit-app-region:\s*drag/);
+
+  // ...and every interactive-control selector scoped under `.drag-region`
+  // and `[data-toolbar]` must be paired with `-webkit-app-region: no-drag`
+  // in the same rule, so clicks on buttons/radios/etc. reach the control
+  // instead of being swallowed as a window-drag gesture.
+  const noDragRuleMatch = css.match(
+    /((?:\.drag-region|\[data-toolbar\])[^{]*\{[^}]*-webkit-app-region:\s*no-drag[^}]*\})/,
+  );
+  assert.ok(noDragRuleMatch, "expected a no-drag rule scoped to .drag-region/[data-toolbar]");
+  const [noDragRule] = noDragRuleMatch;
+
+  for (const scope of [".drag-region", "[data-toolbar]"]) {
+    for (const selector of ["button", '[role="radio"]']) {
+      assert.ok(
+        noDragRule.includes(`${scope} ${selector}`),
+        `expected the no-drag rule to include selector "${scope} ${selector}"`,
+      );
+    }
+  }
+});
+
+test("the standalone renderer's shell CSS fills the native window (html/body/#root height:100%, no body margin, shell overflow hidden) while staying transparent", () => {
+  const css = readFileSync(join(repoRoot, "renderer", "standalone", "styles.css"), "utf8");
+
+  const htmlBodyRootRuleMatch = css.match(/html,\s*body,\s*#root\s*\{([^}]*)\}/);
+  assert.ok(htmlBodyRootRuleMatch, "expected a combined html, body, #root rule");
+  const [, htmlBodyRootRule] = htmlBodyRootRuleMatch;
+  assert.match(htmlBodyRootRule, /height:\s*100%/, "html/body/#root must fill the native window");
+  assert.match(
+    htmlBodyRootRule,
+    /background:\s*transparent/,
+    "html/body/#root must keep the transparent native window background",
+  );
+
+  const bodyRuleMatch = css.match(/(?<!html,\s*)body\s*\{([^}]*)\}/);
+  assert.ok(bodyRuleMatch, "expected a standalone-specific body rule");
+  const [, bodyRule] = bodyRuleMatch;
+  assert.match(bodyRule, /margin:\s*0/, "body must have no default margin");
+  assert.match(
+    bodyRule,
+    /overflow:\s*hidden/,
+    "the shell (body) must not scroll — only the panel's own scroll area should own overflow",
+  );
+
+  // The panel's own scrollable content area (not the shell) owns overflow.
+  const primitivesSource = readFileSync(join(repoRoot, "renderer", "ui", "primitives.tsx"), "utf8");
+  assert.match(
+    primitivesSource,
+    /overflow-y-auto/,
+    "ScrollPanel's content region must own its own vertical overflow",
+  );
+});
+
 test("the source boundary scan rejects Glaze references found in CSS, not just TS/TSX", () => {
-  // Proves CSS is genuinely included in the scan (not just .ts/.tsx) by
-  // planting a transient fixture file with a forbidden pattern, confirming
-  // it is flagged, then removing it so no forbidden source persists.
-  const fixtureDir = join(repoRoot, "renderer", "standalone", "__css-scan-fixture__");
-  const fixtureFile = join(fixtureDir, "forbidden.css");
-  mkdirSync(fixtureDir, { recursive: true });
+  // Proves CSS is genuinely included in the scan (not just .ts/.tsx) using a
+  // disposable fixture directory under the OS tmpdir — never inside
+  // `renderer/`, so this can never leak a forbidden-pattern file into
+  // production sources (even if cleanup failed) or race with another test
+  // run scanning the same repo path in parallel. `mkdtempSync` guarantees a
+  // unique directory per invocation.
+  const tmpRoot = mkdtempSync(join(tmpdir(), "seer-css-scan-"));
+  const fixtureFile = join(tmpRoot, "forbidden.css");
   writeFileSync(fixtureFile, "body { color: red; } /* window.glazeAPI */\n");
 
   try {
-    const files = walk(join(repoRoot, "renderer"));
-    const relFixture = relative(repoRoot, fixtureFile);
-    assert.ok(files.includes(relFixture), "expected the CSS fixture to be picked up by the scan");
+    const files = walkSourceFiles(tmpRoot, { root: tmpRoot });
+    assert.ok(files.includes("forbidden.css"), "expected the CSS fixture to be picked up by the scan");
 
-    const offenders = scanForbiddenPatterns(files);
+    const offenders = scanForbiddenPatterns(files, tmpRoot);
     assert.ok(
-      offenders.some((offender) => offender.startsWith(relFixture)),
+      offenders.some((offender) => offender.startsWith("forbidden.css")),
       "expected the CSS fixture's forbidden Glaze reference to be flagged",
     );
   } finally {
-    rmSync(fixtureDir, { recursive: true, force: true });
+    rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
 

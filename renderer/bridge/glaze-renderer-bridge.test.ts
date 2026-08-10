@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import process from "node:process";
 import test from "node:test";
 
 import { createGlazeRendererBridge, type GlazeIpcFacade } from "./glaze-renderer-bridge";
@@ -230,7 +231,7 @@ function createDeferred<T>() {
  * exact completion order of overlapping `getSnapshot`/mutation calls.
  */
 function createControllableIpc() {
-  const queues = new Map<string, Array<{ resolve: (value: unknown) => void }>>();
+  const queues = new Map<string, Array<{ resolve: (value: unknown) => void; reject: (error: unknown) => void }>>();
   const notificationCallbacks = new Map<string, (params: unknown) => void>();
   const invokedChannels: string[] = [];
 
@@ -239,7 +240,7 @@ function createControllableIpc() {
       invokedChannels.push(channel);
       const deferred = createDeferred<unknown>();
       const queue = queues.get(channel) ?? [];
-      queue.push({ resolve: deferred.resolve });
+      queue.push({ resolve: deferred.resolve, reject: deferred.reject });
       queues.set(channel, queue);
       return deferred.promise as Promise<T>;
     },
@@ -264,6 +265,14 @@ function createControllableIpc() {
         throw new Error(`No pending call #${index} for channel "${channel}"`);
       }
       call.resolve(value);
+    },
+    rejectCall(channel: string, index: number, error: unknown): void {
+      const queue = queues.get(channel);
+      const call = queue?.[index];
+      if (!call) {
+        throw new Error(`No pending call #${index} for channel "${channel}"`);
+      }
+      call.reject(error);
     },
   };
 }
@@ -493,4 +502,105 @@ test("an older concurrent getSnapshot completion does not clobber a newer comple
   // A's own resolution must reflect B's already-applied, newer state.
   assert.equal(snapshotA.monitor.active, true);
   assert.equal(snapshotA.appVersion, "2.0.0");
+});
+
+// --- Additional Finding 5 coverage: independent history-refresh generations, ---
+// --- error handling, and disconnect/unsubscribe guards.                     ---
+
+test("two quick agent ticks each trigger their own history refresh; the first refresh to resolve is not incorrectly treated as stale by the second tick's mere monitor merge", async () => {
+  const fake = createControllableIpc();
+  const bridge = createGlazeRendererBridge(fake.ipc);
+  const received: Array<Awaited<ReturnType<typeof bridge.getSnapshot>>> = [];
+  bridge.subscribe((snapshot) => received.push(snapshot));
+
+  const snapshotPromise = bridge.getSnapshot();
+  fake.resolveCall("agents:getState", 0, makeMonitor());
+  fake.resolveCall("history:getStats", 0, makeHistory({ totalAwakeMs: 1000 }));
+  fake.resolveCall("app:getInfo", 0, { name: "Seer", version: "1.0.0", environment: "test" });
+  await snapshotPromise;
+
+  // Tick 1: monitor merge applied immediately, background history refresh #1
+  // (history:getStats call index 1) kicked off and left pending.
+  fake.fireNotification("agents:state-changed", makeMonitor({ active: true, lastScanAt: 1 }));
+  assert.equal(received.length, 1);
+
+  // Tick 2 fires quickly, before refresh #1 resolves: another monitor merge
+  // applied immediately, and background history refresh #2 (call index 2)
+  // kicked off and also left pending.
+  fake.fireNotification("agents:state-changed", makeMonitor({ active: true, lastScanAt: 2 }));
+  assert.equal(received.length, 2);
+
+  // Refresh #1 (triggered by tick 1) resolves first, with fresher stats than
+  // the initial fetch. Even though tick 2's plain monitor merge was sequenced
+  // after refresh #1 was kicked off, it must not make refresh #1's result
+  // look "stale" — no newer history data exists yet.
+  fake.resolveCall("history:getStats", 1, makeHistory({ totalAwakeMs: 5000 }));
+  await Promise.resolve();
+  await Promise.resolve();
+
+  assert.equal(received.length, 3, "refresh #1 must emit a third snapshot");
+  assert.equal(received[2].history.totalAwakeMs, 5000, "refresh #1's data must be applied, not dropped");
+  assert.equal(received[2].monitor.lastScanAt, 2, "the latest monitor merge must still be present");
+
+  // Refresh #2 (triggered by tick 2) resolves last, with even fresher stats,
+  // and must supersede refresh #1's now-stale result.
+  fake.resolveCall("history:getStats", 2, makeHistory({ totalAwakeMs: 9000 }));
+  await Promise.resolve();
+  await Promise.resolve();
+
+  assert.equal(received.length, 4, "refresh #2 must emit a fourth snapshot");
+  assert.equal(received[3].history.totalAwakeMs, 9000, "refresh #2 must supersede refresh #1");
+});
+
+test("a rejected background history refresh triggered by an agent tick produces no unhandled promise rejection", async () => {
+  const fake = createControllableIpc();
+  const bridge = createGlazeRendererBridge(fake.ipc);
+
+  const snapshotPromise = bridge.getSnapshot();
+  fake.resolveCall("agents:getState", 0, makeMonitor());
+  fake.resolveCall("history:getStats", 0, makeHistory());
+  fake.resolveCall("app:getInfo", 0, { name: "Seer", version: "1.0.0", environment: "test" });
+  await snapshotPromise;
+
+  const unhandledRejections: unknown[] = [];
+  const onUnhandledRejection = (reason: unknown) => unhandledRejections.push(reason);
+  process.on("unhandledRejection", onUnhandledRejection);
+
+  try {
+    fake.fireNotification("agents:state-changed", makeMonitor({ active: true }));
+    fake.rejectCall("history:getStats", 1, new Error("history:getStats failed"));
+
+    // Give the rejection a chance to surface as an unhandled rejection if it
+    // were not caught internally (Node reports these on a later microtask
+    // turn, sometimes requiring a macrotask tick to fully flush).
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  } finally {
+    process.off("unhandledRejection", onUnhandledRejection);
+  }
+
+  assert.deepEqual(unhandledRejections, [], "a failed background refresh must never be an unhandled rejection");
+});
+
+test("disconnect prevents a pending agent-tick history refresh from emitting anything once it resolves", async () => {
+  const fake = createControllableIpc();
+  const bridge = createGlazeRendererBridge(fake.ipc);
+  const received: Array<Awaited<ReturnType<typeof bridge.getSnapshot>>> = [];
+  bridge.subscribe((snapshot) => received.push(snapshot));
+
+  const snapshotPromise = bridge.getSnapshot();
+  fake.resolveCall("agents:getState", 0, makeMonitor());
+  fake.resolveCall("history:getStats", 0, makeHistory());
+  fake.resolveCall("app:getInfo", 0, { name: "Seer", version: "1.0.0", environment: "test" });
+  await snapshotPromise;
+
+  fake.fireNotification("agents:state-changed", makeMonitor({ active: true }));
+  assert.equal(received.length, 1);
+
+  bridge.disconnect();
+
+  fake.resolveCall("history:getStats", 1, makeHistory({ totalAwakeMs: 555 }));
+  await Promise.resolve();
+  await Promise.resolve();
+
+  assert.equal(received.length, 1, "no emissions must reach any listener after disconnect");
 });
