@@ -1,0 +1,83 @@
+export type KeepAwakeMode = "system" | "display";
+
+export type AgentUsage = {
+  id: string;
+  name: string;
+  durationMs: number;
+};
+
+export type AwakeSession = {
+  id: string;
+  startedAt: number;
+  endedAt: number | null;
+  durationMs: number;
+  mode: KeepAwakeMode;
+  agents: AgentUsage[];
+};
+
+export type HistoryStats = {
+  totalAwakeMs: number;
+  todayAwakeMs: number;
+  sessionCount: number;
+  perAgent: AgentUsage[];
+  currentSession: AwakeSession | null;
+  recentSessions: AwakeSession[];
+};
+
+export const EMPTY_STATS: HistoryStats = {
+  totalAwakeMs: 0,
+  todayAwakeMs: 0,
+  sessionCount: 0,
+  perAgent: [],
+  currentSession: null,
+  recentSessions: [],
+};
+
+export async function fetchHistoryStats(): Promise<HistoryStats> {
+  return await window.glazeAPI.glaze.ipc.invoke<HistoryStats>("history:getStats");
+}
+
+export async function clearHistory(): Promise<HistoryStats> {
+  return await window.glazeAPI.glaze.ipc.invoke<HistoryStats>("history:clear");
+}
+
+/** "38s", "12m", "2h 14m" — compact, at most two units. */
+export function formatDuration(ms: number): string {
+  const totalSeconds = Math.max(0, Math.round(ms / 1000));
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  if (totalMinutes < 60) {
+    const seconds = totalSeconds % 60;
+    return seconds ? `${totalMinutes}m ${seconds}s` : `${totalMinutes}m`;
+  }
+
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return minutes ? `${hours}h ${minutes}m` : `${hours}h`;
+}
+
+/** "Today 2:14 PM", "Yesterday 9:10 AM", "Aug 6 2:14 PM". */
+export function formatSessionTime(ts: number): string {
+  const date = new Date(ts);
+  const now = new Date();
+  const time = date.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+
+  if (date.toDateString() === now.toDateString()) return `Today ${time}`;
+
+  const yesterday = new Date(now);
+  yesterday.setDate(now.getDate() - 1);
+  if (date.toDateString() === yesterday.toDateString()) return `Yesterday ${time}`;
+
+  const day = date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  return `${day} ${time}`;
+}
+
+/** Comma-joined agent names, busiest first. */
+export function sessionAgentNames(session: AwakeSession): string {
+  if (session.agents.length === 0) return "No agent recorded";
+  return [...session.agents]
+    .sort((a, b) => b.durationMs - a.durationMs)
+    .map((agent) => agent.name)
+    .join(", ");
+}

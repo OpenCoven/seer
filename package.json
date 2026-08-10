@@ -1,0 +1,93 @@
+{
+  "id": "6f424aca",
+  "name": "seer",
+  "version": "1.0.0",
+  "productName": "Seer",
+  "description": "Keeps your Mac awake while coding agents work",
+  "iconDescription": "A macOS system utility that monitors Activity Configuration Profile (ACP) agent activity in real-time, automatically enabling caffeinate to prevent sleep when agents are working. The app displays a menubar icon that glows or changes state when active, with a dropdown menu listing all current agents. Think of a watchful eye, a glowing indicator light, a system monitor gauge, or a sentinel standing guard. Represents vigilance, system awareness, and automatic power management.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node glaze.ts build",
+    "dev": "node glaze.ts dev",
+    "dev:renderer": "node glaze.ts dev:renderer",
+    "lint": "node glaze.ts lint",
+    "type-check": "node glaze.ts type-check",
+    "format": "node glaze.ts format",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "dependencies": {
+    "@radix-ui/colors": "^3.0.0",
+    "@tanstack/react-query": "^5.87.4",
+    "@tanstack/react-router": "^1.131.36",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "cmdk": "^1.1.1",
+    "lucide-react": "^0.542.0",
+    "radix-ui": "^1.4.3",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "sonner": "^2.0.7",
+    "tailwind-merge": "^3.3.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.22.0",
+    "@rolldown/plugin-babel": "^0.2.1",
+    "@tailwindcss/vite": "^4.2.2",
+    "@types/node": "^24.3.1",
+    "@types/react": "^19.1.12",
+    "@types/react-dom": "^19.1.9",
+    "@typescript-eslint/eslint-plugin": "^8.18.0",
+    "@typescript-eslint/parser": "^8.18.0",
+    "@vitejs/plugin-react": "^6.0.1",
+    "babel-plugin-react-compiler": "^1.0.0",
+    "esbuild": "^0.27.4",
+    "eslint": "^9.39.2",
+    "eslint-plugin-import": "^2.31.0",
+    "globals": "^17.3.0",
+    "oxfmt": "^0.26.0",
+    "tailwindcss": "^4.2.2",
+    "tsx": "^4.20.5",
+    "typescript": "^5.5.3",
+    "vite": "^8.0.2"
+  },
+  "engines": {
+    "node": ">=24.11.0"
+  },
+  "packageManager": "npm@11.11.0+sha512-82gRxKrh/eY5UnNorkTFcdBQAGpgjWehkfGVqAGlJjejEtJZGGJUqjo3mbBTNbc5BTnPKGVtGPBZGhElujX5cw==",
+  "appConfig": {
+    "macOS": {
+      "activationPolicy": "accessory"
+    }
+  },
+  "glaze": {
+    "capabilities": {},
+    "sdkVersion": "0.13.0.0",
+    "createdAt": "2026-08-08T17:09:11.443Z",
+    "lastMigration": "tray-retina-icons",
+    "host": {
+      "minVersion": "0.13.0.0"
+    },
+    "variant": "local",
+    "remix": {
+      "grantId": "5ae8fbb1-a558-4c99-b046-db06c54c988a",
+      "mode": "remix",
+      "attribution": false,
+      "sourceStoreAppId": "28bb9188-5063-4f9f-8b4a-d93df0ac2197",
+      "sourcePublicId": "4Z5mAG",
+      "sourceVersionId": "978af97f-aa32-4069-b733-d0849967fa20",
+      "sourceVersion": "6.0.0",
+      "sourceDisplayName": "Stay Awake",
+      "sourceAuthorId": "5c8368d0-a2d3-4642-b499-d3428dd3b0bf",
+      "sourceAuthorName": "Samuel Kraft",
+      "sourceAuthorUsername": "samuel",
+      "rootStoreAppId": "28bb9188-5063-4f9f-8b4a-d93df0ac2197",
+      "createdAt": "2026-08-08T17:09:11.443Z",
+      "setup": {
+        "status": "ready",
+        "updatedAt": "2026-08-08T17:09:20.607Z"
+      }
+    },
+    "updatedAt": 1786211934469
+  }
+}
