@@ -1,28 +1,6 @@
-export type KeepAwakeMode = "system" | "display";
+import type { AwakeSession, HistoryStats } from "../bridge/types";
 
-export type AgentUsage = {
-  id: string;
-  name: string;
-  durationMs: number;
-};
-
-export type AwakeSession = {
-  id: string;
-  startedAt: number;
-  endedAt: number | null;
-  durationMs: number;
-  mode: KeepAwakeMode;
-  agents: AgentUsage[];
-};
-
-export type HistoryStats = {
-  totalAwakeMs: number;
-  todayAwakeMs: number;
-  sessionCount: number;
-  perAgent: AgentUsage[];
-  currentSession: AwakeSession | null;
-  recentSessions: AwakeSession[];
-};
+export type { AgentUsage, AwakeSession, HistoryStats, KeepAwakeMode } from "../bridge/types";
 
 export const EMPTY_STATS: HistoryStats = {
   totalAwakeMs: 0,
