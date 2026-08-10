@@ -15,6 +15,47 @@ actor InMemorySettingsFileSystem: SettingsFileSystem {
     var failNextReplace: Error?
     var failNextMove: Error?
 
+    // MARK: - Controlled suspension hooks (ordering tests)
+    //
+    // Tests that need to prove FIFO gate ordering — not just the final
+    // state — arm a named suspension point (e.g. "readFile"), let one
+    // caller's operation enter and block inside it (recorded in
+    // `enteredSuspensions` and observable via `waitUntilEntered`), then
+    // start a second, queued caller and assert it has *not* reached the
+    // filesystem while the first is still suspended, before releasing the
+    // first via `resumeSuspension` and observing the second proceed.
+    private var armedSuspensions: Set<String> = []
+    private var pendingSuspensions: [String: CheckedContinuation<Void, Never>] = [:]
+    private(set) var enteredSuspensions: Set<String> = []
+
+    func armSuspension(_ name: String) {
+        armedSuspensions.insert(name)
+    }
+
+    func waitUntilEntered(_ name: String) async {
+        while !enteredSuspensions.contains(name) {
+            await Task.yield()
+        }
+    }
+
+    func resumeSuspension(_ name: String) {
+        guard let continuation = pendingSuspensions.removeValue(forKey: name) else {
+            return
+        }
+        continuation.resume()
+    }
+
+    private func suspendIfArmed(_ name: String) async {
+        guard armedSuspensions.contains(name) else {
+            return
+        }
+        armedSuspensions.remove(name)
+        enteredSuspensions.insert(name)
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            pendingSuspensions[name] = continuation
+        }
+    }
+
     func seedFile(at url: URL, contents: Data) {
         files[url.path] = contents
     }
@@ -45,6 +86,7 @@ actor InMemorySettingsFileSystem: SettingsFileSystem {
 
     func readFile(at url: URL) async throws -> Data {
         callLog.append("readFile")
+        await suspendIfArmed("readFile")
         if let error = failNextRead {
             failNextRead = nil
             throw error
@@ -57,6 +99,7 @@ actor InMemorySettingsFileSystem: SettingsFileSystem {
 
     func writeFileAndSynchronize(_ data: Data, to url: URL) async throws {
         callLog.append("writeFileAndSynchronize:\(url.lastPathComponent)")
+        await suspendIfArmed("writeFileAndSynchronize")
         if let error = failNextWrite {
             failNextWrite = nil
             throw error
@@ -402,6 +445,211 @@ final class AtomicJSONStoreTests: XCTestCase {
         try await store.save(SettingsDocument(version: 1, keepAwakeMode: .display, includePrereleaseUpdates: true))
         let saved = await fileSystem.contents(at: settingsURL)
         XCTAssertNotNil(saved)
+    }
+
+    // MARK: 15. FIFO gate ordering — queued save does not enter the filesystem
+    // until the prior save's write completes and releases the gate.
+
+    func testQueuedSaveDoesNotEnterFilesystemUntilPriorSaveReleases() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let store = makeStore(fileSystem: fileSystem)
+        _ = await store.load()
+
+        await fileSystem.armSuspension("writeFileAndSynchronize")
+
+        let taskA = Task {
+            try await store.save(SettingsDocument(version: 1, keepAwakeMode: .display, includePrereleaseUpdates: false))
+        }
+        await fileSystem.waitUntilEntered("writeFileAndSynchronize")
+
+        // A is now suspended inside its write, holding the gate. Start B —
+        // it must queue behind A rather than interleave.
+        let taskB = Task {
+            try await store.save(SettingsDocument(version: 1, keepAwakeMode: .system, includePrereleaseUpdates: true))
+        }
+
+        // Give the scheduler ample opportunity to run B if the gate were
+        // (incorrectly) not serializing: B must still not have reached the
+        // filesystem while A holds it.
+        for _ in 0..<50 {
+            await Task.yield()
+        }
+        let logWhileABlocked = await fileSystem.callLog
+        XCTAssertEqual(
+            logWhileABlocked.filter { $0.hasPrefix("writeFileAndSynchronize") }.count, 1,
+            "queued save B must not enter the filesystem while save A still holds the gate"
+        )
+
+        await fileSystem.resumeSuspension("writeFileAndSynchronize")
+        try await taskA.value
+        try await taskB.value
+
+        let finalLog = await fileSystem.callLog
+        XCTAssertEqual(finalLog.filter { $0.hasPrefix("writeFileAndSynchronize") }.count, 2)
+
+        let decoder = JSONDecoder()
+        let finalBytes = await fileSystem.contents(at: settingsURL)
+        let decoded = try decoder.decode(SettingsDocument.self, from: finalBytes!)
+        XCTAssertEqual(decoded.keepAwakeMode, .system, "disk must match B, the later-queued save")
+        XCTAssertTrue(decoded.includePrereleaseUpdates)
+    }
+
+    // MARK: 16. FIFO gate ordering — a queued save cannot write while a load
+    // is still blocked reading a future-version file; once the load
+    // determines writes are disabled, the queued save throws and the
+    // original bytes are unchanged.
+
+    func testQueuedSaveBlockedBehindLoadOnFutureVersionFileNeverWrites() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let futureBytes = Data("""
+        {"version":999,"someNewField":"unknown-to-us"}
+        """.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: futureBytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        await fileSystem.armSuspension("readFile")
+
+        let loadTask = Task {
+            await store.load()
+        }
+        await fileSystem.waitUntilEntered("readFile")
+
+        // The load is now suspended inside its read, holding the gate.
+        // Queue a save behind it.
+        let saveTask = Task {
+            try await store.save(SettingsDocument.defaultValue)
+        }
+
+        for _ in 0..<50 {
+            await Task.yield()
+        }
+        let logWhileLoadBlocked = await fileSystem.callLog
+        XCTAssertFalse(
+            logWhileLoadBlocked.contains { $0.hasPrefix("writeFileAndSynchronize") },
+            "queued save must not enter the filesystem while load still holds the gate"
+        )
+
+        await fileSystem.resumeSuspension("readFile")
+        let loadResult = await loadTask.value
+        XCTAssertFalse(loadResult.writesEnabled)
+        XCTAssertEqual(loadResult.diagnostic?.id, StorageDiagnosticID.unsupportedVersion)
+
+        do {
+            try await saveTask.value
+            XCTFail("expected StorageError.writesDisabled once the future-version load completes")
+        } catch StorageError.writesDisabled {
+            // expected
+        } catch {
+            XCTFail("expected StorageError.writesDisabled, got \(error)")
+        }
+
+        let finalLog = await fileSystem.callLog
+        XCTAssertFalse(finalLog.contains { $0.hasPrefix("writeFileAndSynchronize") })
+        let preserved = await fileSystem.contents(at: settingsURL)
+        XCTAssertEqual(preserved, futureBytes, "original bytes must be unchanged")
+    }
+
+    // MARK: 17. A failed first queued operation still releases the gate for
+    // the next queued operation.
+
+    func testFailedFirstQueuedSaveReleasesNextQueuedSave() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let store = makeStore(fileSystem: fileSystem)
+        _ = await store.load()
+
+        await fileSystem.armSuspension("writeFileAndSynchronize")
+
+        let taskA = Task {
+            try await store.save(SettingsDocument(version: 1, keepAwakeMode: .display, includePrereleaseUpdates: false))
+        }
+        await fileSystem.waitUntilEntered("writeFileAndSynchronize")
+
+        let taskB = Task {
+            try await store.save(SettingsDocument(version: 1, keepAwakeMode: .system, includePrereleaseUpdates: true))
+        }
+
+        // Arrange for A's write to fail once it resumes, then release it.
+        await fileSystem.setFailNextWrite(SettingsFileSystemError.other("boom"))
+        await fileSystem.resumeSuspension("writeFileAndSynchronize")
+
+        do {
+            try await taskA.value
+            XCTFail("expected save A to throw")
+        } catch StorageError.writeFailed {
+            // expected
+        }
+
+        // B must still be released and able to proceed/succeed even though
+        // A (ahead of it in the queue) failed.
+        try await taskB.value
+
+        let decoder = JSONDecoder()
+        let finalBytes = await fileSystem.contents(at: settingsURL)
+        let decoded = try decoder.decode(SettingsDocument.self, from: finalBytes!)
+        XCTAssertEqual(decoded.keepAwakeMode, .system)
+        XCTAssertTrue(decoded.includePrereleaseUpdates)
+    }
+
+    // MARK: 18. Oversized/boundary numeric versions must never trap at Int
+    // conversion, and must be treated as unsupported-version/read-only.
+
+    func testOversizedExponentialVersionIsUnsupportedReadOnlyAndDoesNotTrap() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        let hugeVersionBytes = Data("""
+        {"version":1e100,"someNewField":"unknown-to-us"}
+        """.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: hugeVersionBytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertEqual(result.diagnostic?.id, StorageDiagnosticID.unsupportedVersion)
+        XCTAssertFalse(result.writesEnabled)
+
+        let preserved = await fileSystem.contents(at: settingsURL)
+        XCTAssertEqual(preserved, hugeVersionBytes, "bytes must be preserved, not quarantined")
+        let names = await fileSystem.fileNames(inDirectoryOf: settingsURL)
+        XCTAssertFalse(names.contains { $0.contains("corrupt") })
+    }
+
+    func testVersionExactlyIntMaxIsUnsupportedReadOnlyAndDoesNotTrap() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        let intMaxVersionBytes = Data("""
+        {"version":9223372036854775807}
+        """.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: intMaxVersionBytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertEqual(result.diagnostic?.id, StorageDiagnosticID.unsupportedVersion)
+        XCTAssertFalse(result.writesEnabled)
+
+        let preserved = await fileSystem.contents(at: settingsURL)
+        XCTAssertEqual(preserved, intMaxVersionBytes)
+    }
+
+    func testVersionJustBeyondIntMaxRangeIsUnsupportedReadOnlyAndDoesNotTrap() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        // 2^63, exactly one past Int64.max — also the value `Double(Int.max)`
+        // itself rounds up to, which is the classic trap trigger for a naive
+        // `Int(doubleValue)` conversion guarded only by `<= Double(Int.max)`.
+        let beyondIntMaxBytes = Data("""
+        {"version":9223372036854775808}
+        """.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: beyondIntMaxBytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertEqual(result.diagnostic?.id, StorageDiagnosticID.unsupportedVersion)
+        XCTAssertFalse(result.writesEnabled)
+
+        let preserved = await fileSystem.contents(at: settingsURL)
+        XCTAssertEqual(preserved, beyondIntMaxBytes)
     }
 
     // MARK: 13. Path resolver uses injected base URL exactly

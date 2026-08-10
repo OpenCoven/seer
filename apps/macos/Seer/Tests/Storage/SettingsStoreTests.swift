@@ -137,4 +137,94 @@ final class SettingsStoreTests: XCTestCase {
         let names = await fileSystem.fileNames(inDirectoryOf: settingsURL)
         XCTAssertEqual(names, ["settings.json"], "no leftover temp files after concurrent mutations")
     }
+
+    // MARK: 13. FIFO gate ordering at the SettingsStore layer itself — a
+    // queued mutation must not enter the filesystem (or publish `current`)
+    // until a prior in-flight mutation's write completes and releases.
+
+    func testQueuedMutationDoesNotEnterFilesystemUntilPriorMutationReleases() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let store = makeSettingsStore(fileSystem: fileSystem)
+        _ = await store.load()
+
+        await fileSystem.armSuspension("writeFileAndSynchronize")
+
+        let taskA = Task {
+            try await store.setKeepAwakeMode(.display)
+        }
+        await fileSystem.waitUntilEntered("writeFileAndSynchronize")
+
+        // A is suspended inside its write, holding SettingsStore's gate.
+        // Queue B behind it.
+        let taskB = Task {
+            try await store.setIncludePrereleaseUpdates(true)
+        }
+
+        for _ in 0..<50 {
+            await Task.yield()
+        }
+        let logWhileABlocked = await fileSystem.callLog
+        XCTAssertEqual(
+            logWhileABlocked.filter { $0.hasPrefix("writeFileAndSynchronize") }.count, 1,
+            "queued mutation B must not enter the filesystem while mutation A still holds the gate"
+        )
+        let currentWhileABlocked = await store.current
+        XCTAssertEqual(
+            currentWhileABlocked, SettingsDocument.defaultValue,
+            "cache must not reflect either mutation until each is actually applied in order"
+        )
+
+        await fileSystem.resumeSuspension("writeFileAndSynchronize")
+        try await taskA.value
+        try await taskB.value
+
+        let finalLog = await fileSystem.callLog
+        XCTAssertEqual(finalLog.filter { $0.hasPrefix("writeFileAndSynchronize") }.count, 2)
+
+        let current = await store.current
+        XCTAssertEqual(current.keepAwakeMode, .display, "A's mutation must still be reflected")
+        XCTAssertTrue(current.includePrereleaseUpdates, "B's mutation must be reflected")
+
+        let decoder = JSONDecoder()
+        let savedBytes = await fileSystem.contents(at: settingsURL)
+        let decoded = try decoder.decode(SettingsDocument.self, from: savedBytes!)
+        XCTAssertEqual(decoded, current, "disk must match the published cache")
+    }
+
+    // MARK: 14. A failed first queued mutation still releases the gate for
+    // the next queued mutation, and does not corrupt the cache.
+
+    func testFailedFirstQueuedMutationReleasesNextQueuedMutation() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let store = makeSettingsStore(fileSystem: fileSystem)
+        _ = await store.load()
+
+        await fileSystem.armSuspension("writeFileAndSynchronize")
+
+        let taskA = Task {
+            try await store.setKeepAwakeMode(.display)
+        }
+        await fileSystem.waitUntilEntered("writeFileAndSynchronize")
+
+        let taskB = Task {
+            try await store.setIncludePrereleaseUpdates(true)
+        }
+
+        await fileSystem.setFailNextWrite(SettingsFileSystemError.other("boom"))
+        await fileSystem.resumeSuspension("writeFileAndSynchronize")
+
+        do {
+            try await taskA.value
+            XCTFail("expected mutation A to throw")
+        } catch StorageError.writeFailed {
+            // expected
+        }
+
+        // B must still be released and able to proceed even though A failed.
+        try await taskB.value
+
+        let current = await store.current
+        XCTAssertEqual(current.keepAwakeMode, .system, "A's failed mutation must not be reflected")
+        XCTAssertTrue(current.includePrereleaseUpdates, "B's mutation must still apply")
+    }
 }

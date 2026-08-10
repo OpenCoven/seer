@@ -244,6 +244,13 @@ public actor AtomicJSONStore<Document: VersionedDocument> {
     private let clock: Clock
     private var writesEnabled = true
 
+    /// Serializes every public `load()`/`save(_:)` call through its full
+    /// awaited I/O and `writesEnabled` publication, in FIFO invocation
+    /// order. Without this, actor reentrancy across the `await`s inside
+    /// `load`/`save` would let a later call observe or mutate state (disk
+    /// bytes, `writesEnabled`) mid-operation of an earlier call.
+    private let gate = AsyncGate()
+
     public init(fileURL: URL, fileSystem: SettingsFileSystem, clock: Clock) {
         self.fileURL = fileURL
         self.fileSystem = fileSystem
@@ -253,6 +260,13 @@ public actor AtomicJSONStore<Document: VersionedDocument> {
     // MARK: - Load
 
     public func load() async -> LoadResult<Document> {
+        await gate.acquire()
+        let result = await performLoad()
+        await gate.release()
+        return result
+    }
+
+    private func performLoad() async -> LoadResult<Document> {
         let data: Data
         switch await readSourceFile() {
         case .missing:
@@ -271,11 +285,11 @@ public actor AtomicJSONStore<Document: VersionedDocument> {
         }
 
         switch probeVersion(in: data) {
-        case .future(let version):
+        case .future(let description):
             writesEnabled = false
             let diagnostic = Diagnostic(
                 id: StorageDiagnosticID.unsupportedVersion,
-                message: "Settings file version \(version) is newer than the version \(Document.currentVersion) this build supports; using defaults without writing to disk (\(StorageError.unsupportedVersion(version))).",
+                message: "Settings file version \(description) is newer than the version \(Document.currentVersion) this build supports; using defaults without writing to disk.",
                 occurredAt: clock.nowMilliseconds()
             )
             return LoadResult(value: Document.defaultValue, diagnostic: diagnostic, writesEnabled: false)
@@ -315,7 +329,12 @@ public actor AtomicJSONStore<Document: VersionedDocument> {
 
     private enum VersionProbe {
         case supported
-        case future(Int)
+        /// A version this build cannot decode, described as text for
+        /// diagnostics. Kept as `String` (not `Int`) because a well-formed
+        /// integral JSON number (e.g. `1e100`) can vastly exceed `Int`'s
+        /// range; a future version is always reported this way regardless
+        /// of whether it happens to fit in an `Int`.
+        case future(String)
         case invalid
     }
 
@@ -343,9 +362,18 @@ public actor AtomicJSONStore<Document: VersionedDocument> {
             return .invalid
         }
 
-        let intValue = Int(doubleValue)
+        // `Int(doubleValue)` traps for any value outside `Int`'s
+        // representable range (e.g. `1e100`, or a value that rounds up to
+        // exactly `Double(Int.max) + 1`). `Int(exactly:)` never traps: it
+        // returns `nil` for anything not exactly representable as an
+        // `Int`, which is exactly the "too large to be anything we
+        // support" case we want to treat as a future/unsupported version.
+        guard let intValue = Int(exactly: doubleValue) else {
+            return .future(String(doubleValue))
+        }
+
         if intValue > Document.currentVersion {
-            return .future(intValue)
+            return .future(String(intValue))
         }
         if intValue == Document.currentVersion {
             return .supported
@@ -409,6 +437,17 @@ public actor AtomicJSONStore<Document: VersionedDocument> {
     /// destination. The temp file is removed on any failure so no orphaned
     /// sibling is left behind.
     public func save(_ document: Document) async throws {
+        await gate.acquire()
+        do {
+            try await performSave(document)
+            await gate.release()
+        } catch {
+            await gate.release()
+            throw error
+        }
+    }
+
+    private func performSave(_ document: Document) async throws {
         guard writesEnabled else {
             throw StorageError.writesDisabled
         }

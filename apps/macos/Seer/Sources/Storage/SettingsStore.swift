@@ -80,6 +80,15 @@ public actor SettingsStore {
     public private(set) var current: SettingsDocument
     public private(set) var lastDiagnostic: Diagnostic?
 
+    /// Serializes every public `load()`/mutator call through its full
+    /// awaited underlying `AtomicJSONStore` round trip and `current`/
+    /// `lastDiagnostic` publication, in FIFO invocation order. Without
+    /// this, actor reentrancy across the `await store.load()`/`await
+    /// store.save(...)` calls below would let a second mutator read
+    /// `current` before the first one has published its result, or let
+    /// two mutators race to publish out of invocation order.
+    private let gate = AsyncGate()
+
     public init(
         store: AtomicJSONStore<SettingsDocument>,
         initialValue: SettingsDocument = SettingsDocument.defaultValue
@@ -93,6 +102,13 @@ public actor SettingsStore {
     /// re-reads from disk through the underlying `AtomicJSONStore`.
     @discardableResult
     public func load() async -> LoadResult<SettingsDocument> {
+        await gate.acquire()
+        let result = await performLoad()
+        await gate.release()
+        return result
+    }
+
+    private func performLoad() async -> LoadResult<SettingsDocument> {
         let result = await store.load()
         current = result.value
         lastDiagnostic = result.diagnostic
@@ -100,6 +116,17 @@ public actor SettingsStore {
     }
 
     public func setKeepAwakeMode(_ mode: KeepAwakeMode) async throws {
+        await gate.acquire()
+        do {
+            try await performSetKeepAwakeMode(mode)
+            await gate.release()
+        } catch {
+            await gate.release()
+            throw error
+        }
+    }
+
+    private func performSetKeepAwakeMode(_ mode: KeepAwakeMode) async throws {
         var updated = current
         updated.keepAwakeMode = mode
         try await store.save(updated)
@@ -107,6 +134,17 @@ public actor SettingsStore {
     }
 
     public func setIncludePrereleaseUpdates(_ value: Bool) async throws {
+        await gate.acquire()
+        do {
+            try await performSetIncludePrereleaseUpdates(value)
+            await gate.release()
+        } catch {
+            await gate.release()
+            throw error
+        }
+    }
+
+    private func performSetIncludePrereleaseUpdates(_ value: Bool) async throws {
         var updated = current
         updated.includePrereleaseUpdates = value
         try await store.save(updated)
