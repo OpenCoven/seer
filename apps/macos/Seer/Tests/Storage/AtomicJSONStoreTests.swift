@@ -1062,6 +1062,243 @@ final class AtomicJSONStoreTests: XCTestCase {
         XCTAssertNil(originalGone)
     }
 
+    // MARK: 21. Every scanner byte access must be bounds-checked: truncated
+    // object/array/string/escape/number tokens must quarantine as invalid,
+    // never index past the end of the buffer.
+
+    func testMalformedNestedObjectTruncatedAfterCommaQuarantinesWithoutCrashing() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        // Reproduction: a nested object truncated immediately after a
+        // trailing comma. The object-value loop in `skipJSONValue` used to
+        // jump back to re-read the next key byte without first checking
+        // that a next byte exists, indexing one past the end of the array.
+        let truncatedNestedBytes = Data(#"{"version":1,"x":{"a":1,"#.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: truncatedNestedBytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertEqual(result.diagnostic?.id, StorageDiagnosticID.corrupt)
+        XCTAssertTrue(result.writesEnabled)
+    }
+
+    func testTruncationAtEveryByteBoundaryOfNestedDocumentNeverCrashesOrHangs() async {
+        // A representative document exercising every token kind the scanner
+        // understands: nested object, nested array, a string containing an
+        // escaped quote and an escaped backslash, and a plain number — all
+        // truncated at every possible byte offset. Every single prefix must
+        // resolve to *some* `LoadResult` (quarantined as corrupt, since a
+        // truncated document is never well-formed) without trapping or
+        // hanging, regardless of exactly where the cut falls (mid-object,
+        // mid-array, mid-string, mid-escape, or mid-number).
+        let full = Data(#"""
+        {"version":1,"nested":{"arr":[1,2,{"s":"a\"b\\c","n":123},[]],"obj":{}},"keepAwakeMode":"system","includePrereleaseUpdates":false}
+        """#.utf8)
+
+        let start = DispatchTime.now()
+        for length in 0...full.count {
+            let fileSystem = InMemorySettingsFileSystem()
+            await fileSystem.seedFile(at: settingsURL, contents: full.prefix(length))
+            let store = makeStore(fileSystem: fileSystem)
+            _ = await store.load()
+        }
+        let elapsedSeconds = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000_000
+
+        XCTAssertLessThan(elapsedSeconds, 15.0, "scanning every truncation boundary must stay linear in input size")
+    }
+
+    // MARK: 22. Recursion must be bounded: deeply nested JSON must be
+    // rejected as invalid rather than overflowing the native call stack.
+
+    private func nestedArrayValue(depth: Int) -> String {
+        String(repeating: "[", count: depth) + String(repeating: "]", count: depth)
+    }
+
+    private func documentWithDeepField(depth: Int) -> Data {
+        // "deep" must precede "version" in byte order: the lexical scanner
+        // returns as soon as it locates the top-level "version" key, so a
+        // pathologically nested sibling field only ever gets fed through
+        // `skipJSONValue`'s recursion/depth-limit if the scanner has to
+        // skip past it first while still searching for "version".
+        Data("""
+        {"deep":\(nestedArrayValue(depth: depth)),"version":1,"keepAwakeMode":"system","includePrereleaseUpdates":false}
+        """.utf8)
+    }
+
+    func test127NestedArraysStillValidatesAndLoadsSupportedVersion() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        await fileSystem.seedFile(at: settingsURL, contents: documentWithDeepField(depth: 127))
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertNil(result.diagnostic)
+        XCTAssertTrue(result.writesEnabled)
+    }
+
+    func test128NestedArraysAtExactlyTheDepthLimitStillValidatesAndLoads() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        await fileSystem.seedFile(at: settingsURL, contents: documentWithDeepField(depth: 128))
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertNil(result.diagnostic)
+        XCTAssertTrue(result.writesEnabled)
+    }
+
+    func test129NestedArraysOneOverTheDepthLimitQuarantinesWithoutCrashing() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        await fileSystem.seedFile(at: settingsURL, contents: documentWithDeepField(depth: 129))
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertEqual(result.diagnostic?.id, StorageDiagnosticID.corrupt)
+        XCTAssertTrue(result.writesEnabled)
+    }
+
+    func test50000NestedArraysRejectedQuicklyWithoutStackOverflow() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        await fileSystem.seedFile(at: settingsURL, contents: documentWithDeepField(depth: 50_000))
+        let store = makeStore(fileSystem: fileSystem)
+
+        let start = DispatchTime.now()
+        let result = await store.load()
+        let elapsedSeconds = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000_000
+
+        XCTAssertLessThan(elapsedSeconds, 5.0, "depth-bounded scan must reject pathological nesting in bounded time")
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertEqual(result.diagnostic?.id, StorageDiagnosticID.corrupt)
+        XCTAssertTrue(result.writesEnabled)
+    }
+
+    // MARK: 23. Zero-padded exponents must be normalized by digit magnitude,
+    // not raw digit count, before classification.
+
+    func testZeroPaddedExponentAllZerosIsExponentZeroAndLoadsSupportedVersion() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        // 1e000000000000000000 has 18 zero exponent digits — one shy of
+        // `maxParsableExponentDigitCount` on its own, but real-world zero
+        // padding can exceed it arbitrarily; use enough zeros to guarantee
+        // the raw (untrimmed) digit count would exceed the threshold.
+        let manyZeros = String(repeating: "0", count: 4_000)
+        let bytes = Data("""
+        {"version":1e\(manyZeros),"keepAwakeMode":"system","includePrereleaseUpdates":false}
+        """.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: bytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertNil(result.diagnostic, "an all-zero exponent must classify as exponent 0, not huge/future")
+        XCTAssertTrue(result.writesEnabled)
+    }
+
+    func testZeroPaddedExponentThousandsOfZerosThenOneIsExponentPlusOneAndFuture() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        // Thousands of leading zeros followed by a single `1` must mean
+        // exponent +1 (value 10, two digits — more than currentVersion's
+        // one digit, so a future version), not an astronomically huge
+        // exponent merely because the raw digit count is large.
+        let leadingZeros = String(repeating: "0", count: 4_000)
+        let bytes = Data("""
+        {"version":1e\(leadingZeros)1,"someNewField":"unknown-to-us"}
+        """.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: bytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertEqual(result.diagnostic?.id, StorageDiagnosticID.unsupportedVersion)
+        XCTAssertFalse(result.writesEnabled)
+
+        let preserved = await fileSystem.contents(at: settingsURL)
+        XCTAssertEqual(preserved, bytes, "bytes must be preserved, not quarantined")
+    }
+
+    func testZeroPaddedExponentThousandsOfZerosThenOneNegativeIsInvalidSchema() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        // Thousands of leading zeros followed by a single `1` in a negative
+        // exponent must mean exponent -1 (value 0.1, non-integral —
+        // invalid schema), not an astronomically huge negative exponent.
+        let leadingZeros = String(repeating: "0", count: 4_000)
+        let bytes = Data("""
+        {"version":1e-\(leadingZeros)1}
+        """.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: bytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertEqual(result.diagnostic?.id, StorageDiagnosticID.corrupt)
+        XCTAssertTrue(result.writesEnabled)
+    }
+
+    func testZeroPaddedHugePositiveExponentStillUnsupported() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        // Leading zero padding in front of a genuinely huge exponent must
+        // not change the outcome: trimming the padding must still leave a
+        // digit count far beyond `maxParsableExponentDigitCount`.
+        let leadingZeros = String(repeating: "0", count: 4_000)
+        let hugeDigits = String(repeating: "9", count: 30)
+        let bytes = Data("""
+        {"version":1e\(leadingZeros)\(hugeDigits),"someNewField":"unknown-to-us"}
+        """.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: bytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertEqual(result.diagnostic?.id, StorageDiagnosticID.unsupportedVersion)
+        XCTAssertFalse(result.writesEnabled)
+
+        let preserved = await fileSystem.contents(at: settingsURL)
+        XCTAssertEqual(preserved, bytes, "bytes must be preserved, not quarantined")
+    }
+
+    func testZeroPaddedHugeNegativeExponentStillInvalid() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        let leadingZeros = String(repeating: "0", count: 4_000)
+        let hugeDigits = String(repeating: "9", count: 30)
+        let bytes = Data("""
+        {"version":1e-\(leadingZeros)\(hugeDigits)}
+        """.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: bytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertEqual(result.diagnostic?.id, StorageDiagnosticID.corrupt)
+        XCTAssertTrue(result.writesEnabled)
+    }
+
+    func testMalformedExponentMissingDigitsIsInvalidSchemaAndDoesNotCrash() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        // `e` with no following digits is not a valid JSON number token at
+        // all (RFC 8259 requires at least one exponent digit) — must
+        // quarantine as corrupt, not crash while scanning past the missing
+        // digits.
+        let bytes = Data(#"{"version":1e,"other":1}"#.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: bytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertEqual(result.diagnostic?.id, StorageDiagnosticID.corrupt)
+        XCTAssertTrue(result.writesEnabled)
+    }
+
     // MARK: 13. Path resolver uses injected base URL exactly
 
     func testSettingsFileURLUsesInjectedBaseURLExactly() throws {

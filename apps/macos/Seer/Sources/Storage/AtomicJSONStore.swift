@@ -364,12 +364,27 @@ fileprivate enum VersionProbing {
         return i
     }
 
+    /// The maximum object/array nesting depth `skipJSONValue` will descend
+    /// into before giving up and reporting the value as malformed.
+    /// `SettingsDocument` is a flat schema, so any real settings file needs
+    /// only a handful of nesting levels; 128 leaves generous headroom for
+    /// nested/unknown-to-us fields in a future schema while keeping the
+    /// recursion depth — and therefore the native call stack used by this
+    /// scan — a small, fixed bound regardless of how deeply nested a
+    /// pathological or adversarial file is. Without this cap, a file
+    /// containing tens of thousands of nested arrays/objects would recurse
+    /// once per nesting level and overflow the stack before ever reaching
+    /// a return value.
+    static let maxNestingDepth = 128
+
     /// Recursively skips exactly one JSON value (string, number, object,
     /// array, or `true`/`false`/`null`) starting at `start`, returning the
     /// index just past it, or `nil` if the bytes are not a well-formed
-    /// value there. Recursion depth is bounded by the JSON's own nesting
-    /// depth, i.e. by the bytes already read from disk.
-    static func skipJSONValue(_ bytes: [UInt8], from start: Int) -> Int? {
+    /// value there, or if it is nested deeper than `maxNestingDepth`
+    /// (treated the same as malformed: this scanner exists to answer a
+    /// yes/no/future question about a flat schema, so pathologically deep
+    /// nesting is rejected as corrupt rather than crashing).
+    static func skipJSONValue(_ bytes: [UInt8], from start: Int, depth: Int = 0) -> Int? {
         guard start < bytes.count else { return nil }
         switch bytes[start] {
         case UInt8(ascii: "\""):
@@ -377,17 +392,20 @@ fileprivate enum VersionProbing {
             return end
 
         case UInt8(ascii: "{"):
+            guard depth < maxNestingDepth else { return nil }
             var i = skipWhitespace(bytes, from: start + 1)
             guard i < bytes.count else { return nil }
             if bytes[i] == UInt8(ascii: "}") { return i + 1 }
             while true {
-                guard bytes[i] == UInt8(ascii: "\""), let (_, afterKey) = scanStringLiteral(bytes, from: i) else {
+                guard i < bytes.count, bytes[i] == UInt8(ascii: "\""),
+                      let (_, afterKey) = scanStringLiteral(bytes, from: i)
+                else {
                     return nil
                 }
                 i = skipWhitespace(bytes, from: afterKey)
                 guard i < bytes.count, bytes[i] == UInt8(ascii: ":") else { return nil }
                 i = skipWhitespace(bytes, from: i + 1)
-                guard let afterValue = skipJSONValue(bytes, from: i) else { return nil }
+                guard let afterValue = skipJSONValue(bytes, from: i, depth: depth + 1) else { return nil }
                 i = skipWhitespace(bytes, from: afterValue)
                 guard i < bytes.count else { return nil }
                 if bytes[i] == UInt8(ascii: ",") {
@@ -399,11 +417,12 @@ fileprivate enum VersionProbing {
             }
 
         case UInt8(ascii: "["):
+            guard depth < maxNestingDepth else { return nil }
             var i = skipWhitespace(bytes, from: start + 1)
             guard i < bytes.count else { return nil }
             if bytes[i] == UInt8(ascii: "]") { return i + 1 }
             while true {
-                guard let afterValue = skipJSONValue(bytes, from: i) else { return nil }
+                guard let afterValue = skipJSONValue(bytes, from: i, depth: depth + 1) else { return nil }
                 i = skipWhitespace(bytes, from: afterValue)
                 guard i < bytes.count else { return nil }
                 if bytes[i] == UInt8(ascii: ",") {
@@ -593,8 +612,20 @@ fileprivate enum VersionProbing {
         let fractionDigitCount = fractionPart.count
         let currentVersionDigits = Array(String(currentVersion))
 
+        // Trim the exponent's own leading zeros before doing anything with
+        // its digit count or magnitude. Grammar allows arbitrarily many
+        // leading zeros in an exponent (e.g. `1e000000000000000000`), and
+        // without this normalization a zero-padded-but-otherwise-tiny
+        // exponent digit count alone (not magnitude) would exceed
+        // `maxParsableExponentDigitCount` and be misclassified as an
+        // astronomically large/huge exponent by the branch below, when the
+        // exponent is actually zero (or, with thousands of leading zeros
+        // followed by a single `1`, exactly ±1). `trimLeadingZeros` returns
+        // `[]` for an all-zero run, correctly representing exponent zero.
+        let normalizedExponentDigits = trimLeadingZeros(Array(exponentDigits))
+
         let integerDigits: [Character]
-        if exponentDigits.count > maxParsableExponentDigitCount {
+        if normalizedExponentDigits.count > maxParsableExponentDigitCount {
             if exponentIsNegative {
                 // The exponent's magnitude vastly exceeds any realistic
                 // fractional-digit count read from disk, so the value
@@ -612,12 +643,12 @@ fileprivate enum VersionProbing {
             return .future(token)
         }
 
-        // `exponentDigits.count <= maxParsableExponentDigitCount` guarantees
-        // this parses without overflow (18 digits maxes out well under
-        // `Int64.max`'s 19 digits), but the resulting `Int` can still be as
-        // large as ~10^18 — nowhere near enough to safely drive an
-        // allocation below.
-        let exponentValue = exponentDigits.isEmpty ? 0 : (Int(exponentDigits) ?? 0)
+        // `normalizedExponentDigits.count <= maxParsableExponentDigitCount`
+        // guarantees this parses without overflow (18 digits maxes out
+        // well under `Int64.max`'s 19 digits), but the resulting `Int` can
+        // still be as large as ~10^18 — nowhere near enough to safely
+        // drive an allocation below.
+        let exponentValue = normalizedExponentDigits.isEmpty ? 0 : (Int(String(normalizedExponentDigits)) ?? 0)
         let signedExponent = exponentIsNegative ? -exponentValue : exponentValue
         let shift = signedExponent - fractionDigitCount
 
