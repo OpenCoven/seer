@@ -652,6 +652,231 @@ final class AtomicJSONStoreTests: XCTestCase {
         XCTAssertEqual(preserved, beyondIntMaxBytes)
     }
 
+    // MARK: 19. Arbitrarily large top-level versions must be recognized as
+    // unsupported/read-only without ever materializing the number as a
+    // `Double`/`Int` (which would either trap or misreport via
+    // `JSONSerialization`'s own non-finite-number rejection).
+
+    func testExponentBeyondDoubleRangeIsUnsupportedReadOnlyAndDoesNotTrap() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        // 1e309 overflows `Double` (max ~1.7976931348623157e308).
+        // `JSONSerialization` itself throws "Number wound up as NaN" when
+        // asked to parse this verbatim, so the probe must never hand the
+        // full, unmodified document to `JSONSerialization` while this
+        // token is still present.
+        let hugeExponentBytes = Data("""
+        {"version":1e309,"someNewField":"unknown-to-us"}
+        """.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: hugeExponentBytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertEqual(result.diagnostic?.id, StorageDiagnosticID.unsupportedVersion)
+        XCTAssertFalse(result.writesEnabled)
+
+        let preserved = await fileSystem.contents(at: settingsURL)
+        XCTAssertEqual(preserved, hugeExponentBytes, "original bytes must be preserved, not quarantined")
+        let names = await fileSystem.fileNames(inDirectoryOf: settingsURL)
+        XCTAssertFalse(names.contains { $0.contains("corrupt") })
+    }
+
+    func testFiveHundredDigitIntegerVersionIsUnsupportedReadOnlyAndDoesNotTrap() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        let fiveHundredDigits = "1" + String(repeating: "0", count: 499)
+        let hugeIntegerBytes = Data("""
+        {"version":\(fiveHundredDigits)}
+        """.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: hugeIntegerBytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertEqual(result.diagnostic?.id, StorageDiagnosticID.unsupportedVersion)
+        XCTAssertFalse(result.writesEnabled)
+
+        let preserved = await fileSystem.contents(at: settingsURL)
+        XCTAssertEqual(preserved, hugeIntegerBytes)
+        let names = await fileSystem.fileNames(inDirectoryOf: settingsURL)
+        XCTAssertFalse(names.contains { $0.contains("corrupt") })
+    }
+
+    func testHugePositiveExponentDigitCountIsUnsupportedReadOnlyAndDoesNotTrap() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        // An exponent with far more digits than fit in an `Int` (20 digits
+        // here), which a naive `Int(exponentString)` parse would trap on.
+        let hugeExponentDigitsBytes = Data("""
+        {"version":1e99999999999999999999}
+        """.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: hugeExponentDigitsBytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertEqual(result.diagnostic?.id, StorageDiagnosticID.unsupportedVersion)
+        XCTAssertFalse(result.writesEnabled)
+
+        let preserved = await fileSystem.contents(at: settingsURL)
+        XCTAssertEqual(preserved, hugeExponentDigitsBytes)
+        let names = await fileSystem.fileNames(inDirectoryOf: settingsURL)
+        XCTAssertFalse(names.contains { $0.contains("corrupt") })
+    }
+
+    func testMalformedJSONWithOversizedVersionStillQuarantines() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        // The version token itself is a huge exponent, but the document
+        // around it is malformed (missing comma between members). The
+        // sanitized structural re-check must catch this and route it to
+        // the ordinary corrupt/quarantine path, not unsupported-version.
+        let malformedBytes = Data("""
+        {"version":1e309 "someNewField":"unknown-to-us"}
+        """.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: malformedBytes)
+        let clock = FixedClock(fixedMilliseconds: 1_700_000_000_000)
+        let store = makeStore(fileSystem: fileSystem, clock: clock)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertEqual(result.diagnostic?.id, StorageDiagnosticID.corrupt)
+        XCTAssertTrue(result.writesEnabled)
+
+        let originalGone = await fileSystem.contents(at: settingsURL)
+        XCTAssertNil(originalGone)
+        let names = await fileSystem.fileNames(inDirectoryOf: settingsURL)
+        XCTAssertTrue(names.contains { $0.hasPrefix("settings.json.corrupt-") })
+    }
+
+    func testNestedVersionDoesNotOverrideMissingTopLevelVersion() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        // "version" only appears inside a nested object; the top-level
+        // document has no "version" key at all, which must be treated the
+        // same as any other missing-version document (invalid schema),
+        // not as if the nested value of 5 were the top-level version.
+        let nestedVersionBytes = Data("""
+        {"outer":{"version":5},"other":1}
+        """.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: nestedVersionBytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertEqual(result.diagnostic?.id, StorageDiagnosticID.corrupt)
+        XCTAssertTrue(result.writesEnabled)
+
+        let originalGone = await fileSystem.contents(at: settingsURL)
+        XCTAssertNil(originalGone)
+    }
+
+    func testStringVersionValueDoesNotOverrideMissingNumericVersion() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        // A string field happens to be named "version" at the top level,
+        // but a string can never be a valid version — must be treated as
+        // invalid schema, not silently coerced.
+        let stringVersionBytes = Data("""
+        {"version":"5","other":1}
+        """.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: stringVersionBytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertEqual(result.diagnostic?.id, StorageDiagnosticID.corrupt)
+        XCTAssertTrue(result.writesEnabled)
+    }
+
+    func testEscapedTopLevelKeysAreHandledCorrectlyWhenLocatingVersion() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        // A preceding sibling key/value contains escaped quotes and a
+        // backslash that must not confuse the scan for the top-level
+        // "version" key, and the "version" key itself is written with a
+        // \u unicode escape that decodes to the same text. The rest of the
+        // fields are exactly what `SettingsDocument` needs so this exercises
+        // only the version scan, not unrelated document decoding.
+        let escapedBytes = Data("""
+        {"note":"a \\"quoted\\" value with a backslash \\\\","\\u0076ersion":1,"keepAwakeMode":"system","includePrereleaseUpdates":false}
+        """.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: escapedBytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value.version, 1)
+        XCTAssertNil(result.diagnostic)
+        XCTAssertTrue(result.writesEnabled)
+    }
+
+    func testFractionalVersionIsInvalidSchemaNotUnsupported() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        let fractionalBytes = Data("""
+        {"version":1.5}
+        """.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: fractionalBytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertEqual(result.diagnostic?.id, StorageDiagnosticID.corrupt)
+        XCTAssertTrue(result.writesEnabled)
+
+        let originalGone = await fileSystem.contents(at: settingsURL)
+        XCTAssertNil(originalGone)
+    }
+
+    func testNegativeVersionIsInvalidSchemaNotUnsupportedAndDoesNotTrap() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        let negativeBytes = Data("""
+        {"version":-1}
+        """.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: negativeBytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertEqual(result.diagnostic?.id, StorageDiagnosticID.corrupt)
+        XCTAssertTrue(result.writesEnabled)
+    }
+
+    func testOrdinaryCurrentVersionStillLoadsUnchanged() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        let document = SettingsDocument(version: 1, keepAwakeMode: .system, includePrereleaseUpdates: false)
+        await fileSystem.seedFile(at: settingsURL, contents: encode(document))
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, document)
+        XCTAssertNil(result.diagnostic)
+        XCTAssertTrue(result.writesEnabled)
+    }
+
+    func testSmallFutureVersionStillUnsupportedReadOnlyUnchanged() async {
+        let fileSystem = InMemorySettingsFileSystem()
+        let futureBytes = Data("""
+        {"version":2,"someNewField":"unknown-to-us"}
+        """.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: futureBytes)
+        let store = makeStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value, SettingsDocument.defaultValue)
+        XCTAssertEqual(result.diagnostic?.id, StorageDiagnosticID.unsupportedVersion)
+        XCTAssertFalse(result.writesEnabled)
+
+        let preserved = await fileSystem.contents(at: settingsURL)
+        XCTAssertEqual(preserved, futureBytes)
+        let names = await fileSystem.fileNames(inDirectoryOf: settingsURL)
+        XCTAssertFalse(names.contains { $0.contains("corrupt") })
+    }
+
     // MARK: 13. Path resolver uses injected base URL exactly
 
     func testSettingsFileURLUsesInjectedBaseURLExactly() throws {

@@ -238,6 +238,429 @@ public enum StorageDiagnosticID {
 ///   safely owns a fresh default document going forward.
 /// - If quarantining itself fails, the corrupt source is left in place and
 ///   writes are disabled.
+/// A minimal, linear, non-backtracking JSON lexer plus decimal-string
+/// classifier used to answer "what is the top-level `version` field, and
+/// is it something this build supports, something newer, or invalid?"
+/// without ever materializing the version value as `Double` or `Int`
+/// (both of which can trap or misreport on the arbitrarily large numbers a
+/// hand-edited or foreign-tool-written settings file might contain, e.g.
+/// `1e309` or a 500-digit integer literal). Kept free of any generic
+/// parameter (unlike `AtomicJSONStore<Document>` itself) so its
+/// `static let`/`static func` members are ordinary ones, not subject to
+/// Swift's "static stored properties not supported in generic types"
+/// restriction.
+fileprivate enum VersionProbing {
+    /// The result of probing the top-level `version` field.
+    enum Result {
+        case supported
+        /// A version this build cannot decode, described as text for
+        /// diagnostics. Kept as `String` (not `Int`) because a well-formed
+        /// integral JSON number (e.g. `1e100`, or a 500-digit literal) can
+        /// vastly exceed `Int`'s range; a future version is always
+        /// reported this way regardless of whether it happens to fit in
+        /// an `Int`.
+        case future(String)
+        case invalid
+    }
+
+    /// Replaces the version number token with the single representable
+    /// byte `0` and feeds the sanitized bytes to `JSONSerialization`,
+    /// so a version token this build can't materialize as `Double`/`Int`
+    /// never prevents validating the well-formedness of everything else
+    /// in the document.
+    static func isStructurallyValid(bytes: [UInt8], versionTokenRange range: Range<Int>) -> Bool {
+        var sanitized = [UInt8]()
+        sanitized.reserveCapacity(bytes.count - (range.upperBound - range.lowerBound) + 1)
+        sanitized.append(contentsOf: bytes[bytes.startIndex..<range.lowerBound])
+        sanitized.append(UInt8(ascii: "0"))
+        sanitized.append(contentsOf: bytes[range.upperBound...])
+        let sanitizedData = Data(sanitized)
+        return (try? JSONSerialization.jsonObject(with: sanitizedData, options: [.fragmentsAllowed])) != nil
+    }
+
+    // MARK: - Lexical top-level `version` scan
+    //
+    // A minimal, linear, non-backtracking JSON lexer: it does exactly one
+    // pass over the already-in-memory bytes (bounded by the file size
+    // already read), tracking string/escape state and object/array
+    // nesting just precisely enough to find the *top-level* `version`
+    // member's number token by byte offset — without ever decoding the
+    // number itself or the rest of the document.
+
+    enum VersionKeyScan {
+        /// The top-level `version` key was found and its value is a JSON
+        /// number token spanning `range` (byte offsets into the scanned
+        /// bytes).
+        case numberToken(range: Range<Int>)
+        /// The top-level `version` key was found, but its value is not a
+        /// JSON number (string/object/array/`true`/`false`/`null`) — never
+        /// a valid version.
+        case nonNumericValue
+        /// The root isn't a JSON object, the object has no top-level
+        /// `version` key, or the bytes are malformed in a way that
+        /// prevents determining an answer (e.g. an unterminated string or
+        /// mismatched brackets encountered before reaching an answer).
+        case notFound
+    }
+
+    static func scanTopLevelVersionToken(in bytes: [UInt8]) -> VersionKeyScan {
+        var i = skipWhitespace(bytes, from: 0)
+        guard i < bytes.count, bytes[i] == UInt8(ascii: "{") else {
+            return .notFound
+        }
+        i += 1
+
+        while true {
+            i = skipWhitespace(bytes, from: i)
+            guard i < bytes.count else { return .notFound }
+            if bytes[i] == UInt8(ascii: "}") {
+                return .notFound
+            }
+            guard bytes[i] == UInt8(ascii: "\""), let (keyBytes, afterKey) = scanStringLiteral(bytes, from: i) else {
+                return .notFound
+            }
+            i = skipWhitespace(bytes, from: afterKey)
+            guard i < bytes.count, bytes[i] == UInt8(ascii: ":") else { return .notFound }
+            i = skipWhitespace(bytes, from: i + 1)
+            guard i < bytes.count else { return .notFound }
+
+            let isVersionKey = keyBytes.elementsEqual(Array("version".utf8))
+            let b = bytes[i]
+            let looksNumeric = b == UInt8(ascii: "-") || (b >= UInt8(ascii: "0") && b <= UInt8(ascii: "9"))
+
+            if isVersionKey, looksNumeric {
+                guard let end = scanNumberToken(bytes, from: i) else { return .notFound }
+                return .numberToken(range: i..<end)
+            }
+            guard let afterValue = skipJSONValue(bytes, from: i) else { return .notFound }
+            i = afterValue
+            if isVersionKey {
+                return .nonNumericValue
+            }
+
+            i = skipWhitespace(bytes, from: i)
+            guard i < bytes.count else { return .notFound }
+            if bytes[i] == UInt8(ascii: ",") {
+                i += 1
+                continue
+            }
+            if bytes[i] == UInt8(ascii: "}") {
+                return .notFound
+            }
+            return .notFound
+        }
+    }
+
+    static func skipWhitespace(_ bytes: [UInt8], from start: Int) -> Int {
+        var i = start
+        while i < bytes.count {
+            switch bytes[i] {
+            case 0x20, 0x09, 0x0A, 0x0D:
+                i += 1
+            default:
+                return i
+            }
+        }
+        return i
+    }
+
+    /// Recursively skips exactly one JSON value (string, number, object,
+    /// array, or `true`/`false`/`null`) starting at `start`, returning the
+    /// index just past it, or `nil` if the bytes are not a well-formed
+    /// value there. Recursion depth is bounded by the JSON's own nesting
+    /// depth, i.e. by the bytes already read from disk.
+    static func skipJSONValue(_ bytes: [UInt8], from start: Int) -> Int? {
+        guard start < bytes.count else { return nil }
+        switch bytes[start] {
+        case UInt8(ascii: "\""):
+            guard let (_, end) = scanStringLiteral(bytes, from: start) else { return nil }
+            return end
+
+        case UInt8(ascii: "{"):
+            var i = skipWhitespace(bytes, from: start + 1)
+            guard i < bytes.count else { return nil }
+            if bytes[i] == UInt8(ascii: "}") { return i + 1 }
+            while true {
+                guard bytes[i] == UInt8(ascii: "\""), let (_, afterKey) = scanStringLiteral(bytes, from: i) else {
+                    return nil
+                }
+                i = skipWhitespace(bytes, from: afterKey)
+                guard i < bytes.count, bytes[i] == UInt8(ascii: ":") else { return nil }
+                i = skipWhitespace(bytes, from: i + 1)
+                guard let afterValue = skipJSONValue(bytes, from: i) else { return nil }
+                i = skipWhitespace(bytes, from: afterValue)
+                guard i < bytes.count else { return nil }
+                if bytes[i] == UInt8(ascii: ",") {
+                    i = skipWhitespace(bytes, from: i + 1)
+                    continue
+                }
+                if bytes[i] == UInt8(ascii: "}") { return i + 1 }
+                return nil
+            }
+
+        case UInt8(ascii: "["):
+            var i = skipWhitespace(bytes, from: start + 1)
+            guard i < bytes.count else { return nil }
+            if bytes[i] == UInt8(ascii: "]") { return i + 1 }
+            while true {
+                guard let afterValue = skipJSONValue(bytes, from: i) else { return nil }
+                i = skipWhitespace(bytes, from: afterValue)
+                guard i < bytes.count else { return nil }
+                if bytes[i] == UInt8(ascii: ",") {
+                    i = skipWhitespace(bytes, from: i + 1)
+                    continue
+                }
+                if bytes[i] == UInt8(ascii: "]") { return i + 1 }
+                return nil
+            }
+
+        case UInt8(ascii: "t"):
+            return matchLiteral(bytes, from: start, literal: "true")
+        case UInt8(ascii: "f"):
+            return matchLiteral(bytes, from: start, literal: "false")
+        case UInt8(ascii: "n"):
+            return matchLiteral(bytes, from: start, literal: "null")
+
+        default:
+            return scanNumberToken(bytes, from: start)
+        }
+    }
+
+    static func matchLiteral(_ bytes: [UInt8], from start: Int, literal: String) -> Int? {
+        let literalBytes = Array(literal.utf8)
+        let end = start + literalBytes.count
+        guard end <= bytes.count, Array(bytes[start..<end]) == literalBytes else { return nil }
+        return end
+    }
+
+    /// Scans a JSON string literal starting at the opening `"` at `start`,
+    /// decoding standard JSON escapes (including `\uXXXX` and surrogate
+    /// pairs), so escaped keys/values are compared and skipped correctly.
+    /// Returns the decoded UTF-8 bytes and the index just past the closing
+    /// `"`, or `nil` if the string is unterminated or contains an invalid
+    /// escape.
+    static func scanStringLiteral(_ bytes: [UInt8], from start: Int) -> ([UInt8], Int)? {
+        var i = start + 1
+        var out: [UInt8] = []
+        while true {
+            guard i < bytes.count else { return nil }
+            let b = bytes[i]
+            if b == UInt8(ascii: "\"") {
+                return (out, i + 1)
+            }
+            if b == UInt8(ascii: "\\") {
+                i += 1
+                guard i < bytes.count else { return nil }
+                switch bytes[i] {
+                case UInt8(ascii: "\""): out.append(UInt8(ascii: "\"")); i += 1
+                case UInt8(ascii: "\\"): out.append(UInt8(ascii: "\\")); i += 1
+                case UInt8(ascii: "/"): out.append(UInt8(ascii: "/")); i += 1
+                case UInt8(ascii: "b"): out.append(0x08); i += 1
+                case UInt8(ascii: "f"): out.append(0x0C); i += 1
+                case UInt8(ascii: "n"): out.append(0x0A); i += 1
+                case UInt8(ascii: "r"): out.append(0x0D); i += 1
+                case UInt8(ascii: "t"): out.append(0x09); i += 1
+                case UInt8(ascii: "u"):
+                    guard let (unit, afterUnit) = readHex4(bytes, from: i + 1) else { return nil }
+                    i = afterUnit
+                    var scalarValue = UInt32(unit)
+                    if unit >= 0xD800, unit <= 0xDBFF {
+                        guard i + 1 < bytes.count, bytes[i] == UInt8(ascii: "\\"), bytes[i + 1] == UInt8(ascii: "u"),
+                              let (low, afterLow) = readHex4(bytes, from: i + 2), low >= 0xDC00, low <= 0xDFFF
+                        else {
+                            return nil
+                        }
+                        scalarValue = 0x10000 + (UInt32(unit) - 0xD800) * 0x400 + (UInt32(low) - 0xDC00)
+                        i = afterLow
+                    } else if unit >= 0xDC00, unit <= 0xDFFF {
+                        return nil
+                    }
+                    guard let scalar = Unicode.Scalar(scalarValue) else { return nil }
+                    out.append(contentsOf: Array(String(scalar).utf8))
+                default:
+                    return nil
+                }
+            } else if b < 0x20 {
+                return nil
+            } else {
+                out.append(b)
+                i += 1
+            }
+        }
+    }
+
+    static func readHex4(_ bytes: [UInt8], from start: Int) -> (UInt16, Int)? {
+        guard start + 4 <= bytes.count else { return nil }
+        var value: UInt16 = 0
+        for offset in 0..<4 {
+            guard let digit = hexDigitValue(bytes[start + offset]) else { return nil }
+            value = value << 4 | UInt16(digit)
+        }
+        return (value, start + 4)
+    }
+
+    static func hexDigitValue(_ byte: UInt8) -> UInt8? {
+        switch byte {
+        case UInt8(ascii: "0")...UInt8(ascii: "9"): return byte - UInt8(ascii: "0")
+        case UInt8(ascii: "a")...UInt8(ascii: "f"): return byte - UInt8(ascii: "a") + 10
+        case UInt8(ascii: "A")...UInt8(ascii: "F"): return byte - UInt8(ascii: "A") + 10
+        default: return nil
+        }
+    }
+
+    /// Matches the strict JSON number grammar (RFC 8259 §6):
+    /// `-? (0 | [1-9][0-9]*) (.[0-9]+)? ([eE][+-]?[0-9]+)?`, returning the
+    /// index just past the token, or `nil` if the bytes at `start` don't
+    /// form a valid JSON number.
+    static func scanNumberToken(_ bytes: [UInt8], from start: Int) -> Int? {
+        var i = start
+        guard i < bytes.count else { return nil }
+        if bytes[i] == UInt8(ascii: "-") { i += 1 }
+        guard i < bytes.count else { return nil }
+
+        if bytes[i] == UInt8(ascii: "0") {
+            i += 1
+        } else if bytes[i] >= UInt8(ascii: "1"), bytes[i] <= UInt8(ascii: "9") {
+            i += 1
+            while i < bytes.count, bytes[i] >= UInt8(ascii: "0"), bytes[i] <= UInt8(ascii: "9") { i += 1 }
+        } else {
+            return nil
+        }
+
+        if i < bytes.count, bytes[i] == UInt8(ascii: ".") {
+            var j = i + 1
+            guard j < bytes.count, bytes[j] >= UInt8(ascii: "0"), bytes[j] <= UInt8(ascii: "9") else { return nil }
+            while j < bytes.count, bytes[j] >= UInt8(ascii: "0"), bytes[j] <= UInt8(ascii: "9") { j += 1 }
+            i = j
+        }
+
+        if i < bytes.count, bytes[i] == UInt8(ascii: "e") || bytes[i] == UInt8(ascii: "E") {
+            var j = i + 1
+            if j < bytes.count, bytes[j] == UInt8(ascii: "+") || bytes[j] == UInt8(ascii: "-") { j += 1 }
+            guard j < bytes.count, bytes[j] >= UInt8(ascii: "0"), bytes[j] <= UInt8(ascii: "9") else { return nil }
+            while j < bytes.count, bytes[j] >= UInt8(ascii: "0"), bytes[j] <= UInt8(ascii: "9") { j += 1 }
+            i = j
+        }
+
+        return i
+    }
+
+    // MARK: - Decimal classification of the version number token
+    //
+    // Classifies an already-grammar-validated JSON number token's exact
+    // decimal magnitude using only string/character arithmetic — never
+    // `Double` (which can't represent `1e309` or a 500-digit integer) and
+    // never `Int` (which traps or overflows on the same inputs).
+
+    /// The number of exponent digits above which the exponent's magnitude
+    /// is guaranteed to dwarf any realistic fractional-digit count derived
+    /// from bytes actually read from disk, letting classification avoid
+    /// parsing the exponent into an `Int` at all for such tokens. 18 digits
+    /// safely fits in `Int64` (max ~9.22e18) with headroom to spare.
+    static let maxParsableExponentDigitCount = 18
+
+    static func classifyVersionNumberToken(_ token: String, currentVersion: Int) -> Result {
+        let remainder = Substring(token)
+        guard remainder.first != "-" else {
+            // A negative version has no meaning and no migration path.
+            return .invalid
+        }
+
+        var mantissaPart = remainder
+        var exponentDigits: Substring = ""
+        var exponentIsNegative = false
+        if let eIndex = remainder.firstIndex(where: { $0 == "e" || $0 == "E" }) {
+            mantissaPart = remainder[remainder.startIndex..<eIndex]
+            var expToken = remainder[remainder.index(after: eIndex)...]
+            if expToken.first == "+" {
+                expToken = expToken.dropFirst()
+            } else if expToken.first == "-" {
+                exponentIsNegative = true
+                expToken = expToken.dropFirst()
+            }
+            exponentDigits = expToken
+        }
+
+        var integerPart = mantissaPart
+        var fractionPart: Substring = ""
+        if let dotIndex = mantissaPart.firstIndex(of: ".") {
+            integerPart = mantissaPart[mantissaPart.startIndex..<dotIndex]
+            fractionPart = mantissaPart[mantissaPart.index(after: dotIndex)...]
+        }
+
+        let mantissaDigits = Array(integerPart) + Array(fractionPart)
+        let mantissaIsZero = mantissaDigits.allSatisfy { $0 == "0" }
+        let fractionDigitCount = fractionPart.count
+
+        let integerDigits: [Character]
+        if exponentDigits.count > maxParsableExponentDigitCount {
+            if exponentIsNegative {
+                // The exponent's magnitude vastly exceeds any realistic
+                // fractional-digit count read from disk, so the value
+                // collapses toward (or exactly to) zero: never a valid
+                // positive integral version.
+                return .invalid
+            }
+            if mantissaIsZero {
+                // 0 * 10^(huge) is exactly zero, not a valid version.
+                return .invalid
+            }
+            // The exponent's magnitude vastly exceeds the fractional
+            // digit count, so the value is unambiguously integral and
+            // astronomically larger than anything this build supports.
+            return .future(token)
+        }
+
+        let exponentValue = exponentDigits.isEmpty ? 0 : (Int(exponentDigits) ?? 0)
+        let signedExponent = exponentIsNegative ? -exponentValue : exponentValue
+        let shift = signedExponent - fractionDigitCount
+
+        if shift >= 0 {
+            integerDigits = mantissaDigits + Array(repeating: Character("0"), count: shift)
+        } else {
+            let shiftMagnitude = -shift
+            guard shiftMagnitude < mantissaDigits.count else {
+                // The decimal point falls at or before the start of the
+                // mantissa: even when the whole value collapses exactly to
+                // zero, that's still not a valid version (versions start
+                // at 1); otherwise it's a non-zero fraction, also invalid.
+                return .invalid
+            }
+            let splitIndex = mantissaDigits.count - shiftMagnitude
+            let tail = mantissaDigits[splitIndex...]
+            guard tail.allSatisfy({ $0 == "0" }) else {
+                // Non-zero digits after the decimal point: not integral.
+                return .invalid
+            }
+            integerDigits = Array(mantissaDigits[..<splitIndex])
+        }
+
+        let normalized = trimLeadingZeros(integerDigits)
+        guard !normalized.isEmpty else {
+            // Value is exactly zero; versions start at 1.
+            return .invalid
+        }
+
+        let currentVersionDigits = Array(String(currentVersion))
+        if normalized.count != currentVersionDigits.count {
+            return normalized.count > currentVersionDigits.count ? .future(token) : .invalid
+        }
+        if normalized.elementsEqual(currentVersionDigits) {
+            return .supported
+        }
+        return normalized.lexicographicallyPrecedes(currentVersionDigits) ? .invalid : .future(token)
+    }
+
+    static func trimLeadingZeros(_ digits: [Character]) -> [Character] {
+        var start = digits.startIndex
+        while start < digits.index(before: digits.endIndex), digits[start] == "0" {
+            start += 1
+        }
+        let trimmed = digits[start...]
+        return trimmed == ["0"] ? [] : Array(trimmed)
+    }
+}
+
 public actor AtomicJSONStore<Document: VersionedDocument> {
     private let fileURL: URL
     private let fileSystem: SettingsFileSystem
@@ -327,65 +750,36 @@ public actor AtomicJSONStore<Document: VersionedDocument> {
         }
     }
 
-    private enum VersionProbe {
-        case supported
-        /// A version this build cannot decode, described as text for
-        /// diagnostics. Kept as `String` (not `Int`) because a well-formed
-        /// integral JSON number (e.g. `1e100`) can vastly exceed `Int`'s
-        /// range; a future version is always reported this way regardless
-        /// of whether it happens to fit in an `Int`.
-        case future(String)
-        case invalid
-    }
-
     /// Inspects the top-level `version` field of `data` as raw JSON,
     /// without decoding the full document, so a future schema (which may
     /// have fields this build doesn't understand) can be safely detected
     /// and preserved untouched rather than misread as corrupt.
-    private func probeVersion(in data: Data) -> VersionProbe {
-        guard
-            let json = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]),
-            let dictionary = json as? [String: Any],
-            let versionValue = dictionary["version"]
-        else {
+    ///
+    /// Deliberately does not hand `data` to `JSONSerialization` while an
+    /// arbitrarily large version number token is still present:
+    /// `JSONSerialization` itself throws when a JSON number overflows
+    /// `Double` (e.g. `1e309`), which would otherwise misreport a
+    /// perfectly well-formed "future version" document as corrupt. Instead
+    /// this lexically locates the top-level `version` number token by byte
+    /// offset, classifies its magnitude using decimal-string arithmetic
+    /// (never materializing it as `Double`/`Int`), and separately
+    /// structurally validates the rest of the document by substituting a
+    /// representable `0` for that one token before parsing.
+    private func probeVersion(in data: Data) -> VersionProbing.Result {
+        let bytes = [UInt8](data)
+        switch VersionProbing.scanTopLevelVersionToken(in: bytes) {
+        case .notFound, .nonNumericValue:
             return .invalid
-        }
 
-        // JSON `true`/`false` bridge to `NSNumber` on Darwin; explicitly
-        // reject them so a boolean "version" isn't misread as 0/1.
-        guard let number = versionValue as? NSNumber, isBooleanNSNumber(number) == false else {
-            return .invalid
+        case .numberToken(let range):
+            guard VersionProbing.isStructurallyValid(bytes: bytes, versionTokenRange: range) else {
+                return .invalid
+            }
+            let token = String(decoding: bytes[range], as: UTF8.self)
+            return VersionProbing.classifyVersionNumberToken(token, currentVersion: Document.currentVersion)
         }
-
-        let doubleValue = number.doubleValue
-        guard doubleValue.isFinite, doubleValue == doubleValue.rounded(), doubleValue >= 1 else {
-            return .invalid
-        }
-
-        // `Int(doubleValue)` traps for any value outside `Int`'s
-        // representable range (e.g. `1e100`, or a value that rounds up to
-        // exactly `Double(Int.max) + 1`). `Int(exactly:)` never traps: it
-        // returns `nil` for anything not exactly representable as an
-        // `Int`, which is exactly the "too large to be anything we
-        // support" case we want to treat as a future/unsupported version.
-        guard let intValue = Int(exactly: doubleValue) else {
-            return .future(String(doubleValue))
-        }
-
-        if intValue > Document.currentVersion {
-            return .future(String(intValue))
-        }
-        if intValue == Document.currentVersion {
-            return .supported
-        }
-        // A lower, currently-unrecognized version: no migration path is
-        // defined yet, so treat it the same as any other invalid schema.
-        return .invalid
     }
 
-    private func isBooleanNSNumber(_ number: NSNumber) -> Bool {
-        CFGetTypeID(number) == CFBooleanGetTypeID()
-    }
 
     private enum QuarantineReason {
         case invalidVersion
