@@ -48,6 +48,43 @@ func finiteNumber(_ value: Any?) -> Double? {
     return doubleValue.isFinite ? doubleValue : nil
 }
 
+/// Converts a `Double` to `Int64`, saturating to `Int64.max`/`Int64.min`
+/// instead of trapping when the magnitude is outside the representable
+/// range (Swift's `Int64(_:)` initializer traps on overflow, unlike
+/// JavaScript's IEEE-754 doubles, which never trap: a JSON timestamp like
+/// `1e300` stays a valid — if extreme — `number` in the TS reference, so
+/// Swift must not crash converting it). Non-finite input (`+inf`/`-inf`)
+/// saturates by sign; `NaN` has no sign, so it saturates to `Int64.min`
+/// (treated as "ancient" — the safer fallback, since callers use these
+/// values in `now - timestamp` age comparisons where under-aging something
+/// stale is worse than the reverse only when caffeinating the Mac is the
+/// risk, and stale is always the fail-safe default in this policy).
+func saturatingInt64(_ value: Double) -> Int64 {
+    guard !value.isNaN else { return Int64.min }
+    guard value.isFinite else { return value > 0 ? Int64.max : Int64.min }
+    if value >= Double(Int64.max) { return Int64.max }
+    if value <= Double(Int64.min) { return Int64.min }
+    return Int64(value)
+}
+
+/// Overflow-safe `a - b` for millisecond timestamps that may already be
+/// saturated to `Int64.min`/`Int64.max` by `saturatingInt64`. Plain `-`
+/// traps on overflow in Swift; this saturates instead so an extreme
+/// timestamp degrades to an extreme (but sensible) age — very stale for an
+/// ancient/`Int64.min` timestamp, very fresh for a future/`Int64.max`
+/// timestamp — rather than crashing.
+func saturatingSubtract(_ a: Int64, _ b: Int64) -> Int64 {
+    let (result, overflow) = a.subtractingReportingOverflow(b)
+    guard overflow else { return result }
+    // Overflow only occurs when `b`'s magnitude/sign pushes the true result
+    // outside Int64 range: `b <= 0` means `a - b` overflowed toward
+    // +infinity (b was an ancient/very-negative timestamp — saturate to the
+    // "very stale" bound); `b > 0` means it overflowed toward -infinity (b
+    // was a future/very-positive timestamp — saturate to the "very fresh"
+    // bound). This holds regardless of `a`'s own range.
+    return b <= 0 ? Int64.max : Int64.min
+}
+
 /// Parses an ISO 8601 timestamp (with or without fractional seconds) to Unix
 /// milliseconds, mirroring `Date.parse` for the timestamp formats every
 /// fixture and session format in this corpus uses.
@@ -55,13 +92,13 @@ func parseISO8601ToMs(_ text: String) -> Int64? {
     let withFractional = ISO8601DateFormatter()
     withFractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
     if let date = withFractional.date(from: text) {
-        return Int64((date.timeIntervalSince1970 * 1000).rounded())
+        return saturatingInt64((date.timeIntervalSince1970 * 1000).rounded())
     }
 
     let plain = ISO8601DateFormatter()
     plain.formatOptions = [.withInternetDateTime]
     if let date = plain.date(from: text) {
-        return Int64((date.timeIntervalSince1970 * 1000).rounded())
+        return saturatingInt64((date.timeIntervalSince1970 * 1000).rounded())
     }
 
     return nil
@@ -70,10 +107,13 @@ func parseISO8601ToMs(_ text: String) -> Int64? {
 /// Mirrors `parseTimestamp` in the TS policy: a finite JSON number greater
 /// than 1e12 is already milliseconds, a smaller finite number is seconds; a
 /// non-empty string is parsed as an ISO 8601 timestamp; anything else falls
-/// back to `fallbackMs`.
+/// back to `fallbackMs`. Both numeric branches saturate through
+/// `saturatingInt64` — including after the `* 1000` seconds→ms
+/// multiplication, which can itself push an in-range `Double` outside
+/// `Int64` range — so no finite JSON number can trap this conversion.
 public func parseTimestamp(_ value: Any?, fallbackMs: Int64) -> Int64 {
     if let doubleValue = finiteNumber(value) {
-        return doubleValue > 1e12 ? Int64(doubleValue) : Int64(doubleValue * 1000)
+        return doubleValue > 1e12 ? saturatingInt64(doubleValue) : saturatingInt64(doubleValue * 1000)
     }
     if let text = value as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
         if let parsedMs = parseISO8601ToMs(text) {
@@ -295,7 +335,7 @@ public func assessClaudeTurn(_ events: [JSONObject], mtimeMs: Int64, now: Int64)
         if claudeMetadataTypes.contains(type) { continue }
 
         let timestamp = parseTimestamp(record["timestamp"], fallbackMs: mtimeMs)
-        let age = now - timestamp
+        let age = saturatingSubtract(now, timestamp)
 
         if type == "system" {
             let subtype = record["subtype"] as? String ?? ""
@@ -497,7 +537,7 @@ public func assessCodexTurn(_ events: [JSONObject], mtimeMs: Int64, now: Int64) 
 
     if lastActivityAt < 0 {
         // Tail held nothing recognizable (huge single records) — trust fresh writes only.
-        let age = now - mtimeMs
+        let age = saturatingSubtract(now, mtimeMs)
         let active = age <= openTurnQuietTailMs
         return TurnAssessment(
             active: active,
@@ -507,7 +547,7 @@ public func assessCodexTurn(_ events: [JSONObject], mtimeMs: Int64, now: Int64) 
         )
     }
 
-    let age = now - lastActivityAt
+    let age = saturatingSubtract(now, lastActivityAt)
 
     if latest?.role == .awaitUser {
         return TurnAssessment(active: false, lastActivityAt: lastActivityAt, reason: "waiting for approval", label: label)
@@ -606,7 +646,7 @@ public func assessGrokTurn(_ events: [JSONObject], mtimeMs: Int64, now: Int64) -
     }
 
     if lastActivityAt < 0 {
-        let age = now - mtimeMs
+        let age = saturatingSubtract(now, mtimeMs)
         let active = age <= openTurnQuietTailMs
         return TurnAssessment(
             active: active,
@@ -615,7 +655,7 @@ public func assessGrokTurn(_ events: [JSONObject], mtimeMs: Int64, now: Int64) -
         )
     }
 
-    let age = now - lastActivityAt
+    let age = saturatingSubtract(now, lastActivityAt)
     let reason = latest?.kind ?? "turn in progress"
 
     if latest?.role == .awaitUser {
@@ -647,7 +687,7 @@ public func assessGrokTurn(_ events: [JSONObject], mtimeMs: Int64, now: Int64) -
 // MARK: - Generic mtime
 
 public func assessGenericMtime(mtimeMs: Int64, now: Int64) -> TurnAssessment {
-    let age = now - mtimeMs
+    let age = saturatingSubtract(now, mtimeMs)
     let active = age <= genericMtimeWindowMs
     return TurnAssessment(
         active: active,
@@ -751,8 +791,17 @@ public func assessCursorComposerRecord(_ record: JSONObject, now: Int64) -> Turn
             sawCompletedTurnAfterUser = false
         }
 
-        // Cursor bubble types: 1 = user, 2 = assistant/tool/thinking
-        let headerType = (header["type"] as? NSNumber).map { Int(truncating: $0) }
+        // Cursor bubble types: 1 = user, 2 = assistant/tool/thinking. TS
+        // compares with strict equality (`header.type === 1`), which only
+        // ever matches the JS number `1` — a JSON boolean is never `=== 1`
+        // (`true !== 1`) and a numeric string never coerces (`"1" !== 1`).
+        // `finiteNumber` already rejects JSON booleans (`NSNumber` wrapping
+        // `CFBoolean`) and non-finite values, so reusing it here (instead of
+        // a raw `NSNumber` truncation, which conflates `true` with `1`)
+        // keeps only genuine JSON numbers, and `== 1` keeps only the exact
+        // value `1` (an integral float like `1.0` still matches, mirroring
+        // JS's single numeric type; `1.5` does not).
+        let headerType = finiteNumber(header["type"])
         if headerType == 1 {
             openUserTurnAt = createdAt
             sawCompletedTurnAfterUser = false
@@ -787,7 +836,7 @@ public func assessCursorComposerRecord(_ record: JSONObject, now: Int64) -> Turn
 
     if let openUserTurnAt, !sawCompletedTurnAfterUser {
         _ = openUserTurnAt // boundary already folded into lastActivityAt, matching the TS reference.
-        let age = now - lastActivityAt
+        let age = saturatingSubtract(now, lastActivityAt)
         let grace = openTurnTouchesTools ? toolTurnGraceMs : turnActiveGraceMs
         if age <= grace {
             return TurnAssessment(

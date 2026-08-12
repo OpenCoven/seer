@@ -24,6 +24,10 @@ tmp/
 apps/macos/Seer/Seer.xcodeproj/
 apps/macos/**/DerivedData/
 DerivedData/
+# Worktree-local derived data when xcodebuild is invoked with a relative
+# `-derivedDataPath build/xcode-derived-data` from apps/macos/Seer itself
+# (as opposed to the repo-root `/build/` above).
+apps/macos/Seer/build/
 build/macos/
 *.xcarchive
 *.dmg
