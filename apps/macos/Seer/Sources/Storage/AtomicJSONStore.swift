@@ -198,9 +198,13 @@ public protocol SettingsFileSystem: Sendable {
 
     /// Returns the byte size of the file at `url` without reading its
     /// contents, so an oversized file can be rejected before any
-    /// allocation.
+    /// allocation. Must resolve `url` the same symlink-refusing way
+    /// `readFile(at:)` does — never following a symlink substituted at the
+    /// document's own path or its canonical parent directory.
     /// - Throws: `SettingsFileSystemError.fileNotFound` if no file exists
-    ///   at `url`; some other error for any other stat failure.
+    ///   at `url`; `SettingsFileSystemError.symlinkRejected` if `url`'s
+    ///   final path component is a symlink; some other error for any other
+    ///   stat failure.
     func fileSize(at url: URL) async throws -> Int64
 
     /// Reads the full contents of the file at `url`.
@@ -382,15 +386,54 @@ public struct FileManagerSettingsFileSystem: SettingsFileSystem {
         return DarwinFileLock(fileDescriptor: fd)
     }
 
+    /// Probes `url`'s size via the same canonical-parent-directory +
+    /// `openat(..., O_NOFOLLOW | O_CLOEXEC)` sequence `readFile` uses,
+    /// rather than a path-based `stat` (which would silently follow a
+    /// symlink substituted at the document's own path and report the
+    /// *target's* size). `fstat`s the opened descriptor and rejects
+    /// anything that isn't a regular file — a symlink can never reach
+    /// this far (the preceding `openat` already refused to follow it),
+    /// but a FIFO/device/socket swapped in at the path is refused here
+    /// too. This is a preflight probe only: the actual bounded read (and
+    /// its own independent `fstat`) still happens in `readFile`.
     public func fileSize(at url: URL) async throws -> Int64 {
+        let fd = try Self.openDocumentDescriptor(at: url, flags: O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        defer { close(fd) }
+
         var statBuffer = stat()
-        guard stat(url.path, &statBuffer) == 0 else {
-            if errno == ENOENT {
-                throw SettingsFileSystemError.fileNotFound
-            }
-            throw SettingsFileSystemError.other("stat failed for \(url.path): \(Self.posixErrorDescription())")
+        guard fstat(fd, &statBuffer) == 0 else {
+            throw SettingsFileSystemError.other("fstat failed for \(url.path): \(Self.posixErrorDescription())")
+        }
+        guard (statBuffer.st_mode & S_IFMT) == S_IFREG else {
+            throw SettingsFileSystemError.other("document path is not a regular file: \(url.path)")
         }
         return Int64(statBuffer.st_size)
+    }
+
+    /// Opens the canonical parent directory, then `openat`s `url`'s
+    /// basename with the caller-supplied `flags` (always including
+    /// `O_NOFOLLOW`) — the exact symlink-refusing sequence `fileSize` and
+    /// `readFile` both need before they can safely `fstat`/read the
+    /// resulting descriptor, hoisted here once so the two share identical
+    /// `ENOENT`/`ELOOP` classification rather than drifting independently.
+    /// Callers own the returned descriptor and must close it.
+    private static func openDocumentDescriptor(at url: URL, flags: Int32) throws -> Int32 {
+        let dirFD = try openCanonicalParentDirectory(of: url)
+        defer { close(dirFD) }
+
+        let basename = url.lastPathComponent
+        let fd = basename.withCString { openat(dirFD, $0, flags) }
+        guard fd >= 0 else {
+            let code = errno
+            if code == ENOENT {
+                throw SettingsFileSystemError.fileNotFound
+            }
+            if code == ELOOP {
+                throw SettingsFileSystemError.symlinkRejected
+            }
+            throw SettingsFileSystemError.other("openat failed for \(url.path): \(posixErrorDescription(code))")
+        }
+        return fd
     }
 
     /// Reads `url`'s contents via a bounded, symlink-refusing POSIX
@@ -415,21 +458,7 @@ public struct FileManagerSettingsFileSystem: SettingsFileSystem {
     /// attacker-controlled size, whether that size was reported by a
     /// preceding `fileSize` probe or by this very `fstat` call.
     public func readFile(at url: URL) async throws -> Data {
-        let dirFD = try Self.openCanonicalParentDirectory(of: url)
-        defer { close(dirFD) }
-
-        let basename = url.lastPathComponent
-        let fd = basename.withCString { openat(dirFD, $0, O_RDONLY | O_NOFOLLOW | O_CLOEXEC) }
-        guard fd >= 0 else {
-            let code = errno
-            if code == ENOENT {
-                throw SettingsFileSystemError.fileNotFound
-            }
-            if code == ELOOP {
-                throw SettingsFileSystemError.symlinkRejected
-            }
-            throw SettingsFileSystemError.other("openat failed for \(url.path): \(Self.posixErrorDescription(code))")
-        }
+        let fd = try Self.openDocumentDescriptor(at: url, flags: O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
         defer { close(fd) }
 
         var statBuffer = stat()
