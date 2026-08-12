@@ -149,10 +149,11 @@ public actor SettingsStore {
 
     private func performSetKeepAwakeMode(_ mode: KeepAwakeMode) async throws {
         await ensureLoaded()
-        var updated = current
-        updated.keepAwakeMode = mode
-        try await store.save(updated)
-        current = updated
+        try await applyUpdate { document in
+            var updated = document
+            updated.keepAwakeMode = mode
+            return updated
+        }
     }
 
     public func setIncludePrereleaseUpdates(_ value: Bool) async throws {
@@ -168,9 +169,38 @@ public actor SettingsStore {
 
     private func performSetIncludePrereleaseUpdates(_ value: Bool) async throws {
         await ensureLoaded()
-        var updated = current
-        updated.includePrereleaseUpdates = value
-        try await store.save(updated)
-        current = updated
+        try await applyUpdate { document in
+            var updated = document
+            updated.includePrereleaseUpdates = value
+            return updated
+        }
+    }
+
+    /// Runs `transform` through `AtomicJSONStore.update(_:)` — a single
+    /// lock-scoped read-modify-write against the *freshest on-disk*
+    /// document, not this instance's own possibly-stale `current` cache —
+    /// so two independently loaded `SettingsStore` instances mutating
+    /// different fields can never lose one's change to the other's stale
+    /// snapshot (see `AtomicJSONStore.update(_:)`'s documentation).
+    ///
+    /// If the underlying write's directory-sync durability is uncertain,
+    /// the new document was still durably committed to disk (the rename
+    /// itself succeeded): `current` is published to that committed value
+    /// *before* rethrowing `StorageError.durabilityUncertain`, so the
+    /// cache is never left stale relative to disk and a subsequent
+    /// mutation always starts from the value actually on disk, never
+    /// reverting it.
+    private func applyUpdate(_ transform: @Sendable (SettingsDocument) -> SettingsDocument) async throws {
+        do {
+            current = try await store.update(transform)
+        } catch let error as StorageUpdateError<SettingsDocument> {
+            switch error {
+            case .durabilityUncertain(let committed):
+                current = committed
+                throw StorageError.durabilityUncertain
+            case .failure(let storageError):
+                throw storageError
+            }
+        }
     }
 }

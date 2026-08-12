@@ -269,4 +269,136 @@ final class SettingsStoreTests: XCTestCase {
         let current = await store.current
         XCTAssertEqual(current, SettingsDocument.defaultValue, "the in-memory cache must reflect the internal load's defaults, not silently claim the mutation applied")
     }
+
+    // MARK: 16. Multi-instance lost update: two independently loaded
+    // `SettingsStore`s, each with their own stale in-memory `current`
+    // cache, must not clobber each other's on-disk changes when they
+    // mutate different fields — the transactional `AtomicJSONStore.update`
+    // fix for the classic load-mutate-save race.
+
+    func testTwoInstancesMutatingDifferentFieldsPreserveBothChanges() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let storeA = makeSettingsStore(fileSystem: fileSystem)
+        let storeB = makeSettingsStore(fileSystem: fileSystem)
+        _ = await storeA.load()
+        _ = await storeB.load()
+
+        // Both instances loaded before either wrote anything, so each
+        // instance's own `current` cache is the stale default document —
+        // exactly the setup that would silently lose one instance's
+        // change under a naive load-then-mutate-then-save
+        // implementation.
+        try await storeA.setKeepAwakeMode(.display)
+        try await storeB.setIncludePrereleaseUpdates(true)
+
+        let decoder = JSONDecoder()
+        let savedBytes = await fileSystem.contents(at: settingsURL)
+        let decoded = try decoder.decode(SettingsDocument.self, from: savedBytes!)
+        XCTAssertEqual(decoded.keepAwakeMode, .display, "instance A's change must survive instance B's independent mutation")
+        XCTAssertTrue(decoded.includePrereleaseUpdates, "instance B's change must also be reflected")
+
+        // Instance B ran its update after A's had already committed, so
+        // B's transform read A's committed change from disk and B's own
+        // published cache reflects both fields — the merged final state.
+        // Instance A's own cache reflects exactly what *it* committed at
+        // the time it wrote (before B's later, independent mutation);
+        // requiring it to omnisciently reflect a write that hadn't
+        // happened yet would be the wrong bar. Confirming B's cache here
+        // is the meaningful assertion: it's the one whose transform ran
+        // second, so it's the one that could have clobbered A's change if
+        // this fix weren't in place.
+        let currentB = await storeB.current
+        XCTAssertEqual(currentB, decoded, "instance B's cache must match the merged on-disk document it actually wrote")
+    }
+
+    func testTwoInstancesMutatingSameFieldControlledLockOrderLastAcceptedWins() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let storeA = makeSettingsStore(fileSystem: fileSystem)
+        let storeB = makeSettingsStore(fileSystem: fileSystem)
+        _ = await storeA.load()
+        _ = await storeB.load()
+
+        await fileSystem.armSuspension("writeFileAndSynchronize")
+
+        let taskA = Task {
+            try await storeA.setKeepAwakeMode(.display)
+        }
+        await fileSystem.waitUntilEntered("writeFileAndSynchronize")
+
+        // storeA is suspended mid-write, holding the cross-instance lock.
+        // Queue storeB's conflicting mutation of the very same field
+        // behind it.
+        let taskB = Task {
+            try await storeB.setKeepAwakeMode(.system)
+        }
+        for _ in 0..<50 {
+            await Task.yield()
+        }
+        let logWhileBlocked = await fileSystem.callLog
+        XCTAssertEqual(
+            logWhileBlocked.filter { $0.hasPrefix("writeFileAndSynchronize") }.count, 1,
+            "storeB must not enter its own write while storeA still holds the cross-instance lock"
+        )
+
+        await fileSystem.resumeSuspension("writeFileAndSynchronize")
+        try await taskA.value
+        try await taskB.value
+
+        // storeB's write actually ran last under the lock, so its value —
+        // not storeA's — must be the final on-disk and published state.
+        let decoder = JSONDecoder()
+        let savedBytes = await fileSystem.contents(at: settingsURL)
+        let decoded = try decoder.decode(SettingsDocument.self, from: savedBytes!)
+        XCTAssertEqual(decoded.keepAwakeMode, .system)
+
+        let currentB = await storeB.current
+        XCTAssertEqual(currentB.keepAwakeMode, .system)
+    }
+
+    // MARK: 17. `durabilityUncertain` cache semantics: when the directory
+    // sync following a successful rename fails, the new document is
+    // already durably on disk. `current`/disk must reflect that committed
+    // value even though `durabilityUncertain` is thrown — never silently
+    // reverted — and the next mutation must build on top of it.
+
+    func testDurabilityUncertainPublishesCommittedValueThenNextMutationPreservesIt() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let store = makeSettingsStore(fileSystem: fileSystem)
+        _ = await store.load()
+
+        await fileSystem.setFailNextDirectorySync(SettingsFileSystemError.other("directory fsync failed"))
+
+        do {
+            try await store.setKeepAwakeMode(.display)
+            XCTFail("expected StorageError.durabilityUncertain")
+        } catch StorageError.durabilityUncertain {
+            // expected
+        }
+
+        // Even though the first mutation threw, its change was already
+        // durably committed to disk (the rename succeeded) — the cache
+        // must reflect that, not silently revert to the pre-mutation
+        // default.
+        let afterFirstMutation = await store.current
+        XCTAssertEqual(afterFirstMutation.keepAwakeMode, .display, "the cache must publish the value already committed to disk, not revert it")
+
+        let decoder = JSONDecoder()
+        let bytesAfterFirst = await fileSystem.contents(at: settingsURL)
+        let decodedAfterFirst = try decoder.decode(SettingsDocument.self, from: bytesAfterFirst!)
+        XCTAssertEqual(decodedAfterFirst.keepAwakeMode, .display, "disk must already contain the committed change")
+
+        // A second, ordinary mutation must build on top of the committed
+        // value — preserving the first field's change while applying the
+        // second — never reverting field one back to its pre-mutation
+        // default.
+        try await store.setIncludePrereleaseUpdates(true)
+
+        let afterSecondMutation = await store.current
+        XCTAssertEqual(afterSecondMutation.keepAwakeMode, .display, "the first mutation's committed field must survive the second mutation")
+        XCTAssertTrue(afterSecondMutation.includePrereleaseUpdates, "the second mutation's own field must also apply")
+
+        let bytesAfterSecond = await fileSystem.contents(at: settingsURL)
+        let decodedAfterSecond = try decoder.decode(SettingsDocument.self, from: bytesAfterSecond!)
+        XCTAssertEqual(decodedAfterSecond, afterSecondMutation, "disk must match the published cache after the second mutation")
+    }
 }

@@ -1,6 +1,19 @@
 import Foundation
 import os
 
+/// The maximum on-disk/encoded document size any `AtomicJSONStore` or
+/// `SettingsFileSystem` will read or write, in bytes. Hoisted out of
+/// `AtomicJSONStore<Document>` (a generic type, whose `static let`s cannot
+/// be referenced without specializing a concrete `Document`) so the
+/// non-generic `FileManagerSettingsFileSystem`'s bounded POSIX read can
+/// enforce the exact same ceiling without allocating based on any
+/// attacker-controlled size it reads from `stat`/`fstat`. 1 MiB is
+/// enormously generous for a flat settings schema while keeping every
+/// byte-scanning operation in this file bounded and safe.
+public enum StorageLimits {
+    public static let maxDocumentBytes: Int64 = 1_048_576
+}
+
 /// A JSON document whose on-disk schema is explicitly versioned.
 ///
 /// `AtomicJSONStore` uses `currentVersion`/`defaultValue` to decide whether a
@@ -60,6 +73,27 @@ public enum StorageError: Error, Equatable, Sendable {
     case durabilityUncertain
 }
 
+/// Thrown by `AtomicJSONStore.update(_:)`, which — unlike plain `save` —
+/// can reach a state where the new document is already durably committed
+/// to disk (the rename succeeded) yet the operation still cannot report
+/// ordinary success (the following directory-sync failed). Wrapping
+/// `StorageError.durabilityUncertain` alone would lose the committed
+/// document; a caller (`SettingsStore`) needs that value to publish as its
+/// new `current` cache *before* surfacing the uncertain-durability error,
+/// so a later mutation starts from the value known to be on disk rather
+/// than silently reverting to a stale in-memory cache.
+public enum StorageUpdateError<Document: Sendable>: Error, Sendable {
+    /// The transform's result was durably written and the rename/replace
+    /// into place succeeded, but the following directory-sync could not be
+    /// confirmed. `committed` is the exact document now on disk.
+    case durabilityUncertain(committed: Document)
+    /// Every other failure `update(_:)` can surface, wrapping the same
+    /// `StorageError` cases `save` uses (`notLoaded`, `writesDisabled`,
+    /// `unsupportedVersion`, `encodeFailed`, `payloadTooLarge`,
+    /// `writeFailed`). No disk mutation occurred.
+    case failure(StorageError)
+}
+
 /// The result of `AtomicJSONStore.load()`. Load never throws: a missing,
 /// corrupt, unreadable, or unsupported-version file all resolve to a usable
 /// in-memory value (defaults) plus enough information for the caller to
@@ -90,12 +124,31 @@ public enum SettingsFileSystemError: Error, Equatable, Sendable {
     /// `moveItem(at:to:)` found an existing file already occupying the
     /// destination path (used by quarantine's collision-avoidance loop).
     case destinationAlreadyExists
+    /// `readFile(at:)` (or the lock/document open it shares its
+    /// canonical-parent-resolution logic with) found the final path
+    /// component was a symlink. Rejected outright rather than followed,
+    /// so a symlink swapped in at the document (or lock) path can never
+    /// silently redirect a read, a lock, or a write to a different file
+    /// than the one this store was constructed to guard.
+    case symlinkRejected
+    /// `readFile(at:)`'s bounded POSIX read found the file's contents
+    /// exceed `StorageLimits.maxDocumentBytes` — either an initial
+    /// `fstat` on the already-open descriptor reported an oversized
+    /// count, or the content grew past the ceiling mid-stream (e.g. a
+    /// non-cooperating writer appending to the same inode after this
+    /// read's own preceding size probe already reported a small size).
+    /// Thrown before any allocation proportional to the attacker-supplied
+    /// size occurs.
+    case tooLarge
     /// Any other I/O failure. `message` is diagnostic-only, not compared.
     case other(String)
 
     public static func == (lhs: SettingsFileSystemError, rhs: SettingsFileSystemError) -> Bool {
         switch (lhs, rhs) {
-        case (.fileNotFound, .fileNotFound), (.destinationAlreadyExists, .destinationAlreadyExists):
+        case (.fileNotFound, .fileNotFound),
+             (.destinationAlreadyExists, .destinationAlreadyExists),
+             (.symlinkRejected, .symlinkRejected),
+             (.tooLarge, .tooLarge):
             return true
         case let (.other(a), .other(b)):
             return a == b
@@ -211,13 +264,24 @@ public struct FileManagerSettingsFileSystem: SettingsFileSystem {
         fileManager.fileExists(atPath: url.path)
     }
 
-    /// Resolves the sibling lock-file path for `documentURL`: the
-    /// canonical (symlink-free) parent directory, plus
-    /// `documentURL.lastPathComponent + ".lock"`. Rejects a symlinked
-    /// parent directory, a symlinked existing document, or a symlinked
-    /// existing lock-file path outright, so the lock can never silently
-    /// guard (or be satisfied by) a different file than the one intended.
-    static func resolveLockURL(for documentURL: URL) throws -> URL {
+    /// Opens `documentURL`'s canonical (symlink-free) parent directory and
+    /// returns an open, directory-verified, `O_CLOEXEC` file descriptor for
+    /// it. Every other syscall-backed operation below that needs to open
+    /// something "underneath" this directory (the lock file, the document
+    /// itself) does so via `openat(dirFD, basename, ..., O_NOFOLLOW, ...)`
+    /// relative to this one resolved descriptor, rather than re-resolving
+    /// (and re-racing) a full path string per call. This removes the
+    /// classic lstat-then-open TOCTOU gap: nothing between resolving the
+    /// parent and opening a child by name can substitute a symlink into
+    /// the child's own final path component, because `openat` never
+    /// re-walks the parent portion of the path at all, and `O_NOFOLLOW` on
+    /// the child open refuses to follow a symlink there either.
+    ///
+    /// Rejects a symlinked parent directory outright (`lstat` before
+    /// `realpath`), and re-verifies with `fstat` after opening that the
+    /// resolved path is still actually a directory (defends against a
+    /// last-instant swap between `realpath` and `open`).
+    static func openCanonicalParentDirectory(of documentURL: URL) throws -> Int32 {
         let parentPath = documentURL.deletingLastPathComponent().path
 
         var parentStat = stat()
@@ -233,31 +297,72 @@ public struct FileManagerSettingsFileSystem: SettingsFileSystem {
         let canonicalParentPath = String(cString: resolvedParent)
         free(resolvedParent)
 
-        var documentStat = stat()
-        if lstat(documentURL.path, &documentStat) == 0 {
-            guard (documentStat.st_mode & S_IFMT) != S_IFLNK else {
-                throw SettingsFileSystemError.other("document path is a symlink: \(documentURL.path)")
-            }
+        let fd = canonicalParentPath.withCString { open($0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) }
+        guard fd >= 0 else {
+            throw SettingsFileSystemError.other("open failed for canonical parent directory \(canonicalParentPath): \(posixErrorDescription())")
         }
-
-        let canonicalParent = URL(fileURLWithPath: canonicalParentPath, isDirectory: true)
-        let lockURL = canonicalParent.appendingPathComponent(documentURL.lastPathComponent + ".lock")
-
-        var lockStat = stat()
-        if lstat(lockURL.path, &lockStat) == 0 {
-            guard (lockStat.st_mode & S_IFMT) != S_IFLNK else {
-                throw SettingsFileSystemError.other("lock file path is a symlink: \(lockURL.path)")
-            }
+        var openedStat = stat()
+        guard fstat(fd, &openedStat) == 0, (openedStat.st_mode & S_IFMT) == S_IFDIR else {
+            close(fd)
+            throw SettingsFileSystemError.other("opened parent path is not a directory: \(canonicalParentPath)")
         }
-        return lockURL
+        return fd
     }
 
+    /// Acquires the sibling `.lock` file's advisory lock relative to
+    /// `url`'s canonical parent directory. Creates the lock file (if
+    /// missing) and opens it via `openat(dirFD, lockBasename, O_CREAT |
+    /// O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0600)` — a single atomic syscall,
+    /// not the removed lstat-then-open pattern, so a symlink substituted
+    /// at the lock path between any check and the open can never be
+    /// followed. After opening, `fstat`s the resulting descriptor and
+    /// refuses to lock a path that isn't a regular, single-hard-link file
+    /// owned by the current effective user with no group/world write bit
+    /// — every one of those would indicate the lock file isn't the
+    /// private, cooperative artifact this store expects, before ever
+    /// calling `flock`.
     public func acquireLock(for url: URL) async throws -> any SettingsFileLock {
-        let lockURL = try Self.resolveLockURL(for: url)
-        let fd = lockURL.path.withCString { open($0, O_CREAT | O_RDWR, 0o600) }
+        let dirFD = try Self.openCanonicalParentDirectory(of: url)
+        let lockBasename = url.lastPathComponent + ".lock"
+
+        let fd = lockBasename.withCString { openat(dirFD, $0, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600) }
         guard fd >= 0 else {
-            throw SettingsFileSystemError.other("open failed for lock file \(lockURL.path): \(Self.posixErrorDescription())")
+            let description = Self.posixErrorDescription()
+            close(dirFD)
+            if errno == ELOOP {
+                throw SettingsFileSystemError.symlinkRejected
+            }
+            throw SettingsFileSystemError.other("openat failed for lock file \(lockBasename): \(description)")
         }
+        // The lock file descriptor is now independent of `dirFD`; the
+        // directory descriptor itself is not held across the lock's
+        // lifetime (unlike the document/lock inode, the directory isn't
+        // what `flock` guards).
+        close(dirFD)
+
+        var lockStat = stat()
+        guard fstat(fd, &lockStat) == 0 else {
+            let description = Self.posixErrorDescription()
+            close(fd)
+            throw SettingsFileSystemError.other("fstat failed for lock file \(lockBasename): \(description)")
+        }
+        guard (lockStat.st_mode & S_IFMT) == S_IFREG else {
+            close(fd)
+            throw SettingsFileSystemError.other("lock file is not a regular file: \(lockBasename)")
+        }
+        guard lockStat.st_nlink <= 1 else {
+            close(fd)
+            throw SettingsFileSystemError.other("lock file has unexpected extra hard links: \(lockBasename)")
+        }
+        guard lockStat.st_uid == geteuid() else {
+            close(fd)
+            throw SettingsFileSystemError.other("lock file has an unexpected owner: \(lockBasename)")
+        }
+        guard (lockStat.st_mode & (S_IWGRP | S_IWOTH)) == 0 else {
+            close(fd)
+            throw SettingsFileSystemError.other("lock file has an unexpectedly permissive mode: \(lockBasename)")
+        }
+
         // Blocking exclusive advisory lock, held across an entire load or
         // save operation. This call is synchronous (like every other
         // syscall-backed method here) and may suspend the calling thread
@@ -271,7 +376,7 @@ public struct FileManagerSettingsFileSystem: SettingsFileSystem {
             if errno != EINTR {
                 let description = Self.posixErrorDescription()
                 close(fd)
-                throw SettingsFileSystemError.other("flock failed for lock file \(lockURL.path): \(description)")
+                throw SettingsFileSystemError.other("flock failed for lock file \(lockBasename): \(description)")
             }
         }
         return DarwinFileLock(fileDescriptor: fd)
@@ -288,15 +393,79 @@ public struct FileManagerSettingsFileSystem: SettingsFileSystem {
         return Int64(statBuffer.st_size)
     }
 
+    /// Reads `url`'s contents via a bounded, symlink-refusing POSIX
+    /// descriptor read — used both for the original document load and for
+    /// quarantine's just-in-time identity re-read, so both paths share
+    /// identical protection against a huge or growing file.
+    ///
+    /// Opens the canonical parent directory, then `openat`s the document's
+    /// basename with `O_RDONLY | O_NOFOLLOW | O_CLOEXEC` (refusing to
+    /// follow a symlink substituted at the document's own path). `fstat`s
+    /// the opened descriptor first: if the reported size already exceeds
+    /// `StorageLimits.maxDocumentBytes`, returns `tooLarge` immediately
+    /// without allocating a buffer anywhere near that size. Otherwise
+    /// reads in fixed-size chunks (handling partial reads and `EINTR`)
+    /// into a buffer capped at `maxDocumentBytes + 1` bytes total: if the
+    /// accumulated content ever exceeds the ceiling — including because a
+    /// non-cooperating writer *grew* the file after this method's own
+    /// `fstat` already saw a small size — the read aborts as `tooLarge`
+    /// having never allocated more than one chunk past the ceiling. This
+    /// makes the read resistant to "replacement-after-stat": no caller of
+    /// `readFile` can be misled into allocating proportional to an
+    /// attacker-controlled size, whether that size was reported by a
+    /// preceding `fileSize` probe or by this very `fstat` call.
     public func readFile(at url: URL) async throws -> Data {
-        guard fileManager.fileExists(atPath: url.path) else {
-            throw SettingsFileSystemError.fileNotFound
+        let dirFD = try Self.openCanonicalParentDirectory(of: url)
+        defer { close(dirFD) }
+
+        let basename = url.lastPathComponent
+        let fd = basename.withCString { openat(dirFD, $0, O_RDONLY | O_NOFOLLOW | O_CLOEXEC) }
+        guard fd >= 0 else {
+            let code = errno
+            if code == ENOENT {
+                throw SettingsFileSystemError.fileNotFound
+            }
+            if code == ELOOP {
+                throw SettingsFileSystemError.symlinkRejected
+            }
+            throw SettingsFileSystemError.other("openat failed for \(url.path): \(Self.posixErrorDescription(code))")
         }
-        do {
-            return try Data(contentsOf: url)
-        } catch {
-            throw SettingsFileSystemError.other(String(describing: error))
+        defer { close(fd) }
+
+        var statBuffer = stat()
+        guard fstat(fd, &statBuffer) == 0 else {
+            throw SettingsFileSystemError.other("fstat failed for \(url.path): \(Self.posixErrorDescription())")
         }
+        guard (statBuffer.st_mode & S_IFMT) == S_IFREG else {
+            throw SettingsFileSystemError.other("document path is not a regular file: \(url.path)")
+        }
+        guard statBuffer.st_size <= StorageLimits.maxDocumentBytes else {
+            throw SettingsFileSystemError.tooLarge
+        }
+
+        let maxBytes = Int(StorageLimits.maxDocumentBytes)
+        let chunkSize = 65_536
+        var buffer = [UInt8]()
+        buffer.reserveCapacity(min(maxBytes, chunkSize) + 1)
+        var chunk = [UInt8](repeating: 0, count: chunkSize)
+
+        while true {
+            let bytesRead = chunk.withUnsafeMutableBytes { rawBuffer -> Int in
+                read(fd, rawBuffer.baseAddress, rawBuffer.count)
+            }
+            if bytesRead < 0 {
+                if errno == EINTR { continue }
+                throw SettingsFileSystemError.other("read failed for \(url.path): \(Self.posixErrorDescription())")
+            }
+            if bytesRead == 0 {
+                break
+            }
+            buffer.append(contentsOf: chunk[0..<bytesRead])
+            if buffer.count > maxBytes {
+                throw SettingsFileSystemError.tooLarge
+            }
+        }
+        return Data(buffer)
     }
 
     /// Writes `data` to a brand-new file at `url` using `open` with
@@ -371,19 +540,18 @@ public struct FileManagerSettingsFileSystem: SettingsFileSystem {
         }
     }
 
-    /// Opens and `fsync`s `url`'s containing directory so a preceding
-    /// rename/replace's directory-entry change is confirmed durable, not
-    /// just the renamed file's own bytes (which the temp file's own
-    /// `F_FULLFSYNC` already covered before the rename).
+    /// Opens and `fsync`s `url`'s containing directory via the same
+    /// canonical-parent resolution `readFile`/`acquireLock` use, so a
+    /// preceding rename/replace's directory-entry change is confirmed
+    /// durable, not just the renamed file's own bytes (which the temp
+    /// file's own `F_FULLFSYNC` already covered before the rename), and so
+    /// the directory actually fsync'd is provably the same one the
+    /// document/lock opens resolved to, not a substituted symlink.
     public func synchronizeDirectory(for url: URL) async throws {
-        let directoryPath = url.deletingLastPathComponent().path
-        let fd = directoryPath.withCString { open($0, O_RDONLY) }
-        guard fd >= 0 else {
-            throw SettingsFileSystemError.other("open failed for directory \(directoryPath): \(Self.posixErrorDescription())")
-        }
+        let fd = try Self.openCanonicalParentDirectory(of: url)
         defer { close(fd) }
         guard fsync(fd) == 0 else {
-            throw SettingsFileSystemError.other("directory fsync failed for \(directoryPath): \(Self.posixErrorDescription())")
+            throw SettingsFileSystemError.other("directory fsync failed for \(url.deletingLastPathComponent().path): \(Self.posixErrorDescription())")
         }
     }
 
@@ -1010,7 +1178,7 @@ public actor AtomicJSONStore<Document: VersionedDocument> {
     /// temp file is created. 1 MiB is enormously generous for a flat
     /// settings schema while keeping every byte-scanning operation in this
     /// file (`VersionProbing`'s lexer included) bounded and safe.
-    public static var maxDocumentBytes: Int64 { 1_048_576 }
+    public static var maxDocumentBytes: Int64 { StorageLimits.maxDocumentBytes }
 
     private let fileURL: URL
     private let fileSystem: SettingsFileSystem
@@ -1075,13 +1243,7 @@ public actor AtomicJSONStore<Document: VersionedDocument> {
             writesEnabled = true
             return LoadResult(value: Document.defaultValue, diagnostic: nil, writesEnabled: true)
         case .tooLarge:
-            writesEnabled = false
-            let diagnostic = Diagnostic(
-                id: StorageDiagnosticID.tooLarge,
-                message: "Settings file at \(fileURL.path) exceeds the \(Self.maxDocumentBytes)-byte limit; using defaults without reading, quarantining, or writing to disk.",
-                occurredAt: clock.nowMilliseconds()
-            )
-            return LoadResult(value: Document.defaultValue, diagnostic: diagnostic, writesEnabled: false)
+            return tooLargeLoadResult()
         case .ok, .indeterminate:
             break
         }
@@ -1091,6 +1253,8 @@ public actor AtomicJSONStore<Document: VersionedDocument> {
         case .missing:
             writesEnabled = true
             return LoadResult(value: Document.defaultValue, diagnostic: nil, writesEnabled: true)
+        case .tooLarge:
+            return tooLargeLoadResult()
         case .failed:
             writesEnabled = false
             let diagnostic = Diagnostic(
@@ -1130,6 +1294,21 @@ public actor AtomicJSONStore<Document: VersionedDocument> {
         }
     }
 
+    /// Shared "too large" `LoadResult`, reached identically whether a
+    /// preceding `fileSize` stat probe or the bounded `readFile` itself
+    /// (having detected the content grow past the ceiling mid-read)
+    /// reported the oversized condition — both disable writes and leave
+    /// the file untouched without ever finishing an unbounded read.
+    private func tooLargeLoadResult() -> LoadResult<Document> {
+        writesEnabled = false
+        let diagnostic = Diagnostic(
+            id: StorageDiagnosticID.tooLarge,
+            message: "Settings file at \(fileURL.path) exceeds the \(Self.maxDocumentBytes)-byte limit; using defaults without reading, quarantining, or writing to disk.",
+            occurredAt: clock.nowMilliseconds()
+        )
+        return LoadResult(value: Document.defaultValue, diagnostic: diagnostic, writesEnabled: false)
+    }
+
     private enum SizeCheckOutcome {
         case ok
         case missing
@@ -1155,6 +1334,13 @@ public actor AtomicJSONStore<Document: VersionedDocument> {
     private enum ReadOutcome {
         case missing
         case failed
+        /// `fileSystem.readFile(at:)` itself detected the content exceeds
+        /// `maxDocumentBytes` — either at its own initial size probe or
+        /// mid-stream growth — distinct from a generic `.failed` so
+        /// callers can surface the same `tooLarge` diagnostic/read-only
+        /// outcome as the pre-flight `checkSourceFileSize()` check,
+        /// rather than a misleading `readFailed`.
+        case tooLarge
         case success(Data)
     }
 
@@ -1163,6 +1349,8 @@ public actor AtomicJSONStore<Document: VersionedDocument> {
             return .success(try await fileSystem.readFile(at: fileURL))
         } catch SettingsFileSystemError.fileNotFound {
             return .missing
+        } catch SettingsFileSystemError.tooLarge {
+            return .tooLarge
         } catch {
             return .failed
         }
@@ -1368,5 +1556,189 @@ public actor AtomicJSONStore<Document: VersionedDocument> {
             // success would wrongly suggest full durability was confirmed.
             throw StorageError.durabilityUncertain
         }
+    }
+
+    // MARK: - Transactional update
+
+    /// Atomically reads the freshest on-disk document, applies `transform`
+    /// to it, and durably writes the result back — all under one single,
+    /// continuously-held instance FIFO gate turn plus cross-instance/
+    /// cross-process advisory lock, so the read this transform sees can
+    /// never go stale between being read and being replaced.
+    ///
+    /// This is the fix for the "lost update" hazard plain `load()` +
+    /// mutate-in-memory + `save()` has across two independently loaded
+    /// `AtomicJSONStore` instances (e.g. two `SettingsStore`s in the same
+    /// process, or a future second process): each instance's own `current`
+    /// cache reflects whatever the file looked like at *that instance's
+    /// last load*, not necessarily what's on disk right now. If instance A
+    /// changes field `x` and saves, then instance B — still holding a
+    /// stale in-memory copy from before A's change — changes field `y` and
+    /// saves *its* stale copy (with `x` reverted to its pre-A value), A's
+    /// change is silently lost even though the two changes touched
+    /// unrelated fields. `update(_:)` closes this gap structurally: the
+    /// value `transform` receives is read from disk *after* this call has
+    /// already acquired both the instance gate and the file lock, and the
+    /// transformed result is written back before either is released — no
+    /// other `AtomicJSONStore` call (in this process or, via the
+    /// cross-process file lock, another process) can observe or mutate the
+    /// document in between. Two instances changing different fields, no
+    /// matter which acquires the lock first, both end up reflected on
+    /// disk; two instances changing the *same* field converge on whichever
+    /// one's transform actually ran last under the lock, matching normal
+    /// last-writer-wins semantics rather than silently reverting either.
+    ///
+    /// - Never calls this instance's own `load()`/`save(_:)` (which would
+    ///   each try to acquire `gate` and the file lock a second time from
+    ///   within a turn that already holds them, deadlocking against
+    ///   itself); it inlines the equivalent probe/write steps under the
+    ///   single lock acquisition this method itself performs.
+    /// - Refuses to run `transform` at all — throwing
+    ///   `StorageUpdateError.failure` instead — if the current on-disk
+    ///   state is a future/unsupported schema version, unreadable,
+    ///   oversized, or fails to decode as the current schema: exactly the
+    ///   states `load()` itself would decline to silently paper over. This
+    ///   store's normal quarantine behavior for a *corrupt* file only
+    ///   triggers from `load()`, deliberately never from `update(_:)`:
+    ///   moving a file aside is a repair action appropriate when a human
+    ///   or the app is explicitly (re)initializing settings, not a side
+    ///   effect a routine field mutation should ever trigger.
+    /// - `transform` is a synchronous, `Sendable` closure — it cannot
+    ///   itself perform I/O or await anything, so it cannot yield the
+    ///   actor mid-transform and reintroduce the very race this API
+    ///   exists to close.
+    public func update(_ transform: @Sendable (Document) throws -> Document) async throws -> Document {
+        await gate.acquire()
+        do {
+            let committed = try await performUpdate(transform)
+            await gate.release()
+            return committed
+        } catch {
+            await gate.release()
+            throw error
+        }
+    }
+
+    private func performUpdate(_ transform: @Sendable (Document) throws -> Document) async throws -> Document {
+        guard isLoaded else {
+            throw StorageUpdateError<Document>.failure(.notLoaded)
+        }
+        guard writesEnabled else {
+            throw StorageUpdateError<Document>.failure(.writesDisabled)
+        }
+
+        let lock: any SettingsFileLock
+        do {
+            lock = try await fileSystem.acquireLock(for: fileURL)
+        } catch {
+            throw StorageUpdateError<Document>.failure(.writeFailed)
+        }
+
+        do {
+            let committed = try await performUpdateLocked(transform)
+            await lock.unlock()
+            return committed
+        } catch {
+            await lock.unlock()
+            throw error
+        }
+    }
+
+    /// Runs entirely under the single lock `performUpdate` already
+    /// acquired: probes the freshest on-disk state, refuses to proceed if
+    /// it isn't safely known to be a decodable current-version document
+    /// (or simply missing), applies `transform`, validates and encodes the
+    /// result, and writes it back via the same `performSaveLocked` plain
+    /// `save` uses — all without acquiring the lock or the instance gate a
+    /// second time.
+    private func performUpdateLocked(_ transform: @Sendable (Document) throws -> Document) async throws -> Document {
+        let currentValue: Document
+
+        switch await checkSourceFileSize() {
+        case .missing:
+            currentValue = Document.defaultValue
+        case .tooLarge:
+            writesEnabled = false
+            throw StorageUpdateError<Document>.failure(.writesDisabled)
+        case .ok, .indeterminate:
+            switch await readSourceFile() {
+            case .missing:
+                currentValue = Document.defaultValue
+            case .tooLarge:
+                writesEnabled = false
+                throw StorageUpdateError<Document>.failure(.writesDisabled)
+            case .failed:
+                writesEnabled = false
+                throw StorageUpdateError<Document>.failure(.writesDisabled)
+            case .success(let bytes):
+                switch probeVersion(in: bytes) {
+                case .future:
+                    writesEnabled = false
+                    throw StorageUpdateError<Document>.failure(.writesDisabled)
+                case .invalid:
+                    writesEnabled = false
+                    throw StorageUpdateError<Document>.failure(.writesDisabled)
+                case .supported:
+                    do {
+                        let document = try JSONDecoder().decode(Document.self, from: bytes)
+                        guard document.version == Document.currentVersion else {
+                            writesEnabled = false
+                            throw StorageUpdateError<Document>.failure(.writesDisabled)
+                        }
+                        currentValue = document
+                    } catch let error as StorageUpdateError<Document> {
+                        throw error
+                    } catch {
+                        writesEnabled = false
+                        throw StorageUpdateError<Document>.failure(.writesDisabled)
+                    }
+                }
+            }
+        }
+
+        // `transform` is synchronous and `Sendable`: it cannot itself
+        // await, so nothing can interleave between reading `currentValue`
+        // above and writing the transformed result below — the entire
+        // read-modify-write is one uninterrupted critical section under
+        // the lock this method's caller already holds.
+        let transformed = try transform(currentValue)
+
+        guard transformed.version == Document.currentVersion else {
+            throw StorageUpdateError<Document>.failure(.unsupportedVersion(transformed.version))
+        }
+
+        let data: Data
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            data = try encoder.encode(transformed)
+        } catch {
+            throw StorageUpdateError<Document>.failure(.encodeFailed)
+        }
+
+        guard Int64(data.count) <= Self.maxDocumentBytes else {
+            throw StorageUpdateError<Document>.failure(.payloadTooLarge)
+        }
+
+        let directory = fileURL.deletingLastPathComponent()
+        do {
+            try await fileSystem.ensureDirectoryExists(at: directory)
+        } catch {
+            throw StorageUpdateError<Document>.failure(.writeFailed)
+        }
+
+        do {
+            try await performSaveLocked(data: data)
+        } catch StorageError.durabilityUncertain {
+            writesEnabled = true
+            throw StorageUpdateError<Document>.durabilityUncertain(committed: transformed)
+        } catch let storageError as StorageError {
+            throw StorageUpdateError<Document>.failure(storageError)
+        } catch {
+            throw StorageUpdateError<Document>.failure(.writeFailed)
+        }
+
+        writesEnabled = true
+        return transformed
     }
 }
