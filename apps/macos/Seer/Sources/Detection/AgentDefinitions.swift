@@ -30,6 +30,25 @@ public enum SessionFormat: String, Equatable, Sendable {
     case none
 }
 
+/// A single process-command matcher: an ICU-compatible regex pattern plus
+/// whether it should compile case-insensitively. Mirrors one `RegExp`
+/// literal from `processMatchers` in the TS policy exactly, including its
+/// flags — most TS patterns carry `/i`, but five scoped-npm-package
+/// patterns (`@anthropic-ai/claude-code`, `@openai/codex`,
+/// `@google/gemini-cli`, `@sourcegraph/amp`, `@continuedev/cli`) are
+/// intentionally left case-sensitive in the TS source. A typed carrier (not
+/// a string convention, e.g. an inline `(?i)` prefix) keeps that flag
+/// explicit and out-of-band from the pattern text itself.
+public struct ProcessMatcher: Equatable, Sendable {
+    public let pattern: String
+    public let caseInsensitive: Bool
+
+    public init(_ pattern: String, caseInsensitive: Bool = true) {
+        self.pattern = pattern
+        self.caseInsensitive = caseInsensitive
+    }
+}
+
 /// Mirrors `AgentKind` in `main/services/agent-detection-policy.ts`.
 /// Regex patterns are kept as raw ICU-compatible pattern strings (not
 /// precompiled `NSRegularExpression`s) so this value stays a plain,
@@ -38,7 +57,7 @@ public enum SessionFormat: String, Equatable, Sendable {
 public struct AgentKind: Equatable, Sendable {
     public let id: AgentFamily
     public let name: String
-    public let processMatcherPatterns: [String]
+    public let processMatchers: [ProcessMatcher]
     public let sessionRoots: [String]
     public let sessionExtensions: [String]
     /// Only consider session files with these exact names (e.g. Grok's events.jsonl).
@@ -52,7 +71,7 @@ public struct AgentKind: Equatable, Sendable {
     public init(
         id: AgentFamily,
         name: String,
-        processMatcherPatterns: [String],
+        processMatchers: [ProcessMatcher],
         sessionRoots: [String],
         sessionExtensions: [String],
         sessionFileNames: [String]? = nil,
@@ -62,7 +81,7 @@ public struct AgentKind: Equatable, Sendable {
     ) {
         self.id = id
         self.name = name
-        self.processMatcherPatterns = processMatcherPatterns
+        self.processMatchers = processMatchers
         self.sessionRoots = sessionRoots
         self.sessionExtensions = sessionExtensions
         self.sessionFileNames = sessionFileNames
@@ -80,10 +99,10 @@ public let AGENT_KINDS: [AgentKind] = [
     AgentKind(
         id: .claudeCode,
         name: "Claude Code",
-        processMatcherPatterns: [
-            #"(^|[/\s])claude(\s|$)"#,
-            #"@anthropic-ai/claude-code"#,
-            #"claude[-_]code"#,
+        processMatchers: [
+            ProcessMatcher(#"(^|[/\s])claude(\s|$)"#),
+            ProcessMatcher(#"@anthropic-ai/claude-code"#, caseInsensitive: false),
+            ProcessMatcher(#"claude[-_]code"#),
         ],
         sessionRoots: [".claude/projects"],
         sessionExtensions: [".jsonl"],
@@ -93,9 +112,9 @@ public let AGENT_KINDS: [AgentKind] = [
     AgentKind(
         id: .codex,
         name: "Codex",
-        processMatcherPatterns: [
-            #"(^|[/\s])codex(\s|$)"#,
-            #"@openai/codex"#,
+        processMatchers: [
+            ProcessMatcher(#"(^|[/\s])codex(\s|$)"#),
+            ProcessMatcher(#"@openai/codex"#, caseInsensitive: false),
         ],
         sessionRoots: [".codex/sessions"],
         sessionExtensions: [".jsonl"],
@@ -106,10 +125,10 @@ public let AGENT_KINDS: [AgentKind] = [
         id: .grok,
         name: "Grok",
         // The launcher lives in ~/.grok/bin; the real binary is ~/.grok/downloads/grok-<ver>-macos-*.
-        processMatcherPatterns: [
-            #"(^|[/\s])grok(\s|$)"#,
-            #"\.grok/(?:bin|downloads)/"#,
-            #"grok-\d+\.\d+\.\d+-macos"#,
+        processMatchers: [
+            ProcessMatcher(#"(^|[/\s])grok(\s|$)"#),
+            ProcessMatcher(#"\.grok/(?:bin|downloads)/"#),
+            ProcessMatcher(#"grok-\d+\.\d+\.\d+-macos"#),
         ],
         sessionRoots: [".grok/sessions"],
         sessionExtensions: [".jsonl"],
@@ -121,9 +140,9 @@ public let AGENT_KINDS: [AgentKind] = [
     AgentKind(
         id: .gemini,
         name: "Gemini CLI",
-        processMatcherPatterns: [
-            #"(^|[/\s])gemini(\s|$)"#,
-            #"@google/gemini-cli"#,
+        processMatchers: [
+            ProcessMatcher(#"(^|[/\s])gemini(\s|$)"#),
+            ProcessMatcher(#"@google/gemini-cli"#, caseInsensitive: false),
         ],
         sessionRoots: [".gemini"],
         sessionExtensions: [".jsonl", ".json"],
@@ -132,7 +151,7 @@ public let AGENT_KINDS: [AgentKind] = [
     AgentKind(
         id: .aider,
         name: "Aider",
-        processMatcherPatterns: [#"(^|[/\s])aider(\s|$)"#],
+        processMatchers: [ProcessMatcher(#"(^|[/\s])aider(\s|$)"#)],
         sessionRoots: [],
         sessionExtensions: [],
         sessionFormat: .none
@@ -140,7 +159,7 @@ public let AGENT_KINDS: [AgentKind] = [
     AgentKind(
         id: .opencode,
         name: "OpenCode",
-        processMatcherPatterns: [#"(^|[/\s])opencode(\s|$)"#],
+        processMatchers: [ProcessMatcher(#"(^|[/\s])opencode(\s|$)"#)],
         sessionRoots: [".local/share/opencode", ".config/opencode"],
         sessionExtensions: [".jsonl", ".json"],
         sessionFormat: .genericMtime
@@ -148,7 +167,7 @@ public let AGENT_KINDS: [AgentKind] = [
     AgentKind(
         id: .goose,
         name: "Goose",
-        processMatcherPatterns: [#"(^|[/\s])goose(\s|$)"#],
+        processMatchers: [ProcessMatcher(#"(^|[/\s])goose(\s|$)"#)],
         sessionRoots: [".config/goose"],
         sessionExtensions: [".jsonl", ".json"],
         sessionFormat: .genericMtime
@@ -156,9 +175,9 @@ public let AGENT_KINDS: [AgentKind] = [
     AgentKind(
         id: .amp,
         name: "Amp",
-        processMatcherPatterns: [
-            #"(^|[/\s])amp(\s|$)"#,
-            #"@sourcegraph/amp"#,
+        processMatchers: [
+            ProcessMatcher(#"(^|[/\s])amp(\s|$)"#),
+            ProcessMatcher(#"@sourcegraph/amp"#, caseInsensitive: false),
         ],
         sessionRoots: [],
         sessionExtensions: [],
@@ -169,10 +188,10 @@ public let AGENT_KINDS: [AgentKind] = [
         name: "Cursor",
         // IDE agent is detected via composer state; process matchers cover the CLI only.
         // Do not match bare Cursor.app — it stays open while idle.
-        processMatcherPatterns: [
-            #"(^|[/\s])cursor-agent(\s|$)"#,
-            #"cursor-agent-svc"#,
-            #"cursor(?:-agent)?(?:\.js)?\s+--agent\b"#,
+        processMatchers: [
+            ProcessMatcher(#"(^|[/\s])cursor-agent(\s|$)"#),
+            ProcessMatcher(#"cursor-agent-svc"#),
+            ProcessMatcher(#"cursor(?:-agent)?(?:\.js)?\s+--agent\b"#),
         ],
         sessionRoots: [],
         sessionExtensions: [],
@@ -182,9 +201,9 @@ public let AGENT_KINDS: [AgentKind] = [
     AgentKind(
         id: .continueAgent,
         name: "Continue",
-        processMatcherPatterns: [
-            #"continue-cli"#,
-            #"@continuedev/cli"#,
+        processMatchers: [
+            ProcessMatcher(#"continue-cli"#),
+            ProcessMatcher(#"@continuedev/cli"#, caseInsensitive: false),
         ],
         sessionRoots: [".continue/sessions"],
         sessionExtensions: [".jsonl", ".json"],
@@ -192,15 +211,21 @@ public let AGENT_KINDS: [AgentKind] = [
     ),
 ]
 
-/// Compiles each candidate's process-matcher patterns on demand and returns
-/// the first `AgentKind` whose patterns match `command`, mirroring
-/// `matchAgentKind` in the TypeScript policy (case-insensitive, first match
-/// wins in declaration order).
+/// Compiles each candidate's process matchers on demand and returns the
+/// first `AgentKind` whose patterns match `command`, mirroring
+/// `matchAgentKind` in the TypeScript policy: patterns are tried in
+/// declaration order (first match wins) and each pattern's case-sensitivity
+/// is applied exactly as declared — most are `/i` (case-insensitive), but
+/// the five scoped-package patterns above are intentionally not, matching
+/// non-global JS `RegExp.test` semantics (a plain "does this match
+/// anywhere" check, no lastIndex state).
 public func matchAgentKind(command: String) -> AgentKind? {
     let fullRange = NSRange(command.startIndex..<command.endIndex, in: command)
     for kind in AGENT_KINDS {
-        for pattern in kind.processMatcherPatterns {
-            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+        for matcher in kind.processMatchers {
+            var options: NSRegularExpression.Options = []
+            if matcher.caseInsensitive { options.insert(.caseInsensitive) }
+            guard let regex = try? NSRegularExpression(pattern: matcher.pattern, options: options) else {
                 continue
             }
             if regex.firstMatch(in: command, options: [], range: fullRange) != nil {

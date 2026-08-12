@@ -438,6 +438,90 @@ final class TurnAssessorsTests: XCTestCase {
         XCTAssertEqual(saturatingInt64(42.0), 42)
     }
 
+    // MARK: - Process matcher case-sensitivity (Finding 2)
+
+    private struct MatcherFixtureOracle: Decodable {
+        let matcherCases: [MatcherFixtureCase]
+    }
+
+    private struct MatcherFixtureCase: Decodable {
+        let id: String
+        let kind: String
+        let family: String?
+        let patternIndex: Int?
+        let command: String
+        let expectedFamily: String??
+        let expectedMatch: Bool?
+    }
+
+    private func loadMatcherOracle() throws -> MatcherFixtureOracle {
+        let url = fixturesDirectory().appendingPathComponent("expected.json")
+        let data = try Data(contentsOf: url)
+        return try JSONDecoder().decode(MatcherFixtureOracle.self, from: data)
+    }
+
+    /// Cross-language parity: every `matcherCases` row is asserted here and
+    /// in `tests/agent-detection-parity.test.mjs` against the exact same
+    /// `command` / `patternIndex` values, proving Swift's `matchAgentKind`
+    /// (whole-family) and per-pattern case-sensitivity flags agree with the
+    /// TS `RegExp` reference, including the five intentionally
+    /// case-sensitive scoped-package patterns TS never applies `/i` to.
+    func testProcessMatcherOracle() throws {
+        let oracle = try loadMatcherOracle()
+        XCTAssertFalse(oracle.matcherCases.isEmpty)
+
+        for testCase in oracle.matcherCases {
+            switch testCase.kind {
+            case "family":
+                let matched = matchAgentKind(command: testCase.command)
+                let expected = (testCase.expectedFamily ?? nil).flatMap { $0 }
+                XCTAssertEqual(matched?.id.rawValue, expected, testCase.id)
+
+            case "pattern":
+                guard
+                    let familyRaw = testCase.family,
+                    let family = AgentFamily(rawValue: familyRaw),
+                    let patternIndex = testCase.patternIndex,
+                    let expectedMatch = testCase.expectedMatch,
+                    let kind = AGENT_KINDS.first(where: { $0.id == family })
+                else {
+                    XCTFail("malformed pattern matcher case \(testCase.id)")
+                    continue
+                }
+                XCTAssertTrue(patternIndex >= 0 && patternIndex < kind.processMatchers.count, testCase.id)
+                let matcher = kind.processMatchers[patternIndex]
+                var options: NSRegularExpression.Options = []
+                if matcher.caseInsensitive { options.insert(.caseInsensitive) }
+                let regex = try XCTUnwrap(try? NSRegularExpression(pattern: matcher.pattern, options: options))
+                let range = NSRange(testCase.command.startIndex..<testCase.command.endIndex, in: testCase.command)
+                let matches = regex.firstMatch(in: testCase.command, options: [], range: range) != nil
+                XCTAssertEqual(matches, expectedMatch, testCase.id)
+
+            default:
+                XCTFail("unknown matcherCases kind \(testCase.kind)")
+            }
+        }
+    }
+
+    /// Structural guard: exactly the five scoped-package patterns
+    /// (`@anthropic-ai/claude-code`, `@openai/codex`, `@google/gemini-cli`,
+    /// `@sourcegraph/amp`, `@continuedev/cli`) are compiled case-sensitively;
+    /// every other pattern stays case-insensitive, mirroring the `/i` flag
+    /// (or its absence) on each `RegExp` literal in the TS policy exactly.
+    func testExactlyFiveScopedPackagePatternsAreCaseSensitive() {
+        let caseSensitivePatterns = AGENT_KINDS.flatMap { kind in
+            kind.processMatchers.filter { !$0.caseInsensitive }.map(\.pattern)
+        }
+        XCTAssertEqual(caseSensitivePatterns.count, 5)
+        XCTAssertEqual(Set(caseSensitivePatterns), [
+            #"@anthropic-ai/claude-code"#,
+            #"@openai/codex"#,
+            #"@google/gemini-cli"#,
+            #"@sourcegraph/amp"#,
+            #"@continuedev/cli"#,
+        ])
+    }
+
     // MARK: - Cursor composer header `type` strict-equality hardening (Finding 2)
 
     /// Builds a Cursor composer record with a single conversation header

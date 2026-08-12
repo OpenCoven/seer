@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { assessDetectionFixture } from "../main/services/agent-detection-policy.ts";
+import { AGENT_KINDS, assessDetectionFixture, matchAgentKind } from "../main/services/agent-detection-policy.ts";
 
 /**
  * Characterizes `assessDetectionFixture` (the pure policy extracted from
@@ -136,3 +136,61 @@ for (const testCase of oracle.cases) {
     assert.deepEqual(result, testCase.expected, testCase.id);
   });
 }
+
+// MARK: - Process matcher case-sensitivity oracle (Finding 2)
+//
+// `matcherCases` in expected.json is the same shared oracle asserted by the
+// Swift `testProcessMatcherOracle` in TurnAssessorsTests.swift: "family" rows
+// exercise `matchAgentKind` end-to-end (does *some* pattern for this family
+// match, first-match-wins across all ten families in declaration order,
+// exactly like non-global JS `RegExp.test`), and "pattern" rows exercise one
+// specific `processMatchers[patternIndex]` regex in isolation — required
+// because the five case-sensitive scoped-package patterns each overlap with
+// a case-insensitive sibling pattern in the same family (e.g. Claude Code's
+// unanchored `/claude[-_]code/i` always matches wherever
+// `/@anthropic-ai\/claude-code/` would, in any case), so whole-family
+// matching alone cannot prove per-pattern case-sensitivity.
+assert.ok(Array.isArray(oracle.matcherCases) && oracle.matcherCases.length > 0);
+
+for (const testCase of oracle.matcherCases) {
+  test(`matcherCases: ${testCase.id}`, () => {
+    if (testCase.kind === "family") {
+      const matched = matchAgentKind(testCase.command);
+      assert.equal(matched?.id ?? null, testCase.expectedFamily ?? null, testCase.id);
+      return;
+    }
+
+    if (testCase.kind === "pattern") {
+      const kind = AGENT_KINDS.find((candidate) => candidate.id === testCase.family);
+      assert.ok(kind, `unknown family in matcherCases: ${testCase.family}`);
+      const pattern = kind.processMatchers[testCase.patternIndex];
+      assert.ok(pattern, `${testCase.family} has no processMatchers[${testCase.patternIndex}]`);
+      assert.equal(pattern.test(testCase.command), testCase.expectedMatch, testCase.id);
+      return;
+    }
+
+    assert.fail(`unknown matcherCases kind: ${testCase.kind}`);
+  });
+}
+
+test("matcherCases rows have unique ids", () => {
+  const ids = oracle.matcherCases.map((testCase) => testCase.id);
+  assert.equal(new Set(ids).size, ids.length);
+});
+
+test("exactly five scoped-package process matchers are case-sensitive", () => {
+  const caseSensitive = AGENT_KINDS.flatMap((kind) =>
+    kind.processMatchers.filter((re) => !re.flags.includes("i")).map((re) => re.source),
+  );
+  assert.equal(caseSensitive.length, 5);
+  assert.deepEqual(
+    new Set(caseSensitive),
+    new Set([
+      "@anthropic-ai\\/claude-code",
+      "@openai\\/codex",
+      "@google\\/gemini-cli",
+      "@sourcegraph\\/amp",
+      "@continuedev\\/cli",
+    ]),
+  );
+});

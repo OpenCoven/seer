@@ -376,5 +376,213 @@
         "id": "cursor:pid:30012"
       }
     }
+  ],
+  "matcherCases": [
+    {
+      "id": "matcher-family-claude-code",
+      "kind": "family",
+      "command": "claude",
+      "expectedFamily": "claude-code"
+    },
+    {
+      "id": "matcher-family-codex",
+      "kind": "family",
+      "command": "codex",
+      "expectedFamily": "codex"
+    },
+    {
+      "id": "matcher-family-grok",
+      "kind": "family",
+      "command": "grok",
+      "expectedFamily": "grok"
+    },
+    {
+      "id": "matcher-family-gemini",
+      "kind": "family",
+      "command": "gemini",
+      "expectedFamily": "gemini"
+    },
+    {
+      "id": "matcher-family-aider",
+      "kind": "family",
+      "command": "aider",
+      "expectedFamily": "aider"
+    },
+    {
+      "id": "matcher-family-opencode",
+      "kind": "family",
+      "command": "opencode",
+      "expectedFamily": "opencode"
+    },
+    {
+      "id": "matcher-family-goose",
+      "kind": "family",
+      "command": "goose",
+      "expectedFamily": "goose"
+    },
+    {
+      "id": "matcher-family-amp",
+      "kind": "family",
+      "command": "amp",
+      "expectedFamily": "amp"
+    },
+    {
+      "id": "matcher-family-cursor",
+      "kind": "family",
+      "command": "cursor-agent",
+      "expectedFamily": "cursor"
+    },
+    {
+      "id": "matcher-family-continue",
+      "kind": "family",
+      "command": "continue-cli",
+      "expectedFamily": "continue"
+    },
+    {
+      "id": "matcher-family-no-match",
+      "kind": "family",
+      "command": "vim myfile.txt",
+      "expectedFamily": null
+    },
+    {
+      "id": "matcher-family-claude-code-uppercase-cli",
+      "kind": "family",
+      "command": "CLAUDE",
+      "expectedFamily": "claude-code"
+    },
+    {
+      "id": "matcher-family-codex-uppercase-cli",
+      "kind": "family",
+      "command": "CODEX",
+      "expectedFamily": "codex"
+    },
+    {
+      "id": "matcher-family-grok-uppercase-cli",
+      "kind": "family",
+      "command": "GROK",
+      "expectedFamily": "grok"
+    },
+    {
+      "id": "matcher-family-gemini-uppercase-cli",
+      "kind": "family",
+      "command": "GEMINI",
+      "expectedFamily": "gemini"
+    },
+    {
+      "id": "matcher-family-aider-uppercase-cli",
+      "kind": "family",
+      "command": "AIDER",
+      "expectedFamily": "aider"
+    },
+    {
+      "id": "matcher-family-opencode-uppercase-cli",
+      "kind": "family",
+      "command": "OPENCODE",
+      "expectedFamily": "opencode"
+    },
+    {
+      "id": "matcher-family-goose-uppercase-cli",
+      "kind": "family",
+      "command": "GOOSE",
+      "expectedFamily": "goose"
+    },
+    {
+      "id": "matcher-family-amp-uppercase-cli",
+      "kind": "family",
+      "command": "AMP",
+      "expectedFamily": "amp"
+    },
+    {
+      "id": "matcher-family-cursor-uppercase-cli",
+      "kind": "family",
+      "command": "CURSOR-AGENT",
+      "expectedFamily": "cursor"
+    },
+    {
+      "id": "matcher-family-continue-uppercase-cli",
+      "kind": "family",
+      "command": "CONTINUE-CLI",
+      "expectedFamily": "continue"
+    },
+    {
+      "id": "matcher-pattern-claude-code-scoped-lowercase",
+      "kind": "pattern",
+      "family": "claude-code",
+      "patternIndex": 1,
+      "command": "@anthropic-ai/claude-code",
+      "expectedMatch": true
+    },
+    {
+      "id": "matcher-pattern-claude-code-scoped-uppercase",
+      "kind": "pattern",
+      "family": "claude-code",
+      "patternIndex": 1,
+      "command": "@ANTHROPIC-AI/CLAUDE-CODE",
+      "expectedMatch": false
+    },
+    {
+      "id": "matcher-pattern-codex-scoped-lowercase",
+      "kind": "pattern",
+      "family": "codex",
+      "patternIndex": 1,
+      "command": "@openai/codex",
+      "expectedMatch": true
+    },
+    {
+      "id": "matcher-pattern-codex-scoped-uppercase",
+      "kind": "pattern",
+      "family": "codex",
+      "patternIndex": 1,
+      "command": "@OPENAI/CODEX",
+      "expectedMatch": false
+    },
+    {
+      "id": "matcher-pattern-gemini-scoped-lowercase",
+      "kind": "pattern",
+      "family": "gemini",
+      "patternIndex": 1,
+      "command": "@google/gemini-cli",
+      "expectedMatch": true
+    },
+    {
+      "id": "matcher-pattern-gemini-scoped-uppercase",
+      "kind": "pattern",
+      "family": "gemini",
+      "patternIndex": 1,
+      "command": "@GOOGLE/GEMINI-CLI",
+      "expectedMatch": false
+    },
+    {
+      "id": "matcher-pattern-amp-scoped-lowercase",
+      "kind": "pattern",
+      "family": "amp",
+      "patternIndex": 1,
+      "command": "@sourcegraph/amp",
+      "expectedMatch": true
+    },
+    {
+      "id": "matcher-pattern-amp-scoped-uppercase",
+      "kind": "pattern",
+      "family": "amp",
+      "patternIndex": 1,
+      "command": "@SOURCEGRAPH/AMP",
+      "expectedMatch": false
+    },
+    {
+      "id": "matcher-pattern-continue-scoped-lowercase",
+      "kind": "pattern",
+      "family": "continue",
+      "patternIndex": 1,
+      "command": "@continuedev/cli",
+      "expectedMatch": true
+    },
+    {
+      "id": "matcher-pattern-continue-scoped-uppercase",
+      "kind": "pattern",
+      "family": "continue",
+      "patternIndex": 1,
+      "command": "@CONTINUEDEV/CLI",
+      "expectedMatch": false
+    }
   ]
 }
