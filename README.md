@@ -34,6 +34,18 @@ npm run lint
 npm run build
 ```
 
+## Standalone macOS distribution
+
+The standalone Swift/AppKit application and signed release pipeline are
+designed and planned but not yet implemented:
+
+- [Standalone distribution design](docs/superpowers/specs/2026-08-10-seer-standalone-macos-distribution.md)
+- [Standalone implementation plan](docs/superpowers/plans/2026-08-10-seer-standalone-macos-distribution.md)
+- [Apple release credential packet](docs/apple-release-credential-packet.md)
+
+Do not add Apple credentials until the release workflow has landed and been
+reviewed.
+
 ## Architecture
 
 - `main/` — lifecycle, agent detection, monitoring, storage, tray, panel, and IPC
