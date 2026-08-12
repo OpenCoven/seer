@@ -1,0 +1,11 @@
+[
+  { "key": "aider-below-threshold", "family": "aider", "pid": 10010, "cpuPercent": 24.9 },
+  { "key": "aider-at-threshold", "family": "aider", "pid": 10011, "cpuPercent": 25.0 },
+  { "key": "aider-above-threshold", "family": "aider", "pid": 10012, "cpuPercent": 25.1 },
+  { "key": "amp-below-threshold", "family": "amp", "pid": 20010, "cpuPercent": 24.9 },
+  { "key": "amp-at-threshold", "family": "amp", "pid": 20011, "cpuPercent": 25.0 },
+  { "key": "amp-above-threshold", "family": "amp", "pid": 20012, "cpuPercent": 25.1 },
+  { "key": "cursor-cli-below-threshold", "family": "cursor", "pid": 30010, "cpuPercent": 24.9 },
+  { "key": "cursor-cli-at-threshold", "family": "cursor", "pid": 30011, "cpuPercent": 25.0 },
+  { "key": "cursor-cli-above-threshold", "family": "cursor", "pid": 30012, "cpuPercent": 25.1 }
+]

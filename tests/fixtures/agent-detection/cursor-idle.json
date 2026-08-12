@@ -1,0 +1,14 @@
+{
+  "composerKey": "cursor-idle-composer",
+  "record": {
+    "status": "completed",
+    "workspaceIdentifier": {
+      "uri": { "fsPath": "/tmp/seer-fixtures/cursor-idle-project" }
+    },
+    "lastUpdatedAt": "2026-08-10T12:09:00.000Z",
+    "fullConversationHeadersOnly": [
+      { "type": 1, "createdAt": "2026-08-10T12:08:00.000Z" },
+      { "type": 2, "createdAt": "2026-08-10T12:08:30.000Z", "grouping": { "turnDurationMs": 5000 } }
+    ]
+  }
+}

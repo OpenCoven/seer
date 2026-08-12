@@ -1,0 +1,11 @@
+{
+  "composerKey": "cursor-active-composer",
+  "record": {
+    "status": "generating",
+    "workspaceIdentifier": {
+      "uri": { "fsPath": "/tmp/seer-fixtures/cursor-active-project" }
+    },
+    "lastUpdatedAt": "2026-08-10T12:09:50.000Z",
+    "generatingBubbleIds": ["bubble-1"]
+  }
+}
