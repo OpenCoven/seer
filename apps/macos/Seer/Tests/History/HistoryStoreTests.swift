@@ -579,4 +579,167 @@ final class HistoryStoreTests: XCTestCase {
         XCTAssertNotEqual(statsAgain.totalAwakeMs, 999_999)
         XCTAssertEqual(statsAgain.totalAwakeMs, 2_000)
     }
+
+    // MARK: 15. Path resolver uses injected base URL exactly (standalone contract)
+
+    /// Mirrors `testSettingsFileURLUsesInjectedBaseURLExactly` in
+    /// `AtomicJSONStoreTests`. `HistoryFileLocation` is not yet wired into
+    /// production app startup (that's later-task plumbing), but its
+    /// resolver is public API today and must already honor the exact same
+    /// standalone-path contract `SettingsFileLocation` does: always
+    /// `<base>/ai.opencoven.seer/history.json`, creating only that one
+    /// product directory, and never touching a Glaze path or the real
+    /// Application Support directory.
+    func testHistoryFileURLUsesInjectedBaseURLExactly() throws {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SeerHistoryStoreTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+
+        let resolved = try HistoryFileLocation.historyFileURL(applicationSupportDirectory: base)
+
+        XCTAssertEqual(
+            resolved.standardizedFileURL.path,
+            base.appendingPathComponent("ai.opencoven.seer/history.json").standardizedFileURL.path
+        )
+
+        var isDirectory: ObjCBool = false
+        let productDirectory = base.appendingPathComponent("ai.opencoven.seer")
+        let directoryExists = FileManager.default.fileExists(atPath: productDirectory.path, isDirectory: &isDirectory)
+        XCTAssertTrue(directoryExists)
+        XCTAssertTrue(isDirectory.boolValue)
+
+        // Exactly one directory is created directly under `base` — the
+        // shared `ai.opencoven.seer` product directory — never an
+        // additional sibling (in particular, never a Glaze directory).
+        let baseContents = try FileManager.default.contentsOfDirectory(atPath: base.path)
+        XCTAssertEqual(baseContents, ["ai.opencoven.seer"])
+
+        XCTAssertFalse(
+            resolved.path.lowercased().contains("glaze"),
+            "the standalone history path must never resolve into a Glaze path"
+        )
+
+        // A scratch base directory must never coincide with, or resolve
+        // into, the real (user-domain) Application Support directory.
+        if let realApplicationSupport = try? FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: false
+        ) {
+            XCTAssertFalse(
+                resolved.standardizedFileURL.path.hasPrefix(realApplicationSupport.standardizedFileURL.path),
+                "an injected scratch base directory must never resolve into the real Application Support directory"
+            )
+        }
+    }
+
+    // MARK: 16. Genuine concurrent access — overlapping flush()/clear() Tasks
+    // serialize via the actor's own AsyncGate and leave a consistent final
+    // in-memory/persisted state.
+
+    /// Unlike `testOlderDelayedSaveCannotReplaceNewer{Clear,Flush}Snapshot`
+    /// above (which exercise `scheduleGeneration` staleness guarding via a
+    /// manually-driven, single-threaded scheduler double), this test
+    /// exercises `HistoryStore`'s `gate` itself with two genuinely
+    /// overlapping caller `Task`s and a real filesystem-I/O suspension
+    /// point. `flush(at:)` is forced to suspend mid-write (holding the
+    /// gate); `clear()` is then launched concurrently while that write is
+    /// still in flight, so it must queue behind the gate rather than
+    /// interleave its `data = .defaultValue` reset into the middle of
+    /// `flush(at:)`'s still-running operation. Without the gate, that
+    /// reentrant reset could land while `flush(at:)`'s write is suspended,
+    /// so that when `flush(at:)` resumes and builds its own returned
+    /// stats, it would read the already-reset (stale/empty) document
+    /// instead of the very session it just closed — and/or its
+    /// already-captured stale write could still land on disk after
+    /// `clear()`'s reset, clobbering it. Every synchronization point below
+    /// is an explicit continuation/signal (`waitUntilEntered`/
+    /// `resumeSuspension`) — never a wall-clock sleep — so the test is
+    /// fully deterministic.
+    func testOverlappingFlushAndClearTasksSerializeAndPersistConsistentFinalState() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let store = makeStore(fileSystem: fileSystem)
+        _ = await store.load()
+
+        await store.record(activeState(at: 1_000))
+        clock.now = 3_000
+        await store.record(activeState(at: 3_000)) // accumulates a 2_000ms open session
+
+        // Force flush()'s underlying persist to genuinely suspend mid-write.
+        await fileSystem.armSuspension("writeFileAndSynchronize")
+
+        let flushTask = Task { try await store.flush(at: 4_000) }
+        await fileSystem.waitUntilEntered("writeFileAndSynchronize")
+
+        // clear() is launched *while* flush() is suspended inside its own
+        // write, still holding `gate`. If `gate` did not serialize whole
+        // operations, clear()'s field-level reset could run to completion
+        // on the actor during this exact suspension window.
+        let clearTask = Task { await store.clear() }
+
+        // Give the scheduler ample opportunity to run clear() if the gate
+        // were (incorrectly) not serializing: it must still not have
+        // reached the filesystem while flush() holds the gate.
+        for _ in 0..<50 {
+            await Task.yield()
+        }
+        let logWhileFlushBlocked = await fileSystem.callLog
+        XCTAssertEqual(
+            logWhileFlushBlocked.filter { $0.hasPrefix("writeFileAndSynchronize") }.count, 1,
+            "a concurrently-launched clear() must not reach the filesystem while flush() still holds the gate"
+        )
+
+        await fileSystem.resumeSuspension("writeFileAndSynchronize")
+
+        let flushStats = try await flushTask.value
+        let clearStats = await clearTask.value
+
+        // flush() must observe its own, uncorrupted result: the session it
+        // itself closed, never a stale/reset view produced by a reentrant
+        // clear().
+        XCTAssertNil(flushStats.currentSession)
+        XCTAssertEqual(flushStats.sessionCount, 1)
+        XCTAssertEqual(flushStats.recentSessions.count, 1)
+        XCTAssertEqual(flushStats.recentSessions.first?.durationMs, 2_000)
+        XCTAssertEqual(flushStats.recentSessions.first?.endedAt, 4_000)
+        XCTAssertEqual(flushStats.totalAwakeMs, 2_000)
+        XCTAssertEqual(flushStats.perAgent.first?.durationMs, 2_000)
+
+        // clear() must only ever observe/reset state *after* flush() has
+        // fully finished — never a half-applied mix of the two operations.
+        XCTAssertEqual(
+            clearStats,
+            HistoryStats(
+                totalAwakeMs: 0,
+                todayAwakeMs: 0,
+                sessionCount: 0,
+                perAgent: [],
+                currentSession: nil,
+                recentSessions: []
+            )
+        )
+
+        // The gate serializes the two full operations FIFO, so clear()
+        // (the second caller to actually acquire the gate) is also the
+        // final writer: the persisted file must end up exactly at the
+        // reset default — never the closed-session document flush()
+        // wrote, and never some corrupted hybrid of the two.
+        let finalBytes = await fileSystem.contents(at: historyURL)
+        XCTAssertNotNil(finalBytes)
+        let finalDecoded = try JSONDecoder().decode(HistoryDocument.self, from: finalBytes!)
+        XCTAssertEqual(finalDecoded, HistoryDocument.defaultValue)
+
+        // In-memory final state matches the persisted final state exactly —
+        // no divergence between what `stats()` reports and what is on disk.
+        let finalStats = await store.stats()
+        XCTAssertEqual(finalStats, clearStats)
+
+        // Exactly two writes happened — flush()'s and clear()'s — never an
+        // extra write caused by a corrupted/duplicated persist under
+        // reentrancy.
+        let finalLog = await fileSystem.callLog
+        XCTAssertEqual(finalLog.filter { $0.hasPrefix("writeFileAndSynchronize") }.count, 2)
+    }
 }
