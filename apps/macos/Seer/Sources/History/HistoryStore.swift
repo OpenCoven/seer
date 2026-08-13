@@ -554,15 +554,43 @@ public actor HistoryStore {
     @discardableResult
     public func clear() async -> HistoryStats {
         await gate.acquire()
+        let (stats, _) = await performClear()
+        await gate.release()
+        return stats
+    }
+
+    /// Same reset as `clear()`, but — like `flush(at:)` — throws the
+    /// underlying `StorageError` instead of only capturing it into
+    /// `lastDiagnostic`. Added so `AppSnapshotCoordinator` can await a
+    /// clear and react to (or surface) a persistence failure directly,
+    /// rather than needing a separate poll of `lastDiagnostic` after an
+    /// always-succeeding call. The in-memory reset itself still always
+    /// applies before the throw, exactly like `clear()` — a caller must
+    /// not assume a thrown error here means nothing changed.
+    @discardableResult
+    public func clearOrThrow() async throws -> HistoryStats {
+        await gate.acquire()
+        let (stats, error) = await performClear()
+        await gate.release()
+        if let error {
+            throw error
+        }
+        return stats
+    }
+
+    /// Shared body for `clear()`/`clearOrThrow()`: resets in-memory state
+    /// to defaults, persists it, and returns the resulting stats alongside
+    /// the persistence failure (if any) so each public entry point can
+    /// decide independently whether to surface it as a thrown error.
+    private func performClear() async -> (HistoryStats, StorageError?) {
         await ensureLoaded()
         cancelPendingSave()
         data = .defaultValue
         current = nil
         lastTickAt = clock.nowMilliseconds()
-        _ = await persistLocked()
+        let error = await persistLocked()
         let stats = buildStats()
-        await gate.release()
-        return stats
+        return (stats, error)
     }
 
     // MARK: - Shutdown flush

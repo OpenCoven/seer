@@ -43,6 +43,9 @@ targets:
       # Linked for SessionSnapshotSource's read-only Cursor `state.vscdb`
       # access via the SQLite C API (never the `sqlite3` executable).
       - sdk: libsqlite3.tbd
+      # Linked for PowerAssertionService's production IOKitPowerAssertionBackend,
+      # which wraps IOPMAssertionCreateWithName/IOPMAssertionRelease.
+      - sdk: IOKit.framework
 
   SeerTests:
     type: bundle.unit-test
@@ -61,3 +64,6 @@ targets:
       # Tests construct synthetic `state.vscdb` fixtures directly via the
       # SQLite C API, so the test bundle needs the same linkage.
       - sdk: libsqlite3.tbd
+      # Matches the Seer target's IOKit linkage above (needed because the
+      # test bundle links directly against @testable import Seer's symbols).
+      - sdk: IOKit.framework

@@ -1,0 +1,512 @@
+import Foundation
+
+/// Diagnostic ids `AppSnapshotCoordinator` publishes directly (distinct
+/// from ids surfaced verbatim, or via `StorageDiagnosticAlias`, from a
+/// lower layer's own `lastDiagnostic`).
+public enum CoordinatorDiagnosticID {
+    /// A `setKeepAwakeMode(_:)` call's underlying settings persistence
+    /// threw. Not one of the load-time ids `AtomicJSONStore` emits
+    /// directly (`storage.settings.*`/`storage.history.*`); this one is
+    /// specific to a failed *write* attempt while the mode was changing.
+    public static let settingsPersistFailed = "settings.persist-failed"
+
+    /// Reserved for Task 11's GitHub update check, not emitted anywhere by
+    /// this task's coordinator — declared here now so the exact stable id
+    /// string exists before that feature does, per the plan's closed list
+    /// of stable diagnostic ids.
+    public static let updatesCheckFailed = "updates.check.failed"
+}
+
+/// Remaps the `storage.settings.*` ids `AtomicJSONStore` always emits
+/// (regardless of which document type is actually being stored) into
+/// their `storage.history.*` counterparts, for diagnostics that actually
+/// came from `HistoryStore.lastDiagnostic` rather than `SettingsStore`'s.
+///
+/// `AtomicJSONStore<Document>` has no notion of "this instance happens to
+/// store history, not settings" — its `StorageDiagnosticID` constants are
+/// hardcoded with the `settings` word. Without this remap, a corrupt
+/// history file and a corrupt settings file would both surface as the
+/// exact same `storage.settings.corrupt` id, indistinguishable to the
+/// renderer and colliding under the coordinator's per-id dedupe.
+enum StorageDiagnosticAlias {
+    private static let historyIDsByRawID: [String: String] = [
+        StorageDiagnosticID.corrupt: "storage.history.corrupt",
+        StorageDiagnosticID.unsupportedVersion: "storage.history.unsupported-version",
+        StorageDiagnosticID.readFailed: "storage.history.read-failed"
+    ]
+
+    /// Returns `diagnostic` with its id remapped to the `storage.history.*`
+    /// equivalent if it is one of the three ids `AtomicJSONStore` can
+    /// report from `load()`, preserving `message`/`occurredAt` exactly.
+    /// Any other id (e.g. `storage.settings.too-large`, which has no
+    /// required history counterpart in the plan's stable id list) passes
+    /// through unchanged.
+    static func remapForHistory(_ diagnostic: Diagnostic) -> Diagnostic {
+        guard let mappedID = historyIDsByRawID[diagnostic.id] else { return diagnostic }
+        return Diagnostic(id: mappedID, message: diagnostic.message, occurredAt: diagnostic.occurredAt)
+    }
+}
+
+/// Where `AppSnapshotCoordinator` pushes every published `AppSnapshot`.
+/// Exists so this task's coordinator has no direct dependency on WKWebView
+/// or any other UI technology — Task 10 introduces the real
+/// WKWebView-backed conformance; tests use a simple collecting fake.
+/// `@MainActor` to match the coordinator's own isolation: every `emit`
+/// call happens synchronously from a main-actor transition, never from a
+/// background thread.
+@MainActor
+public protocol AppSnapshotRendererSink: AnyObject {
+    func emit(_ snapshot: AppSnapshot)
+}
+
+/// The single main-actor authority for Seer's visible state. Owns an
+/// immutable-per-publication `AppSnapshot`, cooperates with `SettingsStore`
+/// and `HistoryStore` (both already independently testable via their own
+/// injectable file systems — no additional adapter layer is needed for
+/// them) and a `PowerAssertionService`, and pushes every completed
+/// transition to an injected `AppSnapshotRendererSink` exactly once.
+///
+/// Every public entry point (`applyScan`, `applyScanFailure`,
+/// `setKeepAwakeMode`, `clearHistory`, `shutdown`) acquires `gate` — the
+/// same FIFO `AsyncGate` pattern `SettingsStore`/`HistoryStore` use — for
+/// its *entire* awaited duration, including every underlying actor round
+/// trip. Without this, two overlapping calls (each necessarily `async`
+/// because they await `SettingsStore`/`HistoryStore`, both actors) could
+/// interleave at a suspension point despite both nominally running on the
+/// main actor, letting an older call's transition publish *after* a newer
+/// one's and silently overwrite it. `gate` makes every transition run to
+/// completion, in invocation order, before the next queued one starts.
+@MainActor
+public final class AppSnapshotCoordinator {
+    private let settingsStore: SettingsStore
+    private let historyStore: HistoryStore
+    private let power: PowerAssertionService
+    private let renderer: any AppSnapshotRendererSink
+    private let clock: Clock
+
+    /// Serializes every public entry point's full transition — see the
+    /// type documentation above.
+    private let gate = AsyncGate()
+
+    public private(set) var snapshot: AppSnapshot
+
+    /// Plain, non-async initializer: takes an already-computed
+    /// `initialSnapshot` rather than loading anything itself, so
+    /// constructing a coordinator never awaits. Use `makeAtStartup(...)`
+    /// to seed that initial snapshot from `settingsStore`/`historyStore`'s
+    /// real loaded state plus startup diagnostics.
+    public init(
+        settingsStore: SettingsStore,
+        historyStore: HistoryStore,
+        power: PowerAssertionService,
+        renderer: any AppSnapshotRendererSink,
+        clock: Clock,
+        initialSnapshot: AppSnapshot
+    ) {
+        self.settingsStore = settingsStore
+        self.historyStore = historyStore
+        self.power = power
+        self.renderer = renderer
+        self.clock = clock
+        self.snapshot = initialSnapshot
+    }
+
+    /// Async factory: loads `settingsStore`/`historyStore` exactly once
+    /// each, seeds the initial `AppSnapshot` from their loaded values, and
+    /// folds in every startup diagnostic (a corrupt/future-version/
+    /// unreadable settings or history file) with stable, deduplicated,
+    /// history-remapped ids — so the renderer's diagnostics region can
+    /// visibly report a startup failure the very first time it reads
+    /// `snapshot`, without waiting for any scan.
+    public static func makeAtStartup(
+        settingsStore: SettingsStore,
+        historyStore: HistoryStore,
+        power: PowerAssertionService,
+        renderer: any AppSnapshotRendererSink,
+        clock: Clock,
+        appVersion: String
+    ) async -> AppSnapshotCoordinator {
+        let settingsResult = await settingsStore.load()
+        _ = await historyStore.load()
+        let historyDiagnostic = await historyStore.lastDiagnostic
+        let historyStats = await historyStore.stats()
+
+        var diagnostics: [Diagnostic] = []
+        if let settingsDiagnostic = settingsResult.diagnostic {
+            diagnostics.append(settingsDiagnostic)
+        }
+        if let historyDiagnostic {
+            diagnostics.append(StorageDiagnosticAlias.remapForHistory(historyDiagnostic))
+        }
+
+        let monitor = AgentMonitorState(
+            active: false,
+            keepingAwake: false,
+            keepAwakeMode: settingsResult.value.keepAwakeMode,
+            agents: [],
+            lastScanAt: 0
+        )
+
+        let snapshot = AppSnapshot(
+            monitor: monitor,
+            history: historyStats,
+            update: UpdateState(checking: false, availableVersion: nil, releaseURL: nil, lastCheckedAt: nil),
+            diagnostics: dedupedByID(diagnostics),
+            appVersion: appVersion
+        )
+
+        return AppSnapshotCoordinator(
+            settingsStore: settingsStore,
+            historyStore: historyStore,
+            power: power,
+            renderer: renderer,
+            clock: clock,
+            initialSnapshot: snapshot
+        )
+    }
+
+    // MARK: - Monitor scan results
+
+    /// Applies one completed, successful scan as a single atomic
+    /// transition: monitor `active` becomes `!agents.isEmpty`, the power
+    /// assertion is created/replaced/released to match (using the
+    /// currently selected mode), `HistoryStore` records the *actual*
+    /// resulting state (never the merely-desired one), and the rebuilt
+    /// snapshot is emitted exactly once. Clears any prior
+    /// `monitor.scan.failed` diagnostic (a completed scan, by definition,
+    /// succeeded).
+    public func applyScan(_ agents: [ActiveAgent], scannedAt: Int64) async {
+        await gate.acquire()
+        await performApplyScan(agents, scannedAt: scannedAt)
+        await gate.release()
+    }
+
+    private func performApplyScan(_ agents: [ActiveAgent], scannedAt: Int64) async {
+        let desiredActive = !agents.isEmpty
+        let requestedMode = snapshot.monitor.keepAwakeMode
+
+        var idsToClear: Set<String> = [AgentMonitorDiagnosticID.scanFailed]
+        var upserts: [Diagnostic] = []
+        let (keepingAwake, effectiveMode) = applyDesiredPowerState(
+            active: desiredActive,
+            mode: requestedMode,
+            occurredAt: scannedAt,
+            idsToClear: &idsToClear,
+            upserts: &upserts
+        )
+
+        let monitorState = AgentMonitorState(
+            active: desiredActive,
+            keepingAwake: keepingAwake,
+            keepAwakeMode: effectiveMode,
+            agents: agents,
+            lastScanAt: scannedAt
+        )
+
+        await historyStore.record(monitorState)
+        let historyStats = await historyStore.stats()
+
+        publish(monitor: monitorState, history: historyStats, clearing: idsToClear, upserting: upserts)
+    }
+
+    /// Applies one completed, *failed* scan: retains every previous
+    /// monitor field (agents, keep-awake state/mode, active flag,
+    /// `lastScanAt`) untouched — a scan failure must never be
+    /// misinterpreted as "zero agents active," which would falsely
+    /// deactivate the power assertion and close the current history
+    /// session — and adds/refreshes the `monitor.scan.failed` diagnostic.
+    /// The next successful `applyScan` clears it.
+    public func applyScanFailure(occurredAt: Int64) async {
+        await gate.acquire()
+        performApplyScanFailure(occurredAt: occurredAt)
+        await gate.release()
+    }
+
+    private func performApplyScanFailure(occurredAt: Int64) {
+        let diagnostic = Diagnostic(
+            id: AgentMonitorDiagnosticID.scanFailed,
+            message: "Agent scan failed; retaining the last known agent state.",
+            occurredAt: occurredAt
+        )
+        publish(monitor: snapshot.monitor, history: snapshot.history, clearing: [], upserting: [diagnostic])
+    }
+
+    // MARK: - Mode changes
+
+    /// Persists `mode` before publishing anything (matching
+    /// `SettingsStore.setKeepAwakeMode`'s own persist-then-publish
+    /// contract), then — if the monitor currently has agents active —
+    /// updates the live power assertion to the new mode. The mode this
+    /// coordinator actually publishes is always read back from
+    /// `settingsStore.current` *after* the persist attempt, never assumed
+    /// from the requested value: a `StorageError.durabilityUncertain`
+    /// throw still leaves the new value durably committed and cached, so
+    /// blindly reverting to the old mode in that case would itself be a
+    /// lie, while an ordinary write failure leaves `current` at the old
+    /// mode, so nothing "success-shaped" is ever falsely published. The
+    /// original thrown error (if any) is always rethrown to the caller
+    /// after the resulting state is published, so the failure remains
+    /// visible synchronously as well as through the diagnostics list.
+    public func setKeepAwakeMode(_ mode: KeepAwakeMode) async throws {
+        await gate.acquire()
+        do {
+            try await performSetKeepAwakeMode(mode)
+            await gate.release()
+        } catch {
+            await gate.release()
+            throw error
+        }
+    }
+
+    private func performSetKeepAwakeMode(_ requestedMode: KeepAwakeMode) async throws {
+        var settingsError: Error?
+        do {
+            try await settingsStore.setKeepAwakeMode(requestedMode)
+        } catch {
+            settingsError = error
+        }
+
+        let actualMode = await settingsStore.current.keepAwakeMode
+        let monitor = snapshot.monitor
+
+        var idsToClear: Set<String> = []
+        var upserts: [Diagnostic] = []
+
+        // Always reconciles power against `monitor.active`, even when it
+        // is `false` and no backend call is expected: this is what lets a
+        // mode change also self-heal a previously degraded state (e.g. an
+        // earlier scan's deactivate-release failure left an assertion
+        // lingering while `monitor.active` had already gone `false`) —
+        // `PowerAssertionService.setDesired(active: false, ...)` is a safe
+        // idempotent no-op whenever nothing is actually left active.
+        let (keepingAwake, effectiveMode) = applyDesiredPowerState(
+            active: monitor.active,
+            mode: actualMode,
+            occurredAt: clock.nowMilliseconds(),
+            idsToClear: &idsToClear,
+            upserts: &upserts
+        )
+
+        if let settingsError {
+            upserts.append(Diagnostic(
+                id: CoordinatorDiagnosticID.settingsPersistFailed,
+                message: "Failed to persist keep-awake mode: \(settingsError)",
+                occurredAt: clock.nowMilliseconds()
+            ))
+        } else {
+            idsToClear.insert(CoordinatorDiagnosticID.settingsPersistFailed)
+        }
+
+        let updatedMonitor = AgentMonitorState(
+            active: monitor.active,
+            keepingAwake: keepingAwake,
+            keepAwakeMode: effectiveMode,
+            agents: monitor.agents,
+            lastScanAt: monitor.lastScanAt
+        )
+
+        await historyStore.record(updatedMonitor)
+        let historyStats = await historyStore.stats()
+
+        publish(monitor: updatedMonitor, history: historyStats, clearing: idsToClear, upserting: upserts)
+
+        if let settingsError {
+            throw settingsError
+        }
+    }
+
+    // MARK: - History clear
+
+    /// Clears history via `HistoryStore.clearOrThrow()` — awaiting
+    /// persistence rather than the fire-and-forget-shaped `clear()` —
+    /// and republishes exactly once either way. `HistoryStore.clear()`'s
+    /// documented contract never rolls back the in-memory reset on a
+    /// failed persist, so even on failure the snapshot published here
+    /// reflects the *actual* (now-empty) in-memory history plus a visible
+    /// diagnostic; the original error is still rethrown afterward so the
+    /// immediate caller (e.g. a bridge promise) also observes the failure
+    /// synchronously.
+    public func clearHistory() async throws {
+        await gate.acquire()
+        do {
+            try await performClearHistory()
+            await gate.release()
+        } catch {
+            await gate.release()
+            throw error
+        }
+    }
+
+    private func performClearHistory() async throws {
+        do {
+            let stats = try await historyStore.clearOrThrow()
+            publish(monitor: snapshot.monitor, history: stats, clearing: [HistoryDiagnosticID.persistFailed], upserting: [])
+        } catch let error as StorageError {
+            let stats = await historyStore.stats()
+            let diagnostic = Diagnostic(
+                id: HistoryDiagnosticID.persistFailed,
+                message: "Failed to persist cleared history: \(error)",
+                occurredAt: clock.nowMilliseconds()
+            )
+            publish(monitor: snapshot.monitor, history: stats, clearing: [], upserting: [diagnostic])
+            throw error
+        }
+    }
+
+    // MARK: - Shutdown
+
+    /// Awaits `HistoryStore.flush(at:)` and then releases the active
+    /// power assertion (`PowerAssertionService.shutdown()`), publishing
+    /// the fully reconciled final state exactly once regardless of
+    /// outcome, before rethrowing the first failure encountered (history
+    /// takes priority over power, matching the order the two operations
+    /// ran in). A caller awaiting `shutdown()` — e.g. app termination —
+    /// is guaranteed both cleanups have already been attempted, and their
+    /// results published, by the time this call returns.
+    public func shutdown() async throws {
+        await gate.acquire()
+        do {
+            try await performShutdown()
+            await gate.release()
+        } catch {
+            await gate.release()
+            throw error
+        }
+    }
+
+    private func performShutdown() async throws {
+        let now = clock.nowMilliseconds()
+
+        var historyError: Error?
+        var stats: HistoryStats
+        do {
+            stats = try await historyStore.flush(at: now)
+        } catch {
+            historyError = error
+            stats = await historyStore.stats()
+        }
+
+        var powerError: Error?
+        do {
+            try power.shutdown()
+        } catch {
+            powerError = error
+        }
+
+        let updatedMonitor = AgentMonitorState(
+            active: snapshot.monitor.active,
+            keepingAwake: power.isActive,
+            keepAwakeMode: power.activeMode ?? snapshot.monitor.keepAwakeMode,
+            agents: snapshot.monitor.agents,
+            lastScanAt: snapshot.monitor.lastScanAt
+        )
+
+        var upserts: [Diagnostic] = []
+        if let historyError {
+            upserts.append(Diagnostic(
+                id: HistoryDiagnosticID.persistFailed,
+                message: "Failed to flush history at shutdown: \(historyError)",
+                occurredAt: now
+            ))
+        }
+        if let powerError {
+            upserts.append(Diagnostic(
+                id: PowerDiagnosticID.assertionFailed,
+                message: "Failed to release power assertion at shutdown: \(powerError)",
+                occurredAt: now
+            ))
+        }
+
+        publish(monitor: updatedMonitor, history: stats, clearing: [], upserting: upserts)
+
+        if let historyError {
+            throw historyError
+        }
+        if let powerError {
+            throw powerError
+        }
+    }
+
+    // MARK: - Shared power-transition helper
+
+    /// Applies `power.setDesired(active:mode:)` and returns the *actual*
+    /// resulting `(keepingAwake, effectiveMode)` pair — read back from the
+    /// service's own `isActive`/`activeMode` after the call, regardless of
+    /// whether it threw. On success, `PowerDiagnosticID.assertionFailed`
+    /// is queued for clearing (via `idsToClear`); on failure, a fresh
+    /// diagnostic describing the error is queued for upsert (via
+    /// `upserts`) instead. This is the single place that guarantees
+    /// `keepingAwake` never reports the *desired* state after a failure —
+    /// only whatever the service verifiably settled on (e.g. still `true`
+    /// with the old mode, for a mode-replacement creation failure that
+    /// left the prior assertion active).
+    private func applyDesiredPowerState(
+        active: Bool,
+        mode: KeepAwakeMode,
+        occurredAt: Int64,
+        idsToClear: inout Set<String>,
+        upserts: inout [Diagnostic]
+    ) -> (keepingAwake: Bool, effectiveMode: KeepAwakeMode) {
+        do {
+            try power.setDesired(active: active, mode: mode)
+            idsToClear.insert(PowerDiagnosticID.assertionFailed)
+        } catch {
+            upserts.append(Diagnostic(
+                id: PowerDiagnosticID.assertionFailed,
+                message: "Failed to update the power assertion: \(error)",
+                occurredAt: occurredAt
+            ))
+        }
+        return (power.isActive, power.activeMode ?? mode)
+    }
+
+    // MARK: - Publish
+
+    /// Rebuilds `snapshot` from `monitor`/`history` (and `update`, if
+    /// provided), removes every diagnostic whose id is in `idsToClear`,
+    /// upserts every diagnostic in `newDiagnostics` (replacing any
+    /// existing entry with the same id so a repeated failure's
+    /// message/timestamp always reflects the most recent attempt), then
+    /// emits the result to `renderer` exactly once. Every public entry
+    /// point above calls this at most once per invocation — the single
+    /// place a completed transition becomes visible.
+    private func publish(
+        monitor: AgentMonitorState,
+        history: HistoryStats,
+        update: UpdateState? = nil,
+        clearing idsToClear: Set<String>,
+        upserting newDiagnostics: [Diagnostic]
+    ) {
+        var diagnostics = snapshot.diagnostics
+        if !idsToClear.isEmpty {
+            diagnostics.removeAll { idsToClear.contains($0.id) }
+        }
+        for diagnostic in newDiagnostics {
+            diagnostics.removeAll { $0.id == diagnostic.id }
+            diagnostics.append(diagnostic)
+        }
+
+        snapshot = AppSnapshot(
+            monitor: monitor,
+            history: history,
+            update: update ?? snapshot.update,
+            diagnostics: diagnostics,
+            appVersion: snapshot.appVersion
+        )
+        renderer.emit(snapshot)
+    }
+
+    /// Keeps only the first `Diagnostic` for each distinct `id`,
+    /// preserving relative order — used once, at startup, to combine the
+    /// (already history-remapped, so non-colliding in practice) settings
+    /// and history load diagnostics deterministically.
+    private static func dedupedByID(_ diagnostics: [Diagnostic]) -> [Diagnostic] {
+        var seenIDs = Set<String>()
+        var result: [Diagnostic] = []
+        for diagnostic in diagnostics where !seenIDs.contains(diagnostic.id) {
+            seenIDs.insert(diagnostic.id)
+            result.append(diagnostic)
+        }
+        return result
+    }
+}
