@@ -1,24 +1,25 @@
 import "./styles.css";
 
-import type { BridgePort } from "../bridge/standalone-renderer-bridge";
+import { createDomRelayPort } from "../bridge/dom-relay-port";
 import { createStandaloneRendererBridge } from "../bridge/standalone-renderer-bridge";
 import { BRIDGE_VERSION } from "../bridge/types";
 import { mountApp } from "../main/app";
 
 /**
- * The standalone native host is a WKWebView. It exposes a `postMessage`-only
- * script message handler (no generic `invoke`/IPC surface) — this is the
- * only global the standalone entry point may read.
+ * The native host delivers responses/events by calling
+ * `window.seerNative.receive` directly. This is the only global the
+ * standalone entry point reads or writes on `Window` — there is
+ * deliberately no `window.webkit`/`messageHandlers` access here:
+ * `BridgeMessageHandler` is registered only in an isolated `WKContentWorld`
+ * (see `BridgeContentWorld`/`BridgeMessageHandlerRegistration` in
+ * `BridgeMessageHandler.swift`), so `window.webkit.messageHandlers
+ * .seerBridge` is not visible to page-world script at all. Outbound
+ * requests instead go through `createDomRelayPort`, which hands a
+ * JSON-encoded string to a trusted isolated-world relay script via the DOM
+ * (see `renderer/bridge/dom-relay-port.ts`).
  */
 declare global {
   interface Window {
-    webkit?: {
-      messageHandlers?: {
-        seerBridge?: {
-          postMessage(message: unknown): void;
-        };
-      };
-    };
     seerNative?: {
       version: typeof BRIDGE_VERSION;
       receive(message: unknown): void;
@@ -26,14 +27,7 @@ declare global {
   }
 }
 
-const handler = window.webkit?.messageHandlers?.seerBridge;
-if (!handler) {
-  throw new Error("window.webkit.messageHandlers.seerBridge is not available");
-}
-
-const port: BridgePort = {
-  postMessage: (message) => handler.postMessage(message),
-};
+const port = createDomRelayPort();
 
 const bridge = createStandaloneRendererBridge(port);
 

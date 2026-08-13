@@ -27,11 +27,22 @@ import WebKit
 /// The bounds here stop this handler from *adding* a second recursive
 /// walk (`JSONSerialization`) on top of that pre-existing risk; they
 /// cannot retroactively undo work WebKit/Foundation already did
-/// constructing (or will do tearing down) the object graph itself. Task
-/// 12's isolated-content-world registration (`BridgeContentWorld`,
-/// `BridgeMessageHandlerRegistration` below) is the mitigation for that
-/// remaining surface: it keeps arbitrary page script from ever reaching
-/// this handler in the first place.
+/// constructing (or will do tearing down) the object graph itself.
+///
+/// In production this validator (and `JSONSerialization` itself) is never
+/// actually reached at all: `userContentController(_:didReceive:)` routes
+/// through `handleScriptMessageBody(_:)`, which accepts only a `String`
+/// body and decodes it as UTF-8 bytes straight into `JSONDecoder` (see
+/// `BridgeRequestDecoder.decode`) — no arbitrary native object graph, and
+/// therefore no recursive `NSArray`/`NSDictionary` deallocation risk, is
+/// ever constructed from a production message in the first place. `body`
+/// being an arbitrary native object graph at all is only possible when a
+/// test drives `handle(body:)` directly with a synthetic value; this
+/// validator exists to bound that path defensively even though the
+/// isolated-content-world registration (`BridgeContentWorld`,
+/// `BridgeMessageHandlerRegistration` below) plus the string-only
+/// production entry point together mean page script can no longer reach
+/// it with anything but a string at all.
 enum BridgeMessageBodyValidator {
     private static let cfBooleanTypeID = CFBooleanGetTypeID()
 
@@ -92,8 +103,9 @@ enum BridgeMessageBodyValidator {
 /// ends up running there (an XSS in the renderer bundle, or any future
 /// relaxation of `SeerNavigationPolicy`/`SeerSchemeResourceLoader`).
 /// Registering instead in this dedicated, named isolated world means only
-/// script explicitly executed *in that same world* (e.g. a trusted
-/// `WKUserScript` Task 12 injects there) can ever reach
+/// script explicitly executed *in that same world* — namely the trusted
+/// `BridgeRelayUserScript` `BridgeMessageHandlerRegistration` injects
+/// there below — can ever reach
 /// `window.webkit.messageHandlers.seerBridge.postMessage(...)` at all —
 /// page-world script has no visibility of a handler registered under a
 /// different content world.
@@ -102,28 +114,113 @@ public enum BridgeContentWorld {
     public static let bridge: WKContentWorld = .world(name: "com.seer.bridge")
 }
 
-/// The minimal script-message-handler-registration capability
+/// The trusted relay bridging page-world script to the isolated
+/// `BridgeContentWorld.bridge` world. Page script (see
+/// `renderer/bridge/dom-relay-port.ts`) has no direct way to reach
+/// `window.webkit.messageHandlers.seerBridge` — that handler is registered
+/// only in `BridgeContentWorld.bridge` — so instead it: JSON-encodes its
+/// request to a string, writes that string into one fixed, private HTML
+/// attribute (`attributeName`) on `document.documentElement`, and
+/// dispatches one fixed-name (`eventName`), non-bubbling DOM `Event` with
+/// no `detail`/attacker-controlled payload of its own. This script is the
+/// *only* code that ever runs in `BridgeContentWorld.bridge`; it listens
+/// for that same event, reads the attribute back as a plain JS string,
+/// removes the attribute immediately (so nothing lingers for a later
+/// script to read or replay), and — only if the value is actually a
+/// non-empty string — forwards it, completely unparsed/uninterpreted (no
+/// `eval`, no `JSON.parse`, no interpolation of its content), to
+/// `window.webkit.messageHandlers.seerBridge.postMessage(...)`. Because
+/// this script never inspects the *contents* of that string beyond its
+/// type and non-emptiness, a page can only ever hand native code an
+/// opaque string — never a richer object graph — and the native
+/// `BridgeMessageHandler` (see `handleScriptMessageBody(_:)`) remains the
+/// sole, authoritative validator of what that string actually contains.
+///
+/// `attributeName` and `eventName` are deliberately unusual, ASCII-only,
+/// fixed tokens. Swift and TypeScript cannot literally share source, so
+/// this file and `renderer/bridge/dom-relay-port.ts` each hardcode the
+/// exact same literal strings independently; tests on both sides
+/// (`BridgeMessageHandlerTests` here, `dom-relay-port.test.ts` there) lock
+/// down those exact values so the two sides cannot silently drift apart.
+public enum BridgeRelayUserScript {
+    /// Fixed, private attribute `document.documentElement` carries the
+    /// JSON-encoded request string in for the instant between dispatch and
+    /// this script relaying it onward. MUST exactly match
+    /// `DOM_RELAY_ATTRIBUTE` in `renderer/bridge/dom-relay-port.ts`.
+    public static let attributeName = "data-seer-bridge-payload"
+
+    /// Fixed, non-bubbling DOM event name the page-world transport
+    /// dispatches to signal a payload is ready to relay. MUST exactly
+    /// match `DOM_RELAY_EVENT_NAME` in `renderer/bridge/dom-relay-port.ts`.
+    public static let eventName = "seer-bridge-relay"
+
+    /// The exact JavaScript source injected into `BridgeContentWorld
+    /// .bridge` at document start. No user content is ever interpolated
+    /// into this string — `attributeName`/`eventName` are the only
+    /// interpolated values, and both are the fixed literal constants
+    /// above, never anything page-supplied.
+    public static let source = """
+    (function () {
+      document.documentElement.addEventListener("\(eventName)", function () {
+        var value = document.documentElement.getAttribute("\(attributeName)");
+        document.documentElement.removeAttribute("\(attributeName)");
+        if (typeof value !== "string" || value.length === 0) {
+          return;
+        }
+        window.webkit.messageHandlers.seerBridge.postMessage(value);
+      }, false);
+    })();
+    """
+
+    /// Builds the one `WKUserScript` `BridgeMessageHandlerRegistration`
+    /// ever injects: `BridgeContentWorld.bridge`, document-start injection
+    /// (so the listener is attached before any page script — including
+    /// the bundled renderer bundle itself — has a chance to run and
+    /// dispatch the relay event), and main-frame-only (Seer's standalone
+    /// window never hosts untrusted subframes this relay needs to reach).
+    @MainActor
+    public static func makeUserScript() -> WKUserScript {
+        WKUserScript(
+            source: source,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: true,
+            in: BridgeContentWorld.bridge
+        )
+    }
+}
+
+/// The minimal script-message-handler/user-script registration capability
 /// `BridgeMessageHandlerRegistration` needs. `WKUserContentController`
 /// conforms via the extension below; tests inject a fake so the exact
-/// `(handler, contentWorld, name)` triple passed to `add` can be asserted
-/// without needing a real `WKUserContentController`.
+/// `(handler, contentWorld, name)` triple passed to `add`, and the exact
+/// `WKUserScript` passed to `addUserScript`, can both be asserted without
+/// needing a real `WKUserContentController`.
 @MainActor
 public protocol ScriptMessageHandlerRegistering: AnyObject {
     func add(_ scriptMessageHandler: WKScriptMessageHandler, contentWorld: WKContentWorld, name: String)
+    func addUserScript(_ userScript: WKUserScript)
 }
 
 extension WKUserContentController: ScriptMessageHandlerRegistering {}
 
 /// The one sanctioned way to wire a `BridgeMessageHandler` into a
-/// `WKUserContentController`: always `BridgeMessageHandler
-/// .messageHandlerName`, in `BridgeContentWorld.bridge`, never any other
-/// name or content world. Task 12's real production wiring must call this
-/// rather than `WKUserContentController.add(_:contentWorld:name:)`
-/// directly, so a raw `.page`-world registration can never slip in
+/// `WKUserContentController`: injects `BridgeRelayUserScript` and adds
+/// `handler` — always under `BridgeMessageHandler.messageHandlerName`, in
+/// `BridgeContentWorld.bridge`, never any other name or content world —
+/// together, in this fixed order, in a single call. Production wiring
+/// must call this rather than `WKUserContentController
+/// .add(_:contentWorld:name:)`/`.addUserScript(_:)` directly, so a raw
+/// `.page`-world registration, or a handler registered with no relay
+/// script (leaving it unreachable from page script), can never slip in
 /// silently.
 @MainActor
 public enum BridgeMessageHandlerRegistration {
     public static func register(_ handler: BridgeMessageHandler, on controller: any ScriptMessageHandlerRegistering) {
+        // The relay script is added first: it only ever *runs* once a
+        // document starts loading, but registering it before the message
+        // handler keeps this ordering deterministic and documented rather
+        // than incidental.
+        controller.addUserScript(BridgeRelayUserScript.makeUserScript())
         controller.add(handler, contentWorld: BridgeContentWorld.bridge, name: BridgeMessageHandler.messageHandlerName)
     }
 }
@@ -271,13 +368,14 @@ public protocol BridgeResponding {
 /// needs to conform to the plain (reply-less) `WKScriptMessageHandler`.
 @MainActor
 public final class BridgeMessageHandler: NSObject, WKScriptMessageHandler {
-    /// The exact script message handler name the renderer's `postMessage`
-    /// calls target (`window.webkit.messageHandlers.seerBridge`), and the
-    /// name this handler must be registered under. Registration itself
-    /// must always go through `BridgeMessageHandlerRegistration.register`,
-    /// which pins the content world to `BridgeContentWorld.bridge` — never
-    /// `.page` — so this handler is only ever reachable by script running
-    /// in that dedicated isolated world, not by arbitrary page script.
+    /// The exact script message handler name `BridgeRelayUserScript`'s
+    /// `postMessage` call targets (`window.webkit.messageHandlers
+    /// .seerBridge`), and the name this handler must be registered under.
+    /// Registration itself must always go through
+    /// `BridgeMessageHandlerRegistration.register`, which pins the content
+    /// world to `BridgeContentWorld.bridge` — never `.page` — so this
+    /// handler is only ever reachable by `BridgeRelayUserScript` running
+    /// in that dedicated isolated world, never directly by page script.
     public static let messageHandlerName = "seerBridge"
 
     private let router: any BridgeCommandHandling
@@ -321,12 +419,51 @@ public final class BridgeMessageHandler: NSObject, WKScriptMessageHandler {
         _ userContentController: WKUserContentController,
         didReceive message: WKScriptMessage
     ) {
-        handle(body: message.body)
+        handleScriptMessageBody(message.body)
     }
 
-    /// Entry point split out from `userContentController(_:didReceive:)` so
-    /// tests can drive it with a synthetic body directly, without needing
-    /// a real `WKUserContentController`/`WKScriptMessage` delivery.
+    /// The one production entry point for a message actually delivered by
+    /// WebKit. `BridgeRelayUserScript` — the only script ever permitted to
+    /// run in `BridgeContentWorld.bridge` — always calls
+    /// `postMessage(value)` with `value` a plain JS string (the
+    /// JSON-encoded request), never an object/array. Accordingly this
+    /// accepts *only* a `String` body: anything else — an object, array,
+    /// number, `null`, or any other native type WebKit could in principle
+    /// bridge a JS value into — is dropped immediately, before
+    /// `JSONSerialization`, `BridgeMessageBodyValidator`, or any other
+    /// recursive walk of `body` is ever invoked on it. This is
+    /// deliberately stricter than (and never routes through) `handle(body
+    /// :)` below, which still accepts arbitrary native bodies so tests can
+    /// exercise that defense-in-depth path directly; production code must
+    /// never call `handle(body:)`.
+    func handleScriptMessageBody(_ body: Any) {
+        guard let string = body as? String else {
+            return
+        }
+        // Bound the UTF-8 conversion itself before performing it, rather
+        // than converting an unbounded string to `Data` first and only
+        // then discovering it is oversized — `BridgeRequestDecoder.decode`
+        // enforces this same `bridgeMaxMessageBytes` bound again on the
+        // resulting `Data`, but there is no reason to pay for allocating a
+        // pathologically large `Data` just to reject it a moment later.
+        guard string.utf8.count <= bridgeMaxMessageBytes else {
+            return
+        }
+        guard let data = string.data(using: .utf8) else {
+            return
+        }
+        route(data: data)
+    }
+
+    /// Arbitrary-native-body entry point retained solely so tests can
+    /// exercise `BridgeMessageBodyValidator`/the oversized-object-graph
+    /// defense directly, with a synthetic body that would never actually
+    /// arrive from `BridgeRelayUserScript` in production (which only ever
+    /// posts a `String`). Production code must always go through
+    /// `handleScriptMessageBody(_:)`/`userContentController(_:didReceive
+    /// :)` instead — never this method — since routing an arbitrary object
+    /// graph through `JSONSerialization` is exactly the risk the isolated
+    /// relay and its string-only production entry point exist to avoid.
     func handle(body: Any) {
         // Run *before* `JSONSerialization` (and therefore before any
         // recursive walk of `body` at all): an iterative, depth/width/

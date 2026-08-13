@@ -775,12 +775,23 @@ final class BridgeMessageHandlerTests: XCTestCase {
         private(set) var addedContentWorld: WKContentWorld?
         private(set) var addedName: String?
         private(set) var addCallCount = 0
+        private(set) var addedUserScripts: [WKUserScript] = []
+        /// Records the interleaving of `add`/`addUserScript` calls, in
+        /// order, so tests can assert the exact deterministic ordering
+        /// `BridgeMessageHandlerRegistration.register` documents.
+        private(set) var callOrder: [String] = []
 
         func add(_ scriptMessageHandler: WKScriptMessageHandler, contentWorld: WKContentWorld, name: String) {
             addCallCount += 1
             addedHandler = scriptMessageHandler
             addedContentWorld = contentWorld
             addedName = name
+            callOrder.append("add")
+        }
+
+        func addUserScript(_ userScript: WKUserScript) {
+            addedUserScripts.append(userScript)
+            callOrder.append("addUserScript")
         }
     }
 
@@ -806,7 +817,144 @@ final class BridgeMessageHandlerTests: XCTestCase {
         XCTAssertFalse(registering.addedContentWorld === WKContentWorld.page, "must never register in .page")
     }
 
+    func testRegistrationHelperAlsoInjectsExactlyOneRelayUserScriptInTheBridgeContentWorld() {
+        let router = FakeCommandRouter()
+        let responder = FakeResponder()
+        let handler = BridgeMessageHandler(router: router, responder: responder)
+        let registering = FakeScriptMessageHandlerRegistering()
+
+        BridgeMessageHandlerRegistration.register(handler, on: registering)
+
+        XCTAssertEqual(registering.addedUserScripts.count, 1)
+        let script = registering.addedUserScripts[0]
+        // `WKUserScript` does not expose a readable `contentWorld`
+        // property (it is init-only), so the exact content world it was
+        // constructed with cannot be introspected directly here — that is
+        // instead proven behaviorally by the real `WKWebView` integration
+        // tests below (`testRealWKWebViewPageWorldScript...`), which show
+        // the relay script actually runs in `BridgeContentWorld.bridge`
+        // (able to reach the handler) and page-world script cannot see
+        // the handler directly.
+        XCTAssertEqual(script.injectionTime, .atDocumentStart)
+        XCTAssertTrue(script.isForMainFrameOnly)
+        XCTAssertEqual(script.source, BridgeRelayUserScript.source)
+    }
+
+    func testRegistrationHelperAddsTheRelayUserScriptBeforeTheMessageHandlerInDeterministicOrder() {
+        let router = FakeCommandRouter()
+        let responder = FakeResponder()
+        let handler = BridgeMessageHandler(router: router, responder: responder)
+        let registering = FakeScriptMessageHandlerRegistering()
+
+        BridgeMessageHandlerRegistration.register(handler, on: registering)
+
+        XCTAssertEqual(registering.callOrder, ["addUserScript", "add"])
+    }
+
+    func testBridgeRelayUserScriptTokensAreTheExactFixedContractValues() {
+        // These exact literal values are the contract with the TS side
+        // (`DOM_RELAY_ATTRIBUTE`/`DOM_RELAY_EVENT_NAME` in
+        // `renderer/bridge/dom-relay-port.ts`) — Swift and TypeScript
+        // cannot share source, so this pins the Swift side of that
+        // contract; `dom-relay-port.test.ts` pins the TS side.
+        XCTAssertEqual(BridgeRelayUserScript.attributeName, "data-seer-bridge-payload")
+        XCTAssertEqual(BridgeRelayUserScript.eventName, "seer-bridge-relay")
+    }
+
+    func testBridgeRelayUserScriptSourceReferencesTheFixedTokensAndTheHandlerNameOnly() {
+        let source = BridgeRelayUserScript.source
+        XCTAssertTrue(source.contains(BridgeRelayUserScript.attributeName))
+        XCTAssertTrue(source.contains(BridgeRelayUserScript.eventName))
+        XCTAssertTrue(source.contains("window.webkit.messageHandlers.\(BridgeMessageHandler.messageHandlerName).postMessage"))
+        // No eval/interpolation of arbitrary content: the value read from
+        // the attribute is passed straight to `postMessage`, never through
+        // `eval`, `JSON.parse`, `Function(...)`, or string concatenation
+        // that could execute it.
+        XCTAssertFalse(source.contains("eval("))
+        XCTAssertFalse(source.contains("Function("))
+        XCTAssertFalse(source.contains("JSON.parse"))
+    }
+
+    // MARK: - production string-only entry point (handleScriptMessageBody)
+
+    func testHandleScriptMessageBodyRoutesAValidJSONStringAllTheWayToASuccessResponse() async {
+        let router = FakeCommandRouter()
+        router.snapshotGetOutcome = .success(makeSnapshot())
+        let responder = FakeResponder()
+        let handler = BridgeMessageHandler(router: router, responder: responder)
+        let json = String(data: requestData(), encoding: .utf8)!
+
+        handler.handleScriptMessageBody(json)
+        await responder.waitForResponses(count: 1)
+
+        XCTAssertEqual(router.snapshotGetCallCount, 1)
+        XCTAssertEqual(responder.responses.count, 1)
+        guard case .success(let id, _) = responder.responses[0] else {
+            return XCTFail("expected a success response")
+        }
+        XCTAssertEqual(id, "550e8400-e29b-41d4-a716-446655440000")
+    }
+
+    func testHandleScriptMessageBodyDropsANonStringObjectBodyWithoutJSONSerializationOrRouting() async {
+        let router = FakeCommandRouter()
+        let responder = FakeResponder()
+        let handler = BridgeMessageHandler(router: router, responder: responder)
+
+        // An arbitrary object graph — exactly the shape `handle(body:)`
+        // (the arbitrary-native-body test path) accepts, but which the
+        // production entry point must reject outright without ever
+        // reaching `BridgeMessageBodyValidator`/`JSONSerialization`/the
+        // router.
+        handler.handleScriptMessageBody(["id": "550e8400-e29b-41d4-a716-446655440000", "version": bridgeVersion, "method": "snapshot.get", "payload": [String: Any]()])
+        try? await Task.sleep(nanoseconds: 20_000_000)
+
+        XCTAssertEqual(responder.responses.count, 0)
+        XCTAssertEqual(router.snapshotGetCallCount, 0)
+    }
+
+    func testHandleScriptMessageBodyDropsANonJSONNativeTypeBodySuchAsNSObject() async {
+        let router = FakeCommandRouter()
+        let responder = FakeResponder()
+        let handler = BridgeMessageHandler(router: router, responder: responder)
+
+        handler.handleScriptMessageBody(NSObject())
+        try? await Task.sleep(nanoseconds: 20_000_000)
+
+        XCTAssertEqual(responder.responses.count, 0)
+        XCTAssertEqual(router.snapshotGetCallCount, 0)
+    }
+
+    func testHandleScriptMessageBodyDropsAnOversizedStringWithoutRoutingOrResponding() async {
+        let router = FakeCommandRouter()
+        let responder = FakeResponder()
+        let handler = BridgeMessageHandler(router: router, responder: responder)
+        let oversized = String(repeating: "x", count: bridgeMaxMessageBytes + 1)
+
+        handler.handleScriptMessageBody(oversized)
+        try? await Task.sleep(nanoseconds: 20_000_000)
+
+        XCTAssertEqual(responder.responses.count, 0)
+        XCTAssertEqual(router.snapshotGetCallCount, 0)
+    }
+
+    func testHandleScriptMessageBodyAcceptsAWellFormedRequestStringFarUnderTheSizeLimit() async {
+        let router = FakeCommandRouter()
+        router.snapshotGetOutcome = .success(makeSnapshot())
+        let responder = FakeResponder()
+        let handler = BridgeMessageHandler(router: router, responder: responder)
+        let json = String(data: requestData(), encoding: .utf8)!
+        XCTAssertLessThanOrEqual(json.utf8.count, bridgeMaxMessageBytes)
+
+        handler.handleScriptMessageBody(json)
+        await responder.waitForResponses(count: 1)
+
+        XCTAssertEqual(responder.responses.count, 1)
+        XCTAssertEqual(router.snapshotGetCallCount, 1)
+    }
+
     // MARK: - stale task-map: three same-id requests must never double-respond
+
+
 
     /// Reproduces the exact race the token-based `inFlightTasks` entries
     /// guard against: request A is dispatched and left suspended
@@ -897,4 +1045,121 @@ final class BridgeMessageHandlerTests: XCTestCase {
 
         XCTAssertEqual(responder.responses.count, 0, "cancelAll during the orphan window must suppress every pending response")
     }
+
+    // MARK: - real WKWebView integration: the relay is reachable end-to-end from page-world script
+
+    /// Resolves once a real `WKWebView` finishes loading, so the
+    /// integration test below can `await` a load completing before
+    /// driving page script against it.
+    private final class LoadCompletionDelegate: NSObject, WKNavigationDelegate {
+        private var continuation: CheckedContinuation<Void, Never>?
+
+        func waitForLoad() async {
+            await withCheckedContinuation { continuation in
+                self.continuation = continuation
+            }
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            let waiting = continuation
+            continuation = nil
+            waiting?.resume()
+        }
+    }
+
+    /// End-to-end proof that a real page-world script — with no direct
+    /// visibility of `window.webkit.messageHandlers.seerBridge` (never
+    /// registered in `.page`) — can still reach `BridgeMessageHandler`
+    /// purely through the DOM handoff: setting the exact fixed attribute
+    /// and dispatching the exact fixed event, exactly as
+    /// `renderer/bridge/dom-relay-port.ts` does, and exactly as
+    /// `BridgeRelayUserScript` (injected by
+    /// `BridgeMessageHandlerRegistration.register` into
+    /// `BridgeContentWorld.bridge`) expects. This drives a real
+    /// `WKWebView`/`WKUserContentController`/content-world registration —
+    /// nothing here is faked — so it also exercises the exact
+    /// `WKUserScript` this handler produces, not just its literal source
+    /// string in isolation.
+    func testRealWKWebViewPageWorldScriptReachesTheHandlerOnlyThroughTheIsolatedRelay() async throws {
+        let router = FakeCommandRouter()
+        router.snapshotGetOutcome = .success(makeSnapshot(appVersion: "9.9.9-relay-test"))
+        let responder = FakeResponder()
+        let handler = BridgeMessageHandler(router: router, responder: responder)
+
+        let configuration = WKWebViewConfiguration()
+        BridgeMessageHandlerRegistration.register(handler, on: configuration.userContentController)
+
+        let webView = WKWebView(frame: .zero, configuration: configuration)
+        let navigationDelegate = LoadCompletionDelegate()
+        webView.navigationDelegate = navigationDelegate
+
+        // Page-world script only ever does what
+        // `renderer/bridge/dom-relay-port.ts` does: JSON-encode a request,
+        // stash it in the fixed attribute, dispatch the fixed
+        // non-bubbling event with no detail. It never references
+        // `window.webkit` at all.
+        let html = """
+        <!doctype html>
+        <html>
+          <body>
+            <script>
+              var request = {
+                id: "550e8400-e29b-41d4-a716-446655440000",
+                version: "\(bridgeVersion)",
+                method: "snapshot.get",
+                payload: {}
+              };
+              document.documentElement.setAttribute("\(BridgeRelayUserScript.attributeName)", JSON.stringify(request));
+              document.documentElement.dispatchEvent(new Event("\(BridgeRelayUserScript.eventName)", { bubbles: false }));
+            </script>
+          </body>
+        </html>
+        """
+
+        webView.loadHTMLString(html, baseURL: nil)
+        await navigationDelegate.waitForLoad()
+        await responder.waitForResponses(count: 1)
+
+        XCTAssertEqual(router.snapshotGetCallCount, 1, "the routed command must have actually reached the router")
+        guard case .success(let id, .snapshot(let snapshot)) = responder.responses[0] else {
+            return XCTFail("expected a success response carrying the fake snapshot")
+        }
+        XCTAssertEqual(id, "550e8400-e29b-41d4-a716-446655440000")
+        XCTAssertEqual(snapshot.appVersion, "9.9.9-relay-test")
+
+        // The attribute must not be left behind on the page after the
+        // relay script has consumed and removed it.
+        let remainingAttribute = try await webView.evaluateJavaScript(
+            "document.documentElement.getAttribute(\"\(BridgeRelayUserScript.attributeName)\")"
+        )
+        XCTAssertNil(remainingAttribute as? String)
+    }
+
+    /// A page-world script attempting `window.webkit.messageHandlers
+    /// .seerBridge` directly — the exact thing this fix removes from the
+    /// TS transport — must find it `undefined`: the handler is registered
+    /// only in `BridgeContentWorld.bridge`, never `.page`, so page-world
+    /// script has no visibility of it at all, even with the exact same
+    /// `WKWebViewConfiguration`/registration used above.
+    func testRealWKWebViewPageWorldScriptCannotSeeTheHandlerDirectly() async throws {
+        let router = FakeCommandRouter()
+        let responder = FakeResponder()
+        let handler = BridgeMessageHandler(router: router, responder: responder)
+
+        let configuration = WKWebViewConfiguration()
+        BridgeMessageHandlerRegistration.register(handler, on: configuration.userContentController)
+
+        let webView = WKWebView(frame: .zero, configuration: configuration)
+        let navigationDelegate = LoadCompletionDelegate()
+        webView.navigationDelegate = navigationDelegate
+
+        webView.loadHTMLString("<!doctype html><html><body></body></html>", baseURL: nil)
+        await navigationDelegate.waitForLoad()
+
+        let seenFromPageWorld = try await webView.evaluateJavaScript(
+            "typeof (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.seerBridge)"
+        )
+        XCTAssertEqual(seenFromPageWorld as? String, "undefined")
+    }
 }
+
