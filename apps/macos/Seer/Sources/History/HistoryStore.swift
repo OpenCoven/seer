@@ -353,7 +353,16 @@ public actor HistoryStore {
 
     /// The most recent diagnostic from either loading (verbatim from
     /// `AtomicJSONStore.load()`) or a failed persistence attempt from
-    /// `clear()` or a debounced save (`HistoryDiagnosticID.persistFailed`).
+    /// `record()`'s close-session persist, `clear()`, `flush(at:)`, or a
+    /// debounced save (`HistoryDiagnosticID.persistFailed`). A
+    /// `HistoryDiagnosticID.persistFailed` value here is cleared the next
+    /// time any of those persist attempts succeeds (see
+    /// `persistLocked()`); a load-time diagnostic is left untouched by a
+    /// later successful persist. `AppSnapshotCoordinator` reads this
+    /// directly after every `record(_:)` call to reconcile a persist
+    /// failure — including one from an earlier, asynchronous debounced
+    /// save — into the published snapshot's diagnostics, rather than
+    /// leaving it visible only here.
     public private(set) var lastDiagnostic: Diagnostic?
 
     private var pendingSave: HistoryScheduledTask?
@@ -671,11 +680,22 @@ public actor HistoryStore {
     /// of throwing, so both non-throwing callers (`clear()`, the
     /// debounced save) and the throwing caller (`flush(at:)`, which
     /// re-throws it) share one implementation.
+    ///
+    /// On success, clears `lastDiagnostic` *only* if it currently holds a
+    /// previous `HistoryDiagnosticID.persistFailed` — i.e. only a prior
+    /// failure of this exact same persist operation, never a load-time
+    /// diagnostic (`storage.settings.corrupt`/`.unsupported-version`/
+    /// `.read-failed`, surfaced verbatim from `AtomicJSONStore.load()`),
+    /// which a successful save has no bearing on and must not silently
+    /// erase.
     @discardableResult
     private func persistLocked() async -> StorageError? {
         trimDaily()
         do {
             try await store.save(data)
+            if lastDiagnostic?.id == HistoryDiagnosticID.persistFailed {
+                lastDiagnostic = nil
+            }
             return nil
         } catch let error as StorageError {
             lastDiagnostic = Diagnostic(

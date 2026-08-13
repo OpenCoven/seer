@@ -4,12 +4,6 @@ import Foundation
 /// from ids surfaced verbatim, or via `StorageDiagnosticAlias`, from a
 /// lower layer's own `lastDiagnostic`).
 public enum CoordinatorDiagnosticID {
-    /// A `setKeepAwakeMode(_:)` call's underlying settings persistence
-    /// threw. Not one of the load-time ids `AtomicJSONStore` emits
-    /// directly (`storage.settings.*`/`storage.history.*`); this one is
-    /// specific to a failed *write* attempt while the mode was changing.
-    public static let settingsPersistFailed = "settings.persist-failed"
-
     /// Reserved for Task 11's GitHub update check, not emitted anywhere by
     /// this task's coordinator — declared here now so the exact stable id
     /// string exists before that feature does, per the plan's closed list
@@ -44,6 +38,18 @@ enum StorageDiagnosticAlias {
     static func remapForHistory(_ diagnostic: Diagnostic) -> Diagnostic {
         guard let mappedID = historyIDsByRawID[diagnostic.id] else { return diagnostic }
         return Diagnostic(id: mappedID, message: diagnostic.message, occurredAt: diagnostic.occurredAt)
+    }
+
+    /// Every diagnostic id `HistoryStore.lastDiagnostic` can ever surface
+    /// once mapped through `remapForHistory(_:)` — the three
+    /// `storage.history.*` remapped ids plus `HistoryDiagnosticID
+    /// .persistFailed` (which needs no remapping, being already history-
+    /// specific). Used by `AppSnapshotCoordinator.reconcileHistoryDiagnostic`
+    /// to know exactly which ids to clear before conditionally re-upserting
+    /// whichever one (if any) is currently current, without duplicating
+    /// this id list at each call site.
+    static var historyDiagnosticIDs: Set<String> {
+        Set(historyIDsByRawID.values).union([HistoryDiagnosticID.persistFailed])
     }
 }
 
@@ -183,7 +189,20 @@ public final class AppSnapshotCoordinator {
 
     private func performApplyScan(_ agents: [ActiveAgent], scannedAt: Int64) async {
         let desiredActive = !agents.isEmpty
-        let requestedMode = snapshot.monitor.keepAwakeMode
+        // Read the desired mode from `settingsStore.current` — the
+        // durably persisted source of truth — never from
+        // `snapshot.monitor.keepAwakeMode`. The latter is the last
+        // *effective* mode a power call actually settled on, which after
+        // a mode-replacement failure in `setKeepAwakeMode` stays pinned
+        // to the old mode even though the new one was already
+        // successfully persisted. Reading the desired mode from
+        // `snapshot.monitor` there would make every subsequent scan keep
+        // "retrying" the stale old mode forever instead of the actually
+        // requested one; reading it from `settingsStore.current` instead
+        // means the very next scan retries the real desired mode, and
+        // recovers (clearing `PowerDiagnosticID.assertionFailed`) the
+        // moment the backend accepts it.
+        let requestedMode = await settingsStore.current.keepAwakeMode
 
         var idsToClear: Set<String> = [AgentMonitorDiagnosticID.scanFailed]
         var upserts: [Diagnostic] = []
@@ -204,6 +223,7 @@ public final class AppSnapshotCoordinator {
         )
 
         await historyStore.record(monitorState)
+        await reconcileHistoryDiagnostic(idsToClear: &idsToClear, upserts: &upserts)
         let historyStats = await historyStore.stats()
 
         publish(monitor: monitorState, history: historyStats, clearing: idsToClear, upserting: upserts)
@@ -247,6 +267,16 @@ public final class AppSnapshotCoordinator {
     /// original thrown error (if any) is always rethrown to the caller
     /// after the resulting state is published, so the failure remains
     /// visible synchronously as well as through the diagnostics list.
+    ///
+    /// A persist failure here is never reported under an invented
+    /// coordinator-specific diagnostic id — Task 9's stable diagnostic
+    /// vocabulary has no such id. If `settingsStore.lastDiagnostic` is
+    /// already non-nil (e.g. a load-time `storage.settings.read-failed`/
+    /// `.unsupported-version` diagnostic explains *why* every write is
+    /// failing), that existing approved diagnostic is preserved/refreshed
+    /// instead; otherwise (an ordinary transient write failure with no
+    /// accompanying diagnostic) none is added — the thrown error alone
+    /// still carries the failure to the caller.
     public func setKeepAwakeMode(_ mode: KeepAwakeMode) async throws {
         await gate.acquire()
         do {
@@ -287,14 +317,8 @@ public final class AppSnapshotCoordinator {
             upserts: &upserts
         )
 
-        if let settingsError {
-            upserts.append(Diagnostic(
-                id: CoordinatorDiagnosticID.settingsPersistFailed,
-                message: "Failed to persist keep-awake mode: \(settingsError)",
-                occurredAt: clock.nowMilliseconds()
-            ))
-        } else {
-            idsToClear.insert(CoordinatorDiagnosticID.settingsPersistFailed)
+        if settingsError != nil, let existingDiagnostic = await settingsStore.lastDiagnostic {
+            upserts.append(existingDiagnostic)
         }
 
         let updatedMonitor = AgentMonitorState(
@@ -306,6 +330,7 @@ public final class AppSnapshotCoordinator {
         )
 
         await historyStore.record(updatedMonitor)
+        await reconcileHistoryDiagnostic(idsToClear: &idsToClear, upserts: &upserts)
         let historyStats = await historyStore.stats()
 
         publish(monitor: updatedMonitor, history: historyStats, clearing: idsToClear, upserting: upserts)
@@ -424,6 +449,33 @@ public final class AppSnapshotCoordinator {
         }
         if let powerError {
             throw powerError
+        }
+    }
+
+    // MARK: - Shared history-diagnostic helper
+
+    /// Reads `historyStore.lastDiagnostic` — its own authoritative,
+    /// currently-in-effect diagnostic state — and reconciles it into
+    /// `idsToClear`/`upserts` so a persistence failure that would
+    /// otherwise stay hidden inside `HistoryStore` (a close-session
+    /// persist from *this* `record(_:)` call, or an earlier tick's
+    /// asynchronous debounced save that failed after this coordinator had
+    /// already moved on) always surfaces in the very next published
+    /// snapshot, and clears the moment a later persist actually succeeds.
+    ///
+    /// Deliberately re-reads the store's own state directly rather than
+    /// inferring success/failure from `record(_:)`'s own (`Void`) return
+    /// value: a tick that only accumulates a delta into an
+    /// already-pending debounced save touches neither `HistoryStore`'s
+    /// data nor its `lastDiagnostic` at all, so asking the store itself
+    /// — every time, unconditionally — can never mistake "no persist was
+    /// even attempted this tick" for "succeeded," and can therefore never
+    /// falsely clear a still-current diagnostic just because this
+    /// particular call didn't force a write.
+    private func reconcileHistoryDiagnostic(idsToClear: inout Set<String>, upserts: inout [Diagnostic]) async {
+        idsToClear.formUnion(StorageDiagnosticAlias.historyDiagnosticIDs)
+        if let diagnostic = await historyStore.lastDiagnostic {
+            upserts.append(StorageDiagnosticAlias.remapForHistory(diagnostic))
         }
     }
 

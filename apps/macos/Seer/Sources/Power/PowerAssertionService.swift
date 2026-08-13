@@ -45,6 +45,15 @@ public enum PowerAssertionBackendError: Error, Equatable, Sendable {
     /// `IOPMAssertionRelease` returned something other than
     /// `kIOReturnSuccess`.
     case releaseFailed(ioReturnCode: Int32)
+    /// `PowerAssertionBackend`'s protocol declares plain, untyped
+    /// `throws` — nothing prevents a conformance (a test double, or a
+    /// future non-IOKit backend) from throwing some entirely different
+    /// `Error` type instead of one of this enum's own cases.
+    /// `PowerAssertionService` normalizes any such foreign error into
+    /// this case (via `String(describing:)`, so the message stays
+    /// human-readable) rather than letting it escape uncaught and skip
+    /// every compensating rollback below.
+    case foreign(description: String)
 }
 
 #if canImport(IOKit)
@@ -205,10 +214,18 @@ public final class PowerAssertionService {
         }
         do {
             try backend.releaseAssertion(id: id)
-        } catch let error as PowerAssertionBackendError {
+        } catch {
             // Do not clear state: a failed release is never assumed to
-            // have actually released the assertion.
-            throw PowerAssertionServiceError.releaseFailed(underlying: error, actualAssertionID: id, actualMode: mode)
+            // have actually released the assertion. Caught as `any
+            // Error` (not just `PowerAssertionBackendError`) because the
+            // protocol's untyped `throws` permits a conformance to throw
+            // anything; `Self.normalize(_:)` still surfaces it as a
+            // stable, typed underlying error.
+            throw PowerAssertionServiceError.releaseFailed(
+                underlying: Self.normalize(error),
+                actualAssertionID: id,
+                actualMode: mode
+            )
         }
         activeAssertionID = nil
         activeMode = nil
@@ -221,8 +238,8 @@ public final class PowerAssertionService {
             activeAssertionID = id
             activeMode = mode
             return true
-        } catch let error as PowerAssertionBackendError {
-            throw PowerAssertionServiceError.creationFailed(underlying: error)
+        } catch {
+            throw PowerAssertionServiceError.creationFailed(underlying: Self.normalize(error))
         }
     }
 
@@ -230,11 +247,11 @@ public final class PowerAssertionService {
         let newID: UInt32
         do {
             newID = try backend.createAssertion(mode: mode, reason: reason)
-        } catch let error as PowerAssertionBackendError {
+        } catch {
             // Old assertion was never touched: it remains the sole active
             // one, exactly as before this call.
             throw PowerAssertionServiceError.replacementCreationFailed(
-                underlying: error,
+                underlying: Self.normalize(error),
                 actualAssertionID: oldID,
                 actualMode: oldMode
             )
@@ -242,17 +259,24 @@ public final class PowerAssertionService {
 
         do {
             try backend.releaseAssertion(id: oldID)
-        } catch let releaseError as PowerAssertionBackendError {
+        } catch {
+            // Caught as `any Error`, not just `PowerAssertionBackendError`
+            // — a foreign error thrown here must still trigger the
+            // compensating rollback below rather than escaping uncaught
+            // and leaving the just-created replacement's fate (and the
+            // old assertion's) unattempted.
+            let releaseError = Self.normalize(error)
             // Compensate: roll back by releasing the just-created
             // replacement, so the old assertion remains the sole active
             // one — never permit two silently-live ids.
             do {
                 try backend.releaseAssertion(id: newID)
-            } catch let rollbackError as PowerAssertionBackendError {
+            } catch {
                 // Both releases failed: both assertions may still be
                 // alive at the OS level. Pin reported state to the newly
                 // created assertion (confirmed created) and surface the
                 // leaked old id rather than silently dropping it.
+                let rollbackError = Self.normalize(error)
                 activeAssertionID = newID
                 activeMode = mode
                 throw PowerAssertionServiceError.replacementRollbackFailed(
@@ -275,6 +299,18 @@ public final class PowerAssertionService {
         activeAssertionID = newID
         activeMode = mode
         return true
+    }
+
+    /// Normalizes any error a `PowerAssertionBackend` conformance throws
+    /// into a `PowerAssertionBackendError`: passes an already-typed one
+    /// through unchanged, or wraps any foreign error (permitted by the
+    /// protocol's untyped `throws`) into `.foreign`, preserving its
+    /// readable description. The single place every compensation path
+    /// above relies on to keep `PowerAssertionServiceError`'s underlying
+    /// error stable and typed regardless of what the backend actually
+    /// threw.
+    private static func normalize(_ error: Error) -> PowerAssertionBackendError {
+        (error as? PowerAssertionBackendError) ?? .foreign(description: String(describing: error))
     }
 
     /// Releases the active assertion (if any) — the exact same path as

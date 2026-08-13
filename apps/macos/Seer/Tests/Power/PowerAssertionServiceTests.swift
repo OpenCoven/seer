@@ -71,6 +71,51 @@ final class PowerAssertionServiceTests: XCTestCase {
         func releaseAssertion(id: UInt32) throws {}
     }
 
+    /// A foreign (non-`PowerAssertionBackendError`) error a
+    /// `PowerAssertionBackend` conformance might throw — exercising the
+    /// protocol's actual untyped `throws`, which permits any `Error`, not
+    /// only the service's own typed `PowerAssertionBackendError`.
+    struct ForeignBackendError: Error, Equatable, CustomStringConvertible {
+        let message: String
+        var description: String { message }
+    }
+
+    /// A scriptable `PowerAssertionBackend` double that throws arbitrary
+    /// foreign errors (`ForeignBackendError`, never
+    /// `PowerAssertionBackendError`) instead — so tests can verify
+    /// `PowerAssertionService` normalizes *any* `Error` into a stable
+    /// typed one and still runs every compensating rollback, rather than
+    /// only handling errors of its own declared type.
+    final class ForeignErrorAssertionBackend: PowerAssertionBackend, @unchecked Sendable {
+        private(set) var createdModes: [KeepAwakeMode] = []
+        private(set) var releasedIDs: [UInt32] = []
+        private var nextID: UInt32 = 1
+
+        /// One scripted foreign error consumed per `createAssertion` call,
+        /// in order; once exhausted, further calls succeed.
+        var createFailures: [Error] = []
+        /// Consumed (one-shot) per matching id: the next `releaseAssertion`
+        /// call for that id throws this foreign error instead of succeeding.
+        var releaseFailuresByID: [UInt32: Error] = [:]
+
+        func createAssertion(mode: KeepAwakeMode, reason: String) throws -> UInt32 {
+            createdModes.append(mode)
+            if !createFailures.isEmpty {
+                throw createFailures.removeFirst()
+            }
+            let id = nextID
+            nextID += 1
+            return id
+        }
+
+        func releaseAssertion(id: UInt32) throws {
+            releasedIDs.append(id)
+            if let error = releaseFailuresByID.removeValue(forKey: id) {
+                throw error
+            }
+        }
+    }
+
     // MARK: - Mode replacement (plan example)
 
     func testChangingModeReplacesOneActiveAssertion() throws {
@@ -324,6 +369,131 @@ final class PowerAssertionServiceTests: XCTestCase {
         }
         // Never swallowed: the assertion remains reported active since the
         // release could not be confirmed.
+        XCTAssertTrue(service.isActive)
+    }
+
+    // MARK: - Foreign (non-`PowerAssertionBackendError`) error normalization
+
+    /// A foreign error thrown by `createAssertion` (fresh activation, no
+    /// assertion active yet) must still be caught — the protocol's
+    /// untyped `throws` permits it — and normalized into a typed
+    /// `.creationFailed(underlying: .foreign(...))`, preserving the
+    /// underlying message, rather than escaping uncaught.
+    func testForeignCreationErrorIsNormalizedIntoTypedCreationFailed() {
+        let backend = ForeignErrorAssertionBackend()
+        backend.createFailures = [ForeignBackendError(message: "unexpected create boom")]
+        let service = PowerAssertionService(backend: backend)
+
+        XCTAssertThrowsError(try service.setDesired(active: true, mode: .system)) { error in
+            guard case .creationFailed(let underlying) = error as? PowerAssertionServiceError else {
+                return XCTFail("expected .creationFailed, got \(error)")
+            }
+            guard case .foreign(let description) = underlying else {
+                return XCTFail("expected a normalized .foreign underlying error, got \(underlying)")
+            }
+            XCTAssertTrue(description.contains("unexpected create boom"))
+        }
+        XCTAssertFalse(service.isActive)
+        XCTAssertNil(service.activeAssertionID)
+        XCTAssertNil(service.activeMode)
+    }
+
+    /// A foreign error thrown by `releaseAssertion` during a plain
+    /// deactivate must likewise be normalized, and — matching the typed
+    /// case's behavior — never assumed to have actually released the
+    /// assertion.
+    func testForeignDeactivateErrorIsNormalizedAndLeavesStateActive() throws {
+        let backend = ForeignErrorAssertionBackend()
+        let service = PowerAssertionService(backend: backend)
+        try service.setDesired(active: true, mode: .system)
+        backend.releaseFailuresByID[1] = ForeignBackendError(message: "unexpected release boom")
+
+        XCTAssertThrowsError(try service.setDesired(active: false, mode: .system)) { error in
+            guard case .releaseFailed(let underlying, let actualID, let actualMode) = error as? PowerAssertionServiceError else {
+                return XCTFail("expected .releaseFailed, got \(error)")
+            }
+            guard case .foreign(let description) = underlying else {
+                return XCTFail("expected a normalized .foreign underlying error, got \(underlying)")
+            }
+            XCTAssertTrue(description.contains("unexpected release boom"))
+            XCTAssertEqual(actualID, 1)
+            XCTAssertEqual(actualMode, .system)
+        }
+        XCTAssertTrue(service.isActive)
+        XCTAssertEqual(service.activeAssertionID, 1)
+        XCTAssertEqual(service.activeMode, .system)
+    }
+
+    /// A foreign error thrown by the *old* assertion's release during a
+    /// mode replacement must still trigger the compensating rollback
+    /// (releasing the just-created replacement) exactly as a typed
+    /// `PowerAssertionBackendError` would — the untyped `catch` here must
+    /// not let a foreign error skip the rollback entirely.
+    func testForeignOldReleaseErrorDuringReplacementRollsBackSuccessfully() throws {
+        let backend = ForeignErrorAssertionBackend()
+        let service = PowerAssertionService(backend: backend)
+        try service.setDesired(active: true, mode: .system) // id 1
+        backend.releaseFailuresByID[1] = ForeignBackendError(message: "old release boom")
+
+        XCTAssertThrowsError(try service.setDesired(active: true, mode: .display)) { error in
+            guard case .replacementRolledBack(let underlying, let actualID, let actualMode) = error as? PowerAssertionServiceError else {
+                return XCTFail("expected .replacementRolledBack, got \(error)")
+            }
+            guard case .foreign(let description) = underlying else {
+                return XCTFail("expected a normalized .foreign underlying error, got \(underlying)")
+            }
+            XCTAssertTrue(description.contains("old release boom"))
+            XCTAssertEqual(actualID, 1)
+            XCTAssertEqual(actualMode, .system)
+        }
+
+        // The rollback release of the newly created id 2 was actually
+        // attempted (and succeeded), restoring the old assertion as sole
+        // active — never two silently-live ids.
+        XCTAssertEqual(backend.createdModes, [.system, .display])
+        XCTAssertEqual(backend.releasedIDs, [1, 2])
+        XCTAssertEqual(service.activeAssertionID, 1)
+        XCTAssertEqual(service.activeMode, .system)
+        XCTAssertTrue(service.isActive)
+    }
+
+    /// Both the old release *and* the compensating rollback release throw
+    /// foreign errors: the service must still pin its reported state to
+    /// the newly created (confirmed-created) assertion and surface the
+    /// leaked old id, exactly as it does for typed
+    /// `PowerAssertionBackendError` failures.
+    func testForeignBothReleaseFailuresDuringReplacementPinsNewAssertionAndReportsLeak() throws {
+        let backend = ForeignErrorAssertionBackend()
+        let service = PowerAssertionService(backend: backend)
+        try service.setDesired(active: true, mode: .system) // id 1
+        backend.releaseFailuresByID[1] = ForeignBackendError(message: "old release boom")
+        backend.releaseFailuresByID[2] = ForeignBackendError(message: "rollback release boom")
+
+        XCTAssertThrowsError(try service.setDesired(active: true, mode: .display)) { error in
+            guard case .replacementRollbackFailed(
+                let oldUnderlying, let rollbackUnderlying, let leakedID, let actualID, let actualMode
+            ) = error as? PowerAssertionServiceError else {
+                return XCTFail("expected .replacementRollbackFailed, got \(error)")
+            }
+            guard case .foreign(let oldDescription) = oldUnderlying, case .foreign(let rollbackDescription) = rollbackUnderlying else {
+                return XCTFail("expected both underlying errors normalized as .foreign")
+            }
+            XCTAssertTrue(oldDescription.contains("old release boom"))
+            XCTAssertTrue(rollbackDescription.contains("rollback release boom"))
+            XCTAssertEqual(leakedID, 1)
+            XCTAssertEqual(actualID, 2)
+            XCTAssertEqual(actualMode, .display)
+        }
+
+        XCTAssertEqual(backend.createdModes, [.system, .display])
+        // Both releases (old, then the rollback attempt of new) were
+        // attempted.
+        XCTAssertEqual(backend.releasedIDs, [1, 2])
+        // Both may still be alive at the OS level; the service pins to
+        // the newly created (confirmed-created) assertion instead of
+        // pretending the old one is still the sole truth.
+        XCTAssertEqual(service.activeAssertionID, 2)
+        XCTAssertEqual(service.activeMode, .display)
         XCTAssertTrue(service.isActive)
     }
 

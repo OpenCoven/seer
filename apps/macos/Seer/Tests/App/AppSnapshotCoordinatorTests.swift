@@ -76,6 +76,7 @@ final class AppSnapshotCoordinatorTests: XCTestCase {
     private func makeCoordinator(
         settingsFileSystem: InMemorySettingsFileSystem = InMemorySettingsFileSystem(),
         historyFileSystem: InMemorySettingsFileSystem = InMemorySettingsFileSystem(),
+        historyScheduler: HistoryScheduler = ManualHistoryScheduler(),
         clock: MutableClock = MutableClock(now: 1_700_000_000_000),
         powerBackend: CoordinatorFakePowerBackend = CoordinatorFakePowerBackend(),
         appVersion: String = "1.0.0-test"
@@ -95,7 +96,7 @@ final class AppSnapshotCoordinatorTests: XCTestCase {
         let historyStore = HistoryStore(
             store: historyAtomicStore,
             clock: clock,
-            scheduler: ManualHistoryScheduler(),
+            scheduler: historyScheduler,
             idGenerator: SequentialHistorySessionIDGenerator()
         )
 
@@ -113,6 +114,7 @@ final class AppSnapshotCoordinatorTests: XCTestCase {
 
         return (coordinator, renderer, powerBackend)
     }
+
 
     // MARK: - Plan example: completed scan updates power/history/snapshot together
 
@@ -234,6 +236,13 @@ final class AppSnapshotCoordinatorTests: XCTestCase {
         XCTAssertEqual(renderer.emittedSnapshots.count, 0)
     }
 
+    /// Asserts the coordinator's stable diagnostic id vocabulary is
+    /// exactly the approved/reserved set — no more, no less. In
+    /// particular there is deliberately no id here for a settings-write
+    /// failure during `setKeepAwakeMode`: Task 9's plan approved no such
+    /// id, and `CoordinatorDiagnosticID` must never grow one outside that
+    /// closed list (see `testSetKeepAwakeModePersistenceFailure...` below
+    /// for what a settings persist failure surfaces instead).
     func testStableDiagnosticIDsMatchThePlanExactly() {
         XCTAssertEqual(AgentMonitorDiagnosticID.scanFailed, "monitor.scan.failed")
         XCTAssertEqual(PowerDiagnosticID.assertionFailed, "power.assertion.failed")
@@ -276,11 +285,20 @@ final class AppSnapshotCoordinatorTests: XCTestCase {
 
     // MARK: - Mode change: settings persistence failure
 
+    /// An ordinary, transient settings write failure (no accompanying
+    /// load-time diagnostic — the settings file loaded cleanly) must
+    /// never invent a new coordinator-specific diagnostic id: Task 9's
+    /// plan approved no such id (see
+    /// `testStableDiagnosticIDsMatchThePlanExactly`). The failure is
+    /// still never swallowed — the actual (old, unpublished-as-new) mode
+    /// is what gets published, and the original typed error still
+    /// propagates to the caller.
     func testSetKeepAwakeModePersistenceFailureDoesNotPublishSuccessShapedModeAndThrows() async throws {
         let clock = MutableClock(now: 1_700_000_000_000)
         let settingsFS = InMemorySettingsFileSystem()
         let (coordinator, renderer, powerBackend) = await makeCoordinator(settingsFileSystem: settingsFS, clock: clock)
         XCTAssertEqual(coordinator.snapshot.monitor.keepAwakeMode, .system)
+        let diagnosticsBeforeAttempt = coordinator.snapshot.diagnostics
 
         await settingsFS.setFailNextWrite(SettingsFileSystemError.other("disk full"))
 
@@ -295,9 +313,43 @@ final class AppSnapshotCoordinatorTests: XCTestCase {
             coordinator.snapshot.monitor.keepAwakeMode, .system,
             "must never publish the requested mode as though persistence had succeeded"
         )
-        XCTAssertTrue(coordinator.snapshot.diagnostics.contains { $0.id == CoordinatorDiagnosticID.settingsPersistFailed })
+        XCTAssertEqual(
+            coordinator.snapshot.diagnostics, diagnosticsBeforeAttempt,
+            "an ordinary transient write failure with no pre-existing approved diagnostic must not invent one"
+        )
         XCTAssertEqual(powerBackend.createdModes, [], "no power assertion was ever active, so no power call should occur")
         XCTAssertEqual(renderer.emittedSnapshots.count, 1)
+    }
+
+    /// When a settings write fails *because* the file is read-only from
+    /// load time (e.g. a future/unsupported schema version), that
+    /// already-approved `storage.settings.unsupported-version` diagnostic
+    /// — present since startup — is preserved/refreshed rather than
+    /// replaced by (or hidden behind) any invented id.
+    func testSetKeepAwakeModePersistenceFailurePreservesExistingApprovedSettingsDiagnostic() async throws {
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let settingsFS = InMemorySettingsFileSystem()
+        let futureBytes = Data(#"{"version":999,"keepAwakeMode":"system","includePrereleaseUpdates":false}"#.utf8)
+        await settingsFS.seedFile(at: settingsURL, contents: futureBytes)
+        let (coordinator, _, _) = await makeCoordinator(settingsFileSystem: settingsFS, clock: clock)
+
+        XCTAssertTrue(coordinator.snapshot.diagnostics.contains { $0.id == StorageDiagnosticID.unsupportedVersion })
+
+        do {
+            try await coordinator.setKeepAwakeMode(.display)
+            XCTFail("expected the read-only (future-version) settings file to reject the write")
+        } catch StorageError.writesDisabled {
+            // Expected.
+        }
+
+        XCTAssertEqual(
+            coordinator.snapshot.monitor.keepAwakeMode, .system,
+            "a read-only settings file must never accept the requested mode"
+        )
+        XCTAssertEqual(
+            coordinator.snapshot.diagnostics.filter { $0.id == StorageDiagnosticID.unsupportedVersion }.count, 1,
+            "the pre-existing approved diagnostic is preserved/refreshed, never duplicated or replaced by an invented id"
+        )
     }
 
     // MARK: - Mode change: power replacement failure reports actual old state
@@ -324,6 +376,69 @@ final class AppSnapshotCoordinatorTests: XCTestCase {
         XCTAssertTrue(coordinator.snapshot.diagnostics.contains { $0.id == PowerDiagnosticID.assertionFailed })
         XCTAssertEqual(powerBackend.releasedIDs, [], "the old assertion must never be released when the replacement's creation failed")
         XCTAssertEqual(renderer.emittedSnapshots.count, 2)
+    }
+
+    // MARK: - Mode change: next scan retries the desired persisted mode
+
+    /// Regression test for the desired/effective mode desync: after
+    /// `setKeepAwakeMode` persists a new mode but the live IOKit
+    /// replacement fails, the *next* `applyScan` must derive its desired
+    /// mode from `settingsStore.current` (the durably persisted value),
+    /// not from the stale `snapshot.monitor.keepAwakeMode` the failed
+    /// attempt actually published — otherwise every subsequent scan would
+    /// keep "retrying" the old mode forever and never recover.
+    func testApplyScanRetriesDesiredPersistedModeAfterPriorReplacementFailureAndRecoversOnSuccess() async throws {
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let powerBackend = CoordinatorFakePowerBackend()
+        let (coordinator, _, _) = await makeCoordinator(clock: clock, powerBackend: powerBackend)
+        let agent = activeAgent()
+
+        await coordinator.applyScan([agent], scannedAt: clock.now)
+        XCTAssertEqual(coordinator.snapshot.monitor.keepAwakeMode, .system)
+
+        powerBackend.createResults = [.failure(.createFailed(ioReturnCode: -9))]
+        try await coordinator.setKeepAwakeMode(.display)
+
+        XCTAssertEqual(coordinator.snapshot.monitor.keepAwakeMode, .system, "the failed replacement leaves the actual old mode published")
+        XCTAssertTrue(coordinator.snapshot.diagnostics.contains { $0.id == PowerDiagnosticID.assertionFailed })
+
+        clock.now += 10
+        await coordinator.applyScan([agent], scannedAt: clock.now)
+
+        // The retry succeeds this time (no more scripted failures): the
+        // effective mode updates to the persisted `.display`, and the
+        // diagnostic clears.
+        XCTAssertEqual(coordinator.snapshot.monitor.keepAwakeMode, .display, "the next scan must retry the persisted desired mode, not the stale published one")
+        XCTAssertTrue(coordinator.snapshot.monitor.keepingAwake)
+        XCTAssertFalse(coordinator.snapshot.diagnostics.contains { $0.id == PowerDiagnosticID.assertionFailed })
+        XCTAssertEqual(powerBackend.createdModes, [.system, .display, .display])
+        XCTAssertEqual(powerBackend.releasedIDs, [1], "the old .system assertion is released once the retried .display replacement succeeds")
+    }
+
+    /// Same setup as above, but the retry also fails: the coordinator
+    /// must keep reporting the old actual mode and the diagnostic must
+    /// remain, rather than ever reporting a success-shaped state.
+    func testApplyScanRetryStillFailingKeepsOldModeAndDiagnostic() async throws {
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let powerBackend = CoordinatorFakePowerBackend()
+        let (coordinator, _, _) = await makeCoordinator(clock: clock, powerBackend: powerBackend)
+        let agent = activeAgent()
+
+        await coordinator.applyScan([agent], scannedAt: clock.now)
+        powerBackend.createResults = [
+            .failure(.createFailed(ioReturnCode: -9)),
+            .failure(.createFailed(ioReturnCode: -10))
+        ]
+        try await coordinator.setKeepAwakeMode(.display)
+        XCTAssertEqual(coordinator.snapshot.monitor.keepAwakeMode, .system)
+
+        clock.now += 10
+        await coordinator.applyScan([agent], scannedAt: clock.now)
+
+        XCTAssertEqual(coordinator.snapshot.monitor.keepAwakeMode, .system, "a still-failing retry must remain on the old actual mode")
+        XCTAssertTrue(coordinator.snapshot.monitor.keepingAwake, "the old assertion remains active throughout")
+        XCTAssertTrue(coordinator.snapshot.diagnostics.contains { $0.id == PowerDiagnosticID.assertionFailed })
+        XCTAssertEqual(powerBackend.releasedIDs, [], "the old assertion must never be released while every replacement attempt keeps failing")
     }
 
     // MARK: - History clear
@@ -378,6 +493,87 @@ final class AppSnapshotCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinator.snapshot.history.totalAwakeMs, 0)
         XCTAssertTrue(coordinator.snapshot.diagnostics.contains { $0.id == HistoryDiagnosticID.persistFailed })
         XCTAssertEqual(renderer.emittedSnapshots.last?.history.recentSessions.count, 0)
+    }
+
+    // MARK: - History persist failures hidden inside `record(_:)`
+
+    /// A close-session persist failure during a normal `applyScan` (never
+    /// surfaced by `clearHistory()`/`shutdown()`, both of which already
+    /// have their own explicit persist-failure handling) must not stay
+    /// hidden inside `HistoryStore.lastDiagnostic`: the coordinator reads
+    /// it back after every `record(_:)` call and reconciles it into the
+    /// published snapshot. Also exercises the two companion invariants:
+    /// a later tick that never attempts a persist must not falsely clear
+    /// a still-current diagnostic, and a later tick that *does* persist
+    /// successfully must clear it.
+    func testApplyScanCloseSessionPersistFailureSurfacesDiagnosticAndLaterSuccessClearsIt() async throws {
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let historyFS = InMemorySettingsFileSystem()
+        let (coordinator, _, _) = await makeCoordinator(historyFileSystem: historyFS, clock: clock)
+        let agent = activeAgent()
+
+        await coordinator.applyScan([agent], scannedAt: clock.now)
+        clock.now += 100
+
+        await historyFS.setFailNextWrite(SettingsFileSystemError.other("disk full"))
+        await coordinator.applyScan([], scannedAt: clock.now) // closes the session -> immediate persist -> fails
+
+        XCTAssertTrue(
+            coordinator.snapshot.diagnostics.contains { $0.id == HistoryDiagnosticID.persistFailed },
+            "a close-session persist failure during applyScan must become visible, not stay hidden in HistoryStore.lastDiagnostic"
+        )
+        XCTAssertFalse(coordinator.snapshot.monitor.active, "the actual monitor state is still published even though the history persist failed")
+        XCTAssertNil(coordinator.snapshot.history.currentSession)
+
+        clock.now += 100
+        await coordinator.applyScan([agent], scannedAt: clock.now) // reopens a session; no persist is attempted this tick
+
+        XCTAssertTrue(
+            coordinator.snapshot.diagnostics.contains { $0.id == HistoryDiagnosticID.persistFailed },
+            "a tick that never forces a write must not falsely clear a still-current diagnostic"
+        )
+
+        clock.now += 100
+        await coordinator.applyScan([], scannedAt: clock.now) // closes again -> immediate persist, this time succeeding
+
+        XCTAssertFalse(
+            coordinator.snapshot.diagnostics.contains { $0.id == HistoryDiagnosticID.persistFailed },
+            "a later successful persist must clear the diagnostic"
+        )
+    }
+
+    /// A debounced save's failure happens entirely asynchronously,
+    /// outside any coordinator-invoked `record(_:)` call. It must still
+    /// become visible — on the very next `applyScan`, which reads
+    /// `HistoryStore.lastDiagnostic` fresh regardless of whether *that*
+    /// particular tick itself attempted a persist.
+    func testDebouncedHistorySaveFailureBecomesVisibleOnTheNextScan() async throws {
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let historyFS = InMemorySettingsFileSystem()
+        let scheduler = ManualHistoryScheduler()
+        let (coordinator, _, _) = await makeCoordinator(historyFileSystem: historyFS, historyScheduler: scheduler, clock: clock)
+        let agent = activeAgent()
+
+        await coordinator.applyScan([agent], scannedAt: clock.now) // opens the session; no delta yet, no save scheduled
+        clock.now += 2_000
+        await coordinator.applyScan([agent], scannedAt: clock.now) // delta 2000 -> schedules a debounced save
+        XCTAssertEqual(scheduler.pendingCount, 1)
+
+        await historyFS.setFailNextWrite(SettingsFileSystemError.other("disk full"))
+        await scheduler.fireAllPending() // the debounced save now runs (and fails) outside any coordinator call
+
+        XCTAssertFalse(
+            coordinator.snapshot.diagnostics.contains { $0.id == HistoryDiagnosticID.persistFailed },
+            "the coordinator has not yet reconciled this: no record(_:) call has run since the debounced save failed"
+        )
+
+        clock.now += 100
+        await coordinator.applyScan([agent], scannedAt: clock.now) // this tick's record() reconciles the now-stale diagnostic
+
+        XCTAssertTrue(
+            coordinator.snapshot.diagnostics.contains { $0.id == HistoryDiagnosticID.persistFailed },
+            "an earlier debounced save's failure must become visible on the very next applyScan"
+        )
     }
 
     // MARK: - Shutdown
