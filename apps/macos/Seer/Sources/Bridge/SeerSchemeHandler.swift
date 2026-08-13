@@ -355,8 +355,19 @@ public final class SeerSchemeHandler: NSObject, WKURLSchemeHandler {
     /// can only ever land in this set *before* its matching `start` call
     /// begins — this check exists as the same defense-in-depth guarantee
     /// regardless of how that timing might change in the future (e.g. if
-    /// loading ever became asynchronous).
+    /// loading ever became asynchronous). Every path that consults this
+    /// set — the stop-before-start early return in `webView(_:start:)` and
+    /// the terminal `defer` in `finish(_:taskID:requestURL:with:)` — also
+    /// prunes its entry, so this can never grow without bound across the
+    /// handler's lifetime no matter which ordering (`start`-then-`stop` or
+    /// `stop`-then-`start`) a given task takes.
     private var cancelledTasks: Set<ObjectIdentifier> = []
+
+    /// Test-only visibility into `cancelledTasks`' size, to prove it stays
+    /// pruned rather than growing unboundedly.
+    var cancelledTaskCountForTesting: Int {
+        cancelledTasks.count
+    }
 
     public init(rendererRoot: SeerRendererRoot) {
         self.rendererRoot = rendererRoot
@@ -364,7 +375,16 @@ public final class SeerSchemeHandler: NSObject, WKURLSchemeHandler {
 
     public func webView(_ webView: WKWebView, start urlSchemeTask: WKURLSchemeTask) {
         let taskID = ObjectIdentifier(urlSchemeTask)
-        guard !cancelledTasks.contains(taskID) else { return }
+        guard !cancelledTasks.contains(taskID) else {
+            // `stop` arrived before `start` — this is the terminal
+            // handling for this task (no callback is ever delivered, and
+            // `finish` will never run for it), so its entry must be
+            // pruned here. Leaving it behind would let `cancelledTasks`
+            // grow without bound over the process's lifetime for every
+            // task that happens to be stopped before it starts.
+            cancelledTasks.remove(taskID)
+            return
+        }
 
         guard let url = urlSchemeTask.request.url else {
             finish(urlSchemeTask, taskID: taskID, requestURL: nil, with: .failure(.invalidPathEncoding))

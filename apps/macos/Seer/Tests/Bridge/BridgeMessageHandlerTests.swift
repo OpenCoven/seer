@@ -1,4 +1,5 @@
 import XCTest
+import WebKit
 @testable import Seer
 
 /// A minimal, immediately-resolving `AppSnapshot` used across these tests
@@ -57,8 +58,25 @@ private final class FakeCommandRouter: BridgeCommandHandling {
         return keepAwakeModeSetOutcome
     }
 
+    /// Same continuation-gating mechanism as `snapshotGet` above, but for
+    /// `historyClear` — needed so a test can hold *two independent*
+    /// commands in flight simultaneously (e.g. two same-id requests for
+    /// different methods), which a single shared gate could not do.
+    var historyClearContinuation: CheckedContinuation<Void, Never>?
+    var historyClearAwaitsSignal = false
+
+    func resumeHistoryClear() {
+        historyClearContinuation?.resume()
+        historyClearContinuation = nil
+    }
+
     func historyClear() async -> BridgeSnapshotOutcome {
         historyClearCallCount += 1
+        if historyClearAwaitsSignal {
+            await withCheckedContinuation { continuation in
+                historyClearContinuation = continuation
+            }
+        }
         return historyClearOutcome
     }
 
@@ -622,5 +640,261 @@ final class BridgeMessageHandlerTests: XCTestCase {
             return XCTFail("expected app.quit to be unavailable")
         }
         XCTAssertEqual(quitError.code, .commandUnavailable)
+    }
+
+    // MARK: - BridgeMessageBodyValidator: non-recursive preflight before JSONSerialization
+
+    /// Builds `Any` where `depth` measures how many levels below the root
+    /// the leaf string sits (a `depth` of 0 is just `"leaf"` itself, a
+    /// `depth` of 1 is `["leaf"]`, etc.) — matching the exact semantics
+    /// `BridgeMessageBodyValidator.validate` bounds via `bridgeMaxBodyDepth`.
+    private func nestedArray(depth: Int) -> Any {
+        var value: Any = "leaf"
+        for _ in 0..<depth {
+            value = [value]
+        }
+        return value
+    }
+
+    func testValidatorAcceptsExactlyMaxDepth() {
+        XCTAssertTrue(BridgeMessageBodyValidator.validate(nestedArray(depth: bridgeMaxBodyDepth)))
+    }
+
+    func testValidatorRejectsOneDeeperThanMaxDepth() {
+        XCTAssertFalse(BridgeMessageBodyValidator.validate(nestedArray(depth: bridgeMaxBodyDepth + 1)))
+    }
+
+    /// A moderately deep (well past `bridgeMaxBodyDepth`, but nowhere near
+    /// large enough to risk a crash tearing this test's own fixture down)
+    /// nested native array — safe to construct and deallocate in an
+    /// `XCTest`'s own process. Exercises the validator's non-recursive
+    /// walk directly, independent of `handle(body:)`.
+    func testValidatorRejectsAModeratelyDeepNestedBodyWithoutCrashing() {
+        let deeplyNested = nestedArray(depth: 200)
+        XCTAssertFalse(BridgeMessageBodyValidator.validate(deeplyNested))
+    }
+
+    func testValidatorRejectsAWideNodeCountOverTheLimit() {
+        let wideArray = Array(repeating: "x", count: bridgeMaxBodyNodes + 10)
+        XCTAssertFalse(BridgeMessageBodyValidator.validate(wideArray))
+    }
+
+    func testValidatorAcceptsANodeCountAtTheLimit() {
+        // The root array itself counts as one node, so its elements may
+        // total at most `bridgeMaxBodyNodes - 1` while still fitting
+        // within `bridgeMaxBodyNodes` overall.
+        let wideArray = Array(repeating: "x", count: bridgeMaxBodyNodes - 1)
+        XCTAssertTrue(BridgeMessageBodyValidator.validate(wideArray))
+    }
+
+    func testValidatorRejectsANonStringDictionaryKey() {
+        let dictionaryWithIntKey = NSDictionary(dictionary: [1: "value"])
+        XCTAssertFalse(BridgeMessageBodyValidator.validate(dictionaryWithIntKey))
+    }
+
+    func testValidatorRejectsAMixOfStringAndNonStringDictionaryKeys() {
+        let mixedKeys = NSDictionary(dictionary: ["ok": "value", 2: "other"])
+        XCTAssertFalse(BridgeMessageBodyValidator.validate(mixedKeys))
+    }
+
+    func testValidatorRejectsAStringLongerThanTheMaximum() {
+        let tooLong = String(repeating: "a", count: bridgeMaxBodyStringLength + 1)
+        XCTAssertFalse(BridgeMessageBodyValidator.validate(["value": tooLong]))
+    }
+
+    func testValidatorAcceptsAStringExactlyAtTheMaximum() {
+        let atLimit = String(repeating: "a", count: bridgeMaxBodyStringLength)
+        XCTAssertTrue(BridgeMessageBodyValidator.validate(["value": atLimit]))
+    }
+
+    func testValidatorRejectsANonJSONCompatibleLeafValue() {
+        XCTAssertFalse(BridgeMessageBodyValidator.validate(NSObject()))
+        XCTAssertFalse(BridgeMessageBodyValidator.validate(Date()))
+        XCTAssertFalse(BridgeMessageBodyValidator.validate(Data([0x01, 0x02])))
+    }
+
+    /// The classic CFBoolean/`NSNumber` confusion: a real JSON boolean and
+    /// a real JSON number must both still validate correctly (neither
+    /// rejected nor conflated with the other) once boolean detection uses
+    /// `CFGetTypeID` rather than a bare `as? Bool` cast.
+    func testValidatorAcceptsBothBooleansAndNumbersDistinctly() {
+        XCTAssertTrue(BridgeMessageBodyValidator.validate(["flag": true, "count": 42, "ratio": 1.5]))
+    }
+
+    func testValidatorAcceptsNSNull() {
+        XCTAssertTrue(BridgeMessageBodyValidator.validate(NSNull()))
+    }
+
+    func testValidatorAcceptsAnOrdinaryWellFormedRequestBody() {
+        let body: [String: Any] = [
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "version": bridgeVersion,
+            "method": "keepAwakeMode.set",
+            "payload": ["mode": "display"],
+        ]
+        XCTAssertTrue(BridgeMessageBodyValidator.validate(body))
+    }
+
+    // MARK: - handle(body:): the validator gate runs before JSONSerialization
+
+    /// Proves the validator gate, not `JSONSerialization`/`BridgeRequestDecoder`,
+    /// is what rejects an over-deep body: the router is never invoked and
+    /// no response is ever delivered, exactly matching the "unserializable
+    /// body" drop behavior below it — an over-deep body never even
+    /// reaches the `JSONSerialization.isValidJSONObject` call, let alone
+    /// the decoder.
+    func testHandleDropsAnOverDeepBodyBeforeReachingTheRouterOrResponder() async {
+        let router = FakeCommandRouter()
+        let responder = FakeResponder()
+        let handler = BridgeMessageHandler(router: router, responder: responder)
+
+        handler.handle(body: nestedArray(depth: 200))
+        try? await Task.sleep(nanoseconds: 20_000_000)
+
+        XCTAssertEqual(responder.responses.count, 0)
+        XCTAssertEqual(router.snapshotGetCallCount, 0)
+        XCTAssertEqual(router.historyClearCallCount, 0)
+    }
+
+    func testHandleDropsAWideOverNodeCountBodyBeforeReachingTheRouterOrResponder() async {
+        let router = FakeCommandRouter()
+        let responder = FakeResponder()
+        let handler = BridgeMessageHandler(router: router, responder: responder)
+
+        handler.handle(body: Array(repeating: "x", count: bridgeMaxBodyNodes + 10))
+        try? await Task.sleep(nanoseconds: 20_000_000)
+
+        XCTAssertEqual(responder.responses.count, 0)
+        XCTAssertEqual(router.snapshotGetCallCount, 0)
+    }
+
+    // MARK: - BridgeContentWorld / BridgeMessageHandlerRegistration
+
+    private final class FakeScriptMessageHandlerRegistering: ScriptMessageHandlerRegistering {
+        private(set) var addedHandler: WKScriptMessageHandler?
+        private(set) var addedContentWorld: WKContentWorld?
+        private(set) var addedName: String?
+        private(set) var addCallCount = 0
+
+        func add(_ scriptMessageHandler: WKScriptMessageHandler, contentWorld: WKContentWorld, name: String) {
+            addCallCount += 1
+            addedHandler = scriptMessageHandler
+            addedContentWorld = contentWorld
+            addedName = name
+        }
+    }
+
+    func testBridgeContentWorldIsNeverThePageWorld() {
+        XCTAssertFalse(
+            BridgeContentWorld.bridge === WKContentWorld.page,
+            "the bridge handler must never be registered in the page content world"
+        )
+    }
+
+    func testRegistrationHelperWiresTheHandlerUnderTheBridgeContentWorldAndExactName() {
+        let router = FakeCommandRouter()
+        let responder = FakeResponder()
+        let handler = BridgeMessageHandler(router: router, responder: responder)
+        let registering = FakeScriptMessageHandlerRegistering()
+
+        BridgeMessageHandlerRegistration.register(handler, on: registering)
+
+        XCTAssertEqual(registering.addCallCount, 1)
+        XCTAssertTrue(registering.addedHandler === handler)
+        XCTAssertEqual(registering.addedName, BridgeMessageHandler.messageHandlerName)
+        XCTAssertTrue(registering.addedContentWorld === BridgeContentWorld.bridge)
+        XCTAssertFalse(registering.addedContentWorld === WKContentWorld.page, "must never register in .page")
+    }
+
+    // MARK: - stale task-map: three same-id requests must never double-respond
+
+    /// Reproduces the exact race the token-based `inFlightTasks` entries
+    /// guard against: request A is dispatched and left suspended
+    /// in-flight; request B (same id, a different method) supersedes it
+    /// and is also left suspended in-flight; A is *then* resumed and
+    /// allowed to run to completion first — its cleanup must not delete
+    /// B's now-current entry. Only then is request C (same id, a third
+    /// method) dispatched, which must correctly find and cancel B. Only
+    /// C's response may ever be delivered.
+    func testThreeSameIdRequestsResumingTheFirstBeforeTheSecondFinishesOnlyTheThirdResponds() async {
+        let router = FakeCommandRouter()
+        router.snapshotGetAwaitsSignal = true
+        router.historyClearAwaitsSignal = true
+        let responder = FakeResponder()
+        let handler = BridgeMessageHandler(router: router, responder: responder)
+        let sharedID = "550e8400-e29b-41d4-a716-446655440000"
+
+        // A: snapshot.get, held in flight.
+        handler.handle(body: ["id": sharedID, "version": bridgeVersion, "method": "snapshot.get", "payload": [String: Any]()])
+        for _ in 0..<50 where router.snapshotGetContinuation == nil {
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+        XCTAssertEqual(router.snapshotGetCallCount, 1)
+
+        // B: history.clear, same id — supersedes A, also held in flight.
+        handler.handle(body: ["id": sharedID, "version": bridgeVersion, "method": "history.clear", "payload": [String: Any]()])
+        for _ in 0..<50 where router.historyClearContinuation == nil {
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+        XCTAssertEqual(router.historyClearCallCount, 1)
+
+        // Resume A *before* B finishes. A's (superseded) cleanup must not
+        // remove B's entry from the in-flight map.
+        router.resumeSnapshotGet()
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(responder.responses.count, 0, "A was superseded and cancelled — it must never deliver a response")
+
+        // C: keepAwakeMode.set, same id, immediately resolving — must
+        // correctly find and cancel B (proving B's entry survived A's
+        // cleanup above), then take over the id.
+        handler.handle(body: [
+            "id": sharedID, "version": bridgeVersion, "method": "keepAwakeMode.set", "payload": ["mode": "display"],
+        ])
+        await responder.waitForResponses(count: 1)
+
+        // Now let B's (superseded, cancelled) continuation resume — it
+        // must not add a second response.
+        router.resumeHistoryClear()
+        try? await Task.sleep(nanoseconds: 30_000_000)
+
+        XCTAssertEqual(responder.responses.count, 1, "only C — the last of the three same-id requests — may ever respond")
+        XCTAssertEqual(router.keepAwakeModeSetCalls, [.display])
+        guard case .success(_, let result) = responder.responses[0], case .snapshot = result else {
+            return XCTFail("expected C's keepAwakeMode.set success response")
+        }
+    }
+
+    /// `cancelAll()` called during the same "orphan window" (A superseded
+    /// by B, A still resolving) must cancel whatever is currently tracked
+    /// (B) without crashing or ever delivering a response for either A or
+    /// B, and must leave the in-flight map empty afterward.
+    func testCancelAllDuringOrphanWindowCancelsTheCurrentEntryAndDeliversNoResponses() async {
+        let router = FakeCommandRouter()
+        router.snapshotGetAwaitsSignal = true
+        router.historyClearAwaitsSignal = true
+        let responder = FakeResponder()
+        let handler = BridgeMessageHandler(router: router, responder: responder)
+        let sharedID = "550e8400-e29b-41d4-a716-446655440000"
+
+        handler.handle(body: ["id": sharedID, "version": bridgeVersion, "method": "snapshot.get", "payload": [String: Any]()])
+        for _ in 0..<50 where router.snapshotGetContinuation == nil {
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+
+        handler.handle(body: ["id": sharedID, "version": bridgeVersion, "method": "history.clear", "payload": [String: Any]()])
+        for _ in 0..<50 where router.historyClearContinuation == nil {
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+
+        // cancelAll() during the orphan window — B is the currently
+        // tracked (superseding) entry; A is already-orphaned but still
+        // suspended.
+        handler.cancelAll()
+
+        router.resumeSnapshotGet()
+        router.resumeHistoryClear()
+        try? await Task.sleep(nanoseconds: 30_000_000)
+
+        XCTAssertEqual(responder.responses.count, 0, "cancelAll during the orphan window must suppress every pending response")
     }
 }

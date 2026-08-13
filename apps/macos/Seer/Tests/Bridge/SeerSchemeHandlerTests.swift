@@ -365,6 +365,25 @@ final class SeerSchemeHandlerTests: XCTestCase {
         XCTAssertEqual(task.terminalCallbackCount, 0, "a stopped task must never receive any callback")
     }
 
+    func testStopBeforeStartPrunesTheCancelledTaskEntryInsteadOfLeakingIt() throws {
+        try write("<!doctype html>", at: "standalone-window.html")
+        let handler = SeerSchemeHandler(rendererRoot: SeerRendererRoot(url: tempRoot))
+        let webView = WKWebView(frame: .zero)
+
+        for _ in 0..<25 {
+            let task = FakeSchemeTask(url: seerURL("/standalone-window.html"))
+            handler.webView(webView, stop: task)
+            handler.webView(webView, start: task)
+            XCTAssertEqual(task.terminalCallbackCount, 0)
+        }
+
+        XCTAssertEqual(
+            handler.cancelledTaskCountForTesting,
+            0,
+            "every stop-before-start task must be pruned from the cancelled set, not accumulate unboundedly"
+        )
+    }
+
     // MARK: - navigation policy
 
     func testNavigationPolicyAllowsOnlyTheExactInitialDocumentAsMainFrame() {

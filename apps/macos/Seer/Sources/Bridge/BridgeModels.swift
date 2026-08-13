@@ -20,6 +20,25 @@ public let bridgeMaxMessageBytes = 64 * 1024
 /// pathological ids.
 public let bridgeMaxIdLength = 128
 
+/// Maximum nesting depth `BridgeMessageBodyValidator` accepts in a raw
+/// `WKScriptMessage.body` before `JSONSerialization` (or any other
+/// recursive walk) is ever invoked on it. Chosen generously above what
+/// any real bridge request payload needs — every real payload is at most
+/// a few levels deep — while still closing off unbounded/pathological
+/// nesting.
+public let bridgeMaxBodyDepth = 32
+
+/// Maximum total number of values (containers and leaves alike)
+/// `BridgeMessageBodyValidator` will walk in a single raw body before
+/// rejecting it outright. Bounds both "one huge flat array/object" and
+/// "many small nested containers" the same way `bridgeMaxBodyDepth`
+/// bounds pure nesting depth.
+public let bridgeMaxBodyNodes = 2_048
+
+/// Maximum UTF-8 length of any individual JSON string value
+/// `BridgeMessageBodyValidator` accepts inside a raw body.
+public let bridgeMaxBodyStringLength = 8 * 1024
+
 /// Closed set of methods the standalone native host understands. Mirrors
 /// `BridgeMethod` in `renderer/bridge/standalone-renderer-bridge.ts`
 /// exactly — one raw case per wire method string, nothing else accepted.

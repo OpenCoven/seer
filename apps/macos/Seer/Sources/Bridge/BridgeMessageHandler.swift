@@ -1,6 +1,133 @@
 import Foundation
 import WebKit
 
+/// Iteratively (never recursively) validates that a raw
+/// `WKScriptMessage.body` is a JSON-compatible value before
+/// `JSONSerialization` — which itself walks the object graph recursively
+/// — or any `Mirror`-based reflection ever sees it. An explicit array-based
+/// stack stands in for recursion, so no amount of nesting in `body` can
+/// ever grow *this* call stack; `bridgeMaxBodyDepth` additionally bounds
+/// the logical nesting depth accepted, `bridgeMaxBodyNodes` bounds the
+/// total number of values walked (closing off "one huge flat array" as
+/// well as "many small nested containers"), and `bridgeMaxBodyStringLength`
+/// bounds any individual string leaf.
+///
+/// Accepts exactly the JSON-compatible universe: `String`-keyed
+/// dictionaries, arrays, strings, booleans, numbers, and `NSNull`.
+/// Anything else — a custom `NSObject` subclass, `Data`, `Date`, a
+/// dictionary with a non-`String` key, ... — is rejected.
+///
+/// This validator only protects *this process's* handling of `body` once
+/// it already exists as a native Foundation object graph. WebKit's own
+/// bridging of a JS value into that graph happens before this code ever
+/// runs, and — this is the residual, platform-owned risk a reviewer
+/// flagged — deallocating a sufficiently deep chain of nested
+/// `NSArray`/`NSDictionary` instances can itself recurse inside
+/// Foundation's own `dealloc`, entirely outside this validator's control.
+/// The bounds here stop this handler from *adding* a second recursive
+/// walk (`JSONSerialization`) on top of that pre-existing risk; they
+/// cannot retroactively undo work WebKit/Foundation already did
+/// constructing (or will do tearing down) the object graph itself. Task
+/// 12's isolated-content-world registration (`BridgeContentWorld`,
+/// `BridgeMessageHandlerRegistration` below) is the mitigation for that
+/// remaining surface: it keeps arbitrary page script from ever reaching
+/// this handler in the first place.
+enum BridgeMessageBodyValidator {
+    private static let cfBooleanTypeID = CFBooleanGetTypeID()
+
+    static func validate(_ root: Any) -> Bool {
+        var stack: [(value: Any, depth: Int)] = [(root, 0)]
+        var nodeCount = 1
+        guard nodeCount <= bridgeMaxBodyNodes else { return false }
+
+        while let (value, depth) = stack.popLast() {
+            guard depth <= bridgeMaxBodyDepth else { return false }
+
+            if value is NSNull {
+                continue
+            }
+            // Checked *before* the `NSNumber` case below: a plain numeric
+            // `NSNumber` can itself report success for `as? Bool` (the
+            // classic CFBoolean/NSNumber bridging confusion), so only
+            // `CFGetTypeID` reliably tells a real JSON boolean apart from
+            // a JSON number.
+            if CFGetTypeID(value as CFTypeRef) == cfBooleanTypeID {
+                continue
+            }
+            if let string = value as? String {
+                guard string.utf8.count <= bridgeMaxBodyStringLength else { return false }
+                continue
+            }
+            if value is NSNumber {
+                continue
+            }
+            if let array = value as? [Any] {
+                for element in array {
+                    nodeCount += 1
+                    guard nodeCount <= bridgeMaxBodyNodes else { return false }
+                    stack.append((element, depth + 1))
+                }
+                continue
+            }
+            if let dictionary = value as? [AnyHashable: Any] {
+                for (key, element) in dictionary {
+                    guard key is String else { return false }
+                    nodeCount += 1
+                    guard nodeCount <= bridgeMaxBodyNodes else { return false }
+                    stack.append((element, depth + 1))
+                }
+                continue
+            }
+            // Anything else is outside the JSON-compatible universe.
+            return false
+        }
+        return true
+    }
+}
+
+/// The single `WKContentWorld` `BridgeMessageHandler` may ever be
+/// registered under. Deliberately never `.page`: a script message handler
+/// registered in `.page` is callable by *any* script executing in the
+/// page's own JavaScript world — including a hostile script that somehow
+/// ends up running there (an XSS in the renderer bundle, or any future
+/// relaxation of `SeerNavigationPolicy`/`SeerSchemeResourceLoader`).
+/// Registering instead in this dedicated, named isolated world means only
+/// script explicitly executed *in that same world* (e.g. a trusted
+/// `WKUserScript` Task 12 injects there) can ever reach
+/// `window.webkit.messageHandlers.seerBridge.postMessage(...)` at all —
+/// page-world script has no visibility of a handler registered under a
+/// different content world.
+@MainActor
+public enum BridgeContentWorld {
+    public static let bridge: WKContentWorld = .world(name: "com.seer.bridge")
+}
+
+/// The minimal script-message-handler-registration capability
+/// `BridgeMessageHandlerRegistration` needs. `WKUserContentController`
+/// conforms via the extension below; tests inject a fake so the exact
+/// `(handler, contentWorld, name)` triple passed to `add` can be asserted
+/// without needing a real `WKUserContentController`.
+@MainActor
+public protocol ScriptMessageHandlerRegistering: AnyObject {
+    func add(_ scriptMessageHandler: WKScriptMessageHandler, contentWorld: WKContentWorld, name: String)
+}
+
+extension WKUserContentController: ScriptMessageHandlerRegistering {}
+
+/// The one sanctioned way to wire a `BridgeMessageHandler` into a
+/// `WKUserContentController`: always `BridgeMessageHandler
+/// .messageHandlerName`, in `BridgeContentWorld.bridge`, never any other
+/// name or content world. Task 12's real production wiring must call this
+/// rather than `WKUserContentController.add(_:contentWorld:name:)`
+/// directly, so a raw `.page`-world registration can never slip in
+/// silently.
+@MainActor
+public enum BridgeMessageHandlerRegistration {
+    public static func register(_ handler: BridgeMessageHandler, on controller: any ScriptMessageHandlerRegistering) {
+        controller.add(handler, contentWorld: BridgeContentWorld.bridge, name: BridgeMessageHandler.messageHandlerName)
+    }
+}
+
 /// Outcome of a bridge command that returns a fresh `AppSnapshot` on
 /// success (`snapshot.get`, `keepAwakeMode.set`, `history.clear`,
 /// `updates.check`) — matching `BridgeMethodResultMap` in the TS source.
@@ -146,20 +273,44 @@ public protocol BridgeResponding {
 public final class BridgeMessageHandler: NSObject, WKScriptMessageHandler {
     /// The exact script message handler name the renderer's `postMessage`
     /// calls target (`window.webkit.messageHandlers.seerBridge`), and the
-    /// name this handler must be registered under — in the `.page` content
-    /// world only, never any other content world.
+    /// name this handler must be registered under. Registration itself
+    /// must always go through `BridgeMessageHandlerRegistration.register`,
+    /// which pins the content world to `BridgeContentWorld.bridge` — never
+    /// `.page` — so this handler is only ever reachable by script running
+    /// in that dedicated isolated world, not by arbitrary page script.
     public static let messageHandlerName = "seerBridge"
 
     private let router: any BridgeCommandHandling
     private let responder: any BridgeResponding
 
-    /// In-flight command `Task`s, keyed by request id, so `cancelAll()` can
-    /// cooperatively cancel every still-running command — e.g. when the
-    /// owning web view is being torn down — without ever attempting a
-    /// response delivery against a gone-away renderer. A new request that
-    /// reuses an id still in flight supersedes (cancels) the older one
-    /// rather than allowing two competing responses for the same id.
-    private var inFlightTasks: [String: Task<Void, Never>] = [:]
+    /// One in-flight command `Task` entry, tagged with the monotonically
+    /// unique `token` it was created with. `token` (not just presence in
+    /// `inFlightTasks`) is what a completing task checks against before
+    /// removing its own entry — see `completeInFlight(id:token:)` — so a
+    /// superseded task's cleanup can never delete a *later* request's
+    /// still-in-flight entry for the same id.
+    private struct InFlightEntry {
+        let token: UInt64
+        let task: Task<Void, Never>
+    }
+
+    /// In-flight command task entries, keyed by request id, so
+    /// `cancelAll()` can cooperatively cancel every still-running command
+    /// — e.g. when the owning web view is being torn down — without ever
+    /// attempting a response delivery against a gone-away renderer. A new
+    /// request that reuses an id still in flight supersedes (cancels) the
+    /// older one rather than allowing two competing responses for the
+    /// same id.
+    private var inFlightTasks: [String: InFlightEntry] = [:]
+
+    /// Monotonically increasing source of `InFlightEntry.token` values.
+    /// Wraps on overflow (`&+`) rather than trapping — by the time this
+    /// would ever wrap, every token issued a full cycle ago is long gone
+    /// from `inFlightTasks`, so identity is preserved in practice; a
+    /// wrapped value is never treated as equal to a completely different,
+    /// still-tracked token because `inFlightTasks` never holds more than a
+    /// handful of entries at once.
+    private var nextInFlightToken: UInt64 = 0
 
     public init(router: any BridgeCommandHandling, responder: any BridgeResponding) {
         self.router = router
@@ -177,6 +328,16 @@ public final class BridgeMessageHandler: NSObject, WKScriptMessageHandler {
     /// tests can drive it with a synthetic body directly, without needing
     /// a real `WKUserContentController`/`WKScriptMessage` delivery.
     func handle(body: Any) {
+        // Run *before* `JSONSerialization` (and therefore before any
+        // recursive walk of `body` at all): an iterative, depth/width/
+        // string-length-bounded preflight. A body that fails this check is
+        // dropped with no response, for the exact same reason as an
+        // unserializable body below — no trustworthy id can be recovered
+        // from it, and the TS transport's pending request (if any) simply
+        // times out, exactly as if this message had never arrived.
+        guard BridgeMessageBodyValidator.validate(body) else {
+            return
+        }
         guard JSONSerialization.isValidJSONObject(body), let data = try? JSONSerialization.data(withJSONObject: body) else {
             // The body could not even be serialized back to JSON (e.g. it
             // is not a JSON object at all) — no request `id` can be
@@ -207,23 +368,43 @@ public final class BridgeMessageHandler: NSObject, WKScriptMessageHandler {
             // (wrong version, unknown method, or a known method's payload
             // shape) — respond immediately with a typed error so the
             // renderer's pending promise rejects now rather than waiting
-            // out the full timeout.
-            inFlightTasks[id]?.cancel()
+            // out the full timeout. This is itself the newest event for
+            // `id` — nothing can supersede it further since a response is
+            // delivered immediately with no new task created — so
+            // unconditionally cancelling and removing whatever was
+            // tracked for `id` is safe here (unlike a completing task's
+            // own cleanup, which must check its token first).
+            inFlightTasks[id]?.task.cancel()
             inFlightTasks.removeValue(forKey: id)
             responder.deliverResponse(.failure(id: id, error: error))
         }
     }
 
     private func dispatch(_ request: BridgeRequest) {
-        inFlightTasks[request.id]?.cancel()
+        // Cancel (but do not remove) whatever is currently tracked for
+        // this id: the entry is about to be overwritten below regardless.
+        inFlightTasks[request.id]?.task.cancel()
+        nextInFlightToken = nextInFlightToken &+ 1
+        let token = nextInFlightToken
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
-            defer { self.inFlightTasks.removeValue(forKey: request.id) }
+            defer { self.completeInFlight(id: request.id, token: token) }
             let response = await Self.execute(request, router: self.router)
             guard !Task.isCancelled else { return }
             self.responder.deliverResponse(response)
         }
-        inFlightTasks[request.id] = task
+        inFlightTasks[request.id] = InFlightEntry(token: token, task: task)
+    }
+
+    /// Removes `inFlightTasks[id]` only if it is still the exact entry
+    /// this dispatch created (`token` matches). A superseded task
+    /// completing *after* a newer request already replaced its entry for
+    /// the same id must never delete that newer entry — doing so is
+    /// exactly the stale-task-map bug where a third same-id request could
+    /// fail to cancel a second still-in-flight one, letting both respond.
+    private func completeInFlight(id: String, token: UInt64) {
+        guard inFlightTasks[id]?.token == token else { return }
+        inFlightTasks.removeValue(forKey: id)
     }
 
     private static func execute(_ request: BridgeRequest, router: any BridgeCommandHandling) async -> BridgeResponse {
@@ -273,8 +454,8 @@ public final class BridgeMessageHandler: NSObject, WKScriptMessageHandler {
     /// web view/window is torn down so no later `deliverResponse` call is
     /// ever attempted against a gone-away renderer.
     public func cancelAll() {
-        for task in inFlightTasks.values {
-            task.cancel()
+        for entry in inFlightTasks.values {
+            entry.task.cancel()
         }
         inFlightTasks.removeAll()
     }
