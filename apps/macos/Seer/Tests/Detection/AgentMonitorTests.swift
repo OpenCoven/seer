@@ -141,6 +141,90 @@ final class AgentMonitorTests: XCTestCase {
     }
 
 
+    /// A detector double whose `detect(now:)` suspends on a continuation
+    /// that only this test's explicit `release(with:)` call resumes — it
+    /// never observes or reacts to the surrounding task's cancellation.
+    /// Deliberately built without `withTaskCancellationHandler`, so
+    /// cancelling the task that calls `detect(now:)` (as `AgentMonitor`'s
+    /// detached detection task is, once the fix under test lands) has zero
+    /// effect on when this continuation resumes. This models a
+    /// non-cooperative detector that does not call
+    /// `Task.checkCancellation()` or otherwise poll `Task.isCancelled` —
+    /// exactly the failure mode the finding describes, where `stop()` must
+    /// not depend on the detector's cooperation to return promptly.
+    ///
+    /// Mirrors `ManualAgentMonitorScheduler` above: every state
+    /// transition (recording an entry, deciding whether to park or resume
+    /// immediately) happens inside one single lock acquisition, never
+    /// split across two, so a `release(with:)` racing a `detect(now:)`
+    /// call can never arm a pending release that nothing consumes nor
+    /// leave a continuation parked that nothing ever resumes.
+    private final class BlockingDetector: AgentDetecting, @unchecked Sendable {
+        private struct State {
+            var entryWaiters: [CheckedContinuation<Void, Never>] = []
+            var enteredCount = 0
+            var resultWaiters: [CheckedContinuation<[ActiveAgent], Never>] = []
+            var pendingReleases: [[ActiveAgent]] = []
+            var invocationCount = 0
+        }
+
+        private let state = OSAllocatedUnfairLock(initialState: State())
+
+        var invocationCount: Int { state.withLock { $0.invocationCount } }
+
+        /// Suspends until `detect(now:)` has been entered at least `count`
+        /// times — a continuation-based rendezvous, never a wall-clock
+        /// sleep or timeout, so tests can deterministically observe "the
+        /// detector is now blocked inside `detect(now:)`."
+        func waitUntilEntered(count: Int = 1) async {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                let resumeNow = state.withLock { s -> Bool in
+                    if s.enteredCount >= count { return true }
+                    s.entryWaiters.append(continuation)
+                    return false
+                }
+                if resumeNow { continuation.resume() }
+            }
+        }
+
+        /// Releases the currently-parked `detect(now:)` call with `result`,
+        /// or — if none is parked yet — arms the *next* call to return
+        /// `result` immediately, matching `ManualAgentMonitorScheduler
+        /// .advance()`'s semantics above.
+        func release(with result: [ActiveAgent]) {
+            let continuation = state.withLock { s -> CheckedContinuation<[ActiveAgent], Never>? in
+                if !s.resultWaiters.isEmpty {
+                    return s.resultWaiters.removeFirst()
+                }
+                s.pendingReleases.append(result)
+                return nil
+            }
+            continuation?.resume(returning: result)
+        }
+
+        func detect(now: Int64) async throws -> [ActiveAgent] {
+            let entryWaiters = state.withLock { s -> [CheckedContinuation<Void, Never>] in
+                s.invocationCount += 1
+                s.enteredCount += 1
+                let waiters = s.entryWaiters
+                s.entryWaiters.removeAll()
+                return waiters
+            }
+            for waiter in entryWaiters { waiter.resume() }
+
+            return await withCheckedContinuation { (continuation: CheckedContinuation<[ActiveAgent], Never>) in
+                let immediate = state.withLock { s -> [ActiveAgent]? in
+                    if !s.pendingReleases.isEmpty {
+                        return s.pendingReleases.removeFirst()
+                    }
+                    s.resultWaiters.append(continuation)
+                    return nil
+                }
+                if let immediate { continuation.resume(returning: immediate) }
+            }
+        }
+    }
+
     private let fixedNow: Int64 = 1_700_000_000_000
 
     private func activeAgent(id: String = "codex:/fixtures/a.jsonl") -> ActiveAgent {
@@ -347,5 +431,117 @@ final class AgentMonitorTests: XCTestCase {
         // has a fourth scripted result queued.
         invocationCount = await detector.invocationCount
         XCTAssertEqual(invocationCount, 3)
+    }
+
+    // MARK: - stop() must not hang on a non-cooperative in-flight detection
+
+    /// Reproduces the finding directly: `scan()`'s detached detection task
+    /// has independent cancellation from `loopTask`, so a detector that
+    /// never notices cancellation must not be able to make `stop()` hang.
+    /// Synchronization is entirely continuation/expectation-driven — the
+    /// `timeout:` below is only a safety net bound on the assertion, never
+    /// the mechanism proving promptness (a regressed `stop()` awaiting the
+    /// detector directly would still hang past it).
+    func testStopReturnsPromptlyWhileDetachedDetectionIsBlockedNonCooperatively() async {
+        let detector = BlockingDetector()
+        let monitor = AgentMonitor(detector: detector, clock: FixedClock(fixedMilliseconds: fixedNow))
+
+        await monitor.start()
+        await detector.waitUntilEntered() // the loop's first scan() is now blocked inside detect(now:)
+
+        let stopReturned = expectation(description: "stop() returns while the detector is still blocked")
+        Task {
+            await monitor.stop()
+            stopReturned.fulfill()
+        }
+        await fulfillment(of: [stopReturned], timeout: 5)
+
+        // stop() returned without the detector ever cooperating — prove
+        // the monitor's published state was never touched by the still-
+        // in-flight (now merely canceled, not resolved) detection.
+        let stateAfterStop = await monitor.state
+        XCTAssertEqual(stateAfterStop.agents, [], "no scan has resolved yet, so state must remain untouched")
+        let diagnosticAfterStop = await monitor.diagnostic
+        XCTAssertNil(diagnosticAfterStop)
+
+        // Now release the stale detector call and prove its result cannot
+        // mutate state/diagnostic after the fact, then prove the monitor
+        // is fully usable again afterward (no continuation left dangling,
+        // no permanent lockout).
+        let staleAgents = [activeAgent(id: "codex:/fixtures/stale.jsonl")]
+        detector.release(with: staleAgents)
+
+        // Drive a fresh, manual scan() to prove the monitor recovers.
+        // scan() silently no-ops while `isScanning` is still held by the
+        // stale, just-released call settling on the actor — so poll via
+        // cooperative yields (never a wall-clock sleep) until the second
+        // invocation actually lands, then arm its immediate result.
+        let freshAgents = [activeAgent(id: "codex:/fixtures/fresh.jsonl")]
+        detector.release(with: freshAgents) // arms the *next* call to return immediately
+        while await detector.invocationCount < 2 {
+            await monitor.scan()
+            await Task.yield()
+        }
+
+        let finalState = await monitor.state
+        XCTAssertEqual(finalState.agents, freshAgents, "only the fresh, post-stop scan may ever be published")
+        XCTAssertNotEqual(finalState.agents, staleAgents, "the stale, pre-stop detection must never win")
+    }
+
+    /// Complements the previous test: proves that a *second* `start()`
+    /// while the prior, canceled loop's detector call is still draining
+    /// does not create an overlapping second detector invocation — the
+    /// generation/`isScanning` isolation must hold even across a fresh
+    /// loop, not just within the original one.
+    func testStartAfterStopWhileDetectorStillDrainingNeverOverlaps() async {
+        let detector = BlockingDetector()
+        let monitor = AgentMonitor(detector: detector, clock: FixedClock(fixedMilliseconds: fixedNow))
+
+        await monitor.start()
+        await detector.waitUntilEntered()
+
+        await monitor.stop()
+
+        // Immediately start a new loop while the first (canceled) call is
+        // still parked inside detect(now:) — a naive implementation could
+        // let this spawn a second concurrent detector invocation.
+        await monitor.start()
+
+        // Give the new loop's own scan() attempts a chance to run; they
+        // must observe the still in-flight stale call and no-op rather
+        // than invoke the detector a second time.
+        for _ in 0..<50 { await Task.yield() }
+        XCTAssertEqual(detector.invocationCount, 1, "starting a new loop must never overlap with a still-draining prior detection")
+
+        detector.release(with: [])
+        await monitor.stop()
+    }
+
+    // MARK: - Manual scan() unaffected by an idle stop()
+
+    /// Documents the chosen scope: `stop()` only ever manages loop-driven
+    /// scans. A directly-invoked `scan()` call (never routed through
+    /// `start()`) is completely unaffected by a concurrent/idle `stop()`
+    /// call — `stop()` is a no-op whenever no loop is running, exactly as
+    /// `testStopIsIdempotentWhenNoLoopIsRunning` already establishes, and
+    /// that no-op must not reach into or cancel an independently-running
+    /// manual scan.
+    func testStopWithNoLoopRunningDoesNotAffectAConcurrentManualScan() async {
+        let detector = BlockingDetector()
+        let monitor = AgentMonitor(detector: detector, clock: FixedClock(fixedMilliseconds: fixedNow))
+
+        let manualScan = Task { await monitor.scan() }
+        await detector.waitUntilEntered()
+
+        // No loop was ever started, so this must be a pure no-op and must
+        // not cancel the manual scan's in-flight detection.
+        await monitor.stop()
+
+        let agents = [activeAgent(id: "codex:/fixtures/manual.jsonl")]
+        detector.release(with: agents)
+        await manualScan.value
+
+        let state = await monitor.state
+        XCTAssertEqual(state.agents, agents, "a manual scan() must complete normally when stop() never owned a loop")
     }
 }

@@ -91,6 +91,12 @@ public struct NativeSessionSnapshotSource: SessionSnapshotProviding {
 
         var evidence: [SessionTurnEvidence] = []
         for kind in AGENT_KINDS {
+            // Defense-in-depth only, checked once per family: this alone
+            // does not guarantee a prompt `AgentMonitor.stop()` return
+            // (`stop()` never awaits this task's cooperation), but it lets
+            // a cancelled traversal unwind between families rather than
+            // always walking every configured root to completion.
+            try Task.checkCancellation()
             switch kind.sessionFormat {
             case .none:
                 continue

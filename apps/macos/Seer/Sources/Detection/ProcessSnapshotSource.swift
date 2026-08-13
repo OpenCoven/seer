@@ -139,6 +139,11 @@ public struct LibProcProcessBackend: ProcessBackend {
         samples.reserveCapacity(count)
 
         for index in 0..<count {
+            // Defense-in-depth only: does not by itself guarantee a prompt
+            // `AgentMonitor.stop()` return (`stop()` never awaits this
+            // task's cooperation), but lets a cancelled scan unwind mid
+            // enumeration instead of always walking the full pid table.
+            try Task.checkCancellation()
             let pid = pids[index]
             guard pid > 0 else { continue }
             // A process that disappears or denies access between
@@ -350,6 +355,11 @@ public actor NativeProcessSnapshotSource: ProcessSnapshotProviding {
         results.reserveCapacity(min(raws.count, Self.maximumTrackedPIDs))
 
         for raw in raws {
+            // Defense-in-depth only: does not by itself guarantee a prompt
+            // `AgentMonitor.stop()` return (`stop()` never awaits this
+            // task's cooperation), but lets a cancelled scan unwind mid
+            // process-table walk instead of always finishing it.
+            try Task.checkCancellation()
             if raw.pid == ownPID { continue }
             guard results.count < Self.maximumTrackedPIDs else { break }
             seenPIDs.insert(raw.pid)

@@ -30,6 +30,14 @@ public struct AgentDetector: AgentDetecting {
     /// `AgentMonitor`, is responsible for retaining prior state on
     /// failure).
     public func detect(now: Int64) async throws -> [ActiveAgent] {
+        // Defense-in-depth only: this alone does not guarantee a prompt
+        // `AgentMonitor.stop()` return, since `stop()` never awaits this
+        // task's cooperation in the first place — see `AgentMonitor.scan()`
+        // and `stop()`. It simply lets a cancelled detached detection task
+        // unwind sooner when it does get scheduled, rather than running an
+        // otherwise-abandoned scan to completion.
+        try Task.checkCancellation()
+
         async let processSnapshotsTask = processes.snapshot()
         async let sessionEvidenceTask = sessions.snapshot(now: now)
         let (processSnapshots, sessionEvidence) = try await (processSnapshotsTask, sessionEvidenceTask)
@@ -48,6 +56,10 @@ public struct AgentDetector: AgentDetecting {
         var agents: [ActiveAgent] = []
 
         for kind in AGENT_KINDS {
+            // Same defense-in-depth rationale as above — checked once per
+            // family so a cancelled scan can unwind between families
+            // instead of always finishing the full merge.
+            try Task.checkCancellation()
             let kindProcesses = processesByFamily[kind.id] ?? []
             // Stable "first max" selection, matching a stable sort by
             // descending cpuPercent followed by taking the first element:

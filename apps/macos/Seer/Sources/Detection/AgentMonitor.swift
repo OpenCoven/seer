@@ -58,6 +58,23 @@ public actor AgentMonitor {
 
     private var isScanning = false
     private var loopTask: Task<Void, Never>?
+    /// The currently in-flight detached detection task, if any — tracked
+    /// separately from `loopTask` specifically so `stop()` can cancel *it*
+    /// directly. `Task.detached` work is not a child of `loopTask`, so
+    /// cancelling `loopTask` alone never propagates to this task; without
+    /// this reference `stop()` would have no way to signal cancellation to
+    /// a detector that is currently running.
+    private var activeDetection: Task<[ActiveAgent], Error>?
+    /// Monotonically incremented by `stop()` (never by `scan()` itself).
+    /// `scan()` captures the generation in effect when it starts and, once
+    /// its detection resolves (successfully, by throwing, or by being
+    /// cancelled), only applies the result to `state`/`diagnostic` if the
+    /// generation is unchanged. This is what makes a stale result from a
+    /// non-cooperative detector — one that keeps running well past
+    /// `stop()` having already returned — provably unable to mutate
+    /// published state: `stop()` bumps the generation *before* it returns,
+    /// so no later-resolving scan from before that point can ever match.
+    private var generation: UInt64 = 0
 
     public init(
         detector: any AgentDetecting,
@@ -87,6 +104,12 @@ public actor AgentMonitor {
     public func scan() async {
         guard !isScanning else { return }
         isScanning = true
+        // Snapshot the generation in effect *before* detection starts.
+        // `stop()` only ever increments `generation` (never `scan()`
+        // itself), so a later `stop()` call racing this in-flight scan
+        // deterministically invalidates the result this call is about to
+        // await — see the generation check below.
+        let myGeneration = generation
         defer { isScanning = false }
 
         let now = clock.nowMilliseconds()
@@ -103,9 +126,25 @@ public actor AgentMonitor {
         let detection = Task.detached(priority: .utility) {
             try await detector.detect(now: now)
         }
+        // Recorded so `stop()` can cancel this specific detached task
+        // directly. Since `isScanning` guarantees only one `scan()` call
+        // ever runs at a time, this property is exclusively owned by this
+        // call for its entire duration — nothing else writes it until this
+        // call's `defer` below clears it.
+        activeDetection = detection
+        defer { activeDetection = nil }
 
         do {
             let agents = try await detection.value
+            // A `stop()` that ran while this call was suspended above has
+            // already cancelled `detection` and bumped `generation` — its
+            // (possibly successful, possibly-thrown-CancellationError)
+            // result must never reach `state`/`diagnostic` at this point,
+            // regardless of how long the detector itself took to actually
+            // notice the cancellation. This is what keeps a non-cooperative
+            // detector's eventual, stale result from mutating published
+            // state after `stop()` has already returned to its caller.
+            guard generation == myGeneration else { return }
             state = AgentMonitorState(
                 active: !agents.isEmpty,
                 keepingAwake: state.keepingAwake,
@@ -115,6 +154,7 @@ public actor AgentMonitor {
             )
             diagnostic = nil
         } catch {
+            guard generation == myGeneration else { return }
             // Intentionally leave `state` untouched: the last successful
             // agent list is retained rather than replaced by an empty
             // list, so a transient scan failure never falsely reports
@@ -150,13 +190,33 @@ public actor AgentMonitor {
         await scheduler.sleep(milliseconds: Self.scanIntervalMilliseconds)
     }
 
-    /// Stops the periodic scan loop if one is running, cancelling it and
-    /// awaiting its exit so no detached loop work outlives this call.
-    /// Idempotent: calling `stop()` when no loop is running is a no-op.
+    /// Stops the periodic scan loop if one is running. Cancels the loop
+    /// task *and* the currently in-flight detached detection directly, but
+    /// deliberately never awaits either — a non-cooperative detector (one
+    /// that never checks `Task.isCancelled`) must never be able to make
+    /// `stop()` hang. `generation` is bumped first so that if a scan is
+    /// currently in flight, its eventual result (success, thrown error, or
+    /// `CancellationError`) can never be applied to `state`/`diagnostic`
+    /// once this method returns — see the generation check in `scan()`.
+    ///
+    /// `loopTask` is cleared immediately (not from within the loop itself)
+    /// so `start()` can begin a fresh loop right away; the old loop's task
+    /// keeps running in the background purely to notice its own
+    /// cancellation and exit — it never touches `loopTask` again, so it
+    /// can never clobber a newer loop's identity. Overlap between the old,
+    /// still-draining detection and any new loop's scans is prevented by
+    /// `isScanning`, which the old `scan()` call continues to hold until
+    /// its detection actually resolves, regardless of how long that takes.
+    ///
+    /// Idempotent: calling `stop()` when no loop is running is a no-op —
+    /// scoped intentionally to loop-driven scans, so a directly-invoked
+    /// `scan()` call (never routed through `start()`) is left untouched by
+    /// an idle `stop()`.
     public func stop() async {
         guard let loopTask else { return }
+        generation &+= 1
+        activeDetection?.cancel()
         loopTask.cancel()
-        await loopTask.value
         self.loopTask = nil
     }
 }
