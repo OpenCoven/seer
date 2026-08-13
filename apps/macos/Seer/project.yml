@@ -39,6 +39,10 @@ targets:
         MACOSX_DEPLOYMENT_TARGET: "14.0"
         MARKETING_VERSION: "$(MARKETING_VERSION)"
         CURRENT_PROJECT_VERSION: "$(CURRENT_PROJECT_VERSION)"
+    dependencies:
+      # Linked for SessionSnapshotSource's read-only Cursor `state.vscdb`
+      # access via the SQLite C API (never the `sqlite3` executable).
+      - sdk: libsqlite3.tbd
 
   SeerTests:
     type: bundle.unit-test
@@ -54,3 +58,6 @@ targets:
         TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Seer.app/Contents/MacOS/Seer"
     dependencies:
       - target: Seer
+      # Tests construct synthetic `state.vscdb` fixtures directly via the
+      # SQLite C API, so the test bundle needs the same linkage.
+      - sdk: libsqlite3.tbd
