@@ -1,0 +1,626 @@
+import XCTest
+@testable import Seer
+
+/// A minimal, immediately-resolving `AppSnapshot` used across these tests
+/// wherever only *some* valid snapshot value is needed, not a specific one.
+private func makeSnapshot(appVersion: String = "1.0.0-test") -> AppSnapshot {
+    .empty(version: appVersion)
+}
+
+/// A fully scriptable `BridgeCommandHandling` test double. Every method
+/// records its call and returns whatever outcome the test pre-configured,
+/// optionally suspending on `gate` (an `AsyncStreamContinuation`-backed
+/// signal) so tests can exercise cancellation of a still-in-flight
+/// command.
+@MainActor
+private final class FakeCommandRouter: BridgeCommandHandling {
+    private(set) var snapshotGetCallCount = 0
+    private(set) var keepAwakeModeSetCalls: [KeepAwakeMode] = []
+    private(set) var historyClearCallCount = 0
+    private(set) var updatesCheckCallCount = 0
+    private(set) var updatesOpenCallCount = 0
+    private(set) var panelHideCallCount = 0
+    private(set) var appQuitCallCount = 0
+
+    var snapshotGetOutcome: BridgeSnapshotOutcome = .success(makeSnapshot())
+    var keepAwakeModeSetOutcome: BridgeSnapshotOutcome = .success(makeSnapshot())
+    var historyClearOutcome: BridgeSnapshotOutcome = .success(makeSnapshot())
+    var updatesCheckOutcome: BridgeSnapshotOutcome = .failure(.unavailable)
+    var updatesOpenOutcome: BridgeVoidOutcome = .failure(.unavailable)
+    var panelHideOutcome: BridgeVoidOutcome = .failure(.unavailable)
+    var appQuitOutcome: BridgeVoidOutcome = .failure(.unavailable)
+
+    /// When non-nil, `snapshotGet()` awaits this continuation before
+    /// returning — lets a test hold a command "in flight" until it
+    /// explicitly resumes it, to exercise `cancelAll()`/superseding
+    /// dispatch behavior deterministically.
+    var snapshotGetContinuation: CheckedContinuation<Void, Never>?
+    var snapshotGetAwaitsSignal = false
+
+    func snapshotGet() async -> BridgeSnapshotOutcome {
+        snapshotGetCallCount += 1
+        if snapshotGetAwaitsSignal {
+            await withCheckedContinuation { continuation in
+                snapshotGetContinuation = continuation
+            }
+        }
+        return snapshotGetOutcome
+    }
+
+    func resumeSnapshotGet() {
+        snapshotGetContinuation?.resume()
+        snapshotGetContinuation = nil
+    }
+
+    func keepAwakeModeSet(_ mode: KeepAwakeMode) async -> BridgeSnapshotOutcome {
+        keepAwakeModeSetCalls.append(mode)
+        return keepAwakeModeSetOutcome
+    }
+
+    func historyClear() async -> BridgeSnapshotOutcome {
+        historyClearCallCount += 1
+        return historyClearOutcome
+    }
+
+    func updatesCheck() async -> BridgeSnapshotOutcome {
+        updatesCheckCallCount += 1
+        return updatesCheckOutcome
+    }
+
+    func updatesOpen() async -> BridgeVoidOutcome {
+        updatesOpenCallCount += 1
+        return updatesOpenOutcome
+    }
+
+    func panelHide() async -> BridgeVoidOutcome {
+        panelHideCallCount += 1
+        return panelHideOutcome
+    }
+
+    func appQuit() async -> BridgeVoidOutcome {
+        appQuitCallCount += 1
+        return appQuitOutcome
+    }
+}
+
+/// Collects every response `BridgeMessageHandler` delivers, in order —
+/// exact values, so tests can assert both "exactly one response" and its
+/// precise content.
+@MainActor
+private final class FakeResponder: BridgeResponding {
+    private(set) var responses: [BridgeResponse] = []
+
+    /// Resolved the next time `deliverResponse` is called, letting async
+    /// tests `await` a response instead of polling.
+    private var continuations: [CheckedContinuation<Void, Never>] = []
+
+    func deliverResponse(_ response: BridgeResponse) {
+        responses.append(response)
+        let waiting = continuations
+        continuations.removeAll()
+        for continuation in waiting {
+            continuation.resume()
+        }
+    }
+
+    /// Suspends until at least `count` responses have been delivered.
+    func waitForResponses(count: Int) async {
+        while responses.count < count {
+            await withCheckedContinuation { continuation in
+                continuations.append(continuation)
+            }
+        }
+    }
+}
+
+private func requestData(
+    id: String = "550e8400-e29b-41d4-a716-446655440000",
+    version: String = bridgeVersion,
+    method: String = "snapshot.get",
+    payload: [String: Any] = [:]
+) -> Data {
+    let object: [String: Any] = ["id": id, "version": version, "method": method, "payload": payload]
+    return try! JSONSerialization.data(withJSONObject: object)
+}
+
+@MainActor
+final class BridgeMessageHandlerTests: XCTestCase {
+    // MARK: - BridgeRequestDecoder: size gate before decode
+
+    func testOversizedBodyIsRejectedBeforeJSONDecodingIsAttempted() {
+        // Deliberately not even valid JSON syntax: if the size gate ran
+        // *after* attempting to decode, this would fail with `invalidJSON`
+        // instead. Getting `messageTooLarge` instead proves the size check
+        // runs first.
+        let oversized = Data(repeating: 0x7B, count: bridgeMaxMessageBytes + 1) // a run of '{' bytes
+        guard case .rejected(let id, let error) = BridgeRequestDecoder.decode(data: oversized) else {
+            return XCTFail("expected a rejection")
+        }
+        XCTAssertNil(id)
+        XCTAssertEqual(error.code, .messageTooLarge)
+    }
+
+    /// Payloads on this bridge are always small, closed shapes — there is
+    /// no way to construct an actually-valid request near the 64KiB limit
+    /// without violating the closed key-set rules tested elsewhere. This
+    /// instead asserts the boundary check itself is inclusive (`<=`) using
+    /// a normal, well-formed request far under the limit.
+    func testWellFormedRequestFarUnderTheSizeLimitIsAccepted() {
+        let data = requestData()
+        XCTAssertLessThanOrEqual(data.count, bridgeMaxMessageBytes)
+        guard case .accepted(let request) = BridgeRequestDecoder.decode(data: data) else {
+            return XCTFail("expected acceptance")
+        }
+        XCTAssertEqual(request.method, .snapshotGet)
+    }
+
+    // MARK: - BridgeRequestDecoder: malformed JSON / shape
+
+    func testMalformedJSONSyntaxIsRejectedAsInvalidJSON() {
+        let data = Data("{not valid json".utf8)
+        guard case .rejected(let id, let error) = BridgeRequestDecoder.decode(data: data) else {
+            return XCTFail("expected a rejection")
+        }
+        XCTAssertNil(id)
+        XCTAssertEqual(error.code, .invalidJSON)
+    }
+
+    func testNonObjectRootIsRejectedAsInvalidRequest() {
+        for data in [Data("[]".utf8), Data("\"hello\"".utf8), Data("42".utf8), Data("null".utf8)] {
+            guard case .rejected(let id, let error) = BridgeRequestDecoder.decode(data: data) else {
+                return XCTFail("expected a rejection for \(data)")
+            }
+            XCTAssertNil(id)
+            XCTAssertEqual(error.code, .invalidRequest)
+        }
+    }
+
+    func testExtraTopLevelKeyIsRejectedAsInvalidRequest() {
+        let object: [String: Any] = [
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "version": bridgeVersion,
+            "method": "snapshot.get",
+            "payload": [String: Any](),
+            "debug": true,
+        ]
+        let data = try! JSONSerialization.data(withJSONObject: object)
+        guard case .rejected(let id, let error) = BridgeRequestDecoder.decode(data: data) else {
+            return XCTFail("expected a rejection")
+        }
+        XCTAssertNil(id, "an extra top-level key means the id was never trusted enough to echo back")
+        XCTAssertEqual(error.code, .invalidRequest)
+    }
+
+    func testMissingTopLevelKeyIsRejectedAsInvalidRequest() {
+        let object: [String: Any] = [
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "version": bridgeVersion,
+            "payload": [String: Any](),
+        ]
+        let data = try! JSONSerialization.data(withJSONObject: object)
+        guard case .rejected(let id, let error) = BridgeRequestDecoder.decode(data: data) else {
+            return XCTFail("expected a rejection")
+        }
+        XCTAssertNil(id)
+        XCTAssertEqual(error.code, .invalidRequest)
+    }
+
+    func testNonStringTopLevelFieldIsRejectedAsInvalidRequest() {
+        let object: [String: Any] = [
+            "id": 12345,
+            "version": bridgeVersion,
+            "method": "snapshot.get",
+            "payload": [String: Any](),
+        ]
+        let data = try! JSONSerialization.data(withJSONObject: object)
+        guard case .rejected(let id, let error) = BridgeRequestDecoder.decode(data: data) else {
+            return XCTFail("expected a rejection")
+        }
+        XCTAssertNil(id)
+        XCTAssertEqual(error.code, .invalidRequest)
+    }
+
+    // MARK: - id validation
+
+    func testEmptyIdIsRejectedWithNoEchoableId() {
+        let data = requestData(id: "")
+        guard case .rejected(let id, let error) = BridgeRequestDecoder.decode(data: data) else {
+            return XCTFail("expected a rejection")
+        }
+        XCTAssertNil(id)
+        XCTAssertEqual(error.code, .invalidRequest)
+    }
+
+    func testOverlongIdIsRejectedWithNoEchoableId() {
+        let data = requestData(id: String(repeating: "a", count: bridgeMaxIdLength + 1))
+        guard case .rejected(let id, let error) = BridgeRequestDecoder.decode(data: data) else {
+            return XCTFail("expected a rejection")
+        }
+        XCTAssertNil(id)
+        XCTAssertEqual(error.code, .invalidRequest)
+    }
+
+    func testIdWithDisallowedCharactersIsRejectedWithNoEchoableId() {
+        let data = requestData(id: "not a uuid; drop table")
+        guard case .rejected(let id, let error) = BridgeRequestDecoder.decode(data: data) else {
+            return XCTFail("expected a rejection")
+        }
+        XCTAssertNil(id)
+        XCTAssertEqual(error.code, .invalidRequest)
+    }
+
+    // MARK: - version validation
+
+    func testWrongVersionIsRejectedAndEchoesTheValidId() {
+        let data = requestData(version: "seer.bridge.v2")
+        guard case .rejected(let id, let error) = BridgeRequestDecoder.decode(data: data) else {
+            return XCTFail("expected a rejection")
+        }
+        XCTAssertEqual(id, "550e8400-e29b-41d4-a716-446655440000")
+        XCTAssertEqual(error.code, .invalidVersion)
+    }
+
+    // MARK: - unknown method (including a dangerous-looking one)
+
+    func testUnknownMethodIsRejectedAndEchoesTheValidId() {
+        let data = requestData(method: "shell.execute")
+        guard case .rejected(let id, let error) = BridgeRequestDecoder.decode(data: data) else {
+            return XCTFail("expected a rejection")
+        }
+        XCTAssertEqual(id, "550e8400-e29b-41d4-a716-446655440000")
+        XCTAssertEqual(error.code, .unknownMethod)
+    }
+
+    // MARK: - payload exactness: empty-payload methods
+
+    func testEveryParameterlessMethodAcceptsOnlyAnExactlyEmptyPayload() {
+        for method in ["snapshot.get", "history.clear", "updates.check", "updates.open", "panel.hide", "app.quit"] {
+            let data = requestData(method: method, payload: [:])
+            guard case .accepted(let request) = BridgeRequestDecoder.decode(data: data) else {
+                return XCTFail("expected acceptance for \(method)")
+            }
+            XCTAssertEqual(request.payload, .empty)
+        }
+    }
+
+    func testExtraKeyInEmptyPayloadIsRejectedAsInvalidPayloadAndEchoesTheId() {
+        let data = requestData(method: "history.clear", payload: ["extra": "value"])
+        guard case .rejected(let id, let error) = BridgeRequestDecoder.decode(data: data) else {
+            return XCTFail("expected a rejection")
+        }
+        XCTAssertEqual(id, "550e8400-e29b-41d4-a716-446655440000")
+        XCTAssertEqual(error.code, .invalidPayload)
+    }
+
+    func testNonObjectPayloadIsRejectedAsInvalidPayload() {
+        for payloadJSON in ["[]", "null", "\"x\"", "1"] {
+            let object = "{\"id\":\"550e8400-e29b-41d4-a716-446655440000\",\"version\":\"\(bridgeVersion)\",\"method\":\"snapshot.get\",\"payload\":\(payloadJSON)}"
+            let data = Data(object.utf8)
+            guard case .rejected(_, let error) = decodeAsRejection(data) else {
+                return XCTFail("expected a rejection for payload \(payloadJSON)")
+            }
+            XCTAssertEqual(error.code, .invalidPayload, "payload \(payloadJSON) should be rejected as invalid_payload")
+        }
+    }
+
+    private func decodeAsRejection(_ data: Data) -> BridgeDecodeOutcome {
+        BridgeRequestDecoder.decode(data: data)
+    }
+
+    // MARK: - payload exactness: keepAwakeMode.set
+
+    func testKeepAwakeModeSetAcceptsExactlySystemOrDisplay() {
+        for (raw, expected) in [("system", KeepAwakeMode.system), ("display", KeepAwakeMode.display)] {
+            let data = requestData(method: "keepAwakeMode.set", payload: ["mode": raw])
+            guard case .accepted(let request) = BridgeRequestDecoder.decode(data: data) else {
+                return XCTFail("expected acceptance for mode \(raw)")
+            }
+            XCTAssertEqual(request.payload, .keepAwakeMode(expected))
+        }
+    }
+
+    func testKeepAwakeModeSetMissingModeKeyIsRejectedAsInvalidPayload() {
+        let data = requestData(method: "keepAwakeMode.set", payload: [:])
+        guard case .rejected(let id, let error) = BridgeRequestDecoder.decode(data: data) else {
+            return XCTFail("expected a rejection")
+        }
+        XCTAssertEqual(id, "550e8400-e29b-41d4-a716-446655440000")
+        XCTAssertEqual(error.code, .invalidPayload)
+    }
+
+    func testKeepAwakeModeSetExtraKeyIsRejectedAsInvalidPayload() {
+        let data = requestData(method: "keepAwakeMode.set", payload: ["mode": "system", "extra": 1])
+        guard case .rejected(_, let error) = decodeAsRejection(data) else {
+            return XCTFail("expected a rejection")
+        }
+        XCTAssertEqual(error.code, .invalidPayload)
+    }
+
+    func testKeepAwakeModeSetUnrecognizedModeStringIsRejectedAsInvalidPayload() {
+        let data = requestData(method: "keepAwakeMode.set", payload: ["mode": "not-a-mode"])
+        guard case .rejected(_, let error) = decodeAsRejection(data) else {
+            return XCTFail("expected a rejection")
+        }
+        XCTAssertEqual(error.code, .invalidPayload)
+    }
+
+    /// The classic Foundation NSNumber pitfall: a JSON boolean must never
+    /// be silently accepted where a string (`mode`) is expected, nor vice
+    /// versa. `JSONDecoder`'s `decode(String.self, forKey:)` genuinely
+    /// requires a JSON string token — a JSON `true`/`false`/number token
+    /// throws a type mismatch rather than being coerced.
+    func testKeepAwakeModeBooleanValueIsRejectedNotCoerced() {
+        let object: [String: Any] = [
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "version": bridgeVersion,
+            "method": "keepAwakeMode.set",
+            "payload": ["mode": true],
+        ]
+        let data = try! JSONSerialization.data(withJSONObject: object)
+        guard case .rejected(_, let error) = decodeAsRejection(data) else {
+            return XCTFail("expected a rejection")
+        }
+        XCTAssertEqual(error.code, .invalidPayload)
+    }
+
+    func testKeepAwakeModeNumericValueIsRejectedNotCoerced() {
+        let data = requestData(method: "keepAwakeMode.set", payload: ["mode": 1])
+        guard case .rejected(_, let error) = decodeAsRejection(data) else {
+            return XCTFail("expected a rejection")
+        }
+        XCTAssertEqual(error.code, .invalidPayload)
+    }
+
+    func testKeepAwakeModeNullValueIsRejectedNotCoerced() {
+        let object = "{\"id\":\"550e8400-e29b-41d4-a716-446655440000\",\"version\":\"\(bridgeVersion)\",\"method\":\"keepAwakeMode.set\",\"payload\":{\"mode\":null}}"
+        guard case .rejected(_, let error) = decodeAsRejection(Data(object.utf8)) else {
+            return XCTFail("expected a rejection")
+        }
+        XCTAssertEqual(error.code, .invalidPayload)
+    }
+
+    func testKeepAwakeModeArrayValueIsRejectedNotCoerced() {
+        let data = requestData(method: "keepAwakeMode.set", payload: ["mode": ["system"]])
+        guard case .rejected(_, let error) = decodeAsRejection(data) else {
+            return XCTFail("expected a rejection")
+        }
+        XCTAssertEqual(error.code, .invalidPayload)
+    }
+
+    // MARK: - BridgeMessageHandler: routing + exactly-one-response
+
+    func testValidSnapshotGetRequestIsRoutedAndProducesASuccessResponse() async {
+        let router = FakeCommandRouter()
+        let snapshot = makeSnapshot(appVersion: "9.9.9")
+        router.snapshotGetOutcome = .success(snapshot)
+        let responder = FakeResponder()
+        let handler = BridgeMessageHandler(router: router, responder: responder)
+
+        handler.handle(body: ["id": "550e8400-e29b-41d4-a716-446655440000", "version": bridgeVersion, "method": "snapshot.get", "payload": [String: Any]()])
+        await responder.waitForResponses(count: 1)
+
+        XCTAssertEqual(router.snapshotGetCallCount, 1)
+        XCTAssertEqual(responder.responses.count, 1)
+        XCTAssertEqual(responder.responses[0], .success(id: "550e8400-e29b-41d4-a716-446655440000", result: .snapshot(snapshot)))
+    }
+
+    func testKeepAwakeModeSetRequestPassesTheDecodedMode() async {
+        let router = FakeCommandRouter()
+        let responder = FakeResponder()
+        let handler = BridgeMessageHandler(router: router, responder: responder)
+
+        handler.handle(body: [
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "version": bridgeVersion,
+            "method": "keepAwakeMode.set",
+            "payload": ["mode": "display"],
+        ])
+        await responder.waitForResponses(count: 1)
+
+        XCTAssertEqual(router.keepAwakeModeSetCalls, [.display])
+    }
+
+    func testHistoryClearRequestRoutesToTheRouter() async {
+        let router = FakeCommandRouter()
+        let responder = FakeResponder()
+        let handler = BridgeMessageHandler(router: router, responder: responder)
+
+        handler.handle(body: ["id": "550e8400-e29b-41d4-a716-446655440000", "version": bridgeVersion, "method": "history.clear", "payload": [String: Any]()])
+        await responder.waitForResponses(count: 1)
+
+        XCTAssertEqual(router.historyClearCallCount, 1)
+    }
+
+    func testVoidMethodsResolveWithResultNone() async {
+        let router = FakeCommandRouter()
+        router.updatesOpenOutcome = .success(())
+        let responder = FakeResponder()
+        let handler = BridgeMessageHandler(router: router, responder: responder)
+
+        handler.handle(body: ["id": "550e8400-e29b-41d4-a716-446655440000", "version": bridgeVersion, "method": "updates.open", "payload": [String: Any]()])
+        await responder.waitForResponses(count: 1)
+
+        XCTAssertEqual(responder.responses[0], .success(id: "550e8400-e29b-41d4-a716-446655440000", result: .none))
+    }
+
+    func testNotYetImplementedCommandsReportCommandUnavailableByDefault() async {
+        let router = FakeCommandRouter()
+        let responder = FakeResponder()
+        let handler = BridgeMessageHandler(router: router, responder: responder)
+
+        for method in ["updates.check", "panel.hide", "app.quit"] {
+            let id = UUID().uuidString
+            handler.handle(body: ["id": id, "version": bridgeVersion, "method": method, "payload": [String: Any]()])
+        }
+        await responder.waitForResponses(count: 3)
+
+        XCTAssertEqual(responder.responses.count, 3)
+        for response in responder.responses {
+            guard case .failure(_, let error) = response else {
+                return XCTFail("expected a failure response for \(response)")
+            }
+            XCTAssertEqual(error.code, .commandUnavailable)
+        }
+    }
+
+    func testUnknownMethodShellExecuteNeverReachesTheRouterAndRespondsUnknownMethod() async {
+        let router = FakeCommandRouter()
+        let responder = FakeResponder()
+        let handler = BridgeMessageHandler(router: router, responder: responder)
+
+        handler.handle(body: ["id": "550e8400-e29b-41d4-a716-446655440000", "version": bridgeVersion, "method": "shell.execute", "payload": [String: Any]()])
+        await responder.waitForResponses(count: 1)
+
+        XCTAssertEqual(router.snapshotGetCallCount, 0)
+        XCTAssertEqual(router.historyClearCallCount, 0)
+        guard case .failure(let id, let error) = responder.responses[0] else {
+            return XCTFail("expected a failure response")
+        }
+        XCTAssertEqual(id, "550e8400-e29b-41d4-a716-446655440000")
+        XCTAssertEqual(error.code, .unknownMethod)
+    }
+
+    func testMalformedMessageWithNoTrustworthyIdIsDroppedWithoutAnyResponse() async {
+        let router = FakeCommandRouter()
+        let responder = FakeResponder()
+        let handler = BridgeMessageHandler(router: router, responder: responder)
+
+        handler.handle(body: ["not": "a bridge request"])
+        // Give any (incorrectly) scheduled work a turn to run.
+        try? await Task.sleep(nanoseconds: 20_000_000)
+
+        XCTAssertEqual(responder.responses.count, 0)
+        XCTAssertEqual(router.snapshotGetCallCount, 0)
+    }
+
+    func testUnserializableBodyIsDroppedWithoutAnyResponse() async {
+        let router = FakeCommandRouter()
+        let responder = FakeResponder()
+        let handler = BridgeMessageHandler(router: router, responder: responder)
+
+        // `NSObject()` cannot be represented as a JSON object at all.
+        handler.handle(body: NSObject())
+        try? await Task.sleep(nanoseconds: 20_000_000)
+
+        XCTAssertEqual(responder.responses.count, 0)
+    }
+
+    // MARK: - cancellation / exactly-one-response under supersession
+
+    func testCancelAllPreventsAResponseForAStillInFlightCommand() async {
+        let router = FakeCommandRouter()
+        router.snapshotGetAwaitsSignal = true
+        let responder = FakeResponder()
+        let handler = BridgeMessageHandler(router: router, responder: responder)
+
+        handler.handle(body: ["id": "550e8400-e29b-41d4-a716-446655440000", "version": bridgeVersion, "method": "snapshot.get", "payload": [String: Any]()])
+
+        // Let the dispatched Task actually start and reach the point
+        // where it is suspended awaiting the router's continuation.
+        for _ in 0..<50 where router.snapshotGetContinuation == nil {
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+        XCTAssertEqual(router.snapshotGetCallCount, 1)
+
+        handler.cancelAll()
+        router.resumeSnapshotGet()
+
+        // Give the (now-cancelled) task a chance to run to completion if
+        // it incorrectly ignored cancellation.
+        try? await Task.sleep(nanoseconds: 30_000_000)
+
+        XCTAssertEqual(responder.responses.count, 0, "a cancelled in-flight command must never still deliver a response")
+    }
+
+    func testASecondRequestWithTheSameIdSupersedesTheFirstRatherThanDoubleResponding() async {
+        let router = FakeCommandRouter()
+        router.snapshotGetAwaitsSignal = true
+        let responder = FakeResponder()
+        let handler = BridgeMessageHandler(router: router, responder: responder)
+        let sharedID = "550e8400-e29b-41d4-a716-446655440000"
+
+        handler.handle(body: ["id": sharedID, "version": bridgeVersion, "method": "snapshot.get", "payload": [String: Any]()])
+        for _ in 0..<50 where router.snapshotGetContinuation == nil {
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+
+        // A second request reusing the same id, this time for a different
+        // (immediately-resolving) method, should supersede the first.
+        router.historyClearOutcome = .success(makeSnapshot(appVersion: "second"))
+        handler.handle(body: ["id": sharedID, "version": bridgeVersion, "method": "history.clear", "payload": [String: Any]()])
+        await responder.waitForResponses(count: 1)
+
+        // Now let the first (superseded, cancelled) command's continuation
+        // resume — it must not add a second response for the same id.
+        router.resumeSnapshotGet()
+        try? await Task.sleep(nanoseconds: 30_000_000)
+
+        XCTAssertEqual(responder.responses.count, 1, "only the superseding request should ever produce a response")
+        XCTAssertEqual(responder.responses[0], .success(id: sharedID, result: .snapshot(makeSnapshot(appVersion: "second"))))
+    }
+
+    // MARK: - Wiring against the real Task 9 AppSnapshotCoordinator
+
+    func testStandaloneBridgeCommandRouterForCoordinatorWiresSnapshotGetKeepAwakeModeSetAndHistoryClear() async {
+        let settingsFileSystem = InMemorySettingsFileSystem()
+        let historyFileSystem = InMemorySettingsFileSystem()
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let settingsStore = SettingsStore(
+            store: AtomicJSONStore<SettingsDocument>(
+                fileURL: URL(fileURLWithPath: "/Bridge-Coordinator-Test/settings.json"),
+                fileSystem: settingsFileSystem,
+                clock: clock
+            )
+        )
+        let historyStore = HistoryStore(
+            store: AtomicJSONStore<HistoryDocument>(
+                fileURL: URL(fileURLWithPath: "/Bridge-Coordinator-Test/history.json"),
+                fileSystem: historyFileSystem,
+                clock: clock
+            ),
+            clock: clock,
+            scheduler: ManualHistoryScheduler(),
+            idGenerator: SequentialHistorySessionIDGenerator()
+        )
+        let power = PowerAssertionService(backend: AppSnapshotCoordinatorTests.CoordinatorFakePowerBackend())
+        final class CollectingSink: AppSnapshotRendererSink {
+            func emit(_ snapshot: AppSnapshot) {}
+        }
+        let coordinator = await AppSnapshotCoordinator.makeAtStartup(
+            settingsStore: settingsStore,
+            historyStore: historyStore,
+            power: power,
+            renderer: CollectingSink(),
+            clock: clock,
+            appVersion: "1.2.3"
+        )
+
+        let router = StandaloneBridgeCommandRouter.forCoordinator(coordinator)
+
+        guard case .success(let initialSnapshot) = await router.snapshotGet() else {
+            return XCTFail("expected snapshot.get to succeed")
+        }
+        XCTAssertEqual(initialSnapshot.appVersion, "1.2.3")
+
+        guard case .success(let afterMode) = await router.keepAwakeModeSet(.display) else {
+            return XCTFail("expected keepAwakeMode.set to succeed")
+        }
+        XCTAssertEqual(afterMode.monitor.keepAwakeMode, .display)
+
+        guard case .success(let afterClear) = await router.historyClear() else {
+            return XCTFail("expected history.clear to succeed")
+        }
+        XCTAssertEqual(afterClear.history.sessionCount, 0)
+
+        // Not-yet-implemented commands remain stubbed as unavailable even
+        // when the router is wired to a real coordinator.
+        guard case .failure(let updatesError) = await router.updatesCheck() else {
+            return XCTFail("expected updates.check to be unavailable")
+        }
+        XCTAssertEqual(updatesError.code, .commandUnavailable)
+        guard case .failure(let quitError) = await router.appQuit() else {
+            return XCTFail("expected app.quit to be unavailable")
+        }
+        XCTAssertEqual(quitError.code, .commandUnavailable)
+    }
+}
