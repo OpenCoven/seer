@@ -98,6 +98,34 @@ public actor UpdateService {
     private let currentVersion: SemanticVersion
     private let releaseOpener: any ReleaseURLOpening
     private var isChecking = false
+    /// How many `check(force:)` calls currently have a network round-trip
+    /// in flight (i.e. have passed the 24h gate above and are somewhere
+    /// between `session.data(for:)`'s call and return) — tracked as a
+    /// count, not a bool, because an actor is reentrant across `await`:
+    /// two overlapping `check(force:)` calls can each be mid-flight at
+    /// once, and the first one to *return* must not report `isChecking =
+    /// false` while the second is still outstanding.
+    private var activeCheckCount = 0
+    /// Monotonically increases every time a `check(force:)` call actually
+    /// starts a network round-trip (i.e. every time `activeCheckCount`
+    /// above is incremented). Each such call captures its own value
+    /// (`myGeneration`) before awaiting `session.data(for:)`, and only
+    /// persists its result if `generation` is *still* exactly that value
+    /// once the await returns — i.e. only if no other `check(force:)` call
+    /// started in the meantime. Because actors are reentrant across
+    /// `await`, two overlapping calls (e.g. a manual/scheduled stable-
+    /// stream check racing a `setIncludePrerelease(true)` switch to the
+    /// prerelease stream) can each have a request in flight at once, and
+    /// whichever *returns* first is not necessarily the one whose
+    /// ETag/release should end up persisted: persisting completion order
+    /// instead of start order would let an older, slower request stomp a
+    /// newer one's fresher result, or let one stream's ETag land after a
+    /// switch to the other stream. This makes the call that *started*
+    /// last always win — never the one that merely *finishes* last — and
+    /// every stale/superseded call instead returns whatever the winning
+    /// call (or, if it hasn't completed yet, whatever was already
+    /// persisted) ends up leaving in `SettingsStore`.
+    private var generation: Int64 = 0
 
     public init(
         settingsStore: SettingsStore,
@@ -205,8 +233,30 @@ public actor UpdateService {
             etag: settings.updateETag
         )
 
+        // See `generation`'s documentation: this call's own "ticket",
+        // captured before the network round-trip begins. Only a call
+        // whose ticket is still the most recently issued one, once its
+        // round-trip completes, is allowed to persist.
+        generation += 1
+        let myGeneration = generation
+        activeCheckCount += 1
         isChecking = true
-        defer { isChecking = false }
+        // Every normal-return exit below calls `finishActiveCheck()`
+        // itself *before* computing its `currentState()` return value —
+        // exactly like the explicit `isChecking = false` this replaced —
+        // so that value reflects this call's own completion rather than
+        // whatever was still true at the moment `await currentState()`
+        // began evaluating. `didFinishActiveCheck` then makes this `defer`
+        // a no-op on those paths, while still catching every thrown-error
+        // exit (which never calls `finishActiveCheck()` itself).
+        var didFinishActiveCheck = false
+        func finishActiveCheck() {
+            guard !didFinishActiveCheck else { return }
+            didFinishActiveCheck = true
+            activeCheckCount -= 1
+            isChecking = activeCheckCount > 0
+        }
+        defer { finishActiveCheck() }
 
         let data: Data
         let response: URLResponse
@@ -221,13 +271,23 @@ public actor UpdateService {
         }
 
         if httpResponse.statusCode == 304 {
+            // A newer `check(force:)` call has started since this one
+            // began — its own result (whether already persisted or still
+            // in flight) must win. This call's own (now-stale) 304 must
+            // not touch `SettingsStore` at all, and its return value
+            // reflects whatever is currently persisted instead of its own
+            // discarded outcome.
+            guard myGeneration == generation else {
+                finishActiveCheck()
+                return await currentState()
+            }
             let completedAt = clock.nowMilliseconds()
             try await settingsStore.recordUpdateCheck(
                 etag: settings.updateETag,
                 lastCheckedAt: completedAt,
                 release: settings.lastRelease
             )
-            isChecking = false
+            finishActiveCheck()
             return await currentState()
         }
 
@@ -247,6 +307,16 @@ public actor UpdateService {
             throw UpdateCheckError.malformedReleasePayload
         }
 
+        // Same staleness check as the 304 branch above, for the same
+        // reason: a newer call started while this one's request was still
+        // in flight, so this (older) call's freshly-fetched 200 result
+        // must not overwrite whatever that newer call has (or will)
+        // persist.
+        guard myGeneration == generation else {
+            finishActiveCheck()
+            return await currentState()
+        }
+
         let selected = Self.selectBestRelease(from: releases)
         let newEtag = httpResponse.value(forHTTPHeaderField: "Etag")
 
@@ -259,7 +329,7 @@ public actor UpdateService {
 
         let completedAt = clock.nowMilliseconds()
         try await settingsStore.recordUpdateCheck(etag: newEtag, lastCheckedAt: completedAt, release: persistedRelease)
-        isChecking = false
+        finishActiveCheck()
         return await currentState()
     }
 

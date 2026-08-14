@@ -87,3 +87,94 @@ final class FakeUpdateSchedulerControlling: UpdateSchedulerControlling, @uncheck
     func start() async { startCallCount += 1 }
     func stop() async { stopCallCount += 1 }
 }
+
+/// A controllable `UpdateChecking` test double whose `check(force:)` call
+/// suspends indefinitely — genuinely, via a `CheckedContinuation`, not
+/// merely a `Task.yield()` loop — until the test explicitly resolves it
+/// (`resolve(with:)`) or rejects it (`reject(with:)`). Lets a test hold a
+/// coordinator's in-flight update check open across some other operation
+/// (e.g. `shutdown()`) before letting it complete, to reproduce races that
+/// only manifest when the update service's own network round-trip is
+/// still outstanding at the exact moment shutdown happens — something
+/// `FakeUpdateChecking`'s always-synchronous `check(force:)` can never
+/// model. An `actor` (not `@unchecked Sendable`) since, unlike the other
+/// fakes here, its state genuinely is accessed from more than one
+/// concurrent caller (the coordinator's in-flight call and the test's own
+/// `resolve`/`reject`/`waitForCall`).
+///
+/// The very first `check(force:)` call resolves immediately with
+/// `currentStateValue` rather than suspending: `AppSnapshotCoordinator
+/// .makeAtStartup(...)` (which `AppSnapshotCoordinatorTests.makeCoordinator`
+/// always goes through) itself performs one synchronous startup check as
+/// part of *constructing* the coordinator, awaiting its result before
+/// ever returning — so a fake that suspended unconditionally on every call
+/// would hang that construction forever, with no continuation ever
+/// registered for a test to resolve. Only the *second* and later calls
+/// (i.e. whichever explicit `checkForUpdates(force:)`/scheduled call a
+/// test itself triggers, once it already holds a constructed coordinator)
+/// actually suspend.
+actor SuspendableUpdateChecking: UpdateChecking {
+    private(set) var checkCallCount = 0
+    private(set) var checkForceValues: [Bool] = []
+    var currentStateValue = UpdateState(checking: false, availableVersion: nil, releaseURL: nil, lastCheckedAt: nil)
+
+    private var pendingCheckContinuation: CheckedContinuation<UpdateState, Error>?
+    private var waitingForCallContinuation: CheckedContinuation<Void, Never>?
+    /// How many suspended (i.e. not auto-resolved) calls have been made so
+    /// far — distinct from `checkCallCount`, which also counts the
+    /// auto-resolved startup call. `waitForCall()` waits on this, not on
+    /// `checkCallCount`, since a test only ever cares about the call it
+    /// can actually still `resolve`/`reject`.
+    private var suspendedCallCount = 0
+
+    func check(force: Bool) async throws -> UpdateState {
+        checkCallCount += 1
+        checkForceValues.append(force)
+
+        // The first call — the coordinator's own automatic startup check —
+        // resolves immediately; see this type's documentation above.
+        guard checkCallCount > 1 else {
+            return currentStateValue
+        }
+
+        suspendedCallCount += 1
+        waitingForCallContinuation?.resume()
+        waitingForCallContinuation = nil
+        return try await withCheckedThrowingContinuation { continuation in
+            self.pendingCheckContinuation = continuation
+        }
+    }
+
+    func currentState() async -> UpdateState { currentStateValue }
+
+    func setIncludePrerelease(_ value: Bool) async throws -> UpdateState { currentStateValue }
+
+    @discardableResult
+    func openCurrentRelease() async -> Bool { false }
+
+    /// Suspends until a (non-startup) `check(force:)` call has actually
+    /// been made — and is therefore itself now suspended awaiting
+    /// `resolve`/`reject` — at least once, so a test can be certain that
+    /// call has already passed any pre-await guard before proceeding.
+    func waitForCall() async {
+        if suspendedCallCount > 0 { return }
+        await withCheckedContinuation { continuation in
+            self.waitingForCallContinuation = continuation
+        }
+    }
+
+    /// Resolves the currently-suspended `check(force:)` call (if any)
+    /// successfully with `state`.
+    func resolve(with state: UpdateState) {
+        currentStateValue = state
+        pendingCheckContinuation?.resume(returning: state)
+        pendingCheckContinuation = nil
+    }
+
+    /// Resolves the currently-suspended `check(force:)` call (if any) by
+    /// throwing `error`.
+    func reject(with error: Error) {
+        pendingCheckContinuation?.resume(throwing: error)
+        pendingCheckContinuation = nil
+    }
+}

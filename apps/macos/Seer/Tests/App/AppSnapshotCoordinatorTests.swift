@@ -1034,6 +1034,204 @@ final class AppSnapshotCoordinatorTests: XCTestCase {
         )
     }
 
+    /// Closes the *other* half of the `isShutDown` race the previous test
+    /// covers. That test proves a check only ever *queued* behind `gate`
+    /// before shutdown begins is skipped outright (never even calling
+    /// through to the update service). This test instead proves the check
+    /// that has *already* passed that pre-await guard and called through
+    /// to the update service — whose network round-trip is still
+    /// genuinely in flight, not merely queued — must also never publish
+    /// once shutdown completes while it was still suspended.
+    /// `performCheckForUpdates` only ever re-examines `isShutDown` once,
+    /// *before* calling `updateService.check(force:)`; without a second
+    /// check immediately after that `await` returns, this in-flight call
+    /// would resume — after `shutdown()` has already flagged `isShutDown`,
+    /// stopped the scheduler, flushed history, released power, and
+    /// published its own final snapshot — and go on to publish its own
+    /// (successful) update result on top of that already-final state.
+    func testInFlightUpdateCheckDoesNotPublishAfterShutdownCompletesWhileItWasStillSuspended() async throws {
+        let updateService = SuspendableUpdateChecking()
+        let updateScheduler = FakeUpdateSchedulerControlling()
+        let (coordinator, renderer, _) = await makeCoordinator(
+            updateService: updateService,
+            updateScheduler: updateScheduler
+        )
+        let emittedBeforeRace = renderer.emittedSnapshots.count
+
+        // A scheduled (or explicit) check starts, passes the pre-await
+        // `!isShutDown` guard, and calls through to the update service —
+        // whose response genuinely never arrives until the test resolves
+        // it below. This holds the coordinator's `gate` open the entire
+        // time.
+        let checkTask = Task {
+            await coordinator.checkForUpdates(force: false)
+        }
+        await updateService.waitForCall()
+
+        // Shutdown is requested next. Its own `gate.acquire()` call
+        // necessarily queues behind the still-in-flight check above, so
+        // it must run concurrently (not be awaited directly here) — but
+        // it still flags `isShutDown` and stops the scheduler
+        // synchronously, without waiting for its own turn at the gate.
+        let shutdownTask = Task {
+            try await coordinator.shutdown()
+        }
+        for _ in 0..<50 { await Task.yield() }
+        XCTAssertEqual(
+            updateScheduler.stopCallCount, 1,
+            "shutdown must stop the scheduler immediately, without waiting for the still-in-flight check to release the gate"
+        )
+        XCTAssertEqual(
+            renderer.emittedSnapshots.count, emittedBeforeRace,
+            "shutdown's own final transition must not publish yet — it is still queued behind the in-flight check"
+        )
+
+        // Only now does the long-suspended update check resolve — with a
+        // *successful* result that, without a post-await recheck of
+        // `isShutDown`, would be published once this call resumes.
+        await updateService.resolve(with: UpdateState(
+            checking: false,
+            availableVersion: "v9.9.9",
+            releaseURL: "https://github.com/OpenCoven/seer/releases/tag/v9.9.9",
+            lastCheckedAt: 1_700_000_000_000
+        ))
+        let succeeded = await checkTask.value
+        try await shutdownTask.value
+
+        XCTAssertFalse(succeeded, "a check that resolves after shutdown began must report failure, not success")
+        XCTAssertEqual(
+            renderer.emittedSnapshots.count, emittedBeforeRace + 1,
+            "only shutdown's own final transition may publish — the check that resolved after shutdown began must publish nothing of its own"
+        )
+        XCTAssertNil(
+            coordinator.snapshot.update.availableVersion,
+            "the update state resolved after shutdown began must never reach the coordinator's published snapshot"
+        )
+        XCTAssertFalse(
+            coordinator.snapshot.diagnostics.contains { $0.id == CoordinatorDiagnosticID.updatesCheckFailed },
+            "a check skipped for shutdown must never surface a check-failed diagnostic either"
+        )
+    }
+
+    /// The rejection-shaped mirror of the test above: an in-flight check
+    /// that *throws* after shutdown has already completed must be just as
+    /// silent as one that succeeds — no diagnostic upsert, no publish.
+    func testInFlightUpdateCheckFailureDoesNotPublishAfterShutdownCompletesWhileItWasStillSuspended() async throws {
+        let updateService = SuspendableUpdateChecking()
+        let updateScheduler = FakeUpdateSchedulerControlling()
+        let (coordinator, renderer, _) = await makeCoordinator(
+            updateService: updateService,
+            updateScheduler: updateScheduler
+        )
+        let emittedBeforeRace = renderer.emittedSnapshots.count
+
+        let checkTask = Task {
+            await coordinator.checkForUpdates(force: false)
+        }
+        await updateService.waitForCall()
+
+        let shutdownTask = Task {
+            try await coordinator.shutdown()
+        }
+        for _ in 0..<50 { await Task.yield() }
+        XCTAssertEqual(updateScheduler.stopCallCount, 1)
+
+        await updateService.reject(with: FakeUpdateCheckError())
+        let succeeded = await checkTask.value
+        try await shutdownTask.value
+
+        XCTAssertFalse(succeeded)
+        XCTAssertEqual(
+            renderer.emittedSnapshots.count, emittedBeforeRace + 1,
+            "only shutdown's own final transition may publish — the check that rejected after shutdown began must publish nothing further"
+        )
+        XCTAssertFalse(
+            coordinator.snapshot.diagnostics.contains { $0.id == CoordinatorDiagnosticID.updatesCheckFailed },
+            "a post-shutdown failure must never surface a check-failed diagnostic — shutdown's own final state is already published"
+        )
+    }
+
+    /// Confirms the fix above doesn't regress the ordinary case: a check
+    /// resolving *before* shutdown ever begins must still publish and
+    /// report success exactly as before.
+    func testInFlightUpdateCheckStillPublishesWhenItResolvesBeforeShutdownBegins() async throws {
+        let updateService = SuspendableUpdateChecking()
+        let (coordinator, renderer, _) = await makeCoordinator(updateService: updateService)
+        let emittedBefore = renderer.emittedSnapshots.count
+
+        let checkTask = Task {
+            await coordinator.checkForUpdates(force: false)
+        }
+        await updateService.waitForCall()
+
+        await updateService.resolve(with: UpdateState(
+            checking: false,
+            availableVersion: "v9.9.9",
+            releaseURL: "https://github.com/OpenCoven/seer/releases/tag/v9.9.9",
+            lastCheckedAt: 1_700_000_000_000
+        ))
+        let succeeded = await checkTask.value
+
+        XCTAssertTrue(succeeded)
+        XCTAssertEqual(renderer.emittedSnapshots.count, emittedBefore + 1)
+        XCTAssertEqual(coordinator.snapshot.update.availableVersion, "v9.9.9")
+
+        try await coordinator.shutdown()
+        XCTAssertEqual(renderer.emittedSnapshots.count, emittedBefore + 2, "shutdown must still publish its own final transition afterward")
+    }
+
+    /// Confirms `shutdown()` remains idempotent even when the *first*
+    /// call has to outlast an in-flight update check the way the tests
+    /// above exercise: a second `shutdown()` call, made after the first
+    /// has already completed, must not re-stop the scheduler or publish
+    /// again.
+    func testShutdownRemainsIdempotentAfterOutlastingAnInFlightUpdateCheck() async throws {
+        let updateService = SuspendableUpdateChecking()
+        let updateScheduler = FakeUpdateSchedulerControlling()
+        let (coordinator, renderer, _) = await makeCoordinator(
+            updateService: updateService,
+            updateScheduler: updateScheduler
+        )
+        let emittedBefore = renderer.emittedSnapshots.count
+
+        let checkTask = Task {
+            await coordinator.checkForUpdates(force: false)
+        }
+        await updateService.waitForCall()
+
+        let firstShutdownTask = Task {
+            try await coordinator.shutdown()
+        }
+        for _ in 0..<50 { await Task.yield() }
+        XCTAssertEqual(updateScheduler.stopCallCount, 1)
+
+        let secondShutdownTask = Task {
+            try await coordinator.shutdown()
+        }
+        for _ in 0..<50 { await Task.yield() }
+        XCTAssertEqual(updateScheduler.stopCallCount, 1, "a second shutdown must not stop the scheduler again")
+        XCTAssertEqual(
+            renderer.emittedSnapshots.count, emittedBefore,
+            "neither shutdown call may publish yet — both are still queued behind the in-flight check"
+        )
+
+        await updateService.resolve(with: UpdateState(
+            checking: false,
+            availableVersion: "v9.9.9",
+            releaseURL: "https://github.com/OpenCoven/seer/releases/tag/v9.9.9",
+            lastCheckedAt: 1_700_000_000_000
+        ))
+        let succeeded = await checkTask.value
+        try await firstShutdownTask.value
+        try await secondShutdownTask.value
+
+        XCTAssertFalse(succeeded, "the still-in-flight check resolving after shutdown began must report failure")
+        XCTAssertEqual(
+            renderer.emittedSnapshots.count, emittedBefore + 2,
+            "each of the two shutdown calls still publishes its own final transition, exactly as before this fix — only the skipped check contributes nothing"
+        )
+    }
+
     // MARK: - Concurrency: serialized transitions, no stale overwrite
 
     func testConcurrentScanAndModeChangeSerializeWithoutStaleOverwrite() async throws {

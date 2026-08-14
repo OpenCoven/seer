@@ -126,12 +126,21 @@ public final class AppSnapshotCoordinator {
     /// has itself acquired `gate`), such an already-queued tick would
     /// always be serviced *first* (FIFO) and would have no way to learn
     /// shutdown was ever requested. Checked by `performCheckForUpdates`
-    /// immediately after it acquires `gate`, so any check — scheduled or
-    /// explicit — granted the gate once shutdown has begun is skipped
-    /// entirely: no network request, no publish. A `checkForUpdates`
-    /// call already running (or already queued) *before* `shutdown()`
-    /// begins is completely unaffected, since it observes this flag
-    /// still `false` at the moment it is granted the gate.
+    /// *twice*: immediately after it acquires `gate` — so any check,
+    /// scheduled or explicit, only granted the gate once shutdown has
+    /// already begun is skipped entirely, before ever touching the
+    /// network — and again immediately after `updateService.check(force:)`
+    /// returns/throws, before any snapshot/diagnostic mutation or publish,
+    /// since this flag can just as easily flip `true` *during* that await
+    /// (i.e. a check already granted the gate and genuinely in flight when
+    /// shutdown begins) as before it. Without that second check, such an
+    /// in-flight call would resume — after `shutdown()`'s own queued
+    /// `gate.acquire()` call has already run `performShutdown()` to
+    /// completion and published its final snapshot — and go on to publish
+    /// its own (now moot) result on top of that already-final state. A
+    /// `checkForUpdates` call already running (or already queued) *before*
+    /// `shutdown()` begins is completely unaffected by either check, since
+    /// it observes this flag still `false` throughout.
     private var isShutDown = false
 
     public private(set) var snapshot: AppSnapshot
@@ -607,6 +616,27 @@ public final class AppSnapshotCoordinator {
             ))
             succeeded = false
         }
+
+        // `isShutDown` is only checked once, above, *before* the
+        // `updateService.check(force:)` await — but `shutdown()` can flip
+        // it `true` at any point during that await (it is set
+        // synchronously, ahead of `shutdown()`'s own `gate.acquire()` call,
+        // specifically so an already-*queued* check observes it the
+        // moment it is granted the gate — see `isShutDown`'s
+        // documentation). That guards a check still *queued* behind
+        // `gate` when shutdown begins, but not one that had already been
+        // granted the gate and was genuinely in flight inside
+        // `updateService.check(force:)` at that moment: without
+        // re-checking here, such a call would resume — after
+        // `shutdown()`'s own `gate.acquire()` call (queued directly behind
+        // this one) has already run `performShutdown()` to completion and
+        // published its final snapshot — and go on to mutate/publish its
+        // own (now moot) result on top of that already-final state.
+        // Bailing out here, before any snapshot/diagnostic mutation or
+        // publish, keeps shutdown's own final transition the last word
+        // regardless of how this call resolves.
+        guard !isShutDown else { return false }
+
         publish(monitor: snapshot.monitor, history: snapshot.history, update: updateState, clearing: idsToClear, upserting: upserts)
         return succeeded
     }

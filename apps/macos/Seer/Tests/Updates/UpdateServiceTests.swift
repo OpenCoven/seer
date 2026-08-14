@@ -18,6 +18,14 @@ final class MockURLProtocol: URLProtocol, @unchecked Sendable {
         let headers: [String: String]
         let body: Data
         let onRequest: (@Sendable (URLRequest) -> Void)?
+        /// When set, response delivery for this stub blocks (on a
+        /// background queue — never the caller's own thread/task) until
+        /// the test explicitly calls `RequestGate.open()`. Lets a test
+        /// deterministically control the *completion* order of two
+        /// concurrent requests independently of their *start* order (which
+        /// is already fixed by this mock's FIFO stub-dequeue-at-
+        /// `startLoading()` behavior).
+        let gate: RequestGate?
     }
 
     private struct State {
@@ -35,10 +43,11 @@ final class MockURLProtocol: URLProtocol, @unchecked Sendable {
         statusCode: Int,
         headers: [String: String] = [:],
         body: Data = Data(),
-        onRequest: (@Sendable (URLRequest) -> Void)? = nil
+        onRequest: (@Sendable (URLRequest) -> Void)? = nil,
+        gate: RequestGate? = nil
     ) {
         state.withLock {
-            $0.stubs.append(Stub(statusCode: statusCode, headers: headers, body: body, onRequest: onRequest))
+            $0.stubs.append(Stub(statusCode: statusCode, headers: headers, body: body, onRequest: onRequest, gate: gate))
         }
     }
 
@@ -60,20 +69,49 @@ final class MockURLProtocol: URLProtocol, @unchecked Sendable {
             client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
             return
         }
-        stub.onRequest?(request)
 
-        let response = HTTPURLResponse(
-            url: url,
-            statusCode: stub.statusCode,
-            httpVersion: "HTTP/1.1",
-            headerFields: stub.headers
-        )!
-        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: stub.body)
-        client?.urlProtocolDidFinishLoading(self)
+        // Stub dequeuing (and therefore `recordedRequests` above) happens
+        // synchronously, in call order, so tests can rely on it to prove
+        // *start* order. Everything from here on — the (possibly gated)
+        // response delivery — runs on a background queue instead of
+        // blocking the calling thread, so a gated stub can hold its
+        // response indefinitely without risking a deadlock against
+        // `URLSession`'s own (possibly limited) loading queue.
+        DispatchQueue.global().async {
+            stub.onRequest?(self.request)
+            stub.gate?.wait()
+
+            let response = HTTPURLResponse(
+                url: url,
+                statusCode: stub.statusCode,
+                httpVersion: "HTTP/1.1",
+                headerFields: stub.headers
+            )!
+            self.client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            self.client?.urlProtocol(self, didLoad: stub.body)
+            self.client?.urlProtocolDidFinishLoading(self)
+        }
     }
 
     override func stopLoading() {}
+}
+
+/// A manually-releasable gate letting a test hold a `MockURLProtocol`
+/// stub's response open until explicitly opened — used to deterministically
+/// prove which of two concurrent `UpdateService.check(force:)` calls'
+/// network responses arrives (and is persisted) first, independent of
+/// which one was *started* first. `@unchecked Sendable`/lock-free by
+/// design: `DispatchSemaphore` itself is safe to signal/wait from any
+/// thread, and this type never holds any other mutable state.
+final class RequestGate: @unchecked Sendable {
+    private let semaphore = DispatchSemaphore(value: 0)
+
+    /// Blocks the calling (background, never Swift-Concurrency-cooperative)
+    /// thread until `open()` is called.
+    func wait() { semaphore.wait() }
+
+    /// Releases exactly one `wait()` call.
+    func open() { semaphore.signal() }
 }
 
 private actor RecordingReleaseOpener: ReleaseURLOpening {
@@ -755,6 +793,106 @@ final class UpdateServiceTests: XCTestCase {
         let secondRequestURL = try XCTUnwrap(MockURLProtocol.recordedRequests.last?.url)
         XCTAssertEqual(secondRequestURL.query, "per_page=20")
         XCTAssertEqual(state.availableVersion, "v1.2.0-beta.1")
+    }
+
+    // MARK: - Concurrency: the later-started check wins, never the later-completed one
+
+    /// `UpdateService` is an actor, but actors are reentrant across
+    /// `await` — so two overlapping `check(force:)` calls can both pass
+    /// the gate above and both have a `session.data(for:)` request in
+    /// flight at once (e.g. a manual/scheduled stable-stream check racing
+    /// a `setIncludePrerelease(true)` switch to the prerelease stream).
+    /// Persisting whichever response merely *returns* first — rather than
+    /// whichever call *started* last — lets an older, slower request stomp
+    /// a newer one's fresher ETag/release, or let a stable-stream ETag
+    /// land after a prerelease-stream switch (or vice versa).
+    ///
+    /// This test starts a stable-stream check, lets it reach the network
+    /// (and suspend there), *then* switches to prerelease mode and starts
+    /// a second, later check against the prerelease stream — and resolves
+    /// the *later-started* (prerelease) request's response first, only
+    /// letting the *earlier-started* (stable) request's now-stale response
+    /// arrive afterward. The later-started prerelease check must win: its
+    /// ETag/release must be exactly what ends up persisted, and the
+    /// earlier, stale stable response must never overwrite it or leak its
+    /// own ETag into the persisted state.
+    func testOverlappingStableAndPrereleaseChecksTheLaterStartedCheckWinsAndETagsDoNotCross() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let settingsStore = makeSettingsStore(fileSystem: fileSystem, clock: clock)
+        let service = UpdateService(
+            settingsStore: settingsStore,
+            session: makeMockSession(),
+            clock: clock,
+            currentVersion: "1.0.0"
+        )
+
+        let stableGate = RequestGate()
+        let prereleaseGate = RequestGate()
+
+        // Stub #1 answers whichever request is sent first — the
+        // stable-stream check, started before prerelease mode is toggled
+        // on — and is held open on `stableGate`.
+        MockURLProtocol.enqueueStub(
+            statusCode: 200,
+            headers: ["Etag": "\"stable-etag\""],
+            body: releaseJSON(tag: "v1.1.0", htmlURL: "https://github.com/OpenCoven/seer/releases/tag/v1.1.0"),
+            gate: stableGate
+        )
+        // Stub #2 answers the prerelease-stream check, started second,
+        // held open on `prereleaseGate`.
+        let prereleaseBody = Data("""
+        [{"tag_name":"v1.2.0-beta.1","html_url":"https://github.com/OpenCoven/seer/releases/tag/v1.2.0-beta.1","draft":false,"prerelease":true}]
+        """.utf8)
+        MockURLProtocol.enqueueStub(
+            statusCode: 200,
+            headers: ["Etag": "\"prerelease-etag\""],
+            body: prereleaseBody,
+            gate: prereleaseGate
+        )
+
+        // 1. Start the stable check; its request reaches the network and
+        //    suspends there, gated on `stableGate`.
+        let stableTask = Task { try await service.check(force: true) }
+        try await waitUntil { MockURLProtocol.recordedRequests.count >= 1 }
+
+        // 2. While that stable check is still in flight, switch to
+        //    prerelease mode (clearing the cached ETag/release for the
+        //    newly selected stream) and start a second, later check
+        //    against it — its request also reaches the network and
+        //    suspends, gated on `prereleaseGate`.
+        try await settingsStore.setIncludePrereleaseUpdates(true)
+        let prereleaseTask = Task { try await service.check(force: true) }
+        try await waitUntil { MockURLProtocol.recordedRequests.count >= 2 }
+
+        // 3. Let the *later-started* (prerelease) request's response
+        //    arrive — and be persisted — first.
+        prereleaseGate.open()
+        let prereleaseState = try await prereleaseTask.value
+
+        // 4. Only afterward let the *earlier-started* (stable) request's
+        //    now-stale response arrive.
+        stableGate.open()
+        let stableResult = try await stableTask.value
+
+        XCTAssertEqual(prereleaseState.availableVersion, "v1.2.0-beta.1")
+
+        let finalState = await service.currentState()
+        XCTAssertEqual(finalState.availableVersion, "v1.2.0-beta.1", "the later-started prerelease check must win over the earlier, now-stale stable response")
+
+        let finalSettings = await settingsStore.current
+        XCTAssertTrue(finalSettings.includePrereleaseUpdates)
+        XCTAssertEqual(
+            finalSettings.updateETag, "\"prerelease-etag\"",
+            "the stale stable-stream ETag must never overwrite the later prerelease-stream ETag"
+        )
+        XCTAssertEqual(finalSettings.lastRelease?.version, "v1.2.0-beta.1")
+
+        // The earlier (now-stale) stable check's own return value must
+        // reflect whatever is actually persisted (the prerelease winner),
+        // never its own now-discarded stable-stream result.
+        XCTAssertEqual(stableResult.availableVersion, "v1.2.0-beta.1", "a stale, superseded check must never report its own discarded result")
+        XCTAssertFalse(finalState.checking, "no check remains in flight once both overlapping calls have completed")
     }
 
     // MARK: - openCurrentRelease only ever opens the stored, validated URL
