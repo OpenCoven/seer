@@ -103,11 +103,18 @@ app.whenReady().then(async () => {
   updateService.subscribe((state) => {
     ipcMain.broadcast("updates:changed", state);
   });
-  try {
-    await updateService.start();
-  } catch (error) {
+  // Deliberately not awaited: each update request is already bounded to
+  // ~10s (see `UpdateService`'s injected fetch timeout), but monitoring/
+  // tray startup must never depend on update availability at all — a
+  // slow or stalled GitHub response must never delay Seer's core
+  // purpose of watching for active agents. `start()`'s own state
+  // transitions still broadcast normally (both this startup check and
+  // every later scheduled one) via the `subscribe` above; `.catch` here
+  // only guards against an unhandled rejection, mirroring the previous
+  // try/catch's own warning-only handling.
+  void updateService.start().catch((error) => {
     logger.warn("updates", "Startup update check failed", { error });
-  }
+  });
 
   onMonitorStateChange((state) => {
     historyStore.recordState(state);

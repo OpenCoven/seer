@@ -2,6 +2,14 @@ import type { UpdateState } from "./types.js";
 
 export const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1_000;
 
+// Bounds every single GitHub release-check request so a stalled/hanging
+// request (e.g. a captive portal or a dead connection) can never block
+// anything awaiting `check()`/`start()` — most importantly Seer's own
+// startup sequence — indefinitely. Injectable via `createTimeoutSignal`
+// purely for deterministic testing (a real `AbortSignal.timeout` cannot be
+// observed/triggered without an actual 10-second wall-clock wait).
+export const UPDATE_REQUEST_TIMEOUT_MS = 10_000;
+
 // Seer's release feed lives in the dedicated public releases repository
 // (`OpenCoven/seer-releases`), never the main `OpenCoven/seer` source
 // repository, which never has its own GitHub releases published against it.
@@ -47,6 +55,12 @@ type UpdateServiceOptions = {
   now?: () => number;
   settings: UpdateSettingsAccess;
   openExternal: (url: string) => Promise<void>;
+  // Bounds every request to `requestTimeoutMs` (default `UPDATE_REQUEST_TIMEOUT_MS`)
+  // by passing the returned `AbortSignal` to `fetchImpl`. Overriding
+  // `createTimeoutSignal` lets tests substitute a controllable signal
+  // instead of waiting on a real timer.
+  requestTimeoutMs?: number;
+  createTimeoutSignal?: (timeoutMs: number) => AbortSignal;
 };
 
 type GitHubRelease = {
@@ -207,6 +221,8 @@ export class UpdateService {
   private readonly now: () => number;
   private readonly settings: UpdateSettingsAccess;
   private readonly openExternal: (url: string) => Promise<void>;
+  private readonly requestTimeoutMs: number;
+  private readonly createTimeoutSignal: (timeoutMs: number) => AbortSignal;
   private readonly listeners = new Set<(state: UpdateState) => void>();
   private state: UpdateState = {
     checking: false,
@@ -214,7 +230,23 @@ export class UpdateService {
     releaseURL: null,
     lastCheckedAt: null,
   };
-  private etag: string | null = null;
+  // ETags are scoped per release stream — the stable "latest release"
+  // endpoint and the prerelease "releases list" endpoint are different
+  // resources with independent caching, so a stable check's ETag must
+  // never be sent as `If-None-Match` on a prerelease request (or vice
+  // versa): doing so would either be silently ignored by GitHub or, worse,
+  // coincidentally validate against the wrong resource.
+  private stableEtag: string | null = null;
+  private prereleaseEtag: string | null = null;
+  // A monotonically increasing token, bumped at the start of every
+  // `check()` call. Captured locally by each call and compared back
+  // against the live field once its request resolves: only the call that
+  // is still the most recently *started* one is allowed to mutate
+  // `state`/the stream ETag or flip `checking` back off. This closes the
+  // race where an older, slower check (e.g. a stable check in flight when
+  // prerelease updates are enabled) completes after a newer one and would
+  // otherwise clobber its result with stale data.
+  private generation = 0;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private started = false;
   private lastAttemptCompletedAt: number | null = null;
@@ -230,6 +262,8 @@ export class UpdateService {
     this.now = options.now ?? Date.now;
     this.settings = options.settings;
     this.openExternal = options.openExternal;
+    this.requestTimeoutMs = options.requestTimeoutMs ?? UPDATE_REQUEST_TIMEOUT_MS;
+    this.createTimeoutSignal = options.createTimeoutSignal ?? ((timeoutMs) => AbortSignal.timeout(timeoutMs));
   }
 
   getState(): UpdateState {
@@ -260,12 +294,24 @@ export class UpdateService {
       return this.getState();
     }
 
+    // Every concurrent/overlapping `check()` call races independently
+    // against the network; `isCurrent()` — captured once, here, before
+    // this call's own request even starts — is what stops a call that
+    // turns out to be stale (superseded by a later `check()` that started
+    // and therefore incremented `generation` again before this one's
+    // request resolved) from mutating `state`/the stream ETag, or from
+    // prematurely flipping `checking` back off on this newer call's
+    // behalf.
+    const myGeneration = ++this.generation;
+    const isCurrent = () => this.generation === myGeneration;
+
     const includePrerelease = this.settings.get().includePrereleaseUpdates;
+    const streamEtag = includePrerelease ? this.prereleaseEtag : this.stableEtag;
     const headers: Record<string, string> = {
       Accept: "application/vnd.github+json",
       "User-Agent": "Seer/1.0.0",
     };
-    if (this.etag) headers["If-None-Match"] = this.etag;
+    if (streamEtag) headers["If-None-Match"] = streamEtag;
 
     this.state = { ...this.state, checking: true };
     this.publish();
@@ -275,6 +321,7 @@ export class UpdateService {
         response = await this.fetchImpl(includePrerelease ? PRERELEASE_URL : STABLE_URL, {
           method: "GET",
           headers,
+          signal: this.createTimeoutSignal(this.requestTimeoutMs),
         });
       } catch (error) {
         throw new UpdateCheckError(`Unable to check for updates: ${error instanceof Error ? error.message : "network error"}`);
@@ -282,8 +329,10 @@ export class UpdateService {
 
       const completedAt = this.now();
       if (response.status === 304) {
-        this.state = { ...this.state, checking: false, lastCheckedAt: completedAt };
-        this.publish();
+        if (isCurrent()) {
+          this.state = { ...this.state, checking: false, lastCheckedAt: completedAt };
+          this.publish();
+        }
         return this.getState();
       }
       if (!response.ok) {
@@ -305,27 +354,36 @@ export class UpdateService {
 
       const best = selectBestRelease(values, includePrerelease);
       const isNewer = best !== null && compareSemanticVersions(this.currentVersion, best.version) < 0;
-      this.etag = response.headers.get("etag");
-      this.state = {
-        checking: false,
-        availableVersion: isNewer ? best.tag : null,
-        releaseURL: isNewer ? best.url : null,
-        lastCheckedAt: this.now(),
-      };
-      this.publish();
+      if (isCurrent()) {
+        if (includePrerelease) {
+          this.prereleaseEtag = response.headers.get("etag");
+        } else {
+          this.stableEtag = response.headers.get("etag");
+        }
+        this.state = {
+          checking: false,
+          availableVersion: isNewer ? best.tag : null,
+          releaseURL: isNewer ? best.url : null,
+          lastCheckedAt: this.now(),
+        };
+        this.publish();
+      }
       return this.getState();
     } finally {
-      this.lastAttemptCompletedAt = this.now();
-      if (this.state.checking) {
-        this.state = { ...this.state, checking: false };
-        this.publish();
+      if (isCurrent()) {
+        this.lastAttemptCompletedAt = this.now();
+        if (this.state.checking) {
+          this.state = { ...this.state, checking: false };
+          this.publish();
+        }
       }
     }
   }
 
   async setIncludePrereleaseUpdates(value: boolean): Promise<UpdateState> {
     await this.settings.setIncludePrereleaseUpdates(value);
-    this.etag = null;
+    this.stableEtag = null;
+    this.prereleaseEtag = null;
     this.state = {
       checking: false,
       availableVersion: null,

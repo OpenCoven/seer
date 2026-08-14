@@ -112,6 +112,28 @@ public final class AppSnapshotCoordinator {
     /// type documentation above.
     private let gate = AsyncGate()
 
+    /// Set synchronously, *before* `shutdown()` ever awaits `gate`'s
+    /// (intentionally non-cancellable — see `AsyncGate`) queue, so it is
+    /// visible to every other call the instant `shutdown()` begins,
+    /// regardless of how long `shutdown()` itself then has to wait for
+    /// its own turn at the gate. A scheduler tick's `checkForUpdates`
+    /// call is always dispatched — and therefore always already queued
+    /// (or running) on `gate` — strictly *before* `shutdown()`'s own
+    /// `gate.acquire()` call can even be issued, since `updateScheduler
+    /// .stop()` only cancels *future* ticks, never one already past its
+    /// cancellation check and blocked on `gate`. Were this flag instead
+    /// set only from inside `performShutdown()` (i.e. after `shutdown()`
+    /// has itself acquired `gate`), such an already-queued tick would
+    /// always be serviced *first* (FIFO) and would have no way to learn
+    /// shutdown was ever requested. Checked by `performCheckForUpdates`
+    /// immediately after it acquires `gate`, so any check — scheduled or
+    /// explicit — granted the gate once shutdown has begun is skipped
+    /// entirely: no network request, no publish. A `checkForUpdates`
+    /// call already running (or already queued) *before* `shutdown()`
+    /// begins is completely unaffected, since it observes this flag
+    /// still `false` at the moment it is granted the gate.
+    private var isShutDown = false
+
     public private(set) var snapshot: AppSnapshot
 
     /// Plain, non-async initializer: takes an already-computed
@@ -563,6 +585,11 @@ public final class AppSnapshotCoordinator {
     }
 
     private func performCheckForUpdates(force: Bool) async -> Bool {
+        // Granted the gate only after `shutdown()` has already begun (see
+        // `isShutDown`'s documentation): never network-check or publish
+        // once shutdown is underway, however long this call was queued.
+        guard !isShutDown else { return false }
+
         var idsToClear: Set<String> = []
         var upserts: [Diagnostic] = []
         let updateState: UpdateState
@@ -650,10 +677,30 @@ public final class AppSnapshotCoordinator {
     /// takes priority over power, matching the order the two operations
     /// ran in). A caller awaiting `shutdown()` — e.g. app termination —
     /// is guaranteed both cleanups have already been attempted, and their
-    /// results published, by the time this call returns. Also stops
-    /// `updateScheduler`'s background loop (see `UpdateScheduler.stop()`)
-    /// so no further update check ever runs after shutdown has completed.
+    /// results published, by the time this call returns.
+    ///
+    /// Marks `isShutDown` and stops `updateScheduler`'s background loop
+    /// (see `UpdateScheduler.stop()`) *before* ever awaiting `gate`, not
+    /// as part of `performShutdown()` — deliberately outside/ahead of the
+    /// gate wait. `UpdateScheduler.stop()` only prevents *future* ticks
+    /// from ever starting; it cannot recall a tick already dispatched and
+    /// currently queued (or running) behind `gate`, since `AsyncGate` is
+    /// intentionally non-cancellable. Setting `isShutDown` here, ahead of
+    /// this call's own (possibly long) wait for `gate`, guarantees any
+    /// such already-queued scheduled check observes it — via
+    /// `performCheckForUpdates`'s own guard — the moment that check is
+    /// finally granted the gate, however that ordering falls out, so no
+    /// queued or in-flight scheduled check can ever network-check or
+    /// publish once shutdown has begun. Idempotent: a second `shutdown()`
+    /// call finds `isShutDown` already `true` and skips re-stopping the
+    /// scheduler, but still proceeds through `gate` to flush/release/
+    /// publish again, exactly as before this change.
     public func shutdown() async throws {
+        if !isShutDown {
+            isShutDown = true
+            await updateScheduler.stop()
+        }
+
         await gate.acquire()
         do {
             try await performShutdown()
@@ -665,9 +712,11 @@ public final class AppSnapshotCoordinator {
     }
 
     private func performShutdown() async throws {
+        // `updateScheduler.stop()` (and `isShutDown`) are already set by
+        // `shutdown()` itself, ahead of its `gate.acquire()` call above —
+        // see that function's documentation for why this must happen
+        // outside/before the gate wait rather than here.
         let now = clock.nowMilliseconds()
-
-        await updateScheduler.stop()
 
         var historyError: Error?
         var stats: HistoryStats

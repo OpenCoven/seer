@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   CHECK_INTERVAL_MS,
+  UPDATE_REQUEST_TIMEOUT_MS,
   UpdateService,
   compareSemanticVersions,
   parseSemanticVersion,
@@ -61,6 +62,55 @@ function makeHarness(options: {
     calls,
     opened,
     persisted,
+    advance(milliseconds: number) {
+      now += milliseconds;
+    },
+  };
+}
+
+/// A harness whose `fetchImpl` never resolves on its own — each call's
+/// `Response` (or thrown error) is supplied later, explicitly, by the
+/// test, in whatever order it chooses. Used to deterministically
+/// reproduce two (or more) `check()` calls genuinely overlapping in
+/// flight, with full control over which one's network response lands
+/// first, second, etc. — something `makeHarness`'s immediately-resolving
+/// `fetchImpl` cannot express.
+function makeDeferredHarness(options: { includePrereleaseUpdates?: boolean } = {}) {
+  let now = 1_700_000_000_000;
+  const calls: FetchCall[] = [];
+  const deferred: Array<{ resolve: (response: Response) => void; reject: (error: unknown) => void }> = [];
+  let settings: UpdateSettings = {
+    includePrereleaseUpdates: options.includePrereleaseUpdates ?? false,
+  };
+
+  const service = new UpdateService({
+    currentVersion: "1.0.0",
+    now: () => now,
+    fetchImpl: (input, init) =>
+      new Promise<Response>((resolve, reject) => {
+        calls.push({ url: String(input), init });
+        deferred.push({ resolve, reject });
+      }),
+    settings: {
+      get: () => settings,
+      setIncludePrereleaseUpdates: async (value) => {
+        settings = { includePrereleaseUpdates: value };
+        return settings;
+      },
+    },
+    openExternal: async () => undefined,
+  });
+
+  return {
+    service,
+    calls,
+    settings: () => settings,
+    setIncludePrerelease(value: boolean) {
+      settings = { includePrereleaseUpdates: value };
+    },
+    resolve(callIndex: number, response: Response) {
+      deferred[callIndex]!.resolve(response);
+    },
     advance(milliseconds: number) {
       now += milliseconds;
     },
@@ -251,4 +301,132 @@ test("network failures are typed and retain the last valid state", async () => {
   await assert.rejects(() => harness.service.check(), { name: "UpdateCheckError" });
 
   assert.deepEqual(harness.service.getState(), before);
+});
+
+test("a stale in-flight stable check cannot regress state after a newer prerelease check has already completed", async () => {
+  const harness = makeDeferredHarness();
+
+  // Call A starts while stable checks are selected...
+  const stableCheck = harness.service.check({ force: true });
+  assert.equal(harness.calls.length, 1);
+  assert.equal(harness.calls[0]!.url, "https://api.github.com/repos/OpenCoven/seer-releases/releases/latest");
+
+  // ...then, before call A's request resolves, prereleases are enabled
+  // and a second, genuinely newer call B starts (mirroring, e.g., a slow
+  // startup check racing a user toggling the setting mid-flight).
+  harness.setIncludePrerelease(true);
+  const prereleaseCheck = harness.service.check({ force: true });
+  assert.equal(harness.calls.length, 2);
+  assert.equal(harness.calls[1]!.url, "https://api.github.com/repos/OpenCoven/seer-releases/releases?per_page=20");
+
+  // Call B (the newer one) completes first...
+  harness.resolve(
+    1,
+    Response.json(
+      [release("v2.0.0-beta.1", "https://github.com/OpenCoven/seer/releases/tag/v2.0.0-beta.1", false, true)],
+      { headers: { ETag: '"prerelease-etag"' } },
+    ),
+  );
+  const prereleaseState = await prereleaseCheck;
+  assert.equal(prereleaseState.availableVersion, "v2.0.0-beta.1");
+
+  // ...and only afterward does call A's now-stale stable response land.
+  // It must never be allowed to overwrite call B's newer result.
+  harness.resolve(0, Response.json(release("v1.2.0"), { headers: { ETag: '"stable-etag"' } }));
+  const staleStableState = await stableCheck;
+
+  assert.equal(staleStableState.availableVersion, "v2.0.0-beta.1", "the stale call's own return value must reflect the current (newer) state, not its own stale result");
+  const finalState = harness.service.getState();
+  assert.equal(finalState.availableVersion, "v2.0.0-beta.1", "a stale completion must never regress the already-published newer state");
+  assert.equal(finalState.checking, false, "a stale completion's finally block must not flip `checking` back off on a still-current call's behalf");
+
+  // The stale stable completion must also not have clobbered the
+  // *prerelease* stream's own ETag with the stable stream's ETag: the
+  // very next prerelease check must still send the prerelease ETag.
+  harness.advance(CHECK_INTERVAL_MS);
+  const nextPrereleaseCheck = harness.service.check({ force: true });
+  assert.equal(harness.calls.length, 3);
+  assert.equal(
+    (harness.calls[2]!.init?.headers as Record<string, string>)["If-None-Match"],
+    '"prerelease-etag"',
+    "the prerelease stream's own ETag must survive an unrelated stale stable completion",
+  );
+  harness.resolve(2, new Response(null, { status: 304 }));
+  await nextPrereleaseCheck;
+});
+
+test("prerelease requests never send the stable stream's ETag, and vice versa", async () => {
+  const harness = makeDeferredHarness();
+
+  const stableCheck = harness.service.check({ force: true });
+  assert.equal((harness.calls[0]!.init?.headers as Record<string, string>)["If-None-Match"], undefined);
+  harness.resolve(0, Response.json(release("v1.2.0"), { headers: { ETag: '"stable-etag"' } }));
+  await stableCheck;
+
+  // Switching streams (without going through `setIncludePrereleaseUpdates`,
+  // which would itself clear the cache) must never send the stable
+  // stream's freshly-cached ETag on the prerelease stream's first-ever
+  // request — the two streams' caches are entirely independent.
+  harness.setIncludePrerelease(true);
+  harness.advance(CHECK_INTERVAL_MS);
+  const prereleaseCheck = harness.service.check({ force: true });
+  assert.equal(
+    (harness.calls[1]!.init?.headers as Record<string, string>)["If-None-Match"],
+    undefined,
+    "the prerelease stream must never send the stable stream's cached ETag",
+  );
+  harness.resolve(
+    1,
+    Response.json(
+      [release("v1.5.0-beta.1", "https://github.com/OpenCoven/seer/releases/tag/v1.5.0-beta.1", false, true)],
+      { headers: { ETag: '"prerelease-etag"' } },
+    ),
+  );
+  await prereleaseCheck;
+
+  // Switching back to stable must likewise still send the *stable*
+  // stream's own previously-cached ETag, not the prerelease one.
+  harness.setIncludePrerelease(false);
+  harness.advance(CHECK_INTERVAL_MS);
+  const secondStableCheck = harness.service.check({ force: true });
+  assert.equal(
+    (harness.calls[2]!.init?.headers as Record<string, string>)["If-None-Match"],
+    '"stable-etag"',
+    "switching back to stable must reuse the stable stream's own cached ETag",
+  );
+  harness.resolve(2, new Response(null, { status: 304 }));
+  await secondStableCheck;
+});
+
+test("each update request is bounded by a 10 second timeout via an injectable, abortable signal", async () => {
+  const now = 1_700_000_000_000;
+  const observedTimeouts: number[] = [];
+  const controller = new AbortController();
+
+  const service = new UpdateService({
+    currentVersion: "1.0.0",
+    now: () => now,
+    fetchImpl: (_input, init) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          reject(new DOMException("The operation was aborted.", "AbortError"));
+        });
+      }),
+    createTimeoutSignal: (timeoutMs) => {
+      observedTimeouts.push(timeoutMs);
+      return controller.signal;
+    },
+    settings: {
+      get: () => ({ includePrereleaseUpdates: false }),
+      setIncludePrereleaseUpdates: async (value) => ({ includePrereleaseUpdates: value }),
+    },
+    openExternal: async () => undefined,
+  });
+
+  const pending = service.check({ force: true });
+  controller.abort();
+
+  await assert.rejects(() => pending, { name: "UpdateCheckError" });
+  assert.deepEqual(observedTimeouts, [UPDATE_REQUEST_TIMEOUT_MS]);
+  assert.equal(UPDATE_REQUEST_TIMEOUT_MS, 10_000);
 });

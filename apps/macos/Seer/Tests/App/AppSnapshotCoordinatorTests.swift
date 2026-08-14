@@ -945,6 +945,95 @@ final class AppSnapshotCoordinatorTests: XCTestCase {
         XCTAssertEqual(powerBackend.releasedIDs, [1], "the second shutdown must not attempt to release again")
     }
 
+    /// Reproduces the exact race `isShutDown` exists to close: a
+    /// scheduled check (in production, `UpdateScheduler`'s own tick
+    /// calling `checkForUpdates(force: false)`) is already queued behind
+    /// `gate` — held here by a suspended empty scan, so no real
+    /// `UpdateScheduler`/`Sleeper` is needed to force the ordering
+    /// deterministically — when `shutdown()` is requested. `shutdown()`
+    /// queues *behind* that already-queued check (strict gate FIFO), yet
+    /// must still flag `isShutDown` (and stop the scheduler)
+    /// *immediately*, before ever waiting its own turn, so that once the
+    /// scan finally releases the gate — handing it straight to the
+    /// queued check, ahead of shutdown, exactly as `AsyncGate` documents
+    /// — that check observes shutdown already underway and skips its
+    /// network request and publish entirely, rather than running to
+    /// completion and publishing a scheduled check's result after
+    /// shutdown was requested.
+    func testShutdownFlagsAnAlreadyQueuedScheduledCheckSoItNeverNetworkChecksOrPublishesAfterward() async throws {
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let historyFS = InMemorySettingsFileSystem()
+        let updateService = FakeUpdateChecking()
+        let updateScheduler = FakeUpdateSchedulerControlling()
+        let (coordinator, renderer, _) = await makeCoordinator(
+            historyFileSystem: historyFS,
+            clock: clock,
+            updateService: updateService,
+            updateScheduler: updateScheduler
+        )
+
+        // Build up an open history session so the empty scan below
+        // actually performs a real disk write worth suspending — giving
+        // a genuine, controlled window in which the coordinator's gate
+        // is held by something other than the scheduled check or
+        // shutdown itself.
+        await coordinator.applyScan([activeAgent()], scannedAt: clock.now)
+        clock.now += 2_000
+        let checkForceValuesBeforeRace = updateService.checkForceValues.count
+        let emittedBeforeRace = renderer.emittedSnapshots.count
+
+        await historyFS.armSuspension("writeFileAndSynchronize")
+
+        // The closing scan holds the gate, suspended mid-write.
+        let scanTask = Task {
+            await coordinator.applyScan([], scannedAt: clock.now)
+        }
+        await historyFS.waitUntilEntered("writeFileAndSynchronize")
+
+        // The scheduler's tick fires — exactly like a real
+        // `UpdateScheduler` calling `checkForUpdates(force:)` — while
+        // the gate is held elsewhere, and queues behind the scan.
+        let tickTask = Task {
+            await coordinator.checkForUpdates(force: false)
+        }
+        for _ in 0..<50 { await Task.yield() }
+
+        // Shutdown is requested next. Its own `gate.acquire()` call
+        // necessarily queues *behind* the already-queued tick — yet it
+        // must still flag `isShutDown` and stop the scheduler
+        // synchronously, without waiting for the gate.
+        let shutdownTask = Task {
+            try await coordinator.shutdown()
+        }
+        for _ in 0..<50 { await Task.yield() }
+        XCTAssertEqual(
+            updateScheduler.stopCallCount, 1,
+            "shutdown must stop the scheduler immediately, without waiting for its own turn at the gate"
+        )
+
+        await historyFS.resumeSuspension("writeFileAndSynchronize")
+        await scanTask.value
+        let tickSucceeded = await tickTask.value
+        try await shutdownTask.value
+
+        XCTAssertFalse(
+            tickSucceeded,
+            "a scheduled check only granted the gate after shutdown began must report failure rather than actually running"
+        )
+        XCTAssertEqual(
+            updateService.checkForceValues.count, checkForceValuesBeforeRace,
+            "the already-queued scheduled check must never call through to the update service once shutdown has begun"
+        )
+        XCTAssertEqual(
+            renderer.emittedSnapshots.count, emittedBeforeRace + 2,
+            "only the scan's own transition and shutdown's final transition may publish — the skipped scheduled check must publish nothing"
+        )
+        XCTAssertFalse(
+            coordinator.snapshot.diagnostics.contains { $0.id == CoordinatorDiagnosticID.updatesCheckFailed },
+            "a check skipped for shutdown, not one that actually failed, must never surface a check-failed diagnostic"
+        )
+    }
+
     // MARK: - Concurrency: serialized transitions, no stale overwrite
 
     func testConcurrentScanAndModeChangeSerializeWithoutStaleOverwrite() async throws {
