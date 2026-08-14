@@ -417,10 +417,15 @@ public typealias UpdateSchedulerLastCheckedAtProvider = @Sendable () async -> In
 /// is running, entirely in the background. `start()` computes how long to
 /// sleep until the last completed check's time plus 24h (or checks
 /// immediately if no check has ever completed), sleeps via the injected
-/// `Sleeper`, invokes `performScheduledCheck`, and reschedules from that
-/// invocation's own completion time — so a slow/failed check never causes
-/// back-to-back immediate retries. `stop()` cancels the background `Task`
-/// at shutdown; an in-progress sleep is abandoned rather than waited out.
+/// `Sleeper`, invokes `performScheduledCheck`, and reschedules from
+/// `lastCompletedCheckAt`'s own latest value after every wake/check
+/// attempt — never from the wake's own wall-clock time — so a slow/failed
+/// check never causes back-to-back immediate retries, and a wake the 24h
+/// gate suppresses (e.g. because a manual/prerelease-forced check already
+/// ran elsewhere while this loop slept) reschedules 24h after *that*
+/// check instead of deferring another full 24h from this stale wake.
+/// `stop()` cancels the background `Task` at shutdown; an in-progress
+/// sleep is abandoned rather than waited out.
 public actor UpdateScheduler {
     private let performScheduledCheck: UpdateSchedulerCheckAction
     private let lastCompletedCheckAt: UpdateSchedulerLastCheckedAtProvider
@@ -506,7 +511,7 @@ public actor UpdateScheduler {
         clock: Clock,
         sleeper: Sleeper
     ) async {
-        var dueAt = await initialDueAt(lastCompletedCheckAt: lastCompletedCheckAt, clock: clock)
+        var dueAt = await nextDueAt(lastCompletedCheckAt: lastCompletedCheckAt, clock: clock)
         while !Task.isCancelled {
             let remainingMs = max(0, dueAt - clock.nowMilliseconds())
             do {
@@ -516,11 +521,23 @@ public actor UpdateScheduler {
             }
             if Task.isCancelled { return }
             await performScheduledCheck()
-            dueAt = clock.nowMilliseconds() + UpdateService.checkIntervalMs
+            // Recompute from the latest completed check's own timestamp
+            // (not from `clock.nowMilliseconds()` right after this wake)
+            // so a wake that the 24h gate suppressed — e.g. because a
+            // manual/prerelease-forced check already ran elsewhere while
+            // this loop slept — reschedules 24h after *that* check
+            // instead of deferring another full 24h from this stale wake.
+            dueAt = await nextDueAt(lastCompletedCheckAt: lastCompletedCheckAt, clock: clock)
         }
     }
 
-    private static func initialDueAt(
+    /// Computes the next due time as 24h after the most recently completed
+    /// check (falling back to "now" if none has ever completed) — used
+    /// both for the loop's initial sleep and to reschedule after every
+    /// wake/check attempt, so both cases always derive from the same
+    /// latest persisted/service `lastCheckedAt` source rather than from
+    /// whenever the loop happened to wake up.
+    private static func nextDueAt(
         lastCompletedCheckAt: UpdateSchedulerLastCheckedAtProvider,
         clock: Clock
     ) async -> Int64 {

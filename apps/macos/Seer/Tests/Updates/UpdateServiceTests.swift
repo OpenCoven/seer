@@ -96,11 +96,17 @@ private actor RecordingReleaseOpener: ReleaseURLOpening {
 /// right away instead of racing the test.
 actor GatedSleeper: Sleeper {
     private(set) var requestedCount = 0
+    /// Every `nanoseconds` value passed to `sleep(nanoseconds:)`, in call
+    /// order — lets a test assert on exactly how long `UpdateScheduler`
+    /// intends to sleep next (i.e. its computed due time), not merely that
+    /// it slept.
+    private(set) var recordedNanoseconds: [UInt64] = []
     private var pendingContinuation: CheckedContinuation<Void, Error>?
     private var availableReleases = 0
 
     func sleep(nanoseconds: UInt64) async throws {
         requestedCount += 1
+        recordedNanoseconds.append(nanoseconds)
         if availableReleases > 0 {
             availableReleases -= 1
             return
@@ -448,6 +454,89 @@ final class UpdateServiceTests: XCTestCase {
         // request was ever made.
         try await Task.sleep(nanoseconds: 50_000_000)
         XCTAssertEqual(MockURLProtocol.recordedRequests.count, 0)
+    }
+
+    /// A test-only, actor-isolated stand-in for whatever a real
+    /// `lastCompletedCheckAt`/`performScheduledCheck` pair would capture
+    /// (e.g. a coordinator's own state or a bare `UpdateService`), letting
+    /// a test simulate a manual/forced check completing out-of-band —
+    /// updating `lastCheckedAt` — without `UpdateScheduler`'s own wake
+    /// having run yet.
+    private actor FakeScheduledCheckTracker {
+        private(set) var lastCheckedAt: Int64?
+        private(set) var performCallCount = 0
+
+        func recordManualCheckCompletion(at time: Int64) {
+            lastCheckedAt = time
+        }
+
+        func recordPerformScheduledCheck() {
+            performCallCount += 1
+        }
+    }
+
+    // MARK: 7b. Scheduler reschedules from the latest completed check, not a stale wake
+
+    /// Regression test for the scheduler deferring its *next* wake from
+    /// whenever it happened to wake up (even a stale wake, suppressed by
+    /// the 24h gate) instead of from the most recently completed check.
+    /// Models: the scheduler starts with no prior check (so its first
+    /// sleep targets `now + 24h`); a manual/forced check completes 1 hour
+    /// into that sleep (e.g. the user opened the updates panel while the
+    /// Mac was briefly awake); the scheduler's original timer still fires
+    /// at the stale `now + 24h` mark and its non-forced check is
+    /// suppressed by the 24h gate (only 23h having elapsed since the
+    /// manual check). The scheduler must then sleep for only 1 more hour —
+    /// 24h after the manual check's own completion — not another full 24h
+    /// from this stale wake (which would leave ~47h between real network
+    /// checks instead of 24h).
+    func testSchedulerReschedulesFromLatestCompletedCheckNotFromAStaleWake() async throws {
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let sleeper = GatedSleeper()
+        let tracker = FakeScheduledCheckTracker()
+        let scheduler = UpdateScheduler(
+            clock: clock,
+            sleeper: sleeper,
+            lastCompletedCheckAt: { await tracker.lastCheckedAt },
+            performScheduledCheck: { await tracker.recordPerformScheduledCheck() }
+        )
+
+        await scheduler.start()
+        try await waitUntil { await sleeper.requestedCount >= 1 }
+
+        // No check has ever completed yet, so the first sleep must target
+        // exactly 24h from now.
+        let initialNanoseconds = await sleeper.recordedNanoseconds.last
+        XCTAssertEqual(initialNanoseconds, UInt64(UpdateService.checkIntervalMs) * 1_000_000)
+
+        // A manual/forced check completes 1 hour into the scheduler's
+        // sleep, independent of the scheduler's own loop.
+        let oneHourMs: Int64 = 60 * 60 * 1000
+        clock.now += oneHourMs
+        await tracker.recordManualCheckCompletion(at: clock.now)
+
+        // The scheduler's original timer still fires at the stale 24h
+        // mark (23h after the manual check completed) — its non-forced
+        // check is expected to be suppressed by the 24h gate upstream, so
+        // it merely records that it *attempted* a scheduled check here.
+        clock.now = 1_700_000_000_000 + UpdateService.checkIntervalMs
+        await sleeper.release()
+
+        try await waitUntil { await tracker.performCallCount >= 1 }
+        try await waitUntil { await sleeper.requestedCount >= 2 }
+
+        // The next sleep must target 24h after the manual check's own
+        // completion (1h from "now") — not another 24h from this stale
+        // wake (which would be 24h from "now").
+        let expectedRemainingMs = oneHourMs
+        let rescheduledNanoseconds = await sleeper.recordedNanoseconds.last
+        XCTAssertEqual(
+            rescheduledNanoseconds,
+            UInt64(expectedRemainingMs) * 1_000_000,
+            "must reschedule from the latest completed check's time, not from this stale wake"
+        )
+
+        await scheduler.stop()
     }
 
     /// Polls `condition` (with a short yield between attempts) until it is
