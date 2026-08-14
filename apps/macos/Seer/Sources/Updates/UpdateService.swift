@@ -391,18 +391,23 @@ public protocol UpdateChecking: Sendable {
 extension UpdateService: UpdateChecking {}
 
 /// Runs `UpdateScheduler`'s own non-forced scheduled check once its 24-hour
-/// interval elapses. `UpdateScheduler` itself has no notion of *how* that
+/// interval elapses, returning whether the attempt succeeded (`true`) or
+/// threw (`false`) — used only to decide how `UpdateScheduler` should
+/// reschedule its *next* attempt (see `runLoop`'s handling of a `false`
+/// result). `UpdateScheduler` itself has no other notion of *how* that
 /// check's resulting `UpdateState` should be surfaced — it only knows how
-/// to wait for the right moment and invoke this callback. Production
-/// wiring that has an `AppSnapshotCoordinator` (or equivalent) available
-/// should route this at `checkForUpdates(force: false)` so a scheduled
-/// check publishes its result and surfaces any failure as
+/// to wait for the right moment, invoke this callback, and interpret its
+/// returned success flag. Production wiring that has an
+/// `AppSnapshotCoordinator` (or equivalent) available should route this at
+/// `checkForUpdates(force: false)` so a scheduled check publishes its
+/// result and surfaces any failure as
 /// `CoordinatorDiagnosticID.updatesCheckFailed`, exactly like an explicit,
-/// renderer-initiated check would; the bare `UpdateChecking`-based
-/// convenience initializer below instead calls `check(force:)` directly
-/// and silently discards its result/failure, for callers (or tests) with
-/// no such coordinator to route through.
-public typealias UpdateSchedulerCheckAction = @Sendable () async -> Void
+/// renderer-initiated check would, while still reporting that failure
+/// back to the scheduler; the bare `UpdateChecking`-based convenience
+/// initializer below instead calls `check(force:)` directly, silently
+/// discards its result, and reports only whether it threw, for callers
+/// (or tests) with no such coordinator to route through.
+public typealias UpdateSchedulerCheckAction = @Sendable () async -> Bool
 
 /// Reports the timestamp (in milliseconds) of the most recently completed
 /// scheduled check, if any — used only to compute `UpdateScheduler`'s
@@ -417,13 +422,24 @@ public typealias UpdateSchedulerLastCheckedAtProvider = @Sendable () async -> In
 /// is running, entirely in the background. `start()` computes how long to
 /// sleep until the last completed check's time plus 24h (or checks
 /// immediately if no check has ever completed), sleeps via the injected
-/// `Sleeper`, invokes `performScheduledCheck`, and reschedules from
-/// `lastCompletedCheckAt`'s own latest value after every wake/check
-/// attempt — never from the wake's own wall-clock time — so a slow/failed
-/// check never causes back-to-back immediate retries, and a wake the 24h
-/// gate suppresses (e.g. because a manual/prerelease-forced check already
-/// ran elsewhere while this loop slept) reschedules 24h after *that*
-/// check instead of deferring another full 24h from this stale wake.
+/// `Sleeper`, invokes `performScheduledCheck`, and reschedules its next
+/// wake depending on that attempt's outcome:
+///
+/// - On success (or a wake the 24h gate suppresses — e.g. because a
+///   manual/prerelease-forced check already ran elsewhere while this loop
+///   slept), it reschedules from `lastCompletedCheckAt`'s own latest
+///   value — never from the wake's own wall-clock time — so it
+///   reschedules 24h after *that* check instead of deferring another
+///   full 24h from this stale wake.
+/// - On failure, `lastCompletedCheckAt` is guaranteed unchanged (a failed
+///   check never persists a new `lastCheckedAt`) and — since that stale
+///   value is exactly what made this attempt due in the first place — is
+///   already in the past. Recomputing from it here would therefore
+///   produce a due time still in the past, causing an immediate,
+///   zero-delay retry loop. Instead the scheduler reschedules a full 24h
+///   from *this* failed attempt's own completion time, bounding retries
+///   to once daily like every other scheduled attempt.
+///
 /// `stop()` cancels the background `Task` at shutdown; an in-progress
 /// sleep is abandoned rather than waited out.
 public actor UpdateScheduler {
@@ -478,7 +494,7 @@ public actor UpdateScheduler {
             clock: clock,
             sleeper: sleeper,
             lastCompletedCheckAt: { await service.currentState().lastCheckedAt },
-            performScheduledCheck: { _ = try? await service.check(force: false) }
+            performScheduledCheck: { (try? await service.check(force: false)) != nil }
         )
     }
 
@@ -520,14 +536,26 @@ public actor UpdateScheduler {
                 return
             }
             if Task.isCancelled { return }
-            await performScheduledCheck()
-            // Recompute from the latest completed check's own timestamp
-            // (not from `clock.nowMilliseconds()` right after this wake)
-            // so a wake that the 24h gate suppressed — e.g. because a
-            // manual/prerelease-forced check already ran elsewhere while
-            // this loop slept — reschedules 24h after *that* check
-            // instead of deferring another full 24h from this stale wake.
-            dueAt = await nextDueAt(lastCompletedCheckAt: lastCompletedCheckAt, clock: clock)
+            let succeeded = await performScheduledCheck()
+            if succeeded {
+                // Recompute from the latest completed check's own timestamp
+                // (not from `clock.nowMilliseconds()` right after this wake)
+                // so a wake that the 24h gate suppressed — e.g. because a
+                // manual/prerelease-forced check already ran elsewhere while
+                // this loop slept — reschedules 24h after *that* check
+                // instead of deferring another full 24h from this stale wake.
+                dueAt = await nextDueAt(lastCompletedCheckAt: lastCompletedCheckAt, clock: clock)
+            } else {
+                // A failed attempt leaves `lastCompletedCheckAt` unchanged —
+                // and that stale value is already in the past (it's exactly
+                // what made this attempt due). Recomputing from it here
+                // would produce a due time still in the past, causing an
+                // immediate, zero-delay retry loop. Reschedule a full 24h
+                // from this failed attempt's own completion time instead,
+                // so a failing scheduled check still only retries once
+                // daily, exactly like a successful one.
+                dueAt = clock.nowMilliseconds() + UpdateService.checkIntervalMs
+            }
         }
     }
 

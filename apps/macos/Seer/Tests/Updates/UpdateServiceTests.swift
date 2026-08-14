@@ -465,13 +465,25 @@ final class UpdateServiceTests: XCTestCase {
     private actor FakeScheduledCheckTracker {
         private(set) var lastCheckedAt: Int64?
         private(set) var performCallCount = 0
+        /// When `true`, `recordPerformScheduledCheck()` reports the attempt
+        /// as failed (mirroring a coordinator's `checkForUpdates(force:)`
+        /// returning `false` after catching a thrown `UpdateCheckError`)
+        /// without ever touching `lastCheckedAt` — exactly like a real
+        /// failed check, which never persists a new `lastCheckedAt` either.
+        var shouldFail = false
+
+        func setShouldFail(to value: Bool) {
+            shouldFail = value
+        }
 
         func recordManualCheckCompletion(at time: Int64) {
             lastCheckedAt = time
         }
 
-        func recordPerformScheduledCheck() {
+        @discardableResult
+        func recordPerformScheduledCheck() -> Bool {
             performCallCount += 1
+            return !shouldFail
         }
     }
 
@@ -535,6 +547,70 @@ final class UpdateServiceTests: XCTestCase {
             UInt64(expectedRemainingMs) * 1_000_000,
             "must reschedule from the latest completed check's time, not from this stale wake"
         )
+
+        await scheduler.stop()
+    }
+
+    // MARK: 7c. A failed scheduled attempt reschedules a bounded 24h — never a zero-delay retry loop
+
+    /// Regression test for the scheduler tight-looping with zero-delay
+    /// retries after a scheduled attempt fails. A failed check never
+    /// persists a new `lastCheckedAt` (mirroring the real
+    /// `AppSnapshotCoordinator.checkForUpdates(force:)`/`UpdateService
+    /// .check(force:)` contract), so `lastCompletedCheckAt` stays fixed at
+    /// whatever stale, already-past value made this attempt due in the
+    /// first place. Recomputing the next due time from that same stale
+    /// value would still be in the past, producing an immediate,
+    /// zero-delay retry — this test asserts the scheduler instead
+    /// reschedules a full, bounded 24h from the failed attempt's own
+    /// completion, and never invokes `performScheduledCheck` a second time
+    /// until that full sleep is released.
+    func testFailedScheduledCheckDoesNotLoopAndReschedulesABounded24HoursFromItsOwnCompletion() async throws {
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let sleeper = GatedSleeper()
+        let tracker = FakeScheduledCheckTracker()
+        let scheduler = UpdateScheduler(
+            clock: clock,
+            sleeper: sleeper,
+            lastCompletedCheckAt: { await tracker.lastCheckedAt },
+            performScheduledCheck: { await tracker.recordPerformScheduledCheck() }
+        )
+
+        // A prior check completed a full 24h ago, so the scheduler's very
+        // first computed due time is already in the past (i.e. this
+        // attempt is already overdue when the loop starts).
+        await tracker.recordManualCheckCompletion(at: clock.now - UpdateService.checkIntervalMs)
+        await tracker.setShouldFail(to: true)
+
+        await scheduler.start()
+        try await waitUntil { await sleeper.requestedCount >= 1 }
+
+        // Already overdue, so the first sleep must request zero delay.
+        let initialNanoseconds = await sleeper.recordedNanoseconds.last
+        XCTAssertEqual(initialNanoseconds, 0)
+
+        // Let the (already-due) scheduled check run; it fails, and
+        // `lastCheckedAt` is left completely untouched by that failure.
+        await sleeper.release()
+        try await waitUntil { await tracker.performCallCount >= 1 }
+
+        // The scheduler must request its *next* sleep for a full, bounded
+        // 24h from this failed attempt's own completion — never another
+        // zero-delay retry computed from the still-stale, still-past
+        // `lastCheckedAt`.
+        try await waitUntil { await sleeper.requestedCount >= 2 }
+        let rescheduledNanoseconds = await sleeper.recordedNanoseconds.last
+        XCTAssertEqual(
+            rescheduledNanoseconds,
+            UInt64(UpdateService.checkIntervalMs) * 1_000_000,
+            "a failed scheduled attempt must reschedule a full 24h from its own completion, not loop with a zero-delay retry"
+        )
+
+        // Give the loop a moment to react in case the fix above is wrong
+        // and it raced ahead anyway, then confirm no second attempt ran.
+        try await Task.sleep(nanoseconds: 50_000_000)
+        let performCallCountAfterSettling = await tracker.performCallCount
+        XCTAssertEqual(performCallCountAfterSettling, 1, "one failed scheduled attempt must not immediately trigger another")
 
         await scheduler.stop()
     }

@@ -309,7 +309,7 @@ public final class AppSnapshotCoordinator {
             clock: clock,
             sleeper: sleeper,
             lastCompletedCheckAt: { await box.coordinator?.snapshot.update.lastCheckedAt },
-            performScheduledCheck: { await box.coordinator?.checkForUpdates(force: false) }
+            performScheduledCheck: { await box.coordinator?.checkForUpdates(force: false) ?? true }
         )
 
         let coordinator = await makeCoordinatorWithoutStartingScheduler(
@@ -548,20 +548,29 @@ public final class AppSnapshotCoordinator {
     /// dropping the failure. Used both by the `updates.check` bridge
     /// command (with `force: true`, matching an explicit user request)
     /// and — with `force: false` — as the basis of `makeAtStartup`'s
-    /// startup check.
-    public func checkForUpdates(force: Bool) async {
+    /// startup check. Returns whether the check succeeded (`true`) or
+    /// threw (`false`); `makeAtStartupWithScheduledUpdates` routes this
+    /// return value straight back to `UpdateScheduler` so a failed
+    /// scheduled attempt reschedules a bounded 24h from its own
+    /// completion instead of recomputing from a stale, already-past
+    /// `lastCheckedAt` (see `UpdateScheduler.runLoop`).
+    @discardableResult
+    public func checkForUpdates(force: Bool) async -> Bool {
         await gate.acquire()
-        await performCheckForUpdates(force: force)
+        let succeeded = await performCheckForUpdates(force: force)
         await gate.release()
+        return succeeded
     }
 
-    private func performCheckForUpdates(force: Bool) async {
+    private func performCheckForUpdates(force: Bool) async -> Bool {
         var idsToClear: Set<String> = []
         var upserts: [Diagnostic] = []
         let updateState: UpdateState
+        let succeeded: Bool
         do {
             updateState = try await updateService.check(force: force)
             idsToClear.insert(CoordinatorDiagnosticID.updatesCheckFailed)
+            succeeded = true
         } catch {
             updateState = await updateService.currentState()
             upserts.append(Diagnostic(
@@ -569,8 +578,10 @@ public final class AppSnapshotCoordinator {
                 message: "Update check failed: \(error)",
                 occurredAt: clock.nowMilliseconds()
             ))
+            succeeded = false
         }
         publish(monitor: snapshot.monitor, history: snapshot.history, update: updateState, clearing: idsToClear, upserting: upserts)
+        return succeeded
     }
 
     /// Persists `value` as `includePrereleaseUpdates` — which also clears
