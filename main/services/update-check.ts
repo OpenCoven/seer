@@ -2,15 +2,33 @@ import type { UpdateState } from "./types.js";
 
 export const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1_000;
 
-const STABLE_URL = "https://api.github.com/repos/OpenCoven/seer/releases/latest";
-const PRERELEASE_URL = "https://api.github.com/repos/OpenCoven/seer/releases?per_page=20";
+// Seer's release feed lives in the dedicated public releases repository
+// (`OpenCoven/seer-releases`), never the main `OpenCoven/seer` source
+// repository, which never has its own GitHub releases published against it.
+const STABLE_URL = "https://api.github.com/repos/OpenCoven/seer-releases/releases/latest";
+const PRERELEASE_URL = "https://api.github.com/repos/OpenCoven/seer-releases/releases?per_page=20";
 
-type PrereleaseIdentifier = number | string;
+// A single dot-separated pre-release identifier. Per the SemVer spec, an
+// identifier composed entirely of digits (and not empty) is compared
+// numerically; any identifier containing a letter or hyphen is compared as
+// a string, and always sorts *after* every numeric identifier regardless
+// of its own text. `digits` is the identifier's normalized decimal digit
+// string (no leading zero unless the identifier is exactly `"0"`) rather
+// than a `number` — SemVer places no upper bound on how large a numeric
+// identifier may be, and `number` cannot exactly represent every integer
+// beyond `Number.MAX_SAFE_INTEGER` (2^53 - 1).
+type PrereleaseIdentifier = { readonly kind: "numeric"; readonly digits: string } | { readonly kind: "alphanumeric"; readonly value: string };
 
 export type SemanticVersion = {
-  major: number;
-  minor: number;
-  patch: number;
+  // Each of `major`/`minor`/`patch` is stored as its normalized decimal
+  // digit string (no leading zero unless the component is exactly `"0"`)
+  // rather than a `number`, for the same overflow-independence reason as
+  // `PrereleaseIdentifier.digits` above. `compareNumericStrings` compares
+  // these (and numeric pre-release identifiers) without ever converting
+  // to `number`.
+  major: string;
+  minor: string;
+  patch: string;
   prerelease: PrereleaseIdentifier[];
 };
 
@@ -51,6 +69,21 @@ export class UpdateCheckError extends Error {
   }
 }
 
+/// Compares two normalized (no leading zero, unless exactly `"0"`) decimal
+/// digit strings as arbitrarily large non-negative integers — used for
+/// `major`/`minor`/`patch` and numeric pre-release identifiers alike —
+/// without ever converting either one to `number`. Because leading zeros
+/// are already disallowed at parse time, a longer digit string is always
+/// numerically larger regardless of its digits, so comparing by length
+/// first and then lexicographically (equal-length decimal digit strings
+/// compare identically either way) is exactly equivalent to numeric
+/// comparison, for numbers of any magnitude.
+function compareNumericStrings(left: string, right: string): -1 | 0 | 1 {
+  if (left.length !== right.length) return left.length < right.length ? -1 : 1;
+  if (left === right) return 0;
+  return left < right ? -1 : 1;
+}
+
 function parseIdentifiers(raw: string, numericLeadingZerosAreInvalid: boolean): PrereleaseIdentifier[] | null {
   const parts = raw.split(".");
   if (parts.length === 0 || parts.some((part) => part.length === 0 || !/^[0-9A-Za-z-]+$/.test(part))) {
@@ -61,11 +94,9 @@ function parseIdentifiers(raw: string, numericLeadingZerosAreInvalid: boolean): 
   for (const part of parts) {
     if (/^\d+$/.test(part)) {
       if (numericLeadingZerosAreInvalid && part.length > 1 && part.startsWith("0")) return null;
-      const value = Number(part);
-      if (!Number.isSafeInteger(value)) return null;
-      identifiers.push(value);
+      identifiers.push({ kind: "numeric", digits: part });
     } else {
-      identifiers.push(part);
+      identifiers.push({ kind: "alphanumeric", value: part });
     }
   }
   return identifiers;
@@ -86,11 +117,9 @@ export function parseSemanticVersion(raw: string): SemanticVersion | null {
   const coreParts = core.split(".");
   if (coreParts.length !== 3) return null;
 
-  const numbers = coreParts.map((part) => {
-    if (!/^(0|[1-9]\d*)$/.test(part)) return null;
-    const value = Number(part);
-    return Number.isSafeInteger(value) ? value : null;
-  });
+  // Normalized decimal digit strings, never converted to `number` — a
+  // core numeric component may validly exceed `Number.MAX_SAFE_INTEGER`.
+  const numbers = coreParts.map((part) => (/^(0|[1-9]\d*)$/.test(part) ? part : null));
   if (numbers.some((part) => part === null)) return null;
 
   const prerelease = prereleaseRaw === null ? [] : parseIdentifiers(prereleaseRaw, true);
@@ -106,8 +135,8 @@ export function parseSemanticVersion(raw: string): SemanticVersion | null {
 
 export function compareSemanticVersions(left: SemanticVersion, right: SemanticVersion): -1 | 0 | 1 {
   for (const key of ["major", "minor", "patch"] as const) {
-    if (left[key] < right[key]) return -1;
-    if (left[key] > right[key]) return 1;
+    const order = compareNumericStrings(left[key], right[key]);
+    if (order !== 0) return order;
   }
 
   if (left.prerelease.length === 0 && right.prerelease.length === 0) return 0;
@@ -120,10 +149,17 @@ export function compareSemanticVersions(left: SemanticVersion, right: SemanticVe
     const rightPart = right.prerelease[index];
     if (leftPart === undefined) return -1;
     if (rightPart === undefined) return 1;
-    if (leftPart === rightPart) continue;
-    if (typeof leftPart === "number" && typeof rightPart === "string") return -1;
-    if (typeof leftPart === "string" && typeof rightPart === "number") return 1;
-    return leftPart < rightPart ? -1 : 1;
+    if (leftPart.kind === "numeric" && rightPart.kind === "numeric") {
+      const order = compareNumericStrings(leftPart.digits, rightPart.digits);
+      if (order !== 0) return order;
+      continue;
+    }
+    if (leftPart.kind === "numeric" && rightPart.kind === "alphanumeric") return -1;
+    if (leftPart.kind === "alphanumeric" && rightPart.kind === "numeric") return 1;
+    if (leftPart.kind === "alphanumeric" && rightPart.kind === "alphanumeric") {
+      if (leftPart.value === rightPart.value) continue;
+      return leftPart.value < rightPart.value ? -1 : 1;
+    }
   }
   return 0;
 }
@@ -185,9 +221,9 @@ export class UpdateService {
 
   constructor(options: UpdateServiceOptions) {
     this.currentVersion = parseSemanticVersion(options.currentVersion) ?? {
-      major: 0,
-      minor: 0,
-      patch: 0,
+      major: "0",
+      minor: "0",
+      patch: "0",
       prerelease: [],
     };
     this.fetchImpl = options.fetchImpl ?? fetch;

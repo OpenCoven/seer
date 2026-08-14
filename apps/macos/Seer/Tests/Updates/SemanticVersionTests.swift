@@ -151,4 +151,69 @@ final class SemanticVersionTests: XCTestCase {
         // whitespace-padding guard above.
         XCTAssertNil(SemanticVersion.parse("1.2 .3"))
     }
+
+    // MARK: - Very large numeric identifiers (overflow-independent comparison)
+
+    /// A syntactically valid major component one digit longer than
+    /// `UInt64.max` (20 digits) — comfortably beyond even an unsigned
+    /// 64-bit platform integer, let alone `Int`. SemVer places no upper
+    /// bound on a numeric identifier's magnitude, so this must still
+    /// parse successfully rather than being rejected as if it were
+    /// malformed.
+    private static let hugeMajor = "123456789012345678901234567890"
+
+    func testVeryLargeMajorVersionParsesSuccessfully() {
+        XCTAssertNotNil(SemanticVersion.parse("\(Self.hugeMajor).0.0"))
+    }
+
+    func testVeryLargeMajorVersionOrdersAboveAnOrdinaryVersion() {
+        let huge = SemanticVersion.parse("\(Self.hugeMajor).0.0")!
+        let ordinary = SemanticVersion.parse("999999999.0.0")!
+        XCTAssertLessThan(ordinary, huge)
+        XCTAssertFalse(huge < ordinary)
+    }
+
+    func testTwoVeryLargeMajorVersionsOfDifferingMagnitudeOrderByLength() {
+        // Same leading digits, but one has an extra trailing digit —
+        // proves comparison is not truncating/wrapping either value to a
+        // bounded integer type (which could otherwise misorder these).
+        let shorter = SemanticVersion.parse("\(Self.hugeMajor).0.0")!
+        let longer = SemanticVersion.parse("\(Self.hugeMajor)9.0.0")!
+        XCTAssertLessThan(shorter, longer)
+    }
+
+    func testTwoEqualVeryLargeMajorVersionsCompareEqual() {
+        let a = SemanticVersion.parse("\(Self.hugeMajor).0.0")!
+        let b = SemanticVersion.parse("\(Self.hugeMajor).0.0")!
+        XCTAssertEqual(a, b)
+        XCTAssertFalse(a < b)
+        XCTAssertFalse(b < a)
+    }
+
+    func testVeryLargeNumericPrereleaseIdentifierParsesAndOrdersByMagnitude() {
+        let smaller = SemanticVersion.parse("1.0.0-alpha.999999999999999999999")!
+        let larger = SemanticVersion.parse("1.0.0-alpha.1000000000000000000000")!
+        XCTAssertLessThan(smaller, larger)
+        XCTAssertFalse(larger < smaller)
+    }
+
+    func testVeryLargeNumericPrereleaseIdentifierWithLeadingZeroIsStillRejected() {
+        XCTAssertNil(SemanticVersion.parse("1.0.0-0123456789012345678901234567890"))
+    }
+
+    func testVeryLargeNumericPrereleaseIdentifierStillOrdersBeforeAlphanumeric() {
+        let numeric = SemanticVersion.parse("1.0.0-123456789012345678901234567890")!
+        let alphanumeric = SemanticVersion.parse("1.0.0-alpha")!
+        XCTAssertLessThan(numeric, alphanumeric)
+    }
+
+    func testVeryLargeMinorAndPatchComponentsParseAndOrder() {
+        let smallerMinor = SemanticVersion.parse("1.999999999999999999999.0")!
+        let largerMinor = SemanticVersion.parse("1.1000000000000000000000.0")!
+        XCTAssertLessThan(smallerMinor, largerMinor)
+
+        let smallerPatch = SemanticVersion.parse("1.0.999999999999999999999")!
+        let largerPatch = SemanticVersion.parse("1.0.1000000000000000000000")!
+        XCTAssertLessThan(smallerPatch, largerPatch)
+    }
 }

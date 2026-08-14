@@ -705,6 +705,181 @@ final class AppSnapshotCoordinatorTests: XCTestCase {
         XCTAssertEqual(updateScheduler.stopCallCount, 1)
     }
 
+    // MARK: - Updates: scheduled (periodic) checks route through the coordinator
+
+    /// Builds a coordinator via `makeAtStartupWithScheduledUpdates(...)` —
+    /// wiring a *real* `UpdateScheduler` (driven by the returned
+    /// `GatedSleeper`, never real wall-clock time) to route every
+    /// scheduled, non-forced check through this very coordinator's own
+    /// `checkForUpdates(force: false)`, exactly as production wiring
+    /// should. `updateService.checkResults`'s first scripted result (if
+    /// any) is consumed by the startup check `makeAtStartup` itself always
+    /// performs; any later scripted results are consumed by the
+    /// scheduler's own periodic ticks once the test releases `sleeper`.
+    private func makeCoordinatorWithScheduledUpdates(
+        settingsFileSystem: InMemorySettingsFileSystem = InMemorySettingsFileSystem(),
+        historyFileSystem: InMemorySettingsFileSystem = InMemorySettingsFileSystem(),
+        historyScheduler: HistoryScheduler = ManualHistoryScheduler(),
+        clock: MutableClock = MutableClock(now: 1_700_000_000_000),
+        powerBackend: CoordinatorFakePowerBackend = CoordinatorFakePowerBackend(),
+        appVersion: String = "1.0.0-test",
+        updateService: FakeUpdateChecking = FakeUpdateChecking()
+    ) async -> (AppSnapshotCoordinator, FakeRendererSink, GatedSleeper) {
+        let settingsAtomicStore = AtomicJSONStore<SettingsDocument>(
+            fileURL: settingsURL,
+            fileSystem: settingsFileSystem,
+            clock: clock
+        )
+        let settingsStore = SettingsStore(store: settingsAtomicStore)
+
+        let historyAtomicStore = AtomicJSONStore<HistoryDocument>(
+            fileURL: historyURL,
+            fileSystem: historyFileSystem,
+            clock: clock
+        )
+        let historyStore = HistoryStore(
+            store: historyAtomicStore,
+            clock: clock,
+            scheduler: historyScheduler,
+            idGenerator: SequentialHistorySessionIDGenerator()
+        )
+
+        let power = PowerAssertionService(backend: powerBackend)
+        let renderer = FakeRendererSink()
+        let sleeper = GatedSleeper()
+
+        let coordinator = await AppSnapshotCoordinator.makeAtStartupWithScheduledUpdates(
+            settingsStore: settingsStore,
+            historyStore: historyStore,
+            power: power,
+            renderer: renderer,
+            clock: clock,
+            appVersion: appVersion,
+            updateService: updateService,
+            sleeper: sleeper
+        )
+
+        return (coordinator, renderer, sleeper)
+    }
+
+    /// Polls `condition` (with a short yield between attempts) until it is
+    /// true or a generous bound is hit — used to await the real
+    /// `UpdateScheduler`'s background loop deterministically without any
+    /// fixed sleep. Mirrors `UpdateServiceTests.waitUntil`.
+    private func waitUntil(
+        timeoutSeconds: Double = 2,
+        _ condition: () async -> Bool
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while Date() < deadline {
+            if await condition() { return }
+            try await Task.sleep(nanoseconds: 2_000_000)
+        }
+        XCTFail("condition not met before timeout")
+    }
+
+    func testScheduledCheckSuccessPublishesUpdateStateExactlyOnceThroughTheCoordinator() async throws {
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let updateService = FakeUpdateChecking()
+        updateService.checkResults = [
+            // The startup check: nothing available yet.
+            .success(UpdateState(checking: false, availableVersion: nil, releaseURL: nil, lastCheckedAt: clock.now)),
+            // The scheduled check, 24 hours later: a new release appears.
+            .success(UpdateState(
+                checking: false,
+                availableVersion: "v5.0.0",
+                releaseURL: "https://github.com/OpenCoven/seer-releases/releases/tag/v5.0.0",
+                lastCheckedAt: clock.now + UpdateService.checkIntervalMs
+            )),
+        ]
+
+        let (coordinator, renderer, sleeper) = await makeCoordinatorWithScheduledUpdates(clock: clock, updateService: updateService)
+        let monitorBeforeScheduledCheck = coordinator.snapshot.monitor
+        let emittedBeforeScheduledCheck = renderer.emittedSnapshots.count
+
+        try await waitUntil { await sleeper.requestedCount >= 1 }
+        XCTAssertEqual(updateService.checkForceValues, [false], "only the startup check must have run before the scheduler's sleep elapses")
+
+        clock.now += UpdateService.checkIntervalMs
+        await sleeper.release()
+
+        try await waitUntil { updateService.checkForceValues.count >= 2 }
+        try await waitUntil { coordinator.snapshot.update.availableVersion == "v5.0.0" }
+
+        XCTAssertEqual(updateService.checkForceValues, [false, false], "the scheduled check must be unforced, like the startup check")
+        XCTAssertEqual(coordinator.snapshot.update.releaseURL, "https://github.com/OpenCoven/seer-releases/releases/tag/v5.0.0")
+        XCTAssertFalse(coordinator.snapshot.diagnostics.contains { $0.id == CoordinatorDiagnosticID.updatesCheckFailed })
+        XCTAssertEqual(
+            renderer.emittedSnapshots.count,
+            emittedBeforeScheduledCheck + 1,
+            "a scheduled check must publish exactly one transition, like an explicit checkForUpdates(force:) call"
+        )
+        XCTAssertEqual(renderer.emittedSnapshots.last, coordinator.snapshot)
+        XCTAssertEqual(coordinator.snapshot.monitor, monitorBeforeScheduledCheck, "a scheduled update check must never itself alter monitoring state")
+    }
+
+    func testScheduledCheckFailureSurfacesTheDiagnosticWhileRetainingMonitoringState() async throws {
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let updateService = FakeUpdateChecking()
+        updateService.checkResults = [
+            // The startup check succeeds so the diagnostic below can only
+            // have come from the *scheduled* check, not a stale startup one.
+            .success(UpdateState(checking: false, availableVersion: nil, releaseURL: nil, lastCheckedAt: clock.now)),
+            .failure(FakeUpdateCheckError("scheduled check network failure")),
+        ]
+
+        let (coordinator, renderer, sleeper) = await makeCoordinatorWithScheduledUpdates(clock: clock, updateService: updateService)
+        XCTAssertFalse(coordinator.snapshot.diagnostics.contains { $0.id == CoordinatorDiagnosticID.updatesCheckFailed })
+        let monitorBeforeScheduledCheck = coordinator.snapshot.monitor
+        let historyBeforeScheduledCheck = coordinator.snapshot.history
+        let emittedBeforeScheduledCheck = renderer.emittedSnapshots.count
+
+        try await waitUntil { await sleeper.requestedCount >= 1 }
+
+        clock.now += UpdateService.checkIntervalMs
+        await sleeper.release()
+
+        try await waitUntil { coordinator.snapshot.diagnostics.contains { $0.id == CoordinatorDiagnosticID.updatesCheckFailed } }
+
+        XCTAssertEqual(updateService.checkForceValues, [false, false])
+        XCTAssertEqual(
+            renderer.emittedSnapshots.count,
+            emittedBeforeScheduledCheck + 1,
+            "a failed scheduled check must still publish exactly one transition"
+        )
+        XCTAssertEqual(
+            coordinator.snapshot.monitor,
+            monitorBeforeScheduledCheck,
+            "a failed scheduled update check must never disturb monitoring state"
+        )
+        XCTAssertEqual(
+            coordinator.snapshot.history,
+            historyBeforeScheduledCheck,
+            "a failed scheduled update check must never disturb history state"
+        )
+        XCTAssertNil(coordinator.snapshot.update.availableVersion, "a failed check must leave the update state falling back to the service's own cached value")
+    }
+
+    func testShutdownCancelsARealCoordinatorWiredSchedulerSoNoFurtherScheduledCheckEverRuns() async throws {
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let updateService = FakeUpdateChecking()
+        updateService.checkResults = [.success(UpdateState(checking: false, availableVersion: nil, releaseURL: nil, lastCheckedAt: clock.now))]
+
+        let (coordinator, _, sleeper) = await makeCoordinatorWithScheduledUpdates(clock: clock, updateService: updateService)
+        try await waitUntil { await sleeper.requestedCount >= 1 }
+
+        try await coordinator.shutdown()
+
+        // Releasing after shutdown must not cause any further scheduled
+        // check to run — the cancelled scheduler's loop must have already
+        // exited rather than merely being "about to" exit.
+        clock.now += UpdateService.checkIntervalMs
+        await sleeper.release()
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertEqual(updateService.checkForceValues, [false], "only the startup check must ever have run")
+    }
+
     // MARK: - Shutdown
 
     func testShutdownAwaitsHistoryFlushAndReleasesPowerBeforeReturning() async throws {

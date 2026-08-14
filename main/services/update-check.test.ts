@@ -76,6 +76,50 @@ test("semantic versions use numeric ordering, prerelease precedence, and optiona
   }
 });
 
+test("very large numeric identifiers parse and compare without overflowing Number.MAX_SAFE_INTEGER", () => {
+  // One digit longer than `2^63 - 1` (the largest signed 64-bit integer),
+  // let alone `Number.MAX_SAFE_INTEGER` (2^53 - 1) — SemVer places no
+  // upper bound on a numeric identifier's magnitude, so this must still
+  // parse successfully rather than being rejected as malformed.
+  const hugeMajor = "123456789012345678901234567890";
+
+  const huge = parseSemanticVersion(`${hugeMajor}.0.0`);
+  assert.notEqual(huge, null);
+  const ordinary = parseSemanticVersion("999999999.0.0")!;
+  assert.equal(compareSemanticVersions(ordinary, huge!), -1);
+  assert.equal(compareSemanticVersions(huge!, ordinary), 1);
+
+  // Same leading digits, but one has an extra trailing digit — proves
+  // comparison is not truncating/coercing either value through `Number`
+  // (which could otherwise misorder or silently equate these).
+  const longer = parseSemanticVersion(`${hugeMajor}9.0.0`)!;
+  assert.equal(compareSemanticVersions(huge!, longer), -1);
+
+  const hugeAgain = parseSemanticVersion(`${hugeMajor}.0.0`)!;
+  assert.equal(compareSemanticVersions(huge!, hugeAgain), 0);
+  assert.deepEqual(huge, hugeAgain);
+
+  // A leading zero is still rejected regardless of the identifier's
+  // magnitude.
+  assert.equal(parseSemanticVersion(`0${hugeMajor}.0.0`), null);
+
+  // Numeric pre-release identifiers get the same overflow-independent
+  // treatment, and still always sort before any alphanumeric identifier.
+  const smallerPrerelease = parseSemanticVersion("1.0.0-alpha.999999999999999999999")!;
+  const largerPrerelease = parseSemanticVersion("1.0.0-alpha.1000000000000000000000")!;
+  assert.equal(compareSemanticVersions(smallerPrerelease, largerPrerelease), -1);
+  const hugeNumericPrerelease = parseSemanticVersion("1.0.0-123456789012345678901234567890")!;
+  const alphanumericPrerelease = parseSemanticVersion("1.0.0-alpha")!;
+  assert.equal(compareSemanticVersions(hugeNumericPrerelease, alphanumericPrerelease), -1);
+  assert.equal(parseSemanticVersion("1.0.0-0123456789012345678901234567890"), null);
+
+  // A build-metadata identifier that merely *looks* numeric and has a
+  // leading zero must still parse — build metadata is opaque and never
+  // participates in precedence, so it has no leading-zero restriction at
+  // all, unlike the version core/pre-release identifiers above.
+  assert.notEqual(parseSemanticVersion(`1.0.0+00${hugeMajor}`), null);
+});
+
 test("stable checks latest with a bodyless privacy-bounded request", async () => {
   const harness = makeHarness({
     responses: [
@@ -89,7 +133,7 @@ test("stable checks latest with a bodyless privacy-bounded request", async () =>
 
   assert.equal(state.availableVersion, "v1.2.0");
   assert.equal(harness.calls.length, 1);
-  assert.equal(harness.calls[0].url, "https://api.github.com/repos/OpenCoven/seer/releases/latest");
+  assert.equal(harness.calls[0].url, "https://api.github.com/repos/OpenCoven/seer-releases/releases/latest");
   assert.equal(harness.calls[0].init?.method, "GET");
   assert.equal(harness.calls[0].init?.body, undefined);
   assert.deepEqual(harness.calls[0].init?.headers, {
@@ -112,7 +156,7 @@ test("prerelease checks a bounded list, ignores drafts, and picks highest semant
 
   const state = await harness.service.check({ force: true });
 
-  assert.equal(harness.calls[0].url, "https://api.github.com/repos/OpenCoven/seer/releases?per_page=20");
+  assert.equal(harness.calls[0].url, "https://api.github.com/repos/OpenCoven/seer-releases/releases?per_page=20");
   assert.equal(state.availableVersion, "v1.10.0-beta.1");
 });
 
@@ -194,7 +238,7 @@ test("toggling prereleases persists, clears stream cache, and forces one check",
 
   assert.deepEqual(harness.persisted, [true]);
   assert.equal(harness.calls.length, 2);
-  assert.equal(harness.calls[1].url, "https://api.github.com/repos/OpenCoven/seer/releases?per_page=20");
+  assert.equal(harness.calls[1].url, "https://api.github.com/repos/OpenCoven/seer-releases/releases?per_page=20");
   assert.equal((harness.calls[1].init?.headers as Record<string, string>)["If-None-Match"], undefined);
   assert.equal(state.availableVersion, "v2.0.0-beta.1");
 });

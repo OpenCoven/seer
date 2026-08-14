@@ -13,6 +13,20 @@ public enum CoordinatorDiagnosticID {
     public static let updatesCheckFailed = "updates.check.failed"
 }
 
+/// A tiny reference-type box breaking the retain cycle
+/// `AppSnapshotCoordinator.makeAtStartupWithScheduledUpdates(...)` would
+/// otherwise create between a coordinator and the `UpdateScheduler` it
+/// owns. Captured strongly by the scheduler's per-tick closures, but only
+/// ever holds `coordinator` weakly, set once the coordinator itself has
+/// actually finished constructing. `@unchecked Sendable`: `coordinator` is
+/// a `@MainActor`-isolated class, and every access to it happens through
+/// an `await` at the isolated member itself (`.snapshot`,
+/// `.checkForUpdates(force:)`) — this box never touches any of its
+/// non-isolated state concurrently.
+private final class CoordinatorWeakBox: @unchecked Sendable {
+    weak var coordinator: AppSnapshotCoordinator?
+}
+
 /// Remaps the `storage.settings.*` ids `AtomicJSONStore` always emits
 /// (regardless of which document type is actually being stored) into
 /// their `storage.history.*` counterparts, for diagnostics that actually
@@ -162,6 +176,41 @@ public final class AppSnapshotCoordinator {
         updateService: any UpdateChecking,
         updateScheduler: any UpdateSchedulerControlling
     ) async -> AppSnapshotCoordinator {
+        let coordinator = await makeCoordinatorWithoutStartingScheduler(
+            settingsStore: settingsStore,
+            historyStore: historyStore,
+            power: power,
+            renderer: renderer,
+            clock: clock,
+            appVersion: appVersion,
+            updateService: updateService,
+            updateScheduler: updateScheduler
+        )
+
+        await updateScheduler.start()
+
+        return coordinator
+    }
+
+    /// The shared first half of `makeAtStartup(...)`/
+    /// `makeAtStartupWithScheduledUpdates(...)`: loads `settingsStore`/
+    /// `historyStore`, folds in startup diagnostics, runs the one-time
+    /// startup update check, and constructs the coordinator — but,
+    /// deliberately, does **not** start `updateScheduler`. Split out so
+    /// `makeAtStartupWithScheduledUpdates(...)` can register the
+    /// coordinator with its scheduler's callback closures *before* the
+    /// scheduler's background loop ever starts, rather than racing an
+    /// already-started scheduler task against that registration.
+    private static func makeCoordinatorWithoutStartingScheduler(
+        settingsStore: SettingsStore,
+        historyStore: HistoryStore,
+        power: PowerAssertionService,
+        renderer: any AppSnapshotRendererSink,
+        clock: Clock,
+        appVersion: String,
+        updateService: any UpdateChecking,
+        updateScheduler: any UpdateSchedulerControlling
+    ) async -> AppSnapshotCoordinator {
         let settingsResult = await settingsStore.load()
         _ = await historyStore.load()
         let historyDiagnostic = await historyStore.lastDiagnostic
@@ -203,7 +252,7 @@ public final class AppSnapshotCoordinator {
             appVersion: appVersion
         )
 
-        let coordinator = AppSnapshotCoordinator(
+        return AppSnapshotCoordinator(
             settingsStore: settingsStore,
             historyStore: historyStore,
             power: power,
@@ -213,9 +262,69 @@ public final class AppSnapshotCoordinator {
             updateService: updateService,
             updateScheduler: updateScheduler
         )
+    }
 
-        await updateScheduler.start()
+    /// Builds a fully wired `AppSnapshotCoordinator` whose periodic,
+    /// scheduled (non-forced) update checks route through *this*
+    /// coordinator's own `checkForUpdates(force: false)` — publishing the
+    /// resulting `UpdateState` in a single atomic transition and
+    /// surfacing any failure as `CoordinatorDiagnosticID.updatesCheckFailed`
+    /// — rather than a bare `UpdateService.check(force:)` call whose
+    /// result would be silently discarded. This is the composition every
+    /// real caller should use instead of hand-assembling an
+    /// `UpdateScheduler` bound directly to `updateService` and passing it
+    /// to `makeAtStartup(...)` verbatim, which would bypass the
+    /// coordinator's transition/publish/diagnostic behavior entirely for
+    /// every *scheduled* check (an explicit `checkForUpdates(force:)` call
+    /// — e.g. from the `updates.check` bridge command — is already
+    /// unaffected either way, since it always calls the coordinator
+    /// directly).
+    ///
+    /// Internally breaks the coordinator/scheduler reference cycle this
+    /// wiring would otherwise create: the coordinator strongly owns the
+    /// scheduler (so `shutdown()` can stop it), and the scheduler's
+    /// per-tick callback needs to call back into the coordinator. A small
+    /// weak box mediates this — the scheduler's closures capture the box
+    /// strongly, but the box only ever holds `coordinator` *weakly*, set
+    /// once construction has actually completed — so neither the
+    /// coordinator nor the scheduler ever keeps the other alive past its
+    /// own natural lifetime. The box is populated *before*
+    /// `scheduler.start()` is ever called (unlike `makeAtStartup(...)`,
+    /// which starts its injected scheduler as its very last step) so the
+    /// scheduler's very first background tick can never observe an
+    /// unregistered (`nil`) coordinator — there is no window in which its
+    /// background `Task` could run before this wiring is complete.
+    public static func makeAtStartupWithScheduledUpdates(
+        settingsStore: SettingsStore,
+        historyStore: HistoryStore,
+        power: PowerAssertionService,
+        renderer: any AppSnapshotRendererSink,
+        clock: Clock,
+        appVersion: String,
+        updateService: any UpdateChecking,
+        sleeper: Sleeper = TaskSleeper()
+    ) async -> AppSnapshotCoordinator {
+        let box = CoordinatorWeakBox()
+        let scheduler = UpdateScheduler(
+            clock: clock,
+            sleeper: sleeper,
+            lastCompletedCheckAt: { await box.coordinator?.snapshot.update.lastCheckedAt },
+            performScheduledCheck: { await box.coordinator?.checkForUpdates(force: false) }
+        )
 
+        let coordinator = await makeCoordinatorWithoutStartingScheduler(
+            settingsStore: settingsStore,
+            historyStore: historyStore,
+            power: power,
+            renderer: renderer,
+            clock: clock,
+            appVersion: appVersion,
+            updateService: updateService,
+            updateScheduler: scheduler
+        )
+
+        box.coordinator = coordinator
+        await scheduler.start()
         return coordinator
     }
 

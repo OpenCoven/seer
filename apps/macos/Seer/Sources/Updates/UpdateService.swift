@@ -81,10 +81,12 @@ enum UpdateCheckMode: Equatable, Sendable {
 /// request state.
 public actor UpdateService {
     /// The stable, always-owner/repo GitHub coordinates this app's release
-    /// feed lives at. Not configurable — Seer only ever checks its own
-    /// repository's releases.
+    /// feed lives at. Not configurable — Seer only ever checks the
+    /// dedicated public releases repository (`OpenCoven/seer-releases`),
+    /// never the main `OpenCoven/seer` source repository, which never has
+    /// its own GitHub releases published against it.
     static let owner = "OpenCoven"
-    static let repoName = "seer"
+    static let repoName = "seer-releases"
     static let userAgent = "Seer/1.0.0"
     /// The 24-hour gate `check(force:)` (when not forced) and
     /// `UpdateScheduler` both key off of.
@@ -388,33 +390,104 @@ public protocol UpdateChecking: Sendable {
 
 extension UpdateService: UpdateChecking {}
 
-/// Runs `UpdateService.check(force: false)` once every 24 hours (from the
-/// most recently completed check, not wall-clock ticks) for as long as the
-/// app is running, entirely in the background. `start()` computes how
-/// long to sleep until `lastUpdateCheckAt + 24h` (or checks immediately if
-/// no check has ever completed), sleeps via the injected `Sleeper`,
-/// performs one non-forced check, and reschedules from that check's own
-/// completion time — so a slow/failed check never causes back-to-back
-/// immediate retries. `stop()` cancels the background `Task` at shutdown;
-/// an in-progress sleep is abandoned rather than waited out.
+/// Runs `UpdateScheduler`'s own non-forced scheduled check once its 24-hour
+/// interval elapses. `UpdateScheduler` itself has no notion of *how* that
+/// check's resulting `UpdateState` should be surfaced — it only knows how
+/// to wait for the right moment and invoke this callback. Production
+/// wiring that has an `AppSnapshotCoordinator` (or equivalent) available
+/// should route this at `checkForUpdates(force: false)` so a scheduled
+/// check publishes its result and surfaces any failure as
+/// `CoordinatorDiagnosticID.updatesCheckFailed`, exactly like an explicit,
+/// renderer-initiated check would; the bare `UpdateChecking`-based
+/// convenience initializer below instead calls `check(force:)` directly
+/// and silently discards its result/failure, for callers (or tests) with
+/// no such coordinator to route through.
+public typealias UpdateSchedulerCheckAction = @Sendable () async -> Void
+
+/// Reports the timestamp (in milliseconds) of the most recently completed
+/// scheduled check, if any — used only to compute `UpdateScheduler`'s
+/// initial due time. Mirrors whichever store backs
+/// `UpdateSchedulerCheckAction` (e.g. a coordinator's own
+/// `snapshot.update.lastCheckedAt`, or a bare `UpdateService`'s
+/// `currentState().lastCheckedAt`).
+public typealias UpdateSchedulerLastCheckedAtProvider = @Sendable () async -> Int64?
+
+/// Runs one non-forced update check every 24 hours (from the most
+/// recently completed check, not wall-clock ticks) for as long as the app
+/// is running, entirely in the background. `start()` computes how long to
+/// sleep until the last completed check's time plus 24h (or checks
+/// immediately if no check has ever completed), sleeps via the injected
+/// `Sleeper`, invokes `performScheduledCheck`, and reschedules from that
+/// invocation's own completion time — so a slow/failed check never causes
+/// back-to-back immediate retries. `stop()` cancels the background `Task`
+/// at shutdown; an in-progress sleep is abandoned rather than waited out.
 public actor UpdateScheduler {
-    private let service: UpdateService
+    private let performScheduledCheck: UpdateSchedulerCheckAction
+    private let lastCompletedCheckAt: UpdateSchedulerLastCheckedAtProvider
     private let clock: Clock
     private let sleeper: Sleeper
     private var task: Task<Void, Never>?
 
-    public init(service: UpdateService, clock: Clock, sleeper: Sleeper = TaskSleeper()) {
-        self.service = service
+    /// The primary initializer: every scheduled, non-forced check is
+    /// routed entirely through `performScheduledCheck` (and its due time
+    /// computed from `lastCompletedCheckAt`) rather than this scheduler
+    /// owning an `UpdateService`/`UpdateChecking` directly — so production
+    /// wiring can point both at an `AppSnapshotCoordinator`'s own
+    /// `checkForUpdates(force: false)`/`snapshot.update.lastCheckedAt`
+    /// instead of silently discarding every scheduled check's result the
+    /// way a bare service call would.
+    ///
+    /// If `performScheduledCheck`/`lastCompletedCheckAt` capture a
+    /// class/actor that itself owns this scheduler (e.g. an
+    /// `AppSnapshotCoordinator` that stores the resulting
+    /// `UpdateScheduler` for its own `start()`/`stop()` lifecycle), that
+    /// reference **must** be captured weakly to avoid a retain cycle —
+    /// this initializer has no way to enforce that at the type level,
+    /// since `@Sendable () async -> Void` erases any captured reference's
+    /// identity.
+    public init(
+        clock: Clock,
+        sleeper: Sleeper = TaskSleeper(),
+        lastCompletedCheckAt: @escaping UpdateSchedulerLastCheckedAtProvider,
+        performScheduledCheck: @escaping UpdateSchedulerCheckAction
+    ) {
+        self.lastCompletedCheckAt = lastCompletedCheckAt
+        self.performScheduledCheck = performScheduledCheck
         self.clock = clock
         self.sleeper = sleeper
+    }
+
+    /// A convenience initializer wiring the scheduler directly to a bare
+    /// `UpdateChecking` conformance (typically `UpdateService` itself)
+    /// with no further publish/diagnostic behavior: a scheduled check's
+    /// result is discarded and any failure is silently retried at the
+    /// next interval, mirroring `check(force:)`'s own "leave cached state
+    /// untouched" contract. Used by callers/tests that only need to
+    /// exercise the scheduler's own timing behavior in isolation, with no
+    /// `AppSnapshotCoordinator` (or equivalent) to route scheduled checks
+    /// through — see the primary initializer above for the wiring real
+    /// production code should use instead, whenever such a coordinator is
+    /// available.
+    public init(service: any UpdateChecking, clock: Clock, sleeper: Sleeper = TaskSleeper()) {
+        self.init(
+            clock: clock,
+            sleeper: sleeper,
+            lastCompletedCheckAt: { await service.currentState().lastCheckedAt },
+            performScheduledCheck: { _ = try? await service.check(force: false) }
+        )
     }
 
     /// Starts the background loop, if not already running. Safe to call
     /// more than once — a second call while already started is a no-op.
     public func start() {
         guard task == nil else { return }
-        task = Task { [service, clock, sleeper] in
-            await Self.runLoop(service: service, clock: clock, sleeper: sleeper)
+        task = Task { [performScheduledCheck, lastCompletedCheckAt, clock, sleeper] in
+            await Self.runLoop(
+                performScheduledCheck: performScheduledCheck,
+                lastCompletedCheckAt: lastCompletedCheckAt,
+                clock: clock,
+                sleeper: sleeper
+            )
         }
     }
 
@@ -427,8 +500,13 @@ public actor UpdateScheduler {
         task = nil
     }
 
-    private static func runLoop(service: UpdateService, clock: Clock, sleeper: Sleeper) async {
-        var dueAt = await initialDueAt(service: service, clock: clock)
+    private static func runLoop(
+        performScheduledCheck: UpdateSchedulerCheckAction,
+        lastCompletedCheckAt: UpdateSchedulerLastCheckedAtProvider,
+        clock: Clock,
+        sleeper: Sleeper
+    ) async {
+        var dueAt = await initialDueAt(lastCompletedCheckAt: lastCompletedCheckAt, clock: clock)
         while !Task.isCancelled {
             let remainingMs = max(0, dueAt - clock.nowMilliseconds())
             do {
@@ -437,13 +515,16 @@ public actor UpdateScheduler {
                 return
             }
             if Task.isCancelled { return }
-            _ = try? await service.check(force: false)
+            await performScheduledCheck()
             dueAt = clock.nowMilliseconds() + UpdateService.checkIntervalMs
         }
     }
 
-    private static func initialDueAt(service: UpdateService, clock: Clock) async -> Int64 {
-        let lastCheckedAt = await service.currentState().lastCheckedAt
+    private static func initialDueAt(
+        lastCompletedCheckAt: UpdateSchedulerLastCheckedAtProvider,
+        clock: Clock
+    ) async -> Int64 {
+        let lastCheckedAt = await lastCompletedCheckAt()
         let now = clock.nowMilliseconds()
         return (lastCheckedAt ?? now) + UpdateService.checkIntervalMs
     }

@@ -191,7 +191,7 @@ final class UpdateServiceTests: XCTestCase {
 
         let recorded = MockURLProtocol.recordedRequests
         XCTAssertEqual(recorded.count, 1)
-        XCTAssertEqual(recorded[0].url?.absoluteString, "https://api.github.com/repos/OpenCoven/seer/releases/latest")
+        XCTAssertEqual(recorded[0].url?.absoluteString, "https://api.github.com/repos/OpenCoven/seer-releases/releases/latest")
         XCTAssertEqual(recorded[0].httpMethod, "GET")
     }
 
@@ -222,7 +222,7 @@ final class UpdateServiceTests: XCTestCase {
         XCTAssertEqual(recorded.count, 1)
         let url = try XCTUnwrap(recorded[0].url)
         XCTAssertEqual(url.host, "api.github.com")
-        XCTAssertEqual(url.path, "/repos/OpenCoven/seer/releases")
+        XCTAssertEqual(url.path, "/repos/OpenCoven/seer-releases/releases")
         XCTAssertEqual(url.query, "per_page=20")
         XCTAssertFalse(url.absoluteString.contains("/latest"))
     }
