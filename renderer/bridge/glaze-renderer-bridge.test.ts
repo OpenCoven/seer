@@ -3,7 +3,7 @@ import process from "node:process";
 import test from "node:test";
 
 import { createGlazeRendererBridge, type GlazeIpcFacade } from "./glaze-renderer-bridge";
-import type { AgentMonitorState, HistoryStats } from "./types";
+import type { AgentMonitorState, HistoryStats, UpdateState } from "./types";
 
 function makeMonitor(overrides: Partial<AgentMonitorState> = {}): AgentMonitorState {
   return {
@@ -31,6 +31,8 @@ function makeHistory(overrides: Partial<HistoryStats> = {}): HistoryStats {
 type FakeIpcOptions = {
   monitor?: AgentMonitorState;
   history?: HistoryStats;
+  update?: UpdateState;
+  checkedUpdate?: UpdateState;
   version?: string;
 };
 
@@ -41,6 +43,12 @@ function createFakeIpc(options: FakeIpcOptions = {}) {
 
   const monitor = options.monitor ?? makeMonitor();
   const history = options.history ?? makeHistory();
+  const update = options.update ?? {
+    checking: false,
+    availableVersion: null,
+    releaseURL: null,
+    lastCheckedAt: null,
+  };
   const version = options.version ?? "1.0.0";
 
   let disconnectCalls = 0;
@@ -57,6 +65,12 @@ function createFakeIpc(options: FakeIpcOptions = {}) {
           return history as unknown as T;
         case "app:getInfo":
           return { name: "Seer", version, environment: "test" } as unknown as T;
+        case "updates:getState":
+          return update as unknown as T;
+        case "updates:check":
+          return (options.checkedUpdate ?? update) as unknown as T;
+        case "updates:open":
+          return undefined as unknown as T;
         case "agents:setKeepAwakeMode":
           return { ...monitor, keepAwakeMode: (args[0] as { mode: string }).mode } as unknown as T;
         case "history:clear":
@@ -93,20 +107,26 @@ function createFakeIpc(options: FakeIpcOptions = {}) {
   };
 }
 
-test("getSnapshot returns appVersion 1.0.0 and invokes channels in exact order", async () => {
-  const fake = createFakeIpc({ version: "1.0.0" });
+test("getSnapshot includes the startup update state and invokes every state channel", async () => {
+  const update: UpdateState = {
+    checking: false,
+    availableVersion: "v1.2.0",
+    releaseURL: "https://github.com/OpenCoven/seer/releases/tag/v1.2.0",
+    lastCheckedAt: 123,
+  };
+  const fake = createFakeIpc({ version: "1.0.0", update });
   const bridge = createGlazeRendererBridge(fake.ipc);
 
   const snapshot = await bridge.getSnapshot();
 
   assert.equal(snapshot.appVersion, "1.0.0");
-  assert.deepEqual(fake.invokedChannels, ["agents:getState", "history:getStats", "app:getInfo"]);
-  assert.deepEqual(snapshot.update, {
-    checking: false,
-    availableVersion: null,
-    releaseURL: null,
-    lastCheckedAt: null,
-  });
+  assert.deepEqual(fake.invokedChannels, [
+    "agents:getState",
+    "history:getStats",
+    "updates:getState",
+    "app:getInfo",
+  ]);
+  assert.deepEqual(snapshot.update, update);
   assert.deepEqual(snapshot.diagnostics, []);
 });
 
@@ -211,6 +231,58 @@ test("hidePanel invokes window:hidePanel exactly once with no arguments", async 
   assert.deepEqual(fake.invokeArgs["window:hidePanel"], []);
 });
 
+test("requestUpdateCheck calls updates:check and merges its state into the snapshot", async () => {
+  const checkedUpdate: UpdateState = {
+    checking: false,
+    availableVersion: "v2.0.0",
+    releaseURL: "https://github.com/OpenCoven/seer/releases/tag/v2.0.0",
+    lastCheckedAt: 456,
+  };
+  const fake = createFakeIpc({ checkedUpdate });
+  const bridge = createGlazeRendererBridge(fake.ipc);
+  await bridge.getSnapshot();
+
+  const snapshot = await bridge.requestUpdateCheck();
+
+  assert.equal(fake.invokedChannels[fake.invokedChannels.length - 1], "updates:check");
+  assert.deepEqual(fake.invokeArgs["updates:check"], []);
+  assert.deepEqual(snapshot.update, checkedUpdate);
+  assert.ok(snapshot.monitor);
+  assert.ok(snapshot.history);
+});
+
+test("openCurrentRelease calls updates:open with no renderer URL", async () => {
+  const fake = createFakeIpc();
+  const bridge = createGlazeRendererBridge(fake.ipc);
+
+  await bridge.openCurrentRelease();
+
+  assert.deepEqual(fake.invokedChannels, ["updates:open"]);
+  assert.deepEqual(fake.invokeArgs["updates:open"], []);
+});
+
+test("updates:changed merges into a complete snapshot delivered to subscribers", async () => {
+  const fake = createFakeIpc();
+  const bridge = createGlazeRendererBridge(fake.ipc);
+  const received: Array<Awaited<ReturnType<typeof bridge.getSnapshot>>> = [];
+  bridge.subscribe((snapshot) => received.push(snapshot));
+  await bridge.getSnapshot();
+  const update: UpdateState = {
+    checking: false,
+    availableVersion: "v1.3.0",
+    releaseURL: "https://github.com/OpenCoven/seer/releases/tag/v1.3.0",
+    lastCheckedAt: 789,
+  };
+
+  fake.fireNotification("updates:changed", update);
+
+  assert.equal(received.length, 1);
+  assert.deepEqual(received[0].update, update);
+  assert.ok(received[0].monitor);
+  assert.ok(received[0].history);
+  assert.equal(received[0].appVersion, "1.0.0");
+});
+
 // --- Finding 4: initial getSnapshot cannot clobber newer notifications/mutations. ---
 
 /** A deferred promise: resolve/reject can be called from outside the executor. */
@@ -238,6 +310,14 @@ function createControllableIpc() {
   const ipc: GlazeIpcFacade = {
     invoke<T>(channel: string): Promise<T> {
       invokedChannels.push(channel);
+      if (channel === "updates:getState") {
+        return Promise.resolve({
+          checking: false,
+          availableVersion: null,
+          releaseURL: null,
+          lastCheckedAt: null,
+        } as T);
+      }
       const deferred = createDeferred<unknown>();
       const queue = queues.get(channel) ?? [];
       queue.push({ resolve: deferred.resolve, reject: deferred.reject });

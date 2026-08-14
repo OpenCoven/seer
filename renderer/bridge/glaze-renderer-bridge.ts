@@ -1,5 +1,5 @@
 import type { RendererBridge } from "./renderer-bridge";
-import type { AgentMonitorState, AppSnapshot, HistoryStats, KeepAwakeMode } from "./types";
+import type { AgentMonitorState, AppSnapshot, HistoryStats, KeepAwakeMode, UpdateState } from "./types";
 
 /**
  * Minimal facade over the Glaze IPC bridge that this adapter depends on.
@@ -129,12 +129,13 @@ export function createGlazeRendererBridge(ipc: GlazeIpcFacade): RendererBridge {
   }
   let pendingAgentsNotification: PendingNotification | null = null;
   let pendingHistoryNotification: PendingNotification | null = null;
+  let pendingUpdateNotification: PendingNotification | null = null;
 
   function drainPendingNotifications(): void {
     if (current === null) {
       return;
     }
-    const entries = [pendingAgentsNotification, pendingHistoryNotification].filter(
+    const entries = [pendingAgentsNotification, pendingHistoryNotification, pendingUpdateNotification].filter(
       (entry): entry is PendingNotification => entry !== null,
     );
     if (entries.length === 0) {
@@ -143,6 +144,7 @@ export function createGlazeRendererBridge(ipc: GlazeIpcFacade): RendererBridge {
     entries.sort((a, b) => a.seq - b.seq);
     pendingAgentsNotification = null;
     pendingHistoryNotification = null;
+    pendingUpdateNotification = null;
     for (const entry of entries) {
       if (entry.seq >= appliedSequence) {
         appliedSequence = entry.seq;
@@ -183,21 +185,17 @@ export function createGlazeRendererBridge(ipc: GlazeIpcFacade): RendererBridge {
   }
 
   async function fetchSnapshot(): Promise<AppSnapshot> {
-    const [monitor, history, info] = await Promise.all([
+    const [monitor, history, update, info] = await Promise.all([
       ipc.invoke<AgentMonitorState>("agents:getState"),
       ipc.invoke<HistoryStats>("history:getStats"),
+      ipc.invoke<UpdateState>("updates:getState"),
       ipc.invoke<GlazeAppInfo>("app:getInfo"),
     ]);
 
     return {
       monitor,
       history,
-      update: {
-        checking: false,
-        availableVersion: null,
-        releaseURL: null,
-        lastCheckedAt: null,
-      },
+      update,
       diagnostics: [],
       appVersion: info.version,
     };
@@ -293,6 +291,20 @@ export function createGlazeRendererBridge(ipc: GlazeIpcFacade): RendererBridge {
     notifyListeners(commit(merged, seq));
   });
 
+  const unsubscribeUpdates = ipc.onNotification("updates:changed", (params) => {
+    const update = params as UpdateState;
+    const seq = nextSequence();
+    if (current === null) {
+      pendingUpdateNotification = {
+        seq,
+        apply: (base) => ({ ...base, update }),
+      };
+      return;
+    }
+
+    notifyListeners(commit({ ...current, update }, seq));
+  });
+
   return {
     async getSnapshot(): Promise<AppSnapshot> {
       const seq = nextSequence();
@@ -328,15 +340,14 @@ export function createGlazeRendererBridge(ipc: GlazeIpcFacade): RendererBridge {
     },
 
     async requestUpdateCheck(): Promise<AppSnapshot> {
-      // Update checks are unavailable until Task 11 wires the real update
-      // channel; return the current known-good snapshot unchanged.
       const seq = nextSequence();
+      const update = await ipc.invoke<UpdateState>("updates:check");
       const base = await ensureBase();
-      return commit(base, seq);
+      return commit({ ...base, update }, seq);
     },
 
     async openCurrentRelease(): Promise<void> {
-      // No-op until Task 11 implements the update flow.
+      await ipc.invoke("updates:open");
     },
 
     async quit(): Promise<void> {
@@ -351,6 +362,7 @@ export function createGlazeRendererBridge(ipc: GlazeIpcFacade): RendererBridge {
       disconnected = true;
       unsubscribeAgents();
       unsubscribeHistory();
+      unsubscribeUpdates();
       listeners.clear();
       ipc.disconnect?.();
     },

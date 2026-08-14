@@ -8,6 +8,7 @@ import { fileURLToPath } from "url";
 import { agentHandlers } from "./agents.js";
 import { appHandlers } from "./app.js";
 import { historyHandlers } from "./history.js";
+import { updateHandlers } from "./updates.js";
 import { hidePanelWindow } from "../windows/panel-window.js";
 
 import { app, ipcMain, logger } from "@glaze/core/backend";
@@ -40,6 +41,18 @@ export function registerHandlers(): void {
 
   ipcMain.handle("history:clear", async () => {
     return await historyHandlers.clear();
+  });
+
+  ipcMain.handle("updates:getState", async () => {
+    return updateHandlers.getState();
+  });
+
+  ipcMain.handle("updates:check", async () => {
+    return await updateHandlers.check();
+  });
+
+  ipcMain.handle("updates:open", async () => {
+    await updateHandlers.open();
   });
 
   ipcMain.handle("window:hidePanel", async () => {

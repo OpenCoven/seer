@@ -7,6 +7,7 @@ import type { AppSettings, KeepAwakeMode } from "./types.js";
 
 const DEFAULT_SETTINGS: AppSettings = {
   keepAwakeMode: "system",
+  includePrereleaseUpdates: false,
 };
 
 function isFileNotFound(error: unknown): boolean {
@@ -25,6 +26,10 @@ function normalizeSettings(value: unknown): AppSettings {
   const record = value as Record<string, unknown>;
   return {
     keepAwakeMode: isKeepAwakeMode(record.keepAwakeMode) ? record.keepAwakeMode : DEFAULT_SETTINGS.keepAwakeMode,
+    includePrereleaseUpdates:
+      typeof record.includePrereleaseUpdates === "boolean"
+        ? record.includePrereleaseUpdates
+        : DEFAULT_SETTINGS.includePrereleaseUpdates,
   };
 }
 
@@ -71,6 +76,13 @@ class SettingsStore {
   async setKeepAwakeMode(mode: KeepAwakeMode): Promise<AppSettings> {
     await this.load();
     this.cache = { ...this.cache, keepAwakeMode: mode };
+    await this.persist();
+    return this.cache;
+  }
+
+  async setIncludePrereleaseUpdates(value: boolean): Promise<AppSettings> {
+    await this.load();
+    this.cache = { ...this.cache, includePrereleaseUpdates: value };
     await this.persist();
     return this.cache;
   }

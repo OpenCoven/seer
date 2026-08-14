@@ -28,14 +28,45 @@ function sourceLabel(source: ActiveAgent["source"]): string {
 
 export { sourceLabel };
 
+export function UpdateNotice({
+  availableVersion,
+  checking,
+  onView,
+  onCheck,
+}: {
+  availableVersion: string;
+  checking: boolean;
+  onView: () => void;
+  onCheck: () => void;
+}) {
+  return (
+    <div className="flex items-center gap-2 rounded-xl bg-control-subtle px-3 py-2">
+      <Text variant="small-strong" className="min-w-0 flex-1">
+        Seer {availableVersion} is available
+      </Text>
+      <Button variant="muted" size="small" onClick={onView}>
+        View release
+      </Button>
+      <Button variant="muted" size="small" disabled={checking} onClick={onCheck}>
+        {checking ? "Checking…" : "Check again"}
+      </Button>
+    </div>
+  );
+}
+
 export function HomeView() {
   const bridge = useRendererBridge();
   const queryClient = useQueryClient();
   const { data: snapshot, isLoading } = useAppSnapshot();
   const state = snapshot?.monitor ?? EMPTY_STATE;
+  const update = snapshot?.update;
 
   const modeMutation = useMutation({
     mutationFn: (mode: KeepAwakeMode) => bridge.setKeepAwakeMode(mode),
+    onSuccess: (next) => writeAppSnapshot(queryClient, next),
+  });
+  const updateMutation = useMutation({
+    mutationFn: () => bridge.requestUpdateCheck(),
     onSuccess: (next) => writeAppSnapshot(queryClient, next),
   });
 
@@ -45,6 +76,10 @@ export function HomeView() {
 
   const handleQuit = () => {
     void bridge.quit();
+  };
+
+  const handleViewRelease = () => {
+    void bridge.openCurrentRelease();
   };
 
   const agents = state.agents;
@@ -77,6 +112,15 @@ export function HomeView() {
       }
     >
       <div className="flex flex-col gap-4 px-3 pt-1 pb-3">
+        {update?.availableVersion ? (
+          <UpdateNotice
+            availableVersion={update.availableVersion}
+            checking={update.checking || updateMutation.isPending}
+            onView={handleViewRelease}
+            onCheck={() => updateMutation.mutate()}
+          />
+        ) : null}
+
         <div className="flex items-start gap-3 rounded-xl bg-control-subtle px-3 py-3">
           <div className="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-full bg-control">
             {state.active ? (

@@ -2,7 +2,8 @@ import { Menu, Tray, app, logger } from "@glaze/core/backend";
 import type { MenuItemConstructorOptions, Rectangle } from "@glaze/core/backend";
 
 import { getMonitorState, onMonitorStateChange, setKeepAwakeMode } from "./monitor.js";
-import type { AgentMonitorState, KeepAwakeMode } from "./types.js";
+import type { AgentMonitorState, KeepAwakeMode, UpdateState } from "./types.js";
+import { getSharedUpdateService } from "./update-check.js";
 import { showPanelWindow, togglePanelWindow } from "../windows/panel-window.js";
 
 // Stable GUID — do not regenerate. Preserves menu-bar position across launches.
@@ -16,6 +17,13 @@ const ACTIVE_COLOR = "#F2A93B";
 let tray: Tray | null = null;
 let latestState: AgentMonitorState = getMonitorState();
 let unsubscribeState: (() => void) | null = null;
+let latestUpdate: UpdateState = {
+  checking: false,
+  availableVersion: null,
+  releaseURL: null,
+  lastCheckedAt: null,
+};
+let unsubscribeUpdateState: (() => void) | null = null;
 
 function selectKeepAwakeMode(mode: KeepAwakeMode): void {
   void setKeepAwakeMode(mode).catch((error: unknown) => {
@@ -24,6 +32,7 @@ function selectKeepAwakeMode(mode: KeepAwakeMode): void {
 }
 
 function buildContextMenu(state: AgentMonitorState, bounds?: Rectangle): Menu {
+  const updateService = getSharedUpdateService();
   const items: MenuItemConstructorOptions[] = [
     {
       label: "Open Seer",
@@ -51,6 +60,28 @@ function buildContextMenu(state: AgentMonitorState, bounds?: Rectangle): Menu {
         selectKeepAwakeMode("display");
       },
     },
+    { type: "separator" },
+    { type: "header", label: "Updates" },
+    {
+      label: "Include Prerelease Updates",
+      type: "checkbox",
+      checked: updateService.includesPrereleaseUpdates(),
+      click: () => {
+        void updateService.setIncludePrereleaseUpdates(!updateService.includesPrereleaseUpdates()).catch((error: unknown) => {
+          logger.error("tray", "Failed to change prerelease update setting", error);
+        });
+      },
+    },
+    ...(latestUpdate.availableVersion
+      ? [
+          {
+            label: `View Seer ${latestUpdate.availableVersion}`,
+            click: () => {
+              void updateService.openCurrentRelease();
+            },
+          } satisfies MenuItemConstructorOptions,
+        ]
+      : []),
     { type: "separator" },
     {
       label: "Quit Seer",
@@ -114,6 +145,12 @@ export function createTray(): void {
     latestState = state;
     applyTrayAppearance(state);
   });
+  const updateService = getSharedUpdateService();
+  latestUpdate = updateService.getState();
+  unsubscribeUpdateState?.();
+  unsubscribeUpdateState = updateService.subscribe((state) => {
+    latestUpdate = state;
+  });
 
   latestState = getMonitorState();
   applyTrayAppearance(latestState);
@@ -122,6 +159,8 @@ export function createTray(): void {
 export function destroyTray(): void {
   unsubscribeState?.();
   unsubscribeState = null;
+  unsubscribeUpdateState?.();
+  unsubscribeUpdateState = null;
 
   if (tray && !tray.isDestroyed()) {
     tray.closeContextMenu();

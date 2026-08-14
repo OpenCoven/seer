@@ -57,6 +57,82 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertTrue(decoded.includePrereleaseUpdates)
     }
 
+    // MARK: Update-check cache persistence (Task 11)
+
+    func testRecordUpdateCheckPersistsEtagCheckTimeAndRelease() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let store = makeSettingsStore(fileSystem: fileSystem)
+        _ = await store.load()
+
+        let release = PersistedRelease(version: "v1.3.0", url: "https://github.com/OpenCoven/seer/releases/tag/v1.3.0")
+        try await store.recordUpdateCheck(etag: "\"abc123\"", lastCheckedAt: 1_700_000_500_000, release: release)
+
+        let current = await store.current
+        XCTAssertEqual(current.updateETag, "\"abc123\"")
+        XCTAssertEqual(current.lastUpdateCheckAt, 1_700_000_500_000)
+        XCTAssertEqual(current.lastRelease, release)
+
+        let decoder = JSONDecoder()
+        let savedBytes = await fileSystem.contents(at: settingsURL)
+        let decoded = try decoder.decode(SettingsDocument.self, from: savedBytes!)
+        XCTAssertEqual(decoded.updateETag, "\"abc123\"")
+        XCTAssertEqual(decoded.lastUpdateCheckAt, 1_700_000_500_000)
+        XCTAssertEqual(decoded.lastRelease, release)
+    }
+
+    func testRecordUpdateCheckWithNilEtagAndReleaseClearsThemOnDisk() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let store = makeSettingsStore(fileSystem: fileSystem)
+        _ = await store.load()
+
+        let release = PersistedRelease(version: "v1.3.0", url: "https://github.com/OpenCoven/seer/releases/tag/v1.3.0")
+        try await store.recordUpdateCheck(etag: "\"abc123\"", lastCheckedAt: 1_700_000_500_000, release: release)
+        try await store.recordUpdateCheck(etag: nil, lastCheckedAt: 1_700_000_600_000, release: nil)
+
+        let current = await store.current
+        XCTAssertNil(current.updateETag)
+        XCTAssertEqual(current.lastUpdateCheckAt, 1_700_000_600_000)
+        XCTAssertNil(current.lastRelease)
+    }
+
+    func testSetIncludePrereleaseUpdatesClearsCachedUpdateMetadata() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let store = makeSettingsStore(fileSystem: fileSystem)
+        _ = await store.load()
+
+        let release = PersistedRelease(version: "v1.3.0", url: "https://github.com/OpenCoven/seer/releases/tag/v1.3.0")
+        try await store.recordUpdateCheck(etag: "\"abc123\"", lastCheckedAt: 1_700_000_500_000, release: release)
+
+        try await store.setIncludePrereleaseUpdates(true)
+
+        let current = await store.current
+        XCTAssertTrue(current.includePrereleaseUpdates)
+        XCTAssertNil(current.updateETag, "switching streams must discard the other stream's cached ETag")
+        XCTAssertNil(current.lastUpdateCheckAt, "switching streams must make the next check due immediately")
+        XCTAssertNil(current.lastRelease, "switching streams must discard the other stream's cached release")
+
+        let decoder = JSONDecoder()
+        let savedBytes = await fileSystem.contents(at: settingsURL)
+        let decoded = try decoder.decode(SettingsDocument.self, from: savedBytes!)
+        XCTAssertEqual(decoded, current)
+    }
+
+    func testVersionOneFileWithoutUpdateFieldsDecodesWithNilDefaults() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let legacyBytes = Data("""
+        {"version":1,"keepAwakeMode":"display","includePrereleaseUpdates":false}
+        """.utf8)
+        await fileSystem.seedFile(at: settingsURL, contents: legacyBytes)
+        let store = makeSettingsStore(fileSystem: fileSystem)
+
+        let result = await store.load()
+
+        XCTAssertEqual(result.value.keepAwakeMode, .display)
+        XCTAssertNil(result.value.updateETag)
+        XCTAssertNil(result.value.lastUpdateCheckAt)
+        XCTAssertNil(result.value.lastRelease)
+    }
+
     // MARK: 12. Failed mutation does not change cache
 
     func testFailedMutationDoesNotChangeCache() async throws {
