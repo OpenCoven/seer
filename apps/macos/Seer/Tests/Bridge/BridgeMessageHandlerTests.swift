@@ -579,7 +579,7 @@ final class BridgeMessageHandlerTests: XCTestCase {
 
     // MARK: - Wiring against the real Task 9 AppSnapshotCoordinator
 
-    func testStandaloneBridgeCommandRouterForCoordinatorWiresSnapshotGetKeepAwakeModeSetAndHistoryClear() async {
+    func testStandaloneBridgeCommandRouterForCoordinatorWiresSnapshotGetKeepAwakeModeSetHistoryClearAndUpdates() async {
         let settingsFileSystem = InMemorySettingsFileSystem()
         let historyFileSystem = InMemorySettingsFileSystem()
         let clock = MutableClock(now: 1_700_000_000_000)
@@ -604,13 +604,17 @@ final class BridgeMessageHandlerTests: XCTestCase {
         final class CollectingSink: AppSnapshotRendererSink {
             func emit(_ snapshot: AppSnapshot) {}
         }
+        let updateService = FakeUpdateChecking()
+        let updateScheduler = FakeUpdateSchedulerControlling()
         let coordinator = await AppSnapshotCoordinator.makeAtStartup(
             settingsStore: settingsStore,
             historyStore: historyStore,
             power: power,
             renderer: CollectingSink(),
             clock: clock,
-            appVersion: "1.2.3"
+            appVersion: "1.2.3",
+            updateService: updateService,
+            updateScheduler: updateScheduler
         )
 
         let router = StandaloneBridgeCommandRouter.forCoordinator(coordinator)
@@ -630,12 +634,28 @@ final class BridgeMessageHandlerTests: XCTestCase {
         }
         XCTAssertEqual(afterClear.history.sessionCount, 0)
 
-        // Not-yet-implemented commands remain stubbed as unavailable even
-        // when the router is wired to a real coordinator.
-        guard case .failure(let updatesError) = await router.updatesCheck() else {
-            return XCTFail("expected updates.check to be unavailable")
+        // `updates.check`/`updates.open` are wired to the real coordinator
+        // (Task 11), forwarding to the injected `UpdateChecking` fake.
+        updateService.checkResults = [.success(UpdateState(
+            checking: false,
+            availableVersion: "v9.9.9",
+            releaseURL: "https://github.com/OpenCoven/seer/releases/tag/v9.9.9",
+            lastCheckedAt: 1_700_000_000_500
+        ))]
+        guard case .success(let afterCheck) = await router.updatesCheck() else {
+            return XCTFail("expected updates.check to succeed")
         }
-        XCTAssertEqual(updatesError.code, .commandUnavailable)
+        XCTAssertEqual(afterCheck.update.availableVersion, "v9.9.9")
+        XCTAssertEqual(updateService.checkForceValues.last, true, "the bridge's updates.check must force an immediate check")
+
+        updateService.openCurrentReleaseResult = true
+        guard case .success = await router.updatesOpen() else {
+            return XCTFail("expected updates.open to succeed")
+        }
+        XCTAssertEqual(updateService.openCurrentReleaseCallCount, 1)
+
+        // `panel.hide`/`app.quit` remain stubbed as unavailable even when
+        // the router is wired to a real coordinator — Task 12.
         guard case .failure(let quitError) = await router.appQuit() else {
             return XCTFail("expected app.quit to be unavailable")
         }

@@ -79,7 +79,9 @@ final class AppSnapshotCoordinatorTests: XCTestCase {
         historyScheduler: HistoryScheduler = ManualHistoryScheduler(),
         clock: MutableClock = MutableClock(now: 1_700_000_000_000),
         powerBackend: CoordinatorFakePowerBackend = CoordinatorFakePowerBackend(),
-        appVersion: String = "1.0.0-test"
+        appVersion: String = "1.0.0-test",
+        updateService: any UpdateChecking = FakeUpdateChecking(),
+        updateScheduler: any UpdateSchedulerControlling = FakeUpdateSchedulerControlling()
     ) async -> (AppSnapshotCoordinator, FakeRendererSink, CoordinatorFakePowerBackend) {
         let settingsAtomicStore = AtomicJSONStore<SettingsDocument>(
             fileURL: settingsURL,
@@ -109,7 +111,9 @@ final class AppSnapshotCoordinatorTests: XCTestCase {
             power: power,
             renderer: renderer,
             clock: clock,
-            appVersion: appVersion
+            appVersion: appVersion,
+            updateService: updateService,
+            updateScheduler: updateScheduler
         )
 
         return (coordinator, renderer, powerBackend)
@@ -574,6 +578,131 @@ final class AppSnapshotCoordinatorTests: XCTestCase {
             coordinator.snapshot.diagnostics.contains { $0.id == HistoryDiagnosticID.persistFailed },
             "an earlier debounced save's failure must become visible on the very next applyScan"
         )
+    }
+
+    // MARK: - Updates: startup check, scheduler ownership, checkForUpdates, setIncludePrereleaseUpdates
+
+    func testMakeAtStartupStartsTheUpdateSchedulerAndRunsAnUnforcedCheck() async {
+        let updateService = FakeUpdateChecking()
+        let updateScheduler = FakeUpdateSchedulerControlling()
+        updateService.currentStateValue = UpdateState(checking: false, availableVersion: "v9.9.9", releaseURL: "https://github.com/OpenCoven/seer/releases/tag/v9.9.9", lastCheckedAt: 1_700_000_000_000)
+        updateService.checkResults = [.success(updateService.currentStateValue)]
+
+        let (coordinator, renderer, _) = await makeCoordinator(updateService: updateService, updateScheduler: updateScheduler)
+
+        XCTAssertEqual(updateService.checkForceValues, [false], "the startup check must be unforced, respecting the 24h gate")
+        XCTAssertEqual(updateScheduler.startCallCount, 1, "the scheduler must be started exactly once at startup")
+        XCTAssertEqual(coordinator.snapshot.update.availableVersion, "v9.9.9", "the startup check's result must seed the initial snapshot")
+        XCTAssertEqual(renderer.emittedSnapshots.count, 0, "seeding the startup update state is not itself a completed transition")
+    }
+
+    func testMakeAtStartupSurfacesAFailedStartupCheckAsAVisibleDiagnostic() async {
+        let updateService = FakeUpdateChecking()
+        updateService.checkResults = [.failure(FakeUpdateCheckError())]
+        let updateScheduler = FakeUpdateSchedulerControlling()
+
+        let (coordinator, _, _) = await makeCoordinator(updateService: updateService, updateScheduler: updateScheduler)
+
+        XCTAssertTrue(coordinator.snapshot.diagnostics.contains { $0.id == CoordinatorDiagnosticID.updatesCheckFailed })
+        XCTAssertNil(coordinator.snapshot.update.availableVersion)
+    }
+
+    func testCheckForUpdatesPublishesTheResultingUpdateStateAtomically() async {
+        let updateService = FakeUpdateChecking()
+        let (coordinator, renderer, _) = await makeCoordinator(updateService: updateService)
+        let emittedBefore = renderer.emittedSnapshots.count
+
+        updateService.checkResults = [.success(UpdateState(
+            checking: false,
+            availableVersion: "v2.0.0",
+            releaseURL: "https://github.com/OpenCoven/seer/releases/tag/v2.0.0",
+            lastCheckedAt: 1_700_000_000_500
+        ))]
+
+        await coordinator.checkForUpdates(force: true)
+
+        XCTAssertEqual(updateService.checkForceValues.last, true)
+        XCTAssertEqual(coordinator.snapshot.update.availableVersion, "v2.0.0")
+        XCTAssertEqual(coordinator.snapshot.update.releaseURL, "https://github.com/OpenCoven/seer/releases/tag/v2.0.0")
+        XCTAssertFalse(coordinator.snapshot.diagnostics.contains { $0.id == CoordinatorDiagnosticID.updatesCheckFailed })
+        XCTAssertEqual(renderer.emittedSnapshots.count, emittedBefore + 1, "checkForUpdates must publish exactly one transition")
+        XCTAssertEqual(renderer.emittedSnapshots.last, coordinator.snapshot)
+    }
+
+    func testCheckForUpdatesUpsertsAVisibleDiagnosticOnFailureAndClearsItOnTheNextSuccess() async {
+        let updateService = FakeUpdateChecking()
+        let (coordinator, renderer, _) = await makeCoordinator(updateService: updateService)
+
+        updateService.checkResults = [.failure(FakeUpdateCheckError())]
+        await coordinator.checkForUpdates(force: true)
+
+        XCTAssertTrue(coordinator.snapshot.diagnostics.contains { $0.id == CoordinatorDiagnosticID.updatesCheckFailed })
+        let emittedAfterFailure = renderer.emittedSnapshots.count
+
+        updateService.checkResults = [.success(UpdateState(checking: false, availableVersion: nil, releaseURL: nil, lastCheckedAt: 1_700_000_001_000))]
+        await coordinator.checkForUpdates(force: true)
+
+        XCTAssertFalse(coordinator.snapshot.diagnostics.contains { $0.id == CoordinatorDiagnosticID.updatesCheckFailed })
+        XCTAssertEqual(renderer.emittedSnapshots.count, emittedAfterFailure + 1)
+    }
+
+    func testSetIncludePrereleaseUpdatesForwardsToUpdateServiceAndPublishesTheResult() async throws {
+        let updateService = FakeUpdateChecking()
+        let (coordinator, renderer, _) = await makeCoordinator(updateService: updateService)
+        let emittedBefore = renderer.emittedSnapshots.count
+
+        updateService.setIncludePrereleaseResults = [.success(UpdateState(
+            checking: false,
+            availableVersion: "v3.0.0-beta.1",
+            releaseURL: "https://github.com/OpenCoven/seer/releases/tag/v3.0.0-beta.1",
+            lastCheckedAt: 1_700_000_002_000
+        ))]
+
+        try await coordinator.setIncludePrereleaseUpdates(true)
+
+        XCTAssertEqual(updateService.setIncludePrereleaseValues, [true])
+        XCTAssertEqual(coordinator.snapshot.update.availableVersion, "v3.0.0-beta.1")
+        XCTAssertEqual(renderer.emittedSnapshots.count, emittedBefore + 1)
+    }
+
+    func testSetIncludePrereleaseUpdatesRethrowsAndPublishesAVisibleDiagnosticOnFailure() async throws {
+        let updateService = FakeUpdateChecking()
+        let (coordinator, _, _) = await makeCoordinator(updateService: updateService)
+
+        updateService.setIncludePrereleaseResults = [.failure(FakeUpdateCheckError())]
+
+        do {
+            try await coordinator.setIncludePrereleaseUpdates(true)
+            XCTFail("expected the forced check's failure to be rethrown")
+        } catch is FakeUpdateCheckError {
+            // Expected.
+        }
+
+        XCTAssertTrue(coordinator.snapshot.diagnostics.contains { $0.id == CoordinatorDiagnosticID.updatesCheckFailed })
+    }
+
+    func testOpenLatestReleaseForwardsToUpdateServiceWithoutTouchingTheSnapshot() async {
+        let updateService = FakeUpdateChecking()
+        updateService.openCurrentReleaseResult = true
+        let (coordinator, renderer, _) = await makeCoordinator(updateService: updateService)
+        let snapshotBefore = coordinator.snapshot
+        let emittedBefore = renderer.emittedSnapshots.count
+
+        let opened = await coordinator.openLatestRelease()
+
+        XCTAssertTrue(opened)
+        XCTAssertEqual(updateService.openCurrentReleaseCallCount, 1)
+        XCTAssertEqual(coordinator.snapshot, snapshotBefore, "opening a release must never itself mutate the snapshot")
+        XCTAssertEqual(renderer.emittedSnapshots.count, emittedBefore, "opening a release must never publish a transition")
+    }
+
+    func testShutdownStopsTheUpdateScheduler() async throws {
+        let updateScheduler = FakeUpdateSchedulerControlling()
+        let (coordinator, _, _) = await makeCoordinator(updateScheduler: updateScheduler)
+
+        try await coordinator.shutdown()
+
+        XCTAssertEqual(updateScheduler.stopCallCount, 1)
     }
 
     // MARK: - Shutdown

@@ -256,6 +256,43 @@ final class UpdateServiceTests: XCTestCase {
         XCTAssertEqual(state.availableVersion, "v1.2.0")
     }
 
+    /// Regression test: candidate selection must validate/filter releases
+    /// (draft, parseable tag, *and* trusted URL) before ranking by
+    /// version — not rank first and only then discover the highest
+    /// candidate's URL is untrustworthy. Previously, an invalid-URL
+    /// highest-versioned release (`v9.9.9` here) would be chosen as
+    /// "best" and then rejected wholesale for its bad URL, suppressing
+    /// the lower but perfectly valid `v1.2.0` release instead of falling
+    /// through to it.
+    func testInvalidURLOnHighestVersionedReleaseDoesNotSuppressALowerValidRelease() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let settingsStore = makeSettingsStore(fileSystem: fileSystem, clock: clock)
+        try await settingsStore.setIncludePrereleaseUpdates(true)
+        let service = UpdateService(
+            settingsStore: settingsStore,
+            session: makeMockSession(),
+            clock: clock,
+            currentVersion: "1.0.0"
+        )
+
+        // v9.9.9 is the higher version but has an untrusted (non-github.com)
+        // URL; v1.2.0 is lower but has a fully valid, trusted URL. The
+        // valid, lower release must still be selected.
+        let arrayBody = Data("""
+        [
+          {"tag_name":"v9.9.9","html_url":"https://evil.example.com/releases/tag/v9.9.9","draft":false,"prerelease":false},
+          {"tag_name":"v1.2.0","html_url":"https://github.com/OpenCoven/seer/releases/tag/v1.2.0","draft":false,"prerelease":false}
+        ]
+        """.utf8)
+        MockURLProtocol.enqueueStub(statusCode: 200, body: arrayBody)
+
+        let state = try await service.check(force: true)
+
+        XCTAssertEqual(state.availableVersion, "v1.2.0")
+        XCTAssertEqual(state.releaseURL, "https://github.com/OpenCoven/seer/releases/tag/v1.2.0")
+    }
+
     // MARK: 4. ETag forwarded via If-None-Match
 
     func testETagForwardedViaIfNoneMatch() async throws {

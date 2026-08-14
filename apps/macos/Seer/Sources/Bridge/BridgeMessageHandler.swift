@@ -247,9 +247,9 @@ public struct BridgeCommandError: Error, Equatable, Sendable {
         self.message = message
     }
 
-    /// The standard error every not-yet-implemented command (Task 11's
-    /// update check/open, Task 12's panel/app lifecycle) reports until a
-    /// real runtime implementation is injected. Never a fake success.
+    /// The standard error every not-yet-implemented command (Task 12's
+    /// panel/app lifecycle) reports until a real runtime implementation is
+    /// injected. Never a fake success.
     public static let unavailable = BridgeCommandError(
         code: .commandUnavailable,
         message: "This command is not available in this build"
@@ -275,11 +275,11 @@ public protocol BridgeCommandHandling {
 /// The concrete `BridgeCommandHandling` used by the standalone app. Every
 /// command is an independently injected closure rather than a direct
 /// dependency on any particular service type. `forCoordinator(_:)` wires up
-/// the three commands Task 9's `AppSnapshotCoordinator` already implements;
-/// `updatesCheck`/`updatesOpen`/`panelHide`/`appQuit` default to
-/// `.unavailable` stubs until Task 11/12 inject their real
-/// implementations — this router never fakes a success for a command it
-/// cannot actually perform.
+/// `snapshot.get`/`keepAwakeMode.set`/`history.clear`/`updates.check`/
+/// `updates.open` — every command `AppSnapshotCoordinator` implements;
+/// `panelHide`/`appQuit` remain at their `.unavailable` stub defaults until
+/// Task 12 injects their real implementations — this router never fakes a
+/// success for a command it cannot actually perform.
 @MainActor
 public final class StandaloneBridgeCommandRouter: BridgeCommandHandling {
     private let snapshotGetHandler: () async -> BridgeSnapshotOutcome
@@ -308,12 +308,19 @@ public final class StandaloneBridgeCommandRouter: BridgeCommandHandling {
         self.appQuitHandler = appQuit
     }
 
-    /// Wires `snapshot.get`/`keepAwakeMode.set`/`history.clear` to
-    /// `coordinator` — the real Task 9 `AppSnapshotCoordinator` — reporting
-    /// the coordinator's current `snapshot` after each call, matching the
-    /// TS bridge's `BridgeMethodResultMap` (every one of these three
-    /// methods resolves to a full, up-to-date `AppSnapshot`). Every other
-    /// command is left at its `.unavailable` stub default.
+    /// Wires `snapshot.get`/`keepAwakeMode.set`/`history.clear`/
+    /// `updates.check`/`updates.open` to `coordinator` — the real Task 9
+    /// `AppSnapshotCoordinator`, now also owning Task 11's update
+    /// integration — reporting the coordinator's current `snapshot` after
+    /// each call, matching the TS bridge's `BridgeMethodResultMap`.
+    /// `updates.check` always forces an immediate check (`force: true`),
+    /// matching an explicit user-triggered request rather than the
+    /// scheduler's own periodic, unforced background checks.
+    /// `updates.open` takes no URL/payload of any kind — it can only ever
+    /// open whichever release URL `AppSnapshotCoordinator
+    /// .openLatestRelease()` itself already validated and cached, via
+    /// `UpdateService.openCurrentRelease()`. `panelHide`/`appQuit` are
+    /// left at their `.unavailable` stub defaults (Task 12).
     public static func forCoordinator(_ coordinator: AppSnapshotCoordinator) -> StandaloneBridgeCommandRouter {
         StandaloneBridgeCommandRouter(
             snapshotGet: {
@@ -334,6 +341,16 @@ public final class StandaloneBridgeCommandRouter: BridgeCommandHandling {
                 } catch {
                     return .failure(BridgeCommandError(code: .commandFailed, message: "Failed to clear history"))
                 }
+            },
+            updatesCheck: {
+                await coordinator.checkForUpdates(force: true)
+                return .success(coordinator.snapshot)
+            },
+            updatesOpen: {
+                let opened = await coordinator.openLatestRelease()
+                return opened
+                    ? .success(())
+                    : .failure(BridgeCommandError(code: .commandFailed, message: "No update release is available to open"))
             }
         )
     }

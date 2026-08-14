@@ -39,9 +39,15 @@ public struct SemanticVersion: Equatable, Sendable {
     /// with all-numeric, non-empty major/minor/patch components and
     /// (if present) a non-empty, validly-formed dot-separated pre-release
     /// suffix — malformed release tags must never be silently misread as
-    /// some arbitrary version instead of being rejected outright.
+    /// some arbitrary version instead of being rejected outright. A tag
+    /// padded with any leading/trailing whitespace is itself malformed —
+    /// SemVer tags are never whitespace-padded in practice, and silently
+    /// trimming would let e.g. `" 1.2.3"` or `"1.2.3\n"` parse as if they
+    /// were the clean tag, masking a malformed upstream value instead of
+    /// rejecting it outright.
     public static func parse(_ raw: String) -> SemanticVersion? {
-        var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard raw == raw.trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }
+        var text = raw
         guard !text.isEmpty else { return nil }
 
         if let first = text.first, first == "v" || first == "V" {

@@ -130,4 +130,25 @@ final class SemanticVersionTests: XCTestCase {
             XCTAssertNil(SemanticVersion.parse(tag), "expected \(tag) to be rejected")
         }
     }
+
+    func testLeadingWhitespaceIsRejected() {
+        XCTAssertNil(SemanticVersion.parse(" 1.2.3"))
+        XCTAssertNil(SemanticVersion.parse("\t1.2.3"))
+    }
+
+    func testTrailingWhitespaceIsRejected() {
+        XCTAssertNil(SemanticVersion.parse("1.2.3 "))
+        XCTAssertNil(SemanticVersion.parse("1.2.3\n"))
+    }
+
+    func testLeadingAndTrailingWhitespaceIsRejected() {
+        XCTAssertNil(SemanticVersion.parse("  1.2.3  "))
+    }
+
+    func testInternalWhitespaceIsStillRejected() {
+        // Not whitespace padding — this exercises the pre-existing
+        // "not a valid version at all" path, distinct from the new
+        // whitespace-padding guard above.
+        XCTAssertNil(SemanticVersion.parse("1.2 .3"))
+    }
 }

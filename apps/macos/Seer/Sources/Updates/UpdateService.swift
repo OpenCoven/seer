@@ -248,9 +248,11 @@ public actor UpdateService {
         let selected = Self.selectBestRelease(from: releases)
         let newEtag = httpResponse.value(forHTTPHeaderField: "Etag")
 
-        var persistedRelease: PersistedRelease?
-        if let selected, let releaseURL = URL(string: selected.htmlURL), Self.isValidReleaseURL(releaseURL) {
-            persistedRelease = PersistedRelease(version: selected.tagName, url: selected.htmlURL)
+        // `selectBestRelease` already filtered out every release with an
+        // invalid URL before ranking by version, so `selected` (if any) is
+        // always safe to persist as-is here.
+        let persistedRelease: PersistedRelease? = selected.map {
+            PersistedRelease(version: $0.tagName, url: $0.htmlURL)
         }
 
         let completedAt = clock.nowMilliseconds()
@@ -280,16 +282,26 @@ public actor UpdateService {
     }
 
     /// Every non-draft release in `releases` whose `tagName` parses as a
-    /// valid `SemanticVersion`, keeping the single highest one by SemVer
+    /// valid `SemanticVersion` *and* whose `htmlURL` passes
+    /// `isValidReleaseURL(_:)`, keeping the single highest one by SemVer
     /// precedence (ties broken by keeping the first encountered). Drafts
     /// are unconditionally excluded regardless of endpoint/mode; the
     /// stable `/releases/latest` endpoint itself already excludes drafts
     /// and pre-releases before this ever runs, so this filter chiefly
     /// matters for the bounded `/releases` list used in pre-release mode.
+    ///
+    /// URL validity is filtered *before* ranking by version — not after
+    /// picking the nominally-highest candidate — so a higher-versioned
+    /// release with an untrustworthy URL can never suppress a lower,
+    /// otherwise-valid release from being selected: e.g. releases
+    /// `[9.9.9 (bad URL), 1.2.0 (good URL)]` must still select `1.2.0`,
+    /// not silently report "no update available" just because the
+    /// highest-numbered entry happened to fail URL validation.
     static func selectBestRelease(from releases: [GitHubRelease]) -> GitHubRelease? {
         var best: (release: GitHubRelease, version: SemanticVersion)?
         for release in releases where !release.draft {
             guard let version = SemanticVersion.parse(release.tagName) else { continue }
+            guard let url = URL(string: release.htmlURL), isValidReleaseURL(url) else { continue }
             if best == nil || version > best!.version {
                 best = (release, version)
             }
@@ -356,6 +368,26 @@ public struct TaskSleeper: Sleeper {
     }
 }
 
+/// The `UpdateService` operations `AppSnapshotCoordinator` depends on to
+/// integrate update checks into its own atomic snapshot transitions.
+/// Abstracted behind a protocol (rather than the coordinator depending on
+/// the concrete actor directly) purely for testability: coordinator-level
+/// tests can substitute a scripted fake here instead of standing up a real
+/// `UpdateService` with a live/mocked `URLSession` for every test, even
+/// ones that have nothing to do with updates. `UpdateService` conforms via
+/// the extension immediately below; production code always uses that real
+/// conformance.
+
+public protocol UpdateChecking: Sendable {
+    func check(force: Bool) async throws -> UpdateState
+    func currentState() async -> UpdateState
+    func setIncludePrerelease(_ value: Bool) async throws -> UpdateState
+    @discardableResult
+    func openCurrentRelease() async -> Bool
+}
+
+extension UpdateService: UpdateChecking {}
+
 /// Runs `UpdateService.check(force: false)` once every 24 hours (from the
 /// most recently completed check, not wall-clock ticks) for as long as the
 /// app is running, entirely in the background. `start()` computes how
@@ -416,3 +448,16 @@ public actor UpdateScheduler {
         return (lastCheckedAt ?? now) + UpdateService.checkIntervalMs
     }
 }
+
+/// The `UpdateScheduler` lifecycle operations `AppSnapshotCoordinator`
+/// depends on for scheduler ownership (`start()`/`stop()`), abstracted for
+/// the same testability reason as `UpdateChecking` above — a coordinator
+/// test can verify the scheduler was started/stopped at the right moments
+/// without needing a real background loop or `Sleeper`.
+
+public protocol UpdateSchedulerControlling: Sendable {
+    func start() async
+    func stop() async
+}
+
+extension UpdateScheduler: UpdateSchedulerControlling {}

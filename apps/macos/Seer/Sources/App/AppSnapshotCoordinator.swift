@@ -4,10 +4,12 @@ import Foundation
 /// from ids surfaced verbatim, or via `StorageDiagnosticAlias`, from a
 /// lower layer's own `lastDiagnostic`).
 public enum CoordinatorDiagnosticID {
-    /// Reserved for Task 11's GitHub update check, not emitted anywhere by
-    /// this task's coordinator — declared here now so the exact stable id
-    /// string exists before that feature does, per the plan's closed list
-    /// of stable diagnostic ids.
+    /// Emitted (upserted) whenever `AppSnapshotCoordinator`'s own update
+    /// check — at startup (`makeAtStartup`), via the explicit
+    /// `checkForUpdates(force:)` entry point, or via
+    /// `setIncludePrereleaseUpdates(_:)`'s forced re-check — throws a
+    /// typed `UpdateCheckError`; cleared again the moment a subsequent
+    /// check succeeds.
     public static let updatesCheckFailed = "updates.check.failed"
 }
 
@@ -89,6 +91,8 @@ public final class AppSnapshotCoordinator {
     private let power: PowerAssertionService
     private let renderer: any AppSnapshotRendererSink
     private let clock: Clock
+    private let updateService: any UpdateChecking
+    private let updateScheduler: any UpdateSchedulerControlling
 
     /// Serializes every public entry point's full transition — see the
     /// type documentation above.
@@ -107,7 +111,9 @@ public final class AppSnapshotCoordinator {
         power: PowerAssertionService,
         renderer: any AppSnapshotRendererSink,
         clock: Clock,
-        initialSnapshot: AppSnapshot
+        initialSnapshot: AppSnapshot,
+        updateService: any UpdateChecking,
+        updateScheduler: any UpdateSchedulerControlling
     ) {
         self.settingsStore = settingsStore
         self.historyStore = historyStore
@@ -115,6 +121,8 @@ public final class AppSnapshotCoordinator {
         self.renderer = renderer
         self.clock = clock
         self.snapshot = initialSnapshot
+        self.updateService = updateService
+        self.updateScheduler = updateScheduler
     }
 
     /// Async factory: loads `settingsStore`/`historyStore` exactly once
@@ -124,13 +132,35 @@ public final class AppSnapshotCoordinator {
     /// history-remapped ids — so the renderer's diagnostics region can
     /// visibly report a startup failure the very first time it reads
     /// `snapshot`, without waiting for any scan.
+    ///
+    /// Also performs Seer's one-time startup update check: an *unforced*
+    /// `updateService.check(force: false)` (so a very recent check, e.g.
+    /// from the previous run, still respects the 24-hour gate rather than
+    /// re-hitting the network every launch), whose resulting `UpdateState`
+    /// seeds `snapshot.update` directly — never left at a stale hardcoded
+    /// empty value regardless of what was actually last known. A failed
+    /// startup check folds a `CoordinatorDiagnosticID.updatesCheckFailed`
+    /// diagnostic into the same startup diagnostics list as the settings/
+    /// history ones above (and `snapshot.update` falls back to whatever
+    /// `updateService.currentState()` reports), rather than throwing or
+    /// silently losing the failure. This mirrors, but is distinct from,
+    /// `updateScheduler`'s own periodic background checks: the scheduler
+    /// intentionally does *not* check immediately on a fresh install (its
+    /// first tick is due a full 24h out — see `UpdateScheduler`), so this
+    /// explicit startup check is what actually surfaces an already-known
+    /// or newly-discovered update the moment the app launches. Finally,
+    /// `updateScheduler` itself is started (never left uncreated/unused)
+    /// so periodic checks continue for as long as the coordinator lives;
+    /// `shutdown()` is responsible for stopping it again.
     public static func makeAtStartup(
         settingsStore: SettingsStore,
         historyStore: HistoryStore,
         power: PowerAssertionService,
         renderer: any AppSnapshotRendererSink,
         clock: Clock,
-        appVersion: String
+        appVersion: String,
+        updateService: any UpdateChecking,
+        updateScheduler: any UpdateSchedulerControlling
     ) async -> AppSnapshotCoordinator {
         let settingsResult = await settingsStore.load()
         _ = await historyStore.load()
@@ -153,22 +183,40 @@ public final class AppSnapshotCoordinator {
             lastScanAt: 0
         )
 
+        let updateState: UpdateState
+        do {
+            updateState = try await updateService.check(force: false)
+        } catch {
+            updateState = await updateService.currentState()
+            diagnostics.append(Diagnostic(
+                id: CoordinatorDiagnosticID.updatesCheckFailed,
+                message: "Startup update check failed: \(error)",
+                occurredAt: clock.nowMilliseconds()
+            ))
+        }
+
         let snapshot = AppSnapshot(
             monitor: monitor,
             history: historyStats,
-            update: UpdateState(checking: false, availableVersion: nil, releaseURL: nil, lastCheckedAt: nil),
+            update: updateState,
             diagnostics: dedupedByID(diagnostics),
             appVersion: appVersion
         )
 
-        return AppSnapshotCoordinator(
+        let coordinator = AppSnapshotCoordinator(
             settingsStore: settingsStore,
             historyStore: historyStore,
             power: power,
             renderer: renderer,
             clock: clock,
-            initialSnapshot: snapshot
+            initialSnapshot: snapshot,
+            updateService: updateService,
+            updateScheduler: updateScheduler
         )
+
+        await updateScheduler.start()
+
+        return coordinator
     }
 
     // MARK: - Monitor scan results
@@ -378,6 +426,101 @@ public final class AppSnapshotCoordinator {
         }
     }
 
+    // MARK: - Updates
+
+    /// Runs one update check via the owned `UpdateService` and publishes
+    /// its resulting `UpdateState` into a single atomic transition — the
+    /// same `gate`-serialized, publish-once-per-call pattern every other
+    /// entry point above uses. On success, clears any previously visible
+    /// `CoordinatorDiagnosticID.updatesCheckFailed` diagnostic; on a
+    /// thrown `UpdateCheckError`, upserts a fresh one (with the update
+    /// state falling back to `updateService.currentState()`, which itself
+    /// is guaranteed unchanged by a failed check) instead of silently
+    /// dropping the failure. Used both by the `updates.check` bridge
+    /// command (with `force: true`, matching an explicit user request)
+    /// and — with `force: false` — as the basis of `makeAtStartup`'s
+    /// startup check.
+    public func checkForUpdates(force: Bool) async {
+        await gate.acquire()
+        await performCheckForUpdates(force: force)
+        await gate.release()
+    }
+
+    private func performCheckForUpdates(force: Bool) async {
+        var idsToClear: Set<String> = []
+        var upserts: [Diagnostic] = []
+        let updateState: UpdateState
+        do {
+            updateState = try await updateService.check(force: force)
+            idsToClear.insert(CoordinatorDiagnosticID.updatesCheckFailed)
+        } catch {
+            updateState = await updateService.currentState()
+            upserts.append(Diagnostic(
+                id: CoordinatorDiagnosticID.updatesCheckFailed,
+                message: "Update check failed: \(error)",
+                occurredAt: clock.nowMilliseconds()
+            ))
+        }
+        publish(monitor: snapshot.monitor, history: snapshot.history, update: updateState, clearing: idsToClear, upserting: upserts)
+    }
+
+    /// Persists `value` as `includePrereleaseUpdates` — which also clears
+    /// the cached release ETag/`lastRelease` (see `UpdateService
+    /// .setIncludePrerelease(_:)`) — and immediately forces a fresh check
+    /// against the newly selected release stream, publishing the result
+    /// through the exact same atomic transition/diagnostic handling as
+    /// `checkForUpdates(force:)`. Mirrors `setKeepAwakeMode`'s persist-
+    /// then-publish-then-rethrow contract: the persisted toggle is never
+    /// rolled back even if the forced check itself fails, but the thrown
+    /// `UpdateCheckError` still propagates to the caller after the
+    /// resulting (failure) state has been published, so the failure
+    /// remains visible both synchronously and in `snapshot.diagnostics`.
+    public func setIncludePrereleaseUpdates(_ value: Bool) async throws {
+        await gate.acquire()
+        do {
+            try await performSetIncludePrereleaseUpdates(value)
+            await gate.release()
+        } catch {
+            await gate.release()
+            throw error
+        }
+    }
+
+    private func performSetIncludePrereleaseUpdates(_ value: Bool) async throws {
+        var idsToClear: Set<String> = []
+        var upserts: [Diagnostic] = []
+        var thrownError: Error?
+        let updateState: UpdateState
+        do {
+            updateState = try await updateService.setIncludePrerelease(value)
+            idsToClear.insert(CoordinatorDiagnosticID.updatesCheckFailed)
+        } catch {
+            thrownError = error
+            updateState = await updateService.currentState()
+            upserts.append(Diagnostic(
+                id: CoordinatorDiagnosticID.updatesCheckFailed,
+                message: "Update check failed: \(error)",
+                occurredAt: clock.nowMilliseconds()
+            ))
+        }
+        publish(monitor: snapshot.monitor, history: snapshot.history, update: updateState, clearing: idsToClear, upserting: upserts)
+        if let thrownError {
+            throw thrownError
+        }
+    }
+
+    /// Opens the most recently cached, already-validated release URL via
+    /// `UpdateService.openCurrentRelease()` — never a URL supplied by any
+    /// caller (there is no `URL`/`String` parameter here at all), and
+    /// never one that has not already passed `UpdateService
+    /// .isValidReleaseURL(_:)` at persist time. Does not touch `snapshot`
+    /// at all: opening a release page has no effect on any published
+    /// state, so this deliberately does not go through `gate`/`publish`.
+    @discardableResult
+    public func openLatestRelease() async -> Bool {
+        await updateService.openCurrentRelease()
+    }
+
     // MARK: - Shutdown
 
     /// Awaits `HistoryStore.flush(at:)` and then releases the active
@@ -387,7 +530,9 @@ public final class AppSnapshotCoordinator {
     /// takes priority over power, matching the order the two operations
     /// ran in). A caller awaiting `shutdown()` — e.g. app termination —
     /// is guaranteed both cleanups have already been attempted, and their
-    /// results published, by the time this call returns.
+    /// results published, by the time this call returns. Also stops
+    /// `updateScheduler`'s background loop (see `UpdateScheduler.stop()`)
+    /// so no further update check ever runs after shutdown has completed.
     public func shutdown() async throws {
         await gate.acquire()
         do {
@@ -401,6 +546,8 @@ public final class AppSnapshotCoordinator {
 
     private func performShutdown() async throws {
         let now = clock.nowMilliseconds()
+
+        await updateScheduler.stop()
 
         var historyError: Error?
         var stats: HistoryStats
