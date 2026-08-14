@@ -147,7 +147,24 @@ actor SuspendableUpdateChecking: UpdateChecking {
 
     func currentState() async -> UpdateState { currentStateValue }
 
-    func setIncludePrerelease(_ value: Bool) async throws -> UpdateState { currentStateValue }
+    private(set) var setIncludePrereleaseCallCount = 0
+    private(set) var setIncludePrereleaseValues: [Bool] = []
+    private var pendingSetIncludePrereleaseContinuation: CheckedContinuation<UpdateState, Error>?
+    private var waitingForSetIncludePrereleaseCallContinuation: CheckedContinuation<Void, Never>?
+
+    /// Unlike `check(force:)`, every call here suspends — there is no
+    /// automatic startup call to special-case, since
+    /// `AppSnapshotCoordinator.makeAtStartup(...)` never calls
+    /// `setIncludePrerelease(_:)` itself.
+    func setIncludePrerelease(_ value: Bool) async throws -> UpdateState {
+        setIncludePrereleaseCallCount += 1
+        setIncludePrereleaseValues.append(value)
+        waitingForSetIncludePrereleaseCallContinuation?.resume()
+        waitingForSetIncludePrereleaseCallContinuation = nil
+        return try await withCheckedThrowingContinuation { continuation in
+            self.pendingSetIncludePrereleaseContinuation = continuation
+        }
+    }
 
     @discardableResult
     func openCurrentRelease() async -> Bool { false }
@@ -176,5 +193,31 @@ actor SuspendableUpdateChecking: UpdateChecking {
     func reject(with error: Error) {
         pendingCheckContinuation?.resume(throwing: error)
         pendingCheckContinuation = nil
+    }
+
+    /// Suspends until a `setIncludePrerelease(_:)` call has actually been
+    /// made — and is therefore itself now suspended awaiting
+    /// `resolveSetIncludePrerelease`/`rejectSetIncludePrerelease` — at
+    /// least once, mirroring `waitForCall()` above for `check(force:)`.
+    func waitForSetIncludePrereleaseCall() async {
+        if setIncludePrereleaseCallCount > 0 { return }
+        await withCheckedContinuation { continuation in
+            self.waitingForSetIncludePrereleaseCallContinuation = continuation
+        }
+    }
+
+    /// Resolves the currently-suspended `setIncludePrerelease(_:)` call
+    /// (if any) successfully with `state`.
+    func resolveSetIncludePrerelease(with state: UpdateState) {
+        currentStateValue = state
+        pendingSetIncludePrereleaseContinuation?.resume(returning: state)
+        pendingSetIncludePrereleaseContinuation = nil
+    }
+
+    /// Resolves the currently-suspended `setIncludePrerelease(_:)` call
+    /// (if any) by throwing `error`.
+    func rejectSetIncludePrerelease(with error: Error) {
+        pendingSetIncludePrereleaseContinuation?.resume(throwing: error)
+        pendingSetIncludePrereleaseContinuation = nil
     }
 }

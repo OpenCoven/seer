@@ -1232,6 +1232,196 @@ final class AppSnapshotCoordinatorTests: XCTestCase {
         )
     }
 
+    /// The `setIncludePrereleaseUpdates` counterpart of
+    /// `testShutdownFlagsAnAlreadyQueuedScheduledCheckSoItNeverNetworkChecksOrPublishesAfterward`:
+    /// a tray checkbox toggle already queued behind `gate` when
+    /// `shutdown()` begins must be skipped entirely — never calling
+    /// through to `updateService.setIncludePrerelease(_:)`, never
+    /// mutating the persisted toggle, and never publishing — exactly
+    /// like an already-queued scheduled check.
+    func testShutdownFlagsAnAlreadyQueuedSetIncludePrereleaseUpdatesCallSoItNeverMutatesOrPublishesAfterward() async throws {
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let historyFS = InMemorySettingsFileSystem()
+        let updateService = FakeUpdateChecking()
+        let updateScheduler = FakeUpdateSchedulerControlling()
+        let (coordinator, renderer, _) = await makeCoordinator(
+            historyFileSystem: historyFS,
+            clock: clock,
+            updateService: updateService,
+            updateScheduler: updateScheduler
+        )
+
+        // Build up an open history session so the empty scan below
+        // actually performs a real disk write worth suspending — giving
+        // a genuine, controlled window in which the coordinator's gate
+        // is held by something other than the toggle or shutdown itself.
+        await coordinator.applyScan([activeAgent()], scannedAt: clock.now)
+        clock.now += 2_000
+        let setIncludePrereleaseValuesBeforeRace = updateService.setIncludePrereleaseValues.count
+        let emittedBeforeRace = renderer.emittedSnapshots.count
+
+        await historyFS.armSuspension("writeFileAndSynchronize")
+
+        // The closing scan holds the gate, suspended mid-write.
+        let scanTask = Task {
+            await coordinator.applyScan([], scannedAt: clock.now)
+        }
+        await historyFS.waitUntilEntered("writeFileAndSynchronize")
+
+        // The tray checkbox toggle fires while the gate is held
+        // elsewhere, and queues behind the scan.
+        let toggleTask = Task<Error?, Never> {
+            do {
+                try await coordinator.setIncludePrereleaseUpdates(true)
+                return nil
+            } catch {
+                return error
+            }
+        }
+        for _ in 0..<50 { await Task.yield() }
+
+        // Shutdown is requested next. Its own `gate.acquire()` call
+        // necessarily queues *behind* the already-queued toggle — yet it
+        // must still flag `isShutDown` and stop the scheduler
+        // synchronously, without waiting for the gate.
+        let shutdownTask = Task {
+            try await coordinator.shutdown()
+        }
+        for _ in 0..<50 { await Task.yield() }
+        XCTAssertEqual(
+            updateScheduler.stopCallCount, 1,
+            "shutdown must stop the scheduler immediately, without waiting for its own turn at the gate"
+        )
+
+        await historyFS.resumeSuspension("writeFileAndSynchronize")
+        await scanTask.value
+        let toggleError = await toggleTask.value
+        try await shutdownTask.value
+
+        XCTAssertNil(
+            toggleError,
+            "a tray checkbox action only granted the gate after shutdown began must silently do nothing, not throw"
+        )
+        XCTAssertEqual(
+            updateService.setIncludePrereleaseValues.count, setIncludePrereleaseValuesBeforeRace,
+            "the already-queued tray checkbox action must never call through to the update service once shutdown has begun"
+        )
+        XCTAssertEqual(
+            renderer.emittedSnapshots.count, emittedBeforeRace + 2,
+            "only the scan's own transition and shutdown's final transition may publish — the skipped toggle must publish nothing"
+        )
+        XCTAssertFalse(
+            coordinator.snapshot.diagnostics.contains { $0.id == CoordinatorDiagnosticID.updatesCheckFailed },
+            "a toggle skipped for shutdown, not one that actually failed, must never surface a check-failed diagnostic"
+        )
+    }
+
+    /// The `setIncludePrereleaseUpdates` counterpart of
+    /// `testInFlightUpdateCheckDoesNotPublishAfterShutdownCompletesWhileItWasStillSuspended`:
+    /// a tray checkbox toggle that has already passed the pre-await
+    /// `!isShutDown` guard and called through to
+    /// `updateService.setIncludePrerelease(_:)` — whose round-trip is
+    /// still genuinely in flight, not merely queued — must also never
+    /// mutate/publish once shutdown completes while it was still
+    /// suspended.
+    func testInFlightSetIncludePrereleaseUpdatesDoesNotMutateOrPublishAfterShutdownCompletesWhileItWasStillSuspended() async throws {
+        let updateService = SuspendableUpdateChecking()
+        let updateScheduler = FakeUpdateSchedulerControlling()
+        let (coordinator, renderer, _) = await makeCoordinator(
+            updateService: updateService,
+            updateScheduler: updateScheduler
+        )
+        let emittedBeforeRace = renderer.emittedSnapshots.count
+
+        // A tray checkbox toggle starts, passes the pre-await
+        // `!isShutDown` guard, and calls through to the update service —
+        // whose response genuinely never arrives until the test resolves
+        // it below. This holds the coordinator's `gate` open the entire
+        // time.
+        let toggleTask = Task<Error?, Never> {
+            do {
+                try await coordinator.setIncludePrereleaseUpdates(true)
+                return nil
+            } catch {
+                return error
+            }
+        }
+        await updateService.waitForSetIncludePrereleaseCall()
+
+        // Shutdown is requested next. Its own `gate.acquire()` call
+        // necessarily queues behind the still-in-flight toggle above, so
+        // it must run concurrently (not be awaited directly here) — but
+        // it still flags `isShutDown` and stops the scheduler
+        // synchronously, without waiting for its own turn at the gate.
+        let shutdownTask = Task {
+            try await coordinator.shutdown()
+        }
+        for _ in 0..<50 { await Task.yield() }
+        XCTAssertEqual(
+            updateScheduler.stopCallCount, 1,
+            "shutdown must stop the scheduler immediately, without waiting for the still-in-flight toggle to release the gate"
+        )
+        XCTAssertEqual(
+            renderer.emittedSnapshots.count, emittedBeforeRace,
+            "shutdown's own final transition must not publish yet — it is still queued behind the in-flight toggle"
+        )
+
+        // Only now does the long-suspended toggle resolve — with a
+        // *successful* result that, without a post-await recheck of
+        // `isShutDown`, would be published once this call resumes.
+        await updateService.resolveSetIncludePrerelease(with: UpdateState(
+            checking: false,
+            availableVersion: "v9.9.9",
+            releaseURL: "https://github.com/OpenCoven/seer/releases/tag/v9.9.9",
+            lastCheckedAt: 1_700_000_000_000
+        ))
+        let toggleError = await toggleTask.value
+        try await shutdownTask.value
+
+        XCTAssertNil(toggleError, "a toggle that resolves after shutdown began must silently do nothing, not throw")
+        XCTAssertEqual(
+            renderer.emittedSnapshots.count, emittedBeforeRace + 1,
+            "only shutdown's own final transition may publish — the toggle that resolved after shutdown began must publish nothing of its own"
+        )
+        XCTAssertNil(
+            coordinator.snapshot.update.availableVersion,
+            "the update state resolved after shutdown began must never reach the coordinator's published snapshot"
+        )
+        XCTAssertFalse(
+            coordinator.snapshot.diagnostics.contains { $0.id == CoordinatorDiagnosticID.updatesCheckFailed },
+            "a toggle skipped for shutdown must never surface a check-failed diagnostic either"
+        )
+    }
+
+    /// Confirms the fix above doesn't regress the ordinary case: a tray
+    /// checkbox toggle resolving *before* shutdown ever begins must still
+    /// publish exactly as before — the `setIncludePrereleaseUpdates`
+    /// counterpart of `testInFlightUpdateCheckStillPublishesWhenItResolvesBeforeShutdownBegins`.
+    func testSetIncludePrereleaseUpdatesStillPublishesWhenItResolvesBeforeShutdownBegins() async throws {
+        let updateService = SuspendableUpdateChecking()
+        let (coordinator, renderer, _) = await makeCoordinator(updateService: updateService)
+        let emittedBefore = renderer.emittedSnapshots.count
+
+        let toggleTask = Task {
+            try await coordinator.setIncludePrereleaseUpdates(true)
+        }
+        await updateService.waitForSetIncludePrereleaseCall()
+
+        await updateService.resolveSetIncludePrerelease(with: UpdateState(
+            checking: false,
+            availableVersion: "v9.9.9",
+            releaseURL: "https://github.com/OpenCoven/seer/releases/tag/v9.9.9",
+            lastCheckedAt: 1_700_000_000_000
+        ))
+        try await toggleTask.value
+
+        XCTAssertEqual(renderer.emittedSnapshots.count, emittedBefore + 1)
+        XCTAssertEqual(coordinator.snapshot.update.availableVersion, "v9.9.9")
+
+        try await coordinator.shutdown()
+        XCTAssertEqual(renderer.emittedSnapshots.count, emittedBefore + 2, "shutdown must still publish its own final transition afterward")
+    }
+
     // MARK: - Concurrency: serialized transitions, no stale overwrite
 
     func testConcurrentScanAndModeChangeSerializeWithoutStaleOverwrite() async throws {

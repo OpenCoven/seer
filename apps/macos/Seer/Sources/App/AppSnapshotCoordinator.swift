@@ -125,22 +125,24 @@ public final class AppSnapshotCoordinator {
     /// set only from inside `performShutdown()` (i.e. after `shutdown()`
     /// has itself acquired `gate`), such an already-queued tick would
     /// always be serviced *first* (FIFO) and would have no way to learn
-    /// shutdown was ever requested. Checked by `performCheckForUpdates`
-    /// *twice*: immediately after it acquires `gate` — so any check,
+    /// shutdown was ever requested. Checked by both `performCheckForUpdates`
+    /// and `performSetIncludePrereleaseUpdates` *twice* each: immediately
+    /// after acquiring `gate` — so any check or tray checkbox action,
     /// scheduled or explicit, only granted the gate once shutdown has
     /// already begun is skipped entirely, before ever touching the
     /// network — and again immediately after `updateService.check(force:)`
-    /// returns/throws, before any snapshot/diagnostic mutation or publish,
-    /// since this flag can just as easily flip `true` *during* that await
-    /// (i.e. a check already granted the gate and genuinely in flight when
-    /// shutdown begins) as before it. Without that second check, such an
-    /// in-flight call would resume — after `shutdown()`'s own queued
-    /// `gate.acquire()` call has already run `performShutdown()` to
-    /// completion and published its final snapshot — and go on to publish
-    /// its own (now moot) result on top of that already-final state. A
-    /// `checkForUpdates` call already running (or already queued) *before*
-    /// `shutdown()` begins is completely unaffected by either check, since
-    /// it observes this flag still `false` throughout.
+    /// / `updateService.setIncludePrerelease(_:)` returns/throws, before
+    /// any snapshot/diagnostic mutation or publish, since this flag can
+    /// just as easily flip `true` *during* that await (i.e. a call already
+    /// granted the gate and genuinely in flight when shutdown begins) as
+    /// before it. Without that second check, such an in-flight call would
+    /// resume — after `shutdown()`'s own queued `gate.acquire()` call has
+    /// already run `performShutdown()` to completion and published its
+    /// final snapshot — and go on to publish its own (now moot) result on
+    /// top of that already-final state. A `checkForUpdates` or
+    /// `setIncludePrereleaseUpdates` call already running (or already
+    /// queued) *before* `shutdown()` begins is completely unaffected by
+    /// either check, since it observes this flag still `false` throughout.
     private var isShutDown = false
 
     public private(set) var snapshot: AppSnapshot
@@ -664,6 +666,13 @@ public final class AppSnapshotCoordinator {
     }
 
     private func performSetIncludePrereleaseUpdates(_ value: Bool) async throws {
+        // Granted the gate only after `shutdown()` has already begun (see
+        // `isShutDown`'s documentation, and `performCheckForUpdates`'s
+        // identical guard): never persist the toggle, network-check, or
+        // publish once shutdown is underway, however long this tray
+        // checkbox action was queued behind `gate`.
+        guard !isShutDown else { return }
+
         var idsToClear: Set<String> = []
         var upserts: [Diagnostic] = []
         var thrownError: Error?
@@ -680,6 +689,30 @@ public final class AppSnapshotCoordinator {
                 occurredAt: clock.nowMilliseconds()
             ))
         }
+
+        // `isShutDown` is only checked once, above, *before* the
+        // `updateService.setIncludePrerelease(_:)` await — but
+        // `shutdown()` can flip it `true` at any point during that await
+        // (it is set synchronously, ahead of `shutdown()`'s own
+        // `gate.acquire()` call, specifically so an already-*queued*
+        // action observes it the moment it is granted the gate — see
+        // `isShutDown`'s documentation). That guards a call still
+        // *queued* behind `gate` when shutdown begins, but not one that
+        // had already been granted the gate and was genuinely in flight
+        // inside `updateService.setIncludePrerelease(_:)` at that moment:
+        // without re-checking here, such a call would resume — after
+        // `shutdown()`'s own `gate.acquire()` call (queued directly
+        // behind this one) has already run `performShutdown()` to
+        // completion and published its final snapshot — and go on to
+        // mutate/publish its own (now moot) result on top of that
+        // already-final state. Bailing out here, before any snapshot/
+        // diagnostic mutation or publish, keeps shutdown's own final
+        // transition the last word regardless of how this call resolves,
+        // and without rethrowing `thrownError` either: a failure that
+        // only matters because shutdown made it moot must stay silent,
+        // exactly as `performCheckForUpdates` does for the same race.
+        guard !isShutDown else { return }
+
         publish(monitor: snapshot.monitor, history: snapshot.history, update: updateState, clearing: idsToClear, upserting: upserts)
         if let thrownError {
             throw thrownError

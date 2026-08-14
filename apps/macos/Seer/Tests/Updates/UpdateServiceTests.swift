@@ -895,6 +895,115 @@ final class UpdateServiceTests: XCTestCase {
         XCTAssertFalse(finalState.checking, "no check remains in flight once both overlapping calls have completed")
     }
 
+    /// Regression test for a race `setIncludePrerelease(_:)`'s own
+    /// synchronous `generation` bump exists to close. Before that fix,
+    /// `generation` only ever advanced later — inside the forced
+    /// `check(force: true)` call `setIncludePrerelease(_:)` itself makes,
+    /// *after* awaiting `settingsStore.setIncludePrereleaseUpdates(_:)` —
+    /// so an older stable-stream check already in flight when the switch
+    /// began still held a valid `myGeneration` ticket throughout that
+    /// settings-mutation await. Were that older check's response to
+    /// arrive during exactly that window, it would pass the (unchanged)
+    /// generation check, queue behind `SettingsStore`'s own gate (already
+    /// held by the in-progress settings mutation), and — the instant that
+    /// mutation released it — persist its stale stable-stream ETag/
+    /// release right back on top of the freshly cleared settings. If the
+    /// forced check against the *new* (prerelease) stream that follows
+    /// then itself fails, nothing else would ever overwrite that
+    /// resurrected stale state, silently leaking the old stream's cached
+    /// release across the switch.
+    ///
+    /// This test reproduces exactly that window deterministically: it
+    /// arms a suspension on the settings file write so
+    /// `setIncludePrerelease`'s own settings mutation is caught
+    /// genuinely mid-flight, only then resolves the older stable check's
+    /// held-open response, and finally lets the forced new-stream check
+    /// fail (no stub is queued for it). With the fix, the older check's
+    /// `myGeneration` ticket is already stale by the time its response
+    /// arrives — invalidated synchronously, before `setIncludePrerelease`
+    /// ever reached that settings-mutation await — so it never even
+    /// attempts to persist, and the cleared ETag/release/lastUpdateCheckAt
+    /// survive the forced check's failure untouched.
+    func testSetIncludePrereleaseInvalidatesAnInFlightOldStreamCheckBeforeItsFirstAwaitEvenWhenTheForcedNewStreamCheckFails() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let settingsStore = makeSettingsStore(fileSystem: fileSystem, clock: clock)
+        let service = UpdateService(
+            settingsStore: settingsStore,
+            session: makeMockSession(),
+            clock: clock,
+            currentVersion: "1.0.0"
+        )
+
+        let stableGate = RequestGate()
+
+        // The old stable-stream check's response: held open on
+        // `stableGate` until explicitly released below, well after the
+        // switch to prerelease has already begun.
+        MockURLProtocol.enqueueStub(
+            statusCode: 200,
+            headers: ["Etag": "\"stable-etag\""],
+            body: releaseJSON(tag: "v1.1.0", htmlURL: "https://github.com/OpenCoven/seer/releases/tag/v1.1.0"),
+            gate: stableGate
+        )
+
+        // 1. Start the old stable-stream check; its request reaches the
+        //    network and suspends there.
+        let staleCheckTask = Task { try await service.check(force: true) }
+        try await waitUntil { MockURLProtocol.recordedRequests.count >= 1 }
+
+        // 2. Arm a suspension on the settings file write and start the
+        //    switch to prerelease — deterministically catching
+        //    `setIncludePrerelease`'s own settings mutation genuinely
+        //    mid-flight, proving the fix's `generation` bump happens
+        //    strictly *before* this await is ever reached.
+        await fileSystem.armSuspension("writeFileAndSynchronize")
+        let switchTask = Task<Void, Error> {
+            _ = try await service.setIncludePrerelease(true)
+        }
+        await fileSystem.waitUntilEntered("writeFileAndSynchronize")
+
+        // 3. Only now let the old, now-stale stable-stream response
+        //    resolve — while the switch is still suspended inside its
+        //    own settings mutation, well before it ever reaches the
+        //    forced check against the new stream.
+        stableGate.open()
+        let staleResult = try await staleCheckTask.value
+
+        // 4. Let the settings mutation complete, and — with no stub
+        //    queued for the new prerelease-stream request — let the
+        //    forced check that follows fail with a transport error.
+        await fileSystem.resumeSuspension("writeFileAndSynchronize")
+        do {
+            try await switchTask.value
+            XCTFail("expected the forced new-stream check to throw")
+        } catch let error as UpdateCheckError {
+            guard case .network = error else {
+                return XCTFail("expected .network, got \(error)")
+            }
+        }
+
+        XCTAssertEqual(
+            staleResult.availableVersion, nil,
+            "the stale stable-stream check must never report its own discarded result once invalidated by the switch"
+        )
+
+        let finalSettings = await settingsStore.current
+        XCTAssertTrue(finalSettings.includePrereleaseUpdates, "the toggle itself is never rolled back, even though the forced check failed")
+        XCTAssertNil(
+            finalSettings.updateETag,
+            "the stale stable-stream ETag must never be restored after the switch cleared it, even though the forced new-stream check failed"
+        )
+        XCTAssertNil(
+            finalSettings.lastRelease,
+            "the stale stable-stream release must never be restored after the switch cleared it, even though the forced new-stream check failed"
+        )
+        XCTAssertNil(
+            finalSettings.lastUpdateCheckAt,
+            "the stale check must never record its own completion time either, once invalidated by the switch"
+        )
+    }
+
     // MARK: - openCurrentRelease only ever opens the stored, validated URL
 
     func testOpenCurrentReleaseReturnsFalseWhenNoReleaseIsCached() async {

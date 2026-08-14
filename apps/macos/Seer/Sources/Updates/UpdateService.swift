@@ -108,23 +108,44 @@ public actor UpdateService {
     private var activeCheckCount = 0
     /// Monotonically increases every time a `check(force:)` call actually
     /// starts a network round-trip (i.e. every time `activeCheckCount`
-    /// above is incremented). Each such call captures its own value
-    /// (`myGeneration`) before awaiting `session.data(for:)`, and only
-    /// persists its result if `generation` is *still* exactly that value
-    /// once the await returns — i.e. only if no other `check(force:)` call
-    /// started in the meantime. Because actors are reentrant across
-    /// `await`, two overlapping calls (e.g. a manual/scheduled stable-
-    /// stream check racing a `setIncludePrerelease(true)` switch to the
-    /// prerelease stream) can each have a request in flight at once, and
-    /// whichever *returns* first is not necessarily the one whose
-    /// ETag/release should end up persisted: persisting completion order
-    /// instead of start order would let an older, slower request stomp a
-    /// newer one's fresher result, or let one stream's ETag land after a
-    /// switch to the other stream. This makes the call that *started*
-    /// last always win — never the one that merely *finishes* last — and
-    /// every stale/superseded call instead returns whatever the winning
-    /// call (or, if it hasn't completed yet, whatever was already
+    /// above is incremented), *and* synchronously — before ever awaiting
+    /// anything — at the very start of `setIncludePrerelease(_:)`. Each
+    /// `check(force:)` call captures its own value (`myGeneration`) before
+    /// awaiting `session.data(for:)`, and only persists its result if
+    /// `generation` is *still* exactly that value once the await returns —
+    /// i.e. only if no other `check(force:)` call (or `setIncludePrerelease`
+    /// stream switch) started in the meantime. Because actors are
+    /// reentrant across `await`, two overlapping calls (e.g. a manual/
+    /// scheduled stable-stream check racing a `setIncludePrerelease(true)`
+    /// switch to the prerelease stream) can each have a request in flight
+    /// at once, and whichever *returns* first is not necessarily the one
+    /// whose ETag/release should end up persisted: persisting completion
+    /// order instead of start order would let an older, slower request
+    /// stomp a newer one's fresher result, or let one stream's ETag land
+    /// after a switch to the other stream. This makes the call that
+    /// *started* last always win — never the one that merely *finishes*
+    /// last — and every stale/superseded call instead returns whatever the
+    /// winning call (or, if it hasn't completed yet, whatever was already
     /// persisted) ends up leaving in `SettingsStore`.
+    ///
+    /// `setIncludePrerelease(_:)`'s own synchronous bump exists because,
+    /// without it, an old-stream check already in flight when the switch
+    /// begins would still hold a `myGeneration` ticket that remains valid
+    /// (`generation` not yet advanced) throughout `setIncludePrerelease`'s
+    /// own `await settingsStore.setIncludePrereleaseUpdates(value)` call —
+    /// `generation` was previously only ever advanced later, inside the
+    /// forced `check(force: true)` this function goes on to make. That
+    /// old call could then complete *during* that await and persist its
+    /// now-stale (old-stream) ETag/release right on top of the freshly
+    /// cleared state, and that stale write would survive even if the
+    /// subsequent forced check against the *new* stream then itself
+    /// fails — silently resurrecting the previous stream's cached release
+    /// after a switch. Bumping `generation` as the very first, synchronous
+    /// statement here — actor code runs to completion up to its first
+    /// suspension point, so no other task can interleave before this
+    /// executes — invalidates any such in-flight call immediately, before
+    /// settings are ever touched, regardless of how the forced check that
+    /// follows resolves.
     private var generation: Int64 = 0
 
     public init(
@@ -180,6 +201,13 @@ public actor UpdateService {
     /// reachability — but the thrown `UpdateCheckError` still propagates
     /// to the caller so it can surface the failure.
     public func setIncludePrerelease(_ value: Bool) async throws -> UpdateState {
+        // Synchronously invalidate any check already in flight *before*
+        // ever awaiting anything — see `generation`'s documentation for
+        // why this must happen here, ahead of the settings mutation
+        // below, rather than only later inside the forced `check(force:
+        // true)` call this function goes on to make.
+        generation += 1
+
         try await settingsStore.setIncludePrereleaseUpdates(value)
         return try await check(force: true)
     }

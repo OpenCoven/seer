@@ -133,6 +133,20 @@ test("User-facing surfaces are rebranded to Seer", () => {
   assert.match(readText("main-window.html"), /<title>Seer<\/title>/);
 });
 
+test("UpdateService is constructed with the real packaged app version, not a hardcoded stand-in", () => {
+  const source = readText("main/index.ts");
+
+  assert.match(
+    source,
+    /new UpdateService\(\{\s*\n\s*currentVersion:\s*app\.getVersion\(\)/,
+    "main/index.ts must pass app.getVersion() as UpdateService's currentVersion so update comparisons reflect the actual packaged app version",
+  );
+  assert.ok(
+    !/currentVersion:\s*"1\.0\.0"/.test(source),
+    "main/index.ts must never hardcode UpdateService's currentVersion to a fixed string",
+  );
+});
+
 test("No forbidden generated artifacts are in the change set", () => {
   const changeSet = gitChangeSet();
   const forbiddenComponents = new Set([

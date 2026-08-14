@@ -95,7 +95,7 @@ app.whenReady().then(async () => {
   await historyStore.init();
   await settingsStore.load();
   updateService = new UpdateService({
-    currentVersion: "1.0.0",
+    currentVersion: app.getVersion(),
     settings: settingsStore,
     openExternal: (url) => shell.openExternal(url),
   });
