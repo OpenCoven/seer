@@ -1179,7 +1179,10 @@ public final class AppSnapshotCoordinator {
             ))
         }
 
-        publish(monitor: updatedMonitor, history: stats, clearing: [], upserting: upserts)
+        let idsToClear: Set<String> = powerError == nil && !power.hasPendingReleases
+            ? [PowerDiagnosticID.assertionFailed]
+            : []
+        publish(monitor: updatedMonitor, history: stats, clearing: idsToClear, upserting: upserts)
 
         if let historyError {
             throw historyError

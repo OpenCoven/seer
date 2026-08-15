@@ -453,6 +453,39 @@ final class AppSnapshotCoordinatorTests: XCTestCase {
         XCTAssertEqual(powerBackend.releasedIDs, [], "the old assertion must never be released while every replacement attempt keeps failing")
     }
 
+    func testDeactivateAfterDoubleReleaseFailureReportsInactiveUntilCleanupDiagnosticClears() async throws {
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let powerBackend = CoordinatorFakePowerBackend()
+        let (coordinator, _, _) = await makeCoordinator(clock: clock, powerBackend: powerBackend)
+        let agent = activeAgent()
+        await coordinator.applyScan([agent], scannedAt: clock.now)
+
+        powerBackend.releaseFailuresByID[1] = .releaseFailed(ioReturnCode: -1)
+        powerBackend.releaseFailuresByID[2] = .releaseFailed(ioReturnCode: -2)
+        try await coordinator.setKeepAwakeMode(.display)
+        XCTAssertTrue(coordinator.snapshot.monitor.keepingAwake)
+        XCTAssertTrue(coordinator.snapshot.diagnostics.contains { $0.id == PowerDiagnosticID.assertionFailed })
+
+        powerBackend.releaseFailuresByID[1] = .releaseFailed(ioReturnCode: -3)
+        powerBackend.releaseFailuresByID[2] = .releaseFailed(ioReturnCode: -4)
+        clock.now += 10
+        await coordinator.applyScan([], scannedAt: clock.now)
+
+        XCTAssertFalse(coordinator.snapshot.monitor.active)
+        XCTAssertFalse(coordinator.snapshot.monitor.keepingAwake)
+        XCTAssertTrue(
+            coordinator.snapshot.diagnostics.contains { $0.id == PowerDiagnosticID.assertionFailed },
+            "cleanup uncertainty must remain diagnosed even though desired keepingAwake is false"
+        )
+
+        clock.now += 10
+        await coordinator.applyScan([], scannedAt: clock.now)
+
+        XCTAssertFalse(coordinator.snapshot.monitor.keepingAwake)
+        XCTAssertFalse(coordinator.snapshot.diagnostics.contains { $0.id == PowerDiagnosticID.assertionFailed })
+        XCTAssertEqual(powerBackend.releasedIDs, [1, 2, 1, 2, 1, 2])
+    }
+
     // MARK: - History clear
 
     func testClearHistorySuccessResetsStatsAndEmitsOnce() async throws {
@@ -1103,6 +1136,29 @@ final class AppSnapshotCoordinatorTests: XCTestCase {
         try await coordinator.shutdown()
 
         XCTAssertEqual(powerBackend.releasedIDs, [1], "the second shutdown must not attempt to release again")
+    }
+
+    func testShutdownRetriesUncertainReleaseAndClearsDiagnosticOnlyAfterSuccess() async throws {
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let powerBackend = CoordinatorFakePowerBackend()
+        let (coordinator, _, _) = await makeCoordinator(clock: clock, powerBackend: powerBackend)
+        await coordinator.applyScan([activeAgent()], scannedAt: clock.now)
+        powerBackend.releaseFailuresByID[1] = .releaseFailed(ioReturnCode: -1)
+
+        do {
+            try await coordinator.shutdown()
+            XCTFail("expected first shutdown to surface the uncertain release")
+        } catch {
+            // Expected.
+        }
+        XCTAssertFalse(coordinator.snapshot.monitor.keepingAwake)
+        XCTAssertTrue(coordinator.snapshot.diagnostics.contains { $0.id == PowerDiagnosticID.assertionFailed })
+
+        try await coordinator.shutdown()
+
+        XCTAssertFalse(coordinator.snapshot.monitor.keepingAwake)
+        XCTAssertFalse(coordinator.snapshot.diagnostics.contains { $0.id == PowerDiagnosticID.assertionFailed })
+        XCTAssertEqual(powerBackend.releasedIDs, [1, 1])
     }
 
     /// Reproduces the exact race `isShutDown` exists to close: a

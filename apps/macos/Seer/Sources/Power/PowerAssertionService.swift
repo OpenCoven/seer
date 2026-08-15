@@ -101,21 +101,26 @@ public struct IOKitPowerAssertionBackend: PowerAssertionBackend {
 #endif
 
 /// Typed failures `PowerAssertionService.setDesired(active:mode:)` (and
-/// `shutdown()`) can throw. Every case carries the service's exact actual
-/// post-call state (`actualAssertionID`/`actualMode`) so a caller never has
-/// to guess whether "throw" means "nothing changed" — see each case's
-/// documentation for precisely what it means.
+/// `shutdown()`) can throw. Desired state is always available through the
+/// service, while pending-release cases preserve cleanup uncertainty and
+/// every potentially live id for later reconciliation.
 public enum PowerAssertionServiceError: Error, Equatable, Sendable {
     /// No assertion was active before the call; creating the requested one
     /// failed. The service remains fully inactive (no
     /// `actualAssertionID`/`actualMode` — there is nothing to report).
     case creationFailed(underlying: PowerAssertionBackendError)
 
-    /// An assertion was active and the caller asked to deactivate; the
-    /// release failed. The service conservatively continues reporting the
-    /// original assertion active — a failed release is never assumed to
-    /// have actually released anything.
+    /// An assertion was desired and the caller asked to deactivate; the
+    /// release failed. Desired state is inactive immediately, while the id
+    /// remains tracked for later release retries.
     case releaseFailed(underlying: PowerAssertionBackendError, actualAssertionID: UInt32, actualMode: KeepAwakeMode)
+
+    /// One or more orphaned assertions could not be confirmed released
+    /// during reconciliation. All ids remain tracked and retryable.
+    case pendingReleaseFailed(
+        underlying: PowerAssertionBackendError,
+        pendingAssertionIDs: [UInt32]
+    )
 
     /// A mode replacement's *new* assertion could not be created. The
     /// original assertion was never touched by this call and remains the
@@ -136,9 +141,9 @@ public enum PowerAssertionServiceError: Error, Equatable, Sendable {
     /// silently resolve on its own. It pins its reported state to the
     /// *new* assertion (`actualAssertionID`/`actualMode`, known to have
     /// been created successfully) rather than the old one, and
-    /// `leakedAssertionID` names the old assertion that could not be
-    /// confirmed released, so a caller can still surface the leak instead
-    /// of silently losing track of it.
+    /// `leakedAssertionID` names the newly orphaned old assertion; it is
+    /// also retained in `pendingReleaseAssertionIDs` alongside any earlier
+    /// unresolved ids so later calls can retry every release.
     case replacementRollbackFailed(
         oldReleaseUnderlying: PowerAssertionBackendError,
         rollbackReleaseUnderlying: PowerAssertionBackendError,
@@ -148,7 +153,8 @@ public enum PowerAssertionServiceError: Error, Equatable, Sendable {
     )
 }
 
-/// Owns exactly zero or one active IOKit power assertion at a time.
+/// Owns zero or one desired active IOKit assertion plus any number of
+/// explicitly tracked assertions whose release has not yet been confirmed.
 ///
 /// `@MainActor` to match `AppSnapshotCoordinator`'s isolation. Every method
 /// here is synchronous — the underlying IOKit calls this wraps are
@@ -166,14 +172,21 @@ public final class PowerAssertionService {
     private let backend: any PowerAssertionBackend
     private let reason: String
 
-    /// The currently active assertion's id, or `nil` if none is active.
+    /// The desired active assertion's id, or `nil` if desired state is
+    /// inactive. Potentially-live orphan ids are tracked separately.
     public private(set) var activeAssertionID: UInt32?
-    /// The mode the currently active assertion was created with, or `nil`
-    /// if none is active.
+    /// The mode the desired active assertion was created with, or `nil` if
+    /// desired state is inactive.
     public private(set) var activeMode: KeepAwakeMode?
+    private var pendingReleaseIDs: Set<UInt32> = []
 
-    /// Whether an assertion is currently active. Exactly
-    /// `activeAssertionID != nil`.
+    /// Assertion ids whose release failed or remains uncertain. Sorted to
+    /// make diagnostics and tests deterministic.
+    public var pendingReleaseAssertionIDs: [UInt32] { pendingReleaseIDs.sorted() }
+    public var hasPendingReleases: Bool { !pendingReleaseIDs.isEmpty }
+
+    /// Whether desired state has an active assertion. Cleanup uncertainty
+    /// never changes this semantic.
     public var isActive: Bool { activeAssertionID != nil }
 
     public init(backend: any PowerAssertionBackend, reason: String = PowerAssertionReason.stable) {
@@ -186,64 +199,75 @@ public final class PowerAssertionService {
     ///   if already inactive).
     /// - `active: true` with no assertion currently active creates one.
     /// - `active: true` with an assertion already active in the same
-    ///   `mode` is a no-op (idempotent, no backend calls at all).
+    ///   `mode` performs only pending-release reconciliation, if needed.
     /// - `active: true` with an assertion active in a *different* `mode`
     ///   replaces it: creates the new assertion first, then releases the
     ///   old one — see `PowerAssertionServiceError` for what happens (and
     ///   what is reported) if either step fails.
     ///
-    /// Returns whether the backend was actually invoked (`false` for every
-    /// idempotent no-op).
+    /// Returns whether the backend was actually invoked.
     @discardableResult
     public func setDesired(active: Bool, mode: KeepAwakeMode) throws -> Bool {
+        let pendingRetry = retryPendingReleases()
         guard active else {
-            return try deactivate()
+            return try deactivate(after: pendingRetry)
         }
         guard let currentID = activeAssertionID, let currentMode = activeMode else {
-            return try activateFresh(mode: mode)
+            return try activateFresh(mode: mode, after: pendingRetry)
         }
         guard currentMode != mode else {
-            return false
+            try requirePendingReleasesResolved(firstFailure: pendingRetry.firstFailure)
+            return pendingRetry.invoked
         }
-        return try replace(withMode: mode, oldID: currentID, oldMode: currentMode)
+        return try replace(
+            withMode: mode,
+            oldID: currentID,
+            oldMode: currentMode,
+            priorPendingFailure: pendingRetry.firstFailure
+        )
     }
 
-    private func deactivate() throws -> Bool {
+    private func deactivate(after pendingRetry: PendingRetryResult) throws -> Bool {
         guard let id = activeAssertionID, let mode = activeMode else {
-            return false
+            try requirePendingReleasesResolved(firstFailure: pendingRetry.firstFailure)
+            return pendingRetry.invoked
         }
+        // Desired state changes immediately. A failed OS release is cleanup
+        // uncertainty, not permission to report keepingAwake as desired.
+        activeAssertionID = nil
+        activeMode = nil
         do {
             try backend.releaseAssertion(id: id)
         } catch {
-            // Do not clear state: a failed release is never assumed to
-            // have actually released the assertion. Caught as `any
-            // Error` (not just `PowerAssertionBackendError`) because the
-            // protocol's untyped `throws` permits a conformance to throw
-            // anything; `Self.normalize(_:)` still surfaces it as a
-            // stable, typed underlying error.
+            pendingReleaseIDs.insert(id)
             throw PowerAssertionServiceError.releaseFailed(
                 underlying: Self.normalize(error),
                 actualAssertionID: id,
                 actualMode: mode
             )
         }
-        activeAssertionID = nil
-        activeMode = nil
+        try requirePendingReleasesResolved(firstFailure: pendingRetry.firstFailure)
         return true
     }
 
-    private func activateFresh(mode: KeepAwakeMode) throws -> Bool {
+    private func activateFresh(mode: KeepAwakeMode, after pendingRetry: PendingRetryResult) throws -> Bool {
         do {
             let id = try backend.createAssertion(mode: mode, reason: reason)
             activeAssertionID = id
             activeMode = mode
-            return true
         } catch {
             throw PowerAssertionServiceError.creationFailed(underlying: Self.normalize(error))
         }
+        try requirePendingReleasesResolved(firstFailure: pendingRetry.firstFailure)
+        return true
     }
 
-    private func replace(withMode mode: KeepAwakeMode, oldID: UInt32, oldMode: KeepAwakeMode) throws -> Bool {
+    private func replace(
+        withMode mode: KeepAwakeMode,
+        oldID: UInt32,
+        oldMode: KeepAwakeMode,
+        priorPendingFailure: PowerAssertionBackendError?
+    ) throws -> Bool {
         let newID: UInt32
         do {
             newID = try backend.createAssertion(mode: mode, reason: reason)
@@ -279,6 +303,7 @@ public final class PowerAssertionService {
                 let rollbackError = Self.normalize(error)
                 activeAssertionID = newID
                 activeMode = mode
+                pendingReleaseIDs.insert(oldID)
                 throw PowerAssertionServiceError.replacementRollbackFailed(
                     oldReleaseUnderlying: releaseError,
                     rollbackReleaseUnderlying: rollbackError,
@@ -298,7 +323,46 @@ public final class PowerAssertionService {
 
         activeAssertionID = newID
         activeMode = mode
+        try requirePendingReleasesResolved(firstFailure: priorPendingFailure)
         return true
+    }
+
+    private struct PendingRetryResult {
+        var invoked = false
+        var firstFailure: PowerAssertionBackendError?
+    }
+
+    /// Retries every previously uncertain release exactly once per
+    /// reconciliation. The desired assertion is never released even if an
+    /// invariant violation somehow places its id in the pending set.
+    private func retryPendingReleases() -> PendingRetryResult {
+        var result = PendingRetryResult()
+        for id in pendingReleaseIDs.sorted() {
+            guard id != activeAssertionID else {
+                if result.firstFailure == nil {
+                    result.firstFailure = .foreign(description: "desired assertion \(id) is also marked pending release")
+                }
+                continue
+            }
+            result.invoked = true
+            do {
+                try backend.releaseAssertion(id: id)
+                pendingReleaseIDs.remove(id)
+            } catch {
+                if result.firstFailure == nil {
+                    result.firstFailure = Self.normalize(error)
+                }
+            }
+        }
+        return result
+    }
+
+    private func requirePendingReleasesResolved(firstFailure: PowerAssertionBackendError?) throws {
+        guard !pendingReleaseIDs.isEmpty else { return }
+        throw PowerAssertionServiceError.pendingReleaseFailed(
+            underlying: firstFailure ?? .foreign(description: "one or more assertion releases remain uncertain"),
+            pendingAssertionIDs: pendingReleaseAssertionIDs
+        )
     }
 
     /// Normalizes any error a `PowerAssertionBackend` conformance throws
@@ -313,14 +377,14 @@ public final class PowerAssertionService {
         (error as? PowerAssertionBackendError) ?? .foreign(description: String(describing: error))
     }
 
-    /// Releases the active assertion (if any) — the exact same path as
-    /// `setDesired(active: false, mode:)`. Idempotent: calling this again
-    /// after a successful shutdown, or when no assertion was ever created,
-    /// is a no-op. This is the authoritative release path
+    /// Makes desired state inactive and retries every desired or pending
+    /// assertion release. Idempotent after all releases are confirmed; a
+    /// failed release remains retryable by the next call. This is the
+    /// authoritative release path
     /// `AppSnapshotCoordinator` awaits during app termination; a release
     /// failure is thrown, never swallowed.
     public func shutdown() throws {
-        _ = try deactivate()
+        _ = try setDesired(active: false, mode: activeMode ?? .system)
     }
 
     deinit {
@@ -328,7 +392,11 @@ public final class PowerAssertionService {
         // to a failed release. Explicit `shutdown()` remains the sole
         // authoritative release path; this is purely a safety net against
         // a caller that forgot to call it.
+        var ids = pendingReleaseIDs
         if let id = activeAssertionID {
+            ids.insert(id)
+        }
+        for id in ids {
             try? backend.releaseAssertion(id: id)
         }
     }

@@ -219,7 +219,7 @@ final class PowerAssertionServiceTests: XCTestCase {
         XCTAssertNil(service.activeMode)
     }
 
-    func testDeactivateFailureLeavesStateActive() throws {
+    func testDeactivateFailureReportsInactiveAndTracksPendingRelease() throws {
         let backend = FakeAssertionBackend()
         let service = PowerAssertionService(backend: backend)
         try service.setDesired(active: true, mode: .system)
@@ -232,11 +232,10 @@ final class PowerAssertionServiceTests: XCTestCase {
             XCTAssertEqual(actualID, 1)
             XCTAssertEqual(actualMode, .system)
         }
-        // A failed release is never assumed to have actually released the
-        // assertion: the service must keep reporting it active.
-        XCTAssertTrue(service.isActive)
-        XCTAssertEqual(service.activeAssertionID, 1)
-        XCTAssertEqual(service.activeMode, .system)
+        XCTAssertFalse(service.isActive)
+        XCTAssertNil(service.activeAssertionID)
+        XCTAssertNil(service.activeMode)
+        XCTAssertEqual(service.pendingReleaseAssertionIDs, [1])
     }
 
     // MARK: - Mode replacement: creation failure
@@ -319,6 +318,74 @@ final class PowerAssertionServiceTests: XCTestCase {
         XCTAssertEqual(service.activeAssertionID, 2)
         XCTAssertEqual(service.activeMode, .display)
         XCTAssertTrue(service.isActive)
+        XCTAssertEqual(service.pendingReleaseAssertionIDs, [1])
+        XCTAssertTrue(service.hasPendingReleases)
+    }
+
+    func testSameModeReconciliationRetriesForgottenOldAssertionWithoutReleasingDesiredAssertion() throws {
+        let backend = FakeAssertionBackend()
+        let service = PowerAssertionService(backend: backend)
+        try service.setDesired(active: true, mode: .system)
+        backend.releaseFailuresByID[1] = .releaseFailed(ioReturnCode: -4)
+        backend.releaseFailuresByID[2] = .releaseFailed(ioReturnCode: -5)
+        XCTAssertThrowsError(try service.setDesired(active: true, mode: .display))
+
+        let changed = try service.setDesired(active: true, mode: .display)
+
+        XCTAssertTrue(changed, "releasing a pending assertion is observable reconciliation work")
+        XCTAssertEqual(backend.createdTypes, [.preventUserIdleSystemSleep, .preventUserIdleDisplaySleep])
+        XCTAssertEqual(backend.releasedIDs, [1, 2, 1])
+        XCTAssertEqual(service.activeAssertionID, 2)
+        XCTAssertEqual(service.activeMode, .display)
+        XCTAssertEqual(service.pendingReleaseAssertionIDs, [])
+        XCTAssertFalse(service.hasPendingReleases)
+    }
+
+    func testDeactivateReportsDesiredInactiveWhileBothPotentiallyLiveAssertionsRemainRetryable() throws {
+        let backend = FakeAssertionBackend()
+        let service = PowerAssertionService(backend: backend)
+        try service.setDesired(active: true, mode: .system)
+        backend.releaseFailuresByID[1] = .releaseFailed(ioReturnCode: -4)
+        backend.releaseFailuresByID[2] = .releaseFailed(ioReturnCode: -5)
+        XCTAssertThrowsError(try service.setDesired(active: true, mode: .display))
+
+        backend.releaseFailuresByID[1] = .releaseFailed(ioReturnCode: -6)
+        backend.releaseFailuresByID[2] = .releaseFailed(ioReturnCode: -7)
+        XCTAssertThrowsError(try service.setDesired(active: false, mode: .display))
+
+        XCTAssertFalse(service.isActive, "desired inactive semantics must not be overwritten by cleanup uncertainty")
+        XCTAssertNil(service.activeAssertionID)
+        XCTAssertNil(service.activeMode)
+        XCTAssertEqual(service.pendingReleaseAssertionIDs, [1, 2])
+
+        XCTAssertTrue(try service.setDesired(active: false, mode: .display))
+        XCTAssertEqual(service.pendingReleaseAssertionIDs, [])
+        XCTAssertFalse(service.hasPendingReleases)
+        XCTAssertFalse(service.isActive)
+    }
+
+    func testMultipleFailedReplacementsAccumulateEveryPotentiallyLiveOrphan() throws {
+        let backend = FakeAssertionBackend()
+        let service = PowerAssertionService(backend: backend)
+        try service.setDesired(active: true, mode: .system) // id 1
+        backend.releaseFailuresByID[1] = .releaseFailed(ioReturnCode: -1)
+        backend.releaseFailuresByID[2] = .releaseFailed(ioReturnCode: -2)
+        XCTAssertThrowsError(try service.setDesired(active: true, mode: .display)) // desired id 2, pending id 1
+
+        backend.releaseFailuresByID[1] = .releaseFailed(ioReturnCode: -3)
+        backend.releaseFailuresByID[2] = .releaseFailed(ioReturnCode: -4)
+        backend.releaseFailuresByID[3] = .releaseFailed(ioReturnCode: -5)
+        XCTAssertThrowsError(try service.setDesired(active: true, mode: .system))
+
+        XCTAssertEqual(service.activeAssertionID, 3)
+        XCTAssertEqual(service.activeMode, .system)
+        XCTAssertEqual(service.pendingReleaseAssertionIDs, [1, 2])
+        XCTAssertEqual(backend.releasedIDs, [1, 2, 1, 2, 3])
+
+        XCTAssertTrue(try service.setDesired(active: true, mode: .system))
+        XCTAssertEqual(service.pendingReleaseAssertionIDs, [])
+        XCTAssertEqual(service.activeAssertionID, 3, "pending cleanup must never release the desired assertion")
+        XCTAssertEqual(backend.releasedIDs.suffix(2), [1, 2])
     }
 
     // MARK: - Shutdown
@@ -367,9 +434,28 @@ final class PowerAssertionServiceTests: XCTestCase {
                 return XCTFail("expected .releaseFailed, got \(error)")
             }
         }
-        // Never swallowed: the assertion remains reported active since the
-        // release could not be confirmed.
-        XCTAssertTrue(service.isActive)
+        XCTAssertFalse(service.isActive, "shutdown changes desired state immediately even when OS cleanup is uncertain")
+        XCTAssertEqual(service.pendingReleaseAssertionIDs, [1])
+    }
+
+    func testShutdownRetriesAllPendingReleasesUntilNoAssertionIsForgotten() throws {
+        let backend = FakeAssertionBackend()
+        let service = PowerAssertionService(backend: backend)
+        try service.setDesired(active: true, mode: .system)
+        backend.releaseFailuresByID[1] = .releaseFailed(ioReturnCode: -1)
+        backend.releaseFailuresByID[2] = .releaseFailed(ioReturnCode: -2)
+        XCTAssertThrowsError(try service.setDesired(active: true, mode: .display))
+
+        backend.releaseFailuresByID[1] = .releaseFailed(ioReturnCode: -3)
+        backend.releaseFailuresByID[2] = .releaseFailed(ioReturnCode: -4)
+        XCTAssertThrowsError(try service.shutdown())
+        XCTAssertFalse(service.isActive)
+        XCTAssertEqual(service.pendingReleaseAssertionIDs, [1, 2])
+
+        try service.shutdown()
+
+        XCTAssertEqual(service.pendingReleaseAssertionIDs, [])
+        XCTAssertEqual(backend.releasedIDs.suffix(2), [1, 2])
     }
 
     // MARK: - Foreign (non-`PowerAssertionBackendError`) error normalization
@@ -402,7 +488,7 @@ final class PowerAssertionServiceTests: XCTestCase {
     /// deactivate must likewise be normalized, and — matching the typed
     /// case's behavior — never assumed to have actually released the
     /// assertion.
-    func testForeignDeactivateErrorIsNormalizedAndLeavesStateActive() throws {
+    func testForeignDeactivateErrorIsNormalizedAndTracksPendingRelease() throws {
         let backend = ForeignErrorAssertionBackend()
         let service = PowerAssertionService(backend: backend)
         try service.setDesired(active: true, mode: .system)
@@ -419,9 +505,10 @@ final class PowerAssertionServiceTests: XCTestCase {
             XCTAssertEqual(actualID, 1)
             XCTAssertEqual(actualMode, .system)
         }
-        XCTAssertTrue(service.isActive)
-        XCTAssertEqual(service.activeAssertionID, 1)
-        XCTAssertEqual(service.activeMode, .system)
+        XCTAssertFalse(service.isActive)
+        XCTAssertNil(service.activeAssertionID)
+        XCTAssertNil(service.activeMode)
+        XCTAssertEqual(service.pendingReleaseAssertionIDs, [1])
     }
 
     /// A foreign error thrown by the *old* assertion's release during a
