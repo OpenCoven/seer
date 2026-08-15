@@ -1,5 +1,11 @@
 #!/bin/bash
 
+if [[ "$-" == *x* ]]; then
+  set +x
+  echo "error: shell xtrace is prohibited for authenticated release operations" >&2
+  exit 1
+fi
+
 set -euo pipefail
 
 fail() {
@@ -43,6 +49,8 @@ if [[ "${MODE}" == "marker" ]]; then
   exit 0
 fi
 
+GH_TOKEN="${GH_TOKEN:-}"
+[[ -n "${GH_TOKEN}" ]] || fail "GH_TOKEN is required"
 GH_REPO="${GH_REPO:-}"
 [[ "${GH_REPO}" == "OpenCoven/seer-releases" ]] ||
   fail "release destination must be OpenCoven/seer-releases"

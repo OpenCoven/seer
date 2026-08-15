@@ -170,7 +170,10 @@ function writeFakeCurl(scratch, bin) {
 const statePath = process.env.FAKE_RELEASE_STATE;
 const state = JSON.parse(readFileSync(statePath, "utf8"));
 const args = process.argv.slice(2);
-state.calls.push(["curl", ...args]);
+const redactedArgs = args.map((arg) =>
+  arg.startsWith("Authorization: ") ? "Authorization: [REDACTED]" : arg
+);
+state.calls.push(["curl", ...redactedArgs]);
 const valueAfter = (name) => {
   const index = args.lastIndexOf(name);
   return index === -1 ? null : args[index + 1];
@@ -181,6 +184,13 @@ const headerPath = valueAfter("--dump-header") ?? valueAfter("-D");
 const method = valueAfter("--request") ?? valueAfter("-X") ?? "GET";
 const url = args.findLast((arg) => /^https?:/.test(arg));
 const save = () => writeFileSync(statePath, JSON.stringify(state));
+const authorization = headers.find((header) => header.startsWith("Authorization: "));
+if (authorization !== \`Authorization: Bearer \${process.env.FAKE_EXPECTED_TOKEN}\`) {
+  save();
+  console.error("curl: request authentication rejected");
+  process.exit(97);
+}
+state.authenticatedRequests.push({ method, url });
 const writeResponse = (status, body, etag = state.etag) => {
   if (headerPath) writeFileSync(headerPath, \`HTTP/2 \${status}\\r\\netag: \${etag}\\r\\n\\r\\n\`);
   if (output) writeFileSync(output, body);
@@ -255,6 +265,7 @@ function withHarness(callback, options = {}) {
         etagConflictOnPatch: false,
         nextAssetID: 200,
         calls: [],
+        authenticatedRequests: [],
       }),
     );
 
@@ -270,6 +281,7 @@ function withHarness(callback, options = {}) {
           NODE_BINARY: process.execPath,
           FAKE_GH_SCRIPT: ghScript,
           FAKE_CURL_SCRIPT: curlScript,
+          FAKE_EXPECTED_TOKEN: "test-token",
           FAKE_RELEASE_STATE: statePath,
           GITHUB_API_URL: "https://api.github.test",
           GH_TOKEN: "test-token",
@@ -372,6 +384,50 @@ test("capture emits exact release, metadata, asset, byte, and notes bindings", (
   });
 });
 
+test("capture authenticates release metadata and asset downloads with the injected token", () => {
+  withHarness(({ run, readState, writeState }) => {
+    const state = readState();
+    for (const item of state.release.assets) item.digest = null;
+    writeState(state);
+
+    const result = run("capture", { GH_TOKEN: "auth-test-token", FAKE_EXPECTED_TOKEN: "auth-test-token" });
+    assert.equal(result.status, 0, result.stderr);
+    const requests = readState().authenticatedRequests;
+    assert.equal(requests.filter(({ url }) => url.includes("/releases/tags/")).length, 1);
+    assert.equal(requests.filter(({ url }) => url.includes("/releases/assets/")).length, expectedAssets.length);
+    assert.doesNotMatch(`${result.stdout}\n${result.stderr}\n${JSON.stringify(readState())}`, /auth-test-token/);
+  });
+});
+
+test("capture fails closed when the token is missing or rejected without logging it", () => {
+  for (const [name, env] of [
+    ["missing", { GH_TOKEN: "" }],
+    ["wrong", { GH_TOKEN: "wrong-auth-test-token", FAKE_EXPECTED_TOKEN: "expected-auth-test-token" }],
+  ]) {
+    withHarness(({ run, readState }) => {
+      const result = run("capture", env);
+      assert.notEqual(result.status, 0, `${name} authentication must fail`);
+      if (name === "missing") assert.match(result.stderr, /GH_TOKEN is required/);
+      const observable = `${result.stdout}\n${result.stderr}\n${JSON.stringify(readState())}`;
+      assert.doesNotMatch(observable, /(?:wrong|expected)-auth-test-token/);
+      assert.equal(readState().release.draft, true);
+    });
+  }
+});
+
+test("release policy rejects inherited xtrace before the token can be logged", () => {
+  withHarness(({ run }) => {
+    const result = run("capture", {
+      GH_TOKEN: "xtrace-auth-test-token",
+      FAKE_EXPECTED_TOKEN: "xtrace-auth-test-token",
+      SHELLOPTS: "braceexpand:hashall:interactive-comments:xtrace",
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /xtrace/i);
+    assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /xtrace-auth-test-token/);
+  });
+});
+
 test("publish fails closed when title, notes body, asset id, size, or digest changes", () => {
   const mutations = [
     ["title", (state) => { state.release.title += " changed"; }],
@@ -466,6 +522,9 @@ test("exact captured state publishes by release ID with conditional REST PATCH o
     assert.ok(patch);
     assert.ok(patch.some((arg) => arg.endsWith("/releases/42")));
     assert.ok(patch.includes('If-Match: "draft-etag"'));
+    assert.ok(patch.includes("Authorization: [REDACTED]"));
+    assert.equal(state.authenticatedRequests.filter(({ method }) => method === "PATCH").length, 1);
+    assert.doesNotMatch(`${result.stdout}\n${result.stderr}\n${JSON.stringify(state)}`, /test-token/);
     assert.ok(!state.calls.some((call) => call[0] === "gh" && call[1] === "release" && call[2] === "edit"));
     assert.ok(!state.calls.some((call) => call.includes("delete") || call.includes("DELETE")));
   });
