@@ -72,9 +72,9 @@ jobs:
       # which is run as its own explicit step after "Build unsigned
       # Seer.app" below (its shared `main/services/update-check.test.ts`
       # sibling is exercised via the "Run shared renderer unit tests" step
-      # instead). When Task 16 adds a release-manifest test file, append
-      # it to this explicit list rather than switching to a glob.
-      - name: Run standalone-safe unit tests (identity, standalone-renderer, publication safety, agent-detection, update)
+      # instead). Release packaging tests stub every signing/notarization
+      # tool and never use credentials or contact Apple services.
+      - name: Run standalone-safe unit tests (identity, renderer, publication, packaging, agent-detection, update)
         run: |
           set -euo pipefail
           node --test \
@@ -83,6 +83,8 @@ jobs:
             tests/standalone-renderer.test.mjs \
             tests/standalone-renderer-lock.test.mjs \
             tests/safe-app-publication.test.mjs \
+            tests/release-manifest.test.mjs \
+            tests/package-macos-release.test.mjs \
             tests/agent-detection-parity.test.mjs \
             tests/tray-update-error-handling.test.mjs 2>&1 | tee ci-logs/unit-tests.log
 

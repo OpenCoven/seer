@@ -124,8 +124,11 @@ const SOURCE_SCAN_FILES = [
   "tsconfig.standalone.json",
   "scripts/build-macos-app.sh",
   "scripts/build-standalone-renderer.mjs",
+  "scripts/check-release-boundary.mjs",
+  "scripts/package-macos-release.sh",
   "scripts/test-macos.sh",
   "scripts/publish-macos-app.py",
+  "scripts/write-release-manifest.mjs",
 ];
 
 /**
