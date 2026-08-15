@@ -13,6 +13,15 @@ const scratchRoot = path.join(process.cwd(), "tmp", "settings-store-tests");
 let scratchCounter = 0;
 
 async function makeStore(): Promise<{ store: SettingsStore; dir: string }> {
+  const { store, dir } = await makeColdStore();
+  await store.load();
+  return { store, dir };
+}
+
+// Like `makeStore`, but deliberately does NOT call `store.load()` first —
+// the store's cache is left cold so callers can exercise concurrent
+// setters racing the very first (uncompleted) read.
+async function makeColdStore(): Promise<{ store: SettingsStore; dir: string }> {
   scratchCounter += 1;
   const dir = path.join(
     scratchRoot,
@@ -20,7 +29,6 @@ async function makeStore(): Promise<{ store: SettingsStore; dir: string }> {
   );
   await fs.mkdir(dir, { recursive: true });
   const store = new SettingsStore(() => dir);
-  await store.load();
   return { store, dir };
 }
 
@@ -227,6 +235,196 @@ test("consecutive failed persists each reject independently without poisoning th
   });
 
   await fs.chmod(dir, 0o700);
+  const recovered = await store.setKeepAwakeMode("display");
+  assert.deepEqual(recovered, {
+    keepAwakeMode: "display",
+    includePrereleaseUpdates: false,
+  });
+  assert.deepEqual(await readOnDisk(dir), {
+    keepAwakeMode: "display",
+    includePrereleaseUpdates: false,
+  });
+});
+
+// Regression tests for `mutate()` calling `load()` *before* joining
+// `saveQueue`: with a cold (never-loaded) cache, every concurrent setter
+// call independently sees `this.loaded === false`, so each one performs
+// its own `load()` work and joins `saveQueue` only once that settles —
+// whichever call's `load()` happens to resolve last decides both the
+// join order (regardless of actual call order) and the cache contents
+// (resetting `this.cache` to whatever it just read from disk, even after
+// another call has already derived-and-persisted a newer value on top of
+// it). The fix must make initialization a single shared/serialized
+// operation and fix each caller's queue position *before* any `await` —
+// including before `load()` — so cold-start races behave identically to
+// already-warm races.
+test("cold start: two different-field setters both survive with no prior load() call", async () => {
+  const { store, dir } = await makeColdStore();
+
+  const [afterKeepAwake, afterPrerelease] = await Promise.all([
+    store.setKeepAwakeMode("display"),
+    store.setIncludePrereleaseUpdates(true),
+  ]);
+
+  assert.deepEqual(afterKeepAwake, {
+    keepAwakeMode: "display",
+    includePrereleaseUpdates: false,
+  });
+  assert.deepEqual(afterPrerelease, {
+    keepAwakeMode: "display",
+    includePrereleaseUpdates: true,
+  });
+  assert.deepEqual(store.get(), {
+    keepAwakeMode: "display",
+    includePrereleaseUpdates: true,
+  });
+  assert.deepEqual(await readOnDisk(dir), {
+    keepAwakeMode: "display",
+    includePrereleaseUpdates: true,
+  });
+});
+
+test("cold start: same-field setter calls preserve invocation order — the last invocation wins", async () => {
+  const { store, dir } = await makeColdStore();
+
+  // All three race the same cold cache. Under the bug, whichever call's
+  // own independent `load()` resolves last wins — an ordering unrelated
+  // to which `setKeepAwakeMode` call was actually invoked last. The fix
+  // must make the *third* call ("system") win, because it was invoked
+  // last, regardless of read timing.
+  const results = await Promise.all([
+    store.setKeepAwakeMode("display"),
+    store.setKeepAwakeMode("system"),
+    store.setKeepAwakeMode("display"),
+  ]);
+
+  assert.deepEqual(results[2], {
+    keepAwakeMode: "display",
+    includePrereleaseUpdates: false,
+  });
+  assert.deepEqual(store.get(), {
+    keepAwakeMode: "display",
+    includePrereleaseUpdates: false,
+  });
+  assert.deepEqual(await readOnDisk(dir), {
+    keepAwakeMode: "display",
+    includePrereleaseUpdates: false,
+  });
+});
+
+test("cold start: a delayed initial filesystem read cannot reorder mutations, and only ever happens once", async () => {
+  scratchCounter += 1;
+  const dir = path.join(
+    scratchRoot,
+    `case-${scratchCounter}-${process.hrtime.bigint()}`,
+  );
+  await fs.mkdir(dir, { recursive: true });
+
+  // Seed real on-disk content so a read actually has stale data it could
+  // wrongly reassert if the fix let a second, later-resolving read reset
+  // `this.cache` after a setter already persisted a newer value on top
+  // of it.
+  await fs.writeFile(
+    path.join(dir, "settings.json"),
+    JSON.stringify({
+      keepAwakeMode: "display",
+      includePrereleaseUpdates: false,
+    }),
+    "utf-8",
+  );
+
+  let readCalls = 0;
+  // Injected read seam (rather than patching the global `fs` module,
+  // which tsx/esbuild's per-file ESM transpilation does not reliably
+  // let a test module intercept) that counts calls and delays every
+  // read, so any setter racing the very first (still-unresolved) read
+  // would, under the bug, have already kicked off its own independent
+  // read attempt by the time this one finally completes.
+  const store = new SettingsStore(
+    () => dir,
+    async (filePath) => {
+      readCalls += 1;
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      return fs.readFile(filePath, "utf-8");
+    },
+  );
+
+  const [afterKeepAwake, afterPrerelease] = await Promise.all([
+    store.setKeepAwakeMode("system"),
+    store.setIncludePrereleaseUpdates(true),
+  ]);
+
+  assert.deepEqual(afterKeepAwake, {
+    keepAwakeMode: "system",
+    includePrereleaseUpdates: false,
+  });
+  assert.deepEqual(afterPrerelease, {
+    keepAwakeMode: "system",
+    includePrereleaseUpdates: true,
+  });
+  assert.deepEqual(store.get(), {
+    keepAwakeMode: "system",
+    includePrereleaseUpdates: true,
+  });
+  assert.deepEqual(await readOnDisk(dir), {
+    keepAwakeMode: "system",
+    includePrereleaseUpdates: true,
+  });
+  // Exactly one on-disk read for both concurrent cold-start callers —
+  // proof initialization was coalesced into a single shared operation
+  // rather than each caller performing its own independent read.
+  assert.equal(readCalls, 1);
+});
+
+test("cold start: a failed initial read does not permanently poison later loads or writes", async () => {
+  const { store, dir } = await makeColdStore();
+
+  // A directory in place of the settings file makes `fs.readFile` fail
+  // with `EISDIR` — a genuine (non-ENOENT) read failure, distinct from
+  // the ordinary missing-file case that legitimately falls back to
+  // defaults.
+  const settingsPath = path.join(dir, "settings.json");
+  await fs.mkdir(settingsPath);
+
+  await assert.rejects(() => store.load());
+  await assert.rejects(() => store.setKeepAwakeMode("display"));
+
+  // Clear the obstruction and confirm the store recovers fully — the
+  // earlier failures must not have left it wedged behind a poisoned
+  // shared load operation or a permanently rejected save queue.
+  await fs.rmdir(settingsPath);
+
+  const loaded = await store.load();
+  assert.deepEqual(loaded, {
+    keepAwakeMode: "system",
+    includePrereleaseUpdates: false,
+  });
+
+  const recovered = await store.setIncludePrereleaseUpdates(true);
+  assert.deepEqual(recovered, {
+    keepAwakeMode: "system",
+    includePrereleaseUpdates: true,
+  });
+  assert.deepEqual(await readOnDisk(dir), {
+    keepAwakeMode: "system",
+    includePrereleaseUpdates: true,
+  });
+});
+
+test("cold start: concurrent calls racing a failing initial read each reject without poisoning later recovery", async () => {
+  const { store, dir } = await makeColdStore();
+
+  const settingsPath = path.join(dir, "settings.json");
+  await fs.mkdir(settingsPath);
+
+  // Both calls race the same cold, failing initial read.
+  await Promise.all([
+    assert.rejects(() => store.setKeepAwakeMode("display")),
+    assert.rejects(() => store.setIncludePrereleaseUpdates(true)),
+  ]);
+
+  await fs.rmdir(settingsPath);
+
   const recovered = await store.setKeepAwakeMode("display");
   assert.deepEqual(recovered, {
     keepAwakeMode: "display",

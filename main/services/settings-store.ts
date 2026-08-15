@@ -44,12 +44,24 @@ class SettingsStore {
   private settingsPath: string | null = null;
   private saveQueue: Promise<void> = Promise.resolve();
   private loaded = false;
+  // Coalesces every concurrent cold-cache `load()` attempt (whether
+  // called directly or via `mutate()`) into a single shared read, so
+  // racing callers never each perform their own independent disk read
+  // and never let a later-resolving read reset `this.cache` out from
+  // under an earlier caller's already-applied change. Cleared once the
+  // attempt settles unsuccessfully so a failed read never permanently
+  // wedges later `load()`/`mutate()` calls behind the same rejection.
+  private loadPromise: Promise<AppSettings> | null = null;
   private readonly resolveUserDataPath: () => string;
+  private readonly readSettingsFile: (filePath: string) => Promise<string>;
 
   constructor(
     resolveUserDataPath: () => string = () => app.getPath("userData"),
+    readSettingsFile: (filePath: string) => Promise<string> = (filePath) =>
+      fs.readFile(filePath, "utf-8"),
   ) {
     this.resolveUserDataPath = resolveUserDataPath;
+    this.readSettingsFile = readSettingsFile;
   }
 
   private async getSettingsPath(): Promise<string> {
@@ -66,8 +78,25 @@ class SettingsStore {
       return this.cache;
     }
 
+    if (!this.loadPromise) {
+      this.loadPromise = this.performLoad();
+    }
+
     try {
-      const data = await fs.readFile(await this.getSettingsPath(), "utf-8");
+      return await this.loadPromise;
+    } finally {
+      if (!this.loaded) {
+        // This attempt failed (or was superseded before completing) —
+        // drop it so the next `load()` call starts a fresh attempt
+        // instead of forever replaying the same rejection.
+        this.loadPromise = null;
+      }
+    }
+  }
+
+  private async performLoad(): Promise<AppSettings> {
+    try {
+      const data = await this.readSettingsFile(await this.getSettingsPath());
       const parsed: unknown = JSON.parse(data);
       this.cache = normalizeSettings(parsed);
     } catch (error) {
@@ -97,15 +126,32 @@ class SettingsStore {
     }));
   }
 
-  // Runs the entire read-current -> derive-next -> persist -> cache-commit
-  // transaction as a single job chained onto `saveQueue`, so two
-  // concurrent setters can never both derive `next` from the same stale
-  // `this.cache` snapshot and silently clobber one another. Unlike the
-  // previous implementation (which computed `next` from `this.cache`
-  // *before* ever entering the queue), `transform` only runs once this
-  // job is actually dequeued — after every previously queued transaction
-  // has both persisted *and* committed its own cache update — so it
-  // always sees the latest value, not a stale one captured at call time.
+  // Runs the entire ensure-loaded -> read-current -> derive-next ->
+  // persist -> cache-commit transaction as a single job chained onto
+  // `saveQueue`, so two concurrent setters can never both derive `next`
+  // from the same stale `this.cache` snapshot and silently clobber one
+  // another. `transform` only runs once this job is actually dequeued —
+  // after every previously queued transaction has both persisted *and*
+  // committed its own cache update — so it always sees the latest
+  // value, not a stale one captured at call time.
+  //
+  // Critically, this job is chained onto `saveQueue` — and `saveQueue`
+  // reassigned — synchronously, with no `await` beforehand (not even
+  // for `this.load()`, which now runs *inside* the queued job instead
+  // of before joining the queue). That fixes each caller's FIFO queue
+  // position at the moment `mutate()` is called, not at whenever that
+  // caller's own `load()` happens to resolve. With a cold (`!loaded`)
+  // cache, the previous ordering let every concurrent caller
+  // independently observe `!loaded`, each perform its own `load()`, and
+  // join the queue only once that settled — so queue order (and thus
+  // which change won) depended on read-completion timing rather than
+  // call order, and whichever read resolved last could reset
+  // `this.cache` back to stale disk contents after an earlier-queued
+  // job had already applied and persisted a newer value on top of it.
+  // Because `load()` itself now coalesces concurrent attempts through a
+  // shared `loadPromise` (see above), only the first-queued job here
+  // ever performs the actual disk read; every later job's `load()` call
+  // simply resolves against the already-populated cache.
   //
   // Only commits `this.cache` once the write has actually succeeded — a
   // failed persist must never leave `get()` reporting a value that was
@@ -117,13 +163,13 @@ class SettingsStore {
   // continuation of this job rather than to the job's own
   // (possibly-rejected) promise, while the rejection itself still
   // propagates to this call's own caller via the returned `job` promise.
-  private async mutate(
+  private mutate(
     transform: (current: AppSettings) => AppSettings,
   ): Promise<AppSettings> {
-    await this.load();
     const job = this.saveQueue
       .catch(() => undefined)
       .then(async () => {
+        await this.load();
         const next = transform(this.cache);
         await this.writeToDisk(next);
         this.cache = next;
