@@ -123,8 +123,13 @@ final class NavigationPolicyTests: XCTestCase {
         (try? await webView.evaluateJavaScript(expression)) as? String
     }
 
+    /// Writes the minimal fixture document into `root`, which the caller
+    /// must have already created (and already registered for cleanup) —
+    /// this function performs no directory creation of its own, precisely
+    /// so a caller can register `addTeardownBlock` cleanup immediately
+    /// after `FileManager.default.createDirectory` succeeds, before this
+    /// (or any other fallible write) ever runs.
     private func writeMinimalFixture(into root: URL) throws {
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         try "<!doctype html><html><head><title>Seer</title></head><body></body></html>"
             .write(to: root.appendingPathComponent("standalone-window.html"), atomically: true, encoding: .utf8)
     }
@@ -146,13 +151,15 @@ final class NavigationPolicyTests: XCTestCase {
     func testRealPanelDeniesMaliciousMainFrameNavigations() async throws {
         let tempRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("NavigationPolicyTests-\(UUID().uuidString)", isDirectory: true)
-        try writeMinimalFixture(into: tempRoot)
+        try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
         // Registered immediately after the resource this test owns is
-        // actually created — before anything below can throw — so
-        // `XCTestCase.addTeardownBlock`'s guarantee (runs after the test
-        // method returns whether it passed, failed an assertion, or threw)
-        // means this can never be skipped and leak the temp directory.
+        // actually created — before the fixture write below (or anything
+        // else) can throw — so `XCTestCase.addTeardownBlock`'s guarantee
+        // (runs after the test method returns whether it passed, failed
+        // an assertion, or threw) means this can never be skipped and
+        // leak the temp directory.
         addTeardownBlock { try? FileManager.default.removeItem(at: tempRoot) }
+        try writeMinimalFixture(into: tempRoot)
 
         let panel = PanelController(rendererRoot: SeerRendererRoot(url: tempRoot))
         addTeardownBlock { @MainActor in
@@ -264,6 +271,13 @@ final class NavigationPolicyTests: XCTestCase {
     func testRealSchemeHandlerDeniesPercentEncodedTraversalForARealResourceRequest() async throws {
         let stagingRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("NavigationPolicyTests-\(UUID().uuidString)", isDirectory: true)
+        // `stagingRoot` itself is created — and its cleanup registered —
+        // first and alone, before any nested directory/file write that
+        // could throw, so a failure partway through fixture setup below
+        // can never leak it.
+        try FileManager.default.createDirectory(at: stagingRoot, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: stagingRoot) }
+
         let tempRoot = stagingRoot.appendingPathComponent("renderer-root", isDirectory: true)
         let assetsDir = tempRoot.appendingPathComponent("assets", isDirectory: true)
         try FileManager.default.createDirectory(at: assetsDir, withIntermediateDirectories: true)
@@ -276,7 +290,6 @@ final class NavigationPolicyTests: XCTestCase {
         // `tempRoot`'s parent so this decoy, and its cleanup, both stay
         // scoped to this test.
         try Self.onePixelPNG.write(to: stagingRoot.appendingPathComponent(Self.traversalDecoyFileName))
-        addTeardownBlock { try? FileManager.default.removeItem(at: stagingRoot) }
 
         let html = """
         <!doctype html>
@@ -337,12 +350,18 @@ final class NavigationPolicyTests: XCTestCase {
     func testSeerSchemeHandlerDirectlyRecordsFinishForLegitimateResourceAndFailureForTraversal() throws {
         let stagingRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("NavigationPolicyTests-\(UUID().uuidString)", isDirectory: true)
+        // `stagingRoot` itself is created — and its cleanup registered —
+        // first and alone, before any nested directory/file write that
+        // could throw, so a failure partway through fixture setup below
+        // can never leak it.
+        try FileManager.default.createDirectory(at: stagingRoot, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: stagingRoot) }
+
         let tempRoot = stagingRoot.appendingPathComponent("renderer-root", isDirectory: true)
         let assetsDir = tempRoot.appendingPathComponent("assets", isDirectory: true)
         try FileManager.default.createDirectory(at: assetsDir, withIntermediateDirectories: true)
         try Self.onePixelPNG.write(to: assetsDir.appendingPathComponent("pixel.png"))
         try Self.onePixelPNG.write(to: stagingRoot.appendingPathComponent(Self.traversalDecoyFileName))
-        addTeardownBlock { try? FileManager.default.removeItem(at: stagingRoot) }
 
         let handler = SeerSchemeHandler(rendererRoot: SeerRendererRoot(url: tempRoot))
         // `SeerSchemeHandler.webView(_:start:)` never reads its `webView`

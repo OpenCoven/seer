@@ -23,6 +23,15 @@ private enum BundledRenderer {
 
     private static let documentFileName = "standalone-window.html"
 
+    /// Thrown whenever the bundled renderer document cannot be produced or
+    /// located, even after a genuine build attempt — surfaced as a real
+    /// XCTest setup failure (never `XCTSkip`), so a missing or failed
+    /// renderer build is always visible as a failing required-coverage
+    /// test, never silently allowed to "pass" with no renderer under test.
+    struct SetupFailure: Error, CustomStringConvertible {
+        let description: String
+    }
+
     /// A deterministic precondition, run once before any test in this file:
     /// fail fast with an actionable message rather than letting a missing
     /// build artifact surface later as an opaque `WKWebView` load timeout.
@@ -30,39 +39,101 @@ private enum BundledRenderer {
     /// run the renderer build), this builds it exactly once, entirely
     /// offline — `npm run build:standalone-renderer` only ever invokes the
     /// already-installed local Vite toolchain in `node_modules`, never a
-    /// network fetch — before re-checking and, only if it is still absent,
-    /// skipping with a message pointing at the exact command to run.
+    /// network fetch — checking the real process' termination
+    /// status/reason and capturing its stdout/stderr, and, if the build
+    /// fails or the document is still absent afterward, throws
+    /// `SetupFailure` with the captured diagnostics — which XCTest reports
+    /// as a genuine setup failure of every test in this file, never a skip
+    /// that would let "no renderer" quietly count as "renderer coverage
+    /// passed".
     static func ensureAvailable(file: StaticString = #filePath) throws {
         let documentURL = root.url.appendingPathComponent(documentFileName)
         guard !FileManager.default.fileExists(atPath: documentURL.path) else { return }
 
-        let repoRoot = repoRootURL(fromTestFile: file)
+        let repoRoot = try repoRootURL(fromTestFile: file)
+
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
         let process = Process()
         process.currentDirectoryURL = repoRoot
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = ["npm", "run", "build:standalone-renderer"]
-        try process.run()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        do {
+            try process.run()
+        } catch {
+            throw SetupFailure(description: """
+                Failed to launch `npm run build:standalone-renderer` from \(repoRoot.path): \(error)
+                """)
+        }
         process.waitUntilExit()
 
+        let stdoutText = String(data: stdoutPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let stderrText = String(data: stderrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+
+        guard process.terminationReason == .exit, process.terminationStatus == 0 else {
+            throw SetupFailure(description: """
+                `npm run build:standalone-renderer` (run from \(repoRoot.path)) did not succeed \
+                (terminationReason: \(process.terminationReason), status: \(process.terminationStatus)).
+                --- stdout ---
+                \(stdoutText)
+                --- stderr ---
+                \(stderrText)
+                """)
+        }
+
         guard FileManager.default.fileExists(atPath: documentURL.path) else {
-            throw XCTSkip("""
-                Bundled renderer document not found at \(documentURL.path), even after \
-                attempting `npm run build:standalone-renderer` from \(repoRoot.path). Run \
-                that command yourself (offline — it only needs the already-installed \
-                node_modules) before re-running SeerTests/RendererIntegrationTests.
+            throw SetupFailure(description: """
+                Bundled renderer document not found at \(documentURL.path) even though \
+                `npm run build:standalone-renderer` (run from \(repoRoot.path)) reported success.
+                --- stdout ---
+                \(stdoutText)
+                --- stderr ---
+                \(stderrText)
                 """)
         }
     }
 
-    /// Derives the repository root from this very source file's own
-    /// on-disk location (`apps/macos/Seer/Tests/Integration/
-    /// RendererIntegrationTests.swift`) rather than any assumption about
-    /// the current working directory `xcodebuild` happens to invoke tests
-    /// from — deterministic regardless of caller.
-    private static func repoRootURL(fromTestFile file: StaticString) -> URL {
-        var url = URL(fileURLWithPath: "\(file)")
-        for _ in 0..<5 { url.deleteLastPathComponent() }
-        return url
+    /// Derives the repository root by walking upward from this very
+    /// source file's own on-disk location (`apps/macos/Seer/Tests/
+    /// Integration/RendererIntegrationTests.swift`) until it finds the
+    /// directory that actually contains both `package.json` and
+    /// `vite.standalone.config.ts` — the two files that mark the real
+    /// repository root `npm run build:standalone-renderer` must be
+    /// invoked from — rather than a brittle fixed count of
+    /// `deleteLastPathComponent()` calls (which previously undershot by
+    /// one level, resolving to `<repo>/apps` instead of `<repo>`, so
+    /// `npm run` there always failed with "no such file or directory:
+    /// package.json") or any assumption about the current working
+    /// directory `xcodebuild` happens to invoke tests from. Deterministic
+    /// regardless of caller; throws rather than looping forever if it
+    /// ever walks past the filesystem root without finding a match.
+    /// `fileprivate` (not `private`) so `RendererIntegrationTests`' own
+    /// `testBundledRendererRepoRootDiscoveryFindsTheActualRepoRoot`
+    /// characterization test — in this same file — can exercise it
+    /// directly.
+    fileprivate static func repoRootURL(fromTestFile file: StaticString) throws -> URL {
+        let markers = ["package.json", "vite.standalone.config.ts"]
+        let fileManager = FileManager.default
+        var directory = URL(fileURLWithPath: "\(file)").deletingLastPathComponent()
+
+        while true {
+            let isRepoRoot = markers.allSatisfy {
+                fileManager.fileExists(atPath: directory.appendingPathComponent($0).path)
+            }
+            if isRepoRoot { return directory }
+
+            let parent = directory.deletingLastPathComponent()
+            guard parent.path != directory.path else {
+                throw SetupFailure(description: """
+                    Could not locate the repository root (a directory containing both \
+                    \(markers.joined(separator: " and "))) by walking upward from \(file).
+                    """)
+            }
+            directory = parent
+        }
     }
 }
 
@@ -149,6 +220,33 @@ final class RendererIntegrationTests: XCTestCase {
     override func setUpWithError() throws {
         try super.setUpWithError()
         try BundledRenderer.ensureAvailable()
+    }
+
+    /// A characterization test for `BundledRenderer.repoRootURL`
+    /// independent of the renderer build itself: proves the walk-upward
+    /// discovery actually lands on the real repository root (a directory
+    /// containing both `package.json` and `vite.standalone.config.ts`),
+    /// not merely "some ancestor directory" — the previous fixed
+    /// `deleteLastPathComponent()` count silently resolved one level too
+    /// shallow (`<repo>/apps`) and this test would have caught that
+    /// regression directly, without needing a full `npm` build to surface
+    /// the failure downstream.
+    func testBundledRendererRepoRootDiscoveryFindsTheActualRepoRoot() throws {
+        let discovered = try BundledRenderer.repoRootURL(fromTestFile: #filePath)
+
+        let fileManager = FileManager.default
+        XCTAssertTrue(
+            fileManager.fileExists(atPath: discovered.appendingPathComponent("package.json").path),
+            "discovered root \(discovered.path) must contain package.json"
+        )
+        XCTAssertTrue(
+            fileManager.fileExists(atPath: discovered.appendingPathComponent("vite.standalone.config.ts").path),
+            "discovered root \(discovered.path) must contain vite.standalone.config.ts"
+        )
+        XCTAssertFalse(
+            discovered.path.hasSuffix("/apps"),
+            "must not undershoot to <repo>/apps, the previous fixed-depth bug's exact failure mode"
+        )
     }
 
     /// One full, real Swift-side stack: a real `PanelController` (and
