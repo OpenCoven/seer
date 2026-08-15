@@ -190,14 +190,28 @@ public actor AgentMonitor {
         await scheduler.sleep(milliseconds: Self.scanIntervalMilliseconds)
     }
 
-    /// Stops the periodic scan loop if one is running. Cancels the loop
-    /// task *and* the currently in-flight detached detection directly, but
-    /// deliberately never awaits either — a non-cooperative detector (one
-    /// that never checks `Task.isCancelled`) must never be able to make
-    /// `stop()` hang. `generation` is bumped first so that if a scan is
-    /// currently in flight, its eventual result (success, thrown error, or
-    /// `CancellationError`) can never be applied to `state`/`diagnostic`
-    /// once this method returns — see the generation check in `scan()`.
+    /// Stops the periodic scan loop if one is running, and — regardless of
+    /// whether a loop is running at all — always cancels any currently
+    /// in-flight detached detection and bumps `generation`, so a scan
+    /// already in flight can never publish its result to `state`/
+    /// `diagnostic` once this method returns. This is deliberately *not*
+    /// scoped to loop-driven scans only: a caller that manages its own
+    /// external scan cadence via bare `scan()` calls (e.g. `AppDelegate`,
+    /// which performs an initial scan directly and then dispatches
+    /// further ticks from its own timer loop, never calling `start()` at
+    /// all) must still be able to rely on `stop()` to own and invalidate
+    /// that in-flight work at shutdown — otherwise a non-cooperative
+    /// detector could let a stale scan apply after the caller believes
+    /// shutdown is complete.
+    ///
+    /// Cancels the loop task *and* the currently in-flight detached
+    /// detection directly, but deliberately never awaits either — a
+    /// non-cooperative detector (one that never checks `Task.isCancelled`)
+    /// must never be able to make `stop()` hang. `generation` is bumped
+    /// first so that if a scan is currently in flight, its eventual result
+    /// (success, thrown error, or `CancellationError`) can never be
+    /// applied to `state`/`diagnostic` once this method returns — see the
+    /// generation check in `scan()`.
     ///
     /// `loopTask` is cleared immediately (not from within the loop itself)
     /// so `start()` can begin a fresh loop right away; the old loop's task
@@ -208,15 +222,17 @@ public actor AgentMonitor {
     /// `isScanning`, which the old `scan()` call continues to hold until
     /// its detection actually resolves, regardless of how long that takes.
     ///
-    /// Idempotent: calling `stop()` when no loop is running is a no-op —
-    /// scoped intentionally to loop-driven scans, so a directly-invoked
-    /// `scan()` call (never routed through `start()`) is left untouched by
-    /// an idle `stop()`.
+    /// Idempotent: calling `stop()` repeatedly, or when no loop is
+    /// running, is always safe — the generation bump/detection
+    /// cancellation simply have no further effect once nothing is in
+    /// flight.
     public func stop() async {
-        guard let loopTask else { return }
         generation &+= 1
         activeDetection?.cancel()
-        loopTask.cancel()
-        self.loopTask = nil
+        activeDetection = nil
+        if let loopTask {
+            loopTask.cancel()
+            self.loopTask = nil
+        }
     }
 }

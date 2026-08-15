@@ -517,31 +517,44 @@ final class AgentMonitorTests: XCTestCase {
         await monitor.stop()
     }
 
-    // MARK: - Manual scan() unaffected by an idle stop()
+    // MARK: - stop() also owns/cancels a directly-invoked manual scan
 
-    /// Documents the chosen scope: `stop()` only ever manages loop-driven
-    /// scans. A directly-invoked `scan()` call (never routed through
-    /// `start()`) is completely unaffected by a concurrent/idle `stop()`
-    /// call — `stop()` is a no-op whenever no loop is running, exactly as
-    /// `testStopIsIdempotentWhenNoLoopIsRunning` already establishes, and
-    /// that no-op must not reach into or cancel an independently-running
-    /// manual scan.
-    func testStopWithNoLoopRunningDoesNotAffectAConcurrentManualScan() async {
+    /// `stop()` must not be scoped to loop-driven scans only: a caller
+    /// that manages its own external scan cadence via bare `scan()` calls
+    /// (e.g. `AppDelegate`'s own timer-driven monitor loop, which never
+    /// calls `start()` at all) still relies on `stop()` to own and
+    /// invalidate whatever scan is currently in flight at shutdown. This
+    /// reproduces exactly that shape — a manual `scan()` call with no loop
+    /// ever started — and proves `stop()` still cancels the detached
+    /// detection and bumps `generation`, so the stale, non-cooperative
+    /// detector's eventual result can never reach published state once
+    /// `stop()` has returned, no matter how long that detector keeps
+    /// running in the background afterward.
+    func testStopWithNoLoopRunningStillInvalidatesAConcurrentManualScan() async {
         let detector = BlockingDetector()
         let monitor = AgentMonitor(detector: detector, clock: FixedClock(fixedMilliseconds: fixedNow))
 
         let manualScan = Task { await monitor.scan() }
         await detector.waitUntilEntered()
 
-        // No loop was ever started, so this must be a pure no-op and must
-        // not cancel the manual scan's in-flight detection.
-        await monitor.stop()
+        // No loop was ever started, but `stop()` must still promptly
+        // cancel/invalidate this directly-invoked, still in-flight scan.
+        let stopReturned = expectation(description: "stop() returns promptly even though the manual scan's detector is still blocked")
+        Task {
+            await monitor.stop()
+            stopReturned.fulfill()
+        }
+        await fulfillment(of: [stopReturned], timeout: 5)
 
-        let agents = [activeAgent(id: "codex:/fixtures/manual.jsonl")]
-        detector.release(with: agents)
+        // Release the stale detector call and prove its result can never
+        // mutate published state, since `stop()` already invalidated it.
+        let staleAgents = [activeAgent(id: "codex:/fixtures/manual-stale.jsonl")]
+        detector.release(with: staleAgents)
         await manualScan.value
 
         let state = await monitor.state
-        XCTAssertEqual(state.agents, agents, "a manual scan() must complete normally when stop() never owned a loop")
+        XCTAssertEqual(state.agents, [], "a manual scan already in flight when stop() runs must never publish its result")
+        let diagnostic = await monitor.diagnostic
+        XCTAssertNil(diagnostic)
     }
 }

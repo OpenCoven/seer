@@ -1,5 +1,6 @@
 import Cocoa
 import WebKit
+import os
 
 // MARK: - Testable service seams
 
@@ -34,6 +35,20 @@ protocol BridgeHandlerCancelling: AnyObject {
 
 extension BridgeMessageHandler: BridgeHandlerCancelling {}
 
+/// The one `StatusItemController` operation the prerelease-updates menu
+/// checkbox depends on. Abstracted the same way as `AgentMonitorControlling`/
+/// `BridgeHandlerCancelling` above, so `AppLifecycleTests` can substitute a
+/// scripted fake to assert exactly when the menu checkbox is (and is not)
+/// updated relative to `AppSnapshotCoordinator.setIncludePrereleaseUpdates(_:)`
+/// resolving, without needing a real `NSStatusItem`.
+@MainActor
+protocol PrereleaseUpdatesMenuApplying: AnyObject {
+    var includePrereleaseUpdates: Bool { get }
+    func apply(includePrereleaseUpdates value: Bool)
+}
+
+extension StatusItemController: PrereleaseUpdatesMenuApplying {}
+
 /// Broadcasts one published `AppSnapshot` to every listed sink, in order.
 /// Lets `AppSnapshotCoordinator` — which accepts exactly one `renderer` at
 /// construction — publish to both the renderer's `WKWebView` (via
@@ -65,6 +80,77 @@ enum AppBootstrapDiagnosticID {
     /// could not be resolved at all, so `bootstrapProduction()` fell back
     /// to a temporary directory for settings/history instead.
     static let applicationSupportUnresolved = "bootstrap.application-support.unresolved"
+
+    /// Emitted when `settings.json`/`history.json`'s containing directory
+    /// could not be created under the (already-resolved, possibly already
+    /// temporary-fallback) Application Support directory — e.g. disk full
+    /// or a permissions failure — so `StorageBootstrap.resolveLocations`
+    /// fell back to a second, dedicated temporary directory instead.
+    static let storageLocationUnresolved = "bootstrap.storage-location.unresolved"
+}
+
+/// Resolves the on-disk settings/history file locations `bootstrapProduction()`
+/// needs before any `SettingsStore`/`HistoryStore` can be constructed,
+/// retrying once against a fresh, uniquely-named temporary directory if the
+/// primary `applicationSupportDirectory` cannot yield usable file URLs at
+/// all (e.g. `settings.json`'s containing directory cannot be created due
+/// to a permissions failure or a full disk). Isolated from
+/// `bootstrapProduction()` itself, with every filesystem interaction
+/// injected, specifically so this retry/fallback decision is directly
+/// unit-testable against a real (not mocked) filesystem failure.
+enum StorageBootstrap {
+    /// The successfully resolved settings/history file URLs, plus any
+    /// diagnostic that should be folded into the coordinator's own
+    /// startup diagnostics because resolving them required falling back
+    /// to the dedicated temporary directory below.
+    struct Locations {
+        let settingsURL: URL
+        let historyURL: URL
+        let diagnostics: [Diagnostic]
+    }
+
+    /// Attempts to resolve `settings.json`/`history.json` under
+    /// `applicationSupportDirectory` first; if either throws, retries
+    /// once against a fresh directory from `makeTemporaryFallbackDirectory`
+    /// — mirroring `bootstrapProduction()`'s own Application Support
+    /// fallback above — folding that retry into the returned
+    /// `Locations.diagnostics` so it is still visibly surfaced once the
+    /// UI exists. Returns `.failure` only when even that dedicated
+    /// temporary directory could not yield usable file locations: at
+    /// that point there is truly nowhere to persist settings/history at
+    /// all, and the caller must terminate cleanly rather than continue
+    /// running as an invisible accessory process with no status item and
+    /// no way to quit.
+    static func resolveLocations(
+        applicationSupportDirectory: URL,
+        now: Int64,
+        makeTemporaryFallbackDirectory: () -> URL = {
+            FileManager.default.temporaryDirectory
+                .appendingPathComponent("ai.opencoven.seer-fallback-\(UUID().uuidString)", isDirectory: true)
+        },
+        settingsFileURL: (URL) throws -> URL = { try SettingsFileLocation.settingsFileURL(applicationSupportDirectory: $0) },
+        historyFileURL: (URL) throws -> URL = { try HistoryFileLocation.historyFileURL(applicationSupportDirectory: $0) }
+    ) -> Result<Locations, Error> {
+        do {
+            let settingsURL = try settingsFileURL(applicationSupportDirectory)
+            let historyURL = try historyFileURL(applicationSupportDirectory)
+            return .success(Locations(settingsURL: settingsURL, historyURL: historyURL, diagnostics: []))
+        } catch let primaryError {
+            let fallbackDirectory = makeTemporaryFallbackDirectory()
+            do {
+                let settingsURL = try settingsFileURL(fallbackDirectory)
+                let historyURL = try historyFileURL(fallbackDirectory)
+                let diagnostic = Diagnostic(
+                    id: AppBootstrapDiagnosticID.storageLocationUnresolved,
+                    message: "Failed to prepare the settings/history storage directory; falling back to a dedicated temporary location: \(primaryError)",
+                    occurredAt: now
+                )
+                return .success(Locations(settingsURL: settingsURL, historyURL: historyURL, diagnostics: [diagnostic]))
+            } catch {
+                return .failure(error)
+            }
+        }
+    }
 }
 
 /// Root application delegate. Wires every service from Tasks 2–11 into the
@@ -83,12 +169,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private weak var webViewUserContentController: WKUserContentController?
     private var panelController: PanelController?
     private var statusItemController: StatusItemController?
+    /// The narrow seam `requestSetIncludePrereleaseUpdates(_:)` applies
+    /// the persisted toggle through — set to the same `StatusItemController`
+    /// instance as `statusItemController` in production, but injected
+    /// separately (and independently fakeable) so `AppLifecycleTests` can
+    /// assert exactly when the menu checkbox is (and is not) updated
+    /// relative to persistence succeeding, without needing a real
+    /// `NSStatusItem`.
+    private var prereleaseUpdatesMenu: (any PrereleaseUpdatesMenuApplying)?
 
     private var scanLoopTask: Task<Void, Never>?
     private var terminationTask: Task<Void, Never>?
     private var hasShutDown = false
 
     private let sleeper: any Sleeper
+
+    /// Surfaces failures that have no `AppSnapshotCoordinator`/`AppSnapshot`
+    /// to attach a `Diagnostic` to — either because no coordinator has
+    /// been constructed yet (bootstrap-level failures) or because the
+    /// failure itself never reaches the coordinator at all (e.g. a
+    /// persistence failure inside `requestSetIncludePrereleaseUpdates(_:)`
+    /// that is deliberately not forwarded into an optimistic UI update).
+    private static let logger = Logger(subsystem: "ai.opencoven.seer", category: "AppDelegate")
 
     /// `true` only when this instance was built via the test initializer
     /// below, with every lifecycle-relevant service already injected —
@@ -117,12 +219,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         coordinator: any AppSnapshotCoordinating,
         agentMonitor: any AgentMonitorControlling,
         sleeper: any Sleeper = TaskSleeper(),
-        bridgeMessageHandler: (any BridgeHandlerCancelling)? = nil
+        bridgeMessageHandler: (any BridgeHandlerCancelling)? = nil,
+        prereleaseUpdatesMenu: (any PrereleaseUpdatesMenuApplying)? = nil
     ) {
         self.coordinator = coordinator
         self.agentMonitor = agentMonitor
         self.sleeper = sleeper
         self.bridgeMessageHandler = bridgeMessageHandler
+        self.prereleaseUpdatesMenu = prereleaseUpdatesMenu
         self.skipsProductionBootstrap = true
         super.init()
     }
@@ -195,15 +299,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let settingsURL: URL
         let historyURL: URL
-        do {
-            settingsURL = try SettingsFileLocation.settingsFileURL(applicationSupportDirectory: applicationSupportDirectory)
-            historyURL = try HistoryFileLocation.historyFileURL(applicationSupportDirectory: applicationSupportDirectory)
-        } catch {
-            // Even the fallback location above could not be prepared —
-            // there is truly nowhere to persist settings/history at all,
-            // so no `SettingsStore`/`HistoryStore` can even be
-            // constructed; the app cannot usefully continue past this
-            // point.
+        switch StorageBootstrap.resolveLocations(applicationSupportDirectory: applicationSupportDirectory, now: clock.nowMilliseconds()) {
+        case .success(let locations):
+            settingsURL = locations.settingsURL
+            historyURL = locations.historyURL
+            bootstrapDiagnostics.append(contentsOf: locations.diagnostics)
+        case .failure(let error):
+            // Even a dedicated, freshly-minted temporary directory could
+            // not be prepared — there is truly nowhere to persist
+            // settings/history at all, so no `SettingsStore`/
+            // `HistoryStore` can even be constructed. Rather than
+            // returning silently here — which would leave an invisible
+            // accessory process running forever, with no status item and
+            // no way to quit — surface the native failure and terminate
+            // cleanly.
+            terminateBootstrapFailure(reason: "Seer could not prepare a location to store its settings and history: \(error)")
             return
         }
 
@@ -320,6 +430,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.agentMonitor = agentMonitor
         self.panelController = panel
         self.statusItemController = statusItem
+        self.prereleaseUpdatesMenu = statusItem
         self.bridgeMessageHandler = bridgeMessageHandler
         self.webViewUserContentController = panel.userContentController
 
@@ -342,6 +453,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         await coordinator.performStartupUpdateCheckAndStartScheduler()
     }
 
+    /// Surfaces an unrecoverable bootstrap failure (one that
+    /// `StorageBootstrap.resolveLocations` could not recover from even via
+    /// its own temporary-directory fallback) via a native, user-visible
+    /// alert, then terminates the app cleanly. Reached only when there is
+    /// truly nowhere to persist settings/history at all — a case this
+    /// method must never let pass silently, since `bootstrapProduction()`
+    /// has not yet built a status item or any other way for the user to
+    /// quit on their own; without this, the process would otherwise keep
+    /// running forever as an invisible accessory with no UI at all.
+    private func terminateBootstrapFailure(reason: String) {
+        Self.logger.fault("Seer bootstrap failed and cannot continue: \(reason, privacy: .public)")
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = "Seer failed to start"
+        alert.informativeText = reason
+        alert.addButton(withTitle: "Quit")
+        alert.runModal()
+        NSApp.terminate(nil)
+    }
+
     // MARK: - Status item action wiring
 
     private func toggleFromStatusItem() {
@@ -359,10 +490,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task { try? await coordinator.setKeepAwakeMode(mode) }
     }
 
-    private func requestSetIncludePrereleaseUpdates(_ value: Bool) {
+    /// Persists `value` via `AppSnapshotCoordinator.setIncludePrereleaseUpdates(_:)`
+    /// and only updates the menu checkbox (`prereleaseUpdatesMenu.apply(
+    /// includePrereleaseUpdates:)`) once that persistence has actually
+    /// succeeded — never optimistically ahead of it. `includePrereleaseUpdates`
+    /// has no representation in `AppSnapshot` at all (unlike, say,
+    /// `keepAwakeMode`, which rides the coordinator's normal snapshot-
+    /// publish pipeline), so it is the only settings toggle whose menu
+    /// state `AppDelegate` must apply directly rather than merely
+    /// forwarding a coordinator mutation and letting a later snapshot
+    /// publish reflect it — and therefore the only one that can silently
+    /// drift from the authoritative persisted value if applied before
+    /// persistence is confirmed. A failure is never swallowed via `try?`
+    /// as before: it is logged so it is still visible (there is no
+    /// `AppSnapshot`/`Diagnostic` this specific failure can attach to),
+    /// and the menu is simply left showing whatever value was last
+    /// successfully persisted — the next fresh, right-click-built menu
+    /// (`StatusItemController.buildMenu`, always built from-scratch, never
+    /// mutated in place) therefore always reflects that same authoritative
+    /// persisted state. Internal (not `private`) so `AppLifecycleTests`
+    /// can drive it directly against injected fakes.
+    func requestSetIncludePrereleaseUpdates(_ value: Bool) {
         guard let coordinator else { return }
-        statusItemController?.apply(includePrereleaseUpdates: value)
-        Task { try? await coordinator.setIncludePrereleaseUpdates(value) }
+        Task { [weak self] in
+            do {
+                try await coordinator.setIncludePrereleaseUpdates(value)
+                self?.prereleaseUpdatesMenu?.apply(includePrereleaseUpdates: value)
+            } catch {
+                Self.logger.error("Failed to persist includePrereleaseUpdates=\(value, privacy: .public): \(String(describing: error), privacy: .public)")
+            }
+        }
     }
 
     private func requestOpenLatestRelease() {
@@ -478,12 +635,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return .terminateLater
     }
 
-    /// Stops the monitor scan loop — cancelling it and *awaiting its full
-    /// completion* before proceeding, so any scan tick already in flight at
-    /// the moment termination began (its coordinator call already fenced
-    /// off by `hasShutDown`, per `performScanTick`'s own documentation)
-    /// has definitely finished before shutdown continues — then stops
-    /// `agentMonitor` itself. Only *then* awaits
+    /// Cancels the monitor scan loop and stops `agentMonitor` — never
+    /// awaiting the loop task's own completion — before proceeding to
+    /// `AppSnapshotCoordinator.shutdown()`. `agentMonitor.scan()` may run
+    /// off-actor, detached detection work that never notices cancellation
+    /// (a non-cooperative detector); awaiting `scanLoopTask.value` here
+    /// would let such a scan hang orderly termination indefinitely. Instead,
+    /// `scanLoopTask` is merely signalled to cancel and `agentMonitor.stop()`
+    /// is awaited — which itself never awaits the in-flight detection
+    /// either (see `AgentMonitor.stop()`'s own documentation) — so this
+    /// method always proceeds promptly regardless of how long that
+    /// detection actually takes to resolve, if it ever does. Any scan tick
+    /// already in flight at the moment termination began can still never
+    /// apply to the coordinator: `performScanTick`'s own `hasShutDown`
+    /// check (already flipped `true` above) and `AgentMonitor`'s
+    /// generation-based invalidation both independently fence that off,
+    /// however long that stale scan keeps running afterward.
+    ///
+    /// Only once monitor work has been cancelled/stopped does this await
     /// `AppSnapshotCoordinator.shutdown()`, which flushes history, cancels
     /// the update scheduler, and releases the power assertion; bridge
     /// handlers are removed from the web view only after that coordinator
@@ -495,10 +664,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !hasShutDown else { return }
         hasShutDown = true
 
-        if let scanLoopTask {
-            scanLoopTask.cancel()
-            await scanLoopTask.value
-        }
+        scanLoopTask?.cancel()
         scanLoopTask = nil
         await agentMonitor?.stop()
 

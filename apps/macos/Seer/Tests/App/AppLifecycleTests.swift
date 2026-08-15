@@ -54,7 +54,19 @@ final class FakeAppSnapshotCoordinating: AppSnapshotCoordinating {
 
     func checkForUpdates(force: Bool) async -> Bool { true }
 
-    func setIncludePrereleaseUpdates(_ value: Bool) async throws {}
+    /// Scripted outcome for `setIncludePrereleaseUpdates(_:)`: `nil` (the
+    /// default) always succeeds; set to any `Error` to make every call
+    /// throw instead, letting tests deterministically drive the
+    /// persistence-failure path.
+    var setIncludePrereleaseUpdatesError: Error?
+    private(set) var setIncludePrereleaseUpdatesCalls: [Bool] = []
+
+    func setIncludePrereleaseUpdates(_ value: Bool) async throws {
+        setIncludePrereleaseUpdatesCalls.append(value)
+        if let setIncludePrereleaseUpdatesError {
+            throw setIncludePrereleaseUpdatesError
+        }
+    }
 
     func openLatestRelease() async -> Bool { true }
 
@@ -67,6 +79,26 @@ final class FakeAppSnapshotCoordinating: AppSnapshotCoordinating {
     func shutdown() async throws {
         shutdownCallCount += 1
         orderRecorder?.record("coordinatorShutdown")
+    }
+}
+
+/// A scripted `PrereleaseUpdatesMenuApplying` double: records every
+/// `apply(includePrereleaseUpdates:)` call it receives (value and order),
+/// so `AppLifecycleTests` can assert exactly when — relative to
+/// `AppSnapshotCoordinator.setIncludePrereleaseUpdates(_:)` resolving — the
+/// menu checkbox is (and, on a persistence failure, is *not*) updated.
+@MainActor
+final class FakePrereleaseUpdatesMenuApplying: PrereleaseUpdatesMenuApplying {
+    private(set) var includePrereleaseUpdates: Bool
+    private(set) var appliedValues: [Bool] = []
+
+    init(includePrereleaseUpdates: Bool) {
+        self.includePrereleaseUpdates = includePrereleaseUpdates
+    }
+
+    func apply(includePrereleaseUpdates value: Bool) {
+        includePrereleaseUpdates = value
+        appliedValues.append(value)
     }
 }
 
@@ -110,6 +142,7 @@ final class FakeAgentMonitorControlling: AgentMonitorControlling, @unchecked Sen
 final class GatedAgentMonitorControlling: AgentMonitorControlling, @unchecked Sendable {
     var state: AgentMonitorState
     var diagnostic: Diagnostic?
+    var orderRecorder: CallOrderRecorder?
 
     private struct GateState {
         var scanCallCount = 0
@@ -135,6 +168,7 @@ final class GatedAgentMonitorControlling: AgentMonitorControlling, @unchecked Se
 
     func stop() async {
         gateState.withLock { $0.stopCallCount += 1 }
+        orderRecorder?.record("monitorStop")
     }
 
     private func waitForRelease() async {
@@ -426,13 +460,18 @@ final class AppLifecycleTests: XCTestCase {
 
     /// Companion to the test above: reproduces the same race, but for a
     /// scan tick dispatched from the recurring `scanLoopTask` rather than
-    /// `beginMonitoring()`'s initial one — so `performOrderlyShutdownOnce`
-    /// *does* have a `scanLoopTask` to await, and must block on that
-    /// in-flight tick fully finishing (never merely cancelling and moving
-    /// on) before it proceeds to `coordinator.shutdown()`. Once released,
-    /// that same in-flight tick's own `hasShutDown` guard must still
-    /// prevent it from ever applying to the coordinator.
-    func testTerminationAwaitsInFlightLoopScanBeforeShuttingDownAndThatScanNeverApplies() async {
+    /// `beginMonitoring()`'s initial one. Unlike the analogous test in the
+    /// prior revision of this suite, `performOrderlyShutdownOnce` must
+    /// *not* block on that in-flight tick fully finishing before it
+    /// proceeds to `coordinator.shutdown()` — awaiting it unboundedly is
+    /// exactly Task 12's hang finding, since `agentMonitor.scan()` may be
+    /// running non-cooperative detached detection work that never notices
+    /// cancellation. Termination must cancel the loop task, stop the
+    /// monitor, and proceed to shut the coordinator down *without* ever
+    /// releasing the still in-flight scan; only once released afterward
+    /// must that same tick's own `hasShutDown` guard still prevent it from
+    /// ever applying to the coordinator.
+    func testTerminationDoesNotWaitForInFlightLoopScanAndThatScanNeverApplies() async {
         let fakeMonitor = GatedAgentMonitorControlling(
             state: AgentMonitorState(active: false, keepingAwake: false, keepAwakeMode: .system, agents: [], lastScanAt: 0)
         )
@@ -455,24 +494,82 @@ final class AppLifecycleTests: XCTestCase {
         var replies: [Bool] = []
         _ = delegate.beginTermination { success in replies.append(success) }
 
-        // Give the termination task a moment to actually start; it must
-        // block awaiting the loop task's completion rather than
-        // proceeding, since the loop's second scan is still suspended.
-        try? await Task.sleep(nanoseconds: 30_000_000)
-        XCTAssertTrue(replies.isEmpty, "termination must wait for the in-flight loop scan to finish before completing shutdown")
-        XCTAssertEqual(fakeCoordinator.shutdownCallCount, 0)
-
-        fakeMonitor.releaseScan()
+        // Termination must reach coordinator shutdown and reply promptly
+        // — without this test ever releasing the second, still in-flight
+        // scan tick.
         await waitUntil { !replies.isEmpty }
 
-        XCTAssertEqual(replies, [true])
+        XCTAssertEqual(replies, [true], "termination must not wait for the in-flight loop scan to finish")
         XCTAssertEqual(fakeCoordinator.shutdownCallCount, 1)
+        XCTAssertEqual(fakeMonitor.stopCallCount, 1)
         XCTAssertEqual(
             fakeCoordinator.appliedScans.count,
             1,
-            "the second scan tick — in flight when termination began — must never apply to the coordinator"
+            "the second scan tick — still in flight when termination began — must not have applied yet"
         )
-        XCTAssertEqual(fakeMonitor.stopCallCount, 1)
+
+        // Only now release the stale tick; it must still never apply.
+        fakeMonitor.releaseScan()
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(
+            fakeCoordinator.appliedScans.count,
+            1,
+            "the second scan tick — in flight when termination began — must never apply to the coordinator, even once released after shutdown completed"
+        )
+    }
+
+    /// The deterministic regression test for Task 12's core finding:
+    /// orderly termination must reach coordinator shutdown, bridge
+    /// teardown, and reply *even when the in-flight scan is never
+    /// released at all* — modeling a genuinely non-cooperative detector
+    /// that never resolves. Unlike every other termination test in this
+    /// file, this one never calls `releaseScan()` on the still-suspended
+    /// second scan tick — proving orderly termination does not, and must
+    /// never, depend on that in-flight work ever completing.
+    func testTerminationReachesCoordinatorShutdownBridgeTeardownAndReplyWithAPermanentlySuspendedScan() async {
+        let fakeMonitor = GatedAgentMonitorControlling(
+            state: AgentMonitorState(active: false, keepingAwake: false, keepAwakeMode: .system, agents: [], lastScanAt: 0)
+        )
+        let fakeCoordinator = FakeAppSnapshotCoordinating()
+        let fakeBridge = FakeBridgeHandlerCancelling()
+        let recorder = CallOrderRecorder()
+        fakeMonitor.orderRecorder = recorder
+        fakeCoordinator.orderRecorder = recorder
+        fakeBridge.orderRecorder = recorder
+        let sleeper = GatedSleeper()
+        let delegate = AppDelegate(
+            coordinator: fakeCoordinator,
+            agentMonitor: fakeMonitor,
+            sleeper: sleeper,
+            bridgeMessageHandler: fakeBridge
+        )
+
+        // Bank a credit so the initial scan resolves immediately, then
+        // wake the loop so its second scan tick starts — and this time
+        // never release it at all. This second tick models a permanently
+        // suspended, non-cooperative detector: nothing in this test ever
+        // resolves it manually.
+        fakeMonitor.releaseScan()
+        await delegate.beginMonitoring()
+        await sleeper.release()
+        await waitUntil { fakeMonitor.scanCallCount == 2 }
+
+        var replies: [Bool] = []
+        _ = delegate.beginTermination { success in
+            recorder.record("reply")
+            replies.append(success)
+        }
+
+        await waitUntil(timeout: 5) { !replies.isEmpty }
+
+        XCTAssertEqual(replies, [true], "termination must reach reply without the permanently-suspended scan ever resolving")
+        XCTAssertEqual(fakeCoordinator.shutdownCallCount, 1)
+        XCTAssertEqual(fakeBridge.cancelAllCallCount, 1)
+        XCTAssertEqual(
+            recorder.snapshot(),
+            ["monitorStop", "coordinatorShutdown", "bridgeCancelAll", "reply"],
+            "termination must still stop the monitor, shut down the coordinator, tear down the bridge, then reply — with no manual release of the permanently-suspended scan"
+        )
     }
 
     /// Reproduces the lifecycle-fencing gap this fix closes: quit begins
@@ -533,5 +630,97 @@ final class AppLifecycleTests: XCTestCase {
             fakeCoordinator.appliedScans.isEmpty,
             "the still in-flight initial scan must not have applied either, once shutdown already began"
         )
+    }
+
+    // MARK: - Prerelease-updates menu checkbox (Task 12 finding)
+
+    /// The menu checkbox must apply only *after* persistence has actually
+    /// succeeded — never optimistically ahead of it.
+    func testSetIncludePrereleaseUpdatesAppliesMenuOnlyAfterSuccessfulPersistence() async {
+        let fakeCoordinator = FakeAppSnapshotCoordinating()
+        let fakeMonitor = FakeAgentMonitorControlling(
+            state: AgentMonitorState(active: false, keepingAwake: false, keepAwakeMode: .system, agents: [], lastScanAt: 0)
+        )
+        let fakeMenu = FakePrereleaseUpdatesMenuApplying(includePrereleaseUpdates: false)
+        let delegate = AppDelegate(
+            coordinator: fakeCoordinator,
+            agentMonitor: fakeMonitor,
+            prereleaseUpdatesMenu: fakeMenu
+        )
+
+        delegate.requestSetIncludePrereleaseUpdates(true)
+
+        await waitUntil { fakeMenu.appliedValues.count == 1 }
+
+        XCTAssertEqual(fakeCoordinator.setIncludePrereleaseUpdatesCalls, [true], "persistence must be attempted with the requested value")
+        XCTAssertEqual(fakeMenu.appliedValues, [true], "the menu must apply the new value once persistence succeeds")
+        XCTAssertTrue(fakeMenu.includePrereleaseUpdates)
+    }
+
+    /// The core of Task 12's finding: a persistence failure must never be
+    /// silently swallowed via `try?`, and the menu checkbox must never
+    /// reflect the failed value — it must stay showing whatever was last
+    /// actually persisted, so the next fresh, right-click-built menu still
+    /// reflects authoritative persisted state rather than a value that
+    /// only ever existed in the UI.
+    func testSetIncludePrereleaseUpdatesNeverAppliesMenuOnPersistenceFailure() async {
+        struct PersistenceFailure: Error {}
+
+        let fakeCoordinator = FakeAppSnapshotCoordinating()
+        fakeCoordinator.setIncludePrereleaseUpdatesError = PersistenceFailure()
+        let fakeMonitor = FakeAgentMonitorControlling(
+            state: AgentMonitorState(active: false, keepingAwake: false, keepAwakeMode: .system, agents: [], lastScanAt: 0)
+        )
+        let fakeMenu = FakePrereleaseUpdatesMenuApplying(includePrereleaseUpdates: false)
+        let delegate = AppDelegate(
+            coordinator: fakeCoordinator,
+            agentMonitor: fakeMonitor,
+            prereleaseUpdatesMenu: fakeMenu
+        )
+
+        delegate.requestSetIncludePrereleaseUpdates(true)
+
+        // Wait for the (failing) persistence attempt to actually run,
+        // then give the failure-handling path a brief, deterministic
+        // settle window to prove it never applies the menu afterward
+        // either — not merely "hasn't yet."
+        await waitUntil { fakeCoordinator.setIncludePrereleaseUpdatesCalls.count == 1 }
+        try? await Task.sleep(nanoseconds: 30_000_000)
+
+        XCTAssertEqual(fakeCoordinator.setIncludePrereleaseUpdatesCalls, [true], "persistence must still be attempted")
+        XCTAssertEqual(fakeMenu.appliedValues, [], "the menu must never apply a value whose persistence failed")
+        XCTAssertFalse(fakeMenu.includePrereleaseUpdates, "the menu must keep reflecting the last authoritative persisted value")
+    }
+
+    /// Complements the two tests above: a fresh menu built after a
+    /// persistence failure must reflect the same authoritative persisted
+    /// value a subsequent *successful* toggle eventually applies — proving
+    /// the checkbox never permanently drifts from disk after one failure.
+    func testSetIncludePrereleaseUpdatesRecoversOnANextSuccessfulPersist() async {
+        struct PersistenceFailure: Error {}
+
+        let fakeCoordinator = FakeAppSnapshotCoordinating()
+        fakeCoordinator.setIncludePrereleaseUpdatesError = PersistenceFailure()
+        let fakeMonitor = FakeAgentMonitorControlling(
+            state: AgentMonitorState(active: false, keepingAwake: false, keepAwakeMode: .system, agents: [], lastScanAt: 0)
+        )
+        let fakeMenu = FakePrereleaseUpdatesMenuApplying(includePrereleaseUpdates: false)
+        let delegate = AppDelegate(
+            coordinator: fakeCoordinator,
+            agentMonitor: fakeMonitor,
+            prereleaseUpdatesMenu: fakeMenu
+        )
+
+        delegate.requestSetIncludePrereleaseUpdates(true)
+        await waitUntil { fakeCoordinator.setIncludePrereleaseUpdatesCalls.count == 1 }
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertFalse(fakeMenu.includePrereleaseUpdates, "must still reflect the last persisted value after the failed attempt")
+
+        fakeCoordinator.setIncludePrereleaseUpdatesError = nil
+        delegate.requestSetIncludePrereleaseUpdates(true)
+        await waitUntil { fakeMenu.appliedValues.count == 1 }
+
+        XCTAssertTrue(fakeMenu.includePrereleaseUpdates, "a later successful persist must still update the menu")
+        XCTAssertEqual(fakeCoordinator.setIncludePrereleaseUpdatesCalls, [true, true])
     }
 }
