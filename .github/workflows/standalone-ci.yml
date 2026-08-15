@@ -2,15 +2,15 @@ name: Standalone macOS CI
 
 # This checks the standalone Seer.app surface (renderer + Swift app), not the
 # Glaze/Electron variant: this runner deliberately has no private Glaze SDK,
-# so every step below uses the ":standalone"/"-macos" package scripts, never
-# `npm run build|lint|type-check|test|dev` (those wrap `glaze.ts`, which
-# requires the private SDK — see glaze.ts) and never `tests/*.test.mjs` as a
-# glob (that would also pull in tests/glaze-runtime-resolution.test.mjs,
-# which exercises that same Glaze/Electron wrapper, and
-# tests/standalone-boundary.test.mjs, whose own "npm run build:macos
-# produces..." test would redundantly rebuild the whole app a second time —
-# this workflow already does that build and boundary check as explicit
-# steps below).
+# so every step below relies on the ":standalone"/"-macos" package scripts,
+# never `npm run build|lint|type-check|test|dev` (those wrap `glaze.ts`,
+# which requires the private SDK — see glaze.ts) and never `tests/*.test.mjs`
+# as a glob (that would also pull in tests/glaze-runtime-resolution.test.mjs,
+# which exercises that same Glaze/Electron wrapper — out of scope here).
+# tests/standalone-boundary.test.mjs is run explicitly as its own step below,
+# after the "Build unsigned Seer.app" step: its final test shells out to
+# `npm run build:macos` itself, redundantly rebuilding the app a second time,
+# which is accepted so the full file always executes in CI (no test skipped).
 on:
   pull_request:
   workflow_dispatch:
@@ -34,10 +34,12 @@ jobs:
           echo "runner arch: ${host_arch}"
 
       - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        # v4.4.0
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
       - name: Select Xcode 16.2
-        uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
+        # v1.7.0
+        uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90
         with:
           xcode-version: "16.2"
 
@@ -51,7 +53,8 @@ jobs:
           xcodegen --version
 
       - name: Setup Node 24
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        # v4.4.0
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "24"
           cache: npm
@@ -65,14 +68,15 @@ jobs:
       # Explicit file list, not `tests/*.test.mjs`: this repo's `tests/`
       # directory also holds tests/glaze-runtime-resolution.test.mjs (the
       # Glaze/Electron SDK-resolution wrapper — out of scope for this
-      # standalone-only runner) and tests/standalone-boundary.test.mjs
-      # (whose own final test shells out to `npm run build:macos` itself,
-      # which would redundantly rebuild the whole app a second time — this
-      # workflow already runs that build and the boundary check as their
-      # own steps below). When Task 16 adds a release-manifest test file,
-      # append it to this explicit list rather than switching to a glob.
+      # standalone-only runner) and tests/standalone-boundary.test.mjs,
+      # which is run as its own explicit step after "Build unsigned
+      # Seer.app" below (its shared `main/services/update-check.test.ts`
+      # sibling is exercised via the "Run shared renderer unit tests" step
+      # instead). When Task 16 adds a release-manifest test file, append
+      # it to this explicit list rather than switching to a glob.
       - name: Run standalone-safe unit tests (identity, standalone-renderer, publication safety, agent-detection, update)
         run: |
+          set -euo pipefail
           node --test \
             tests/identity.test.mjs \
             tests/renderer-build-identity.test.mjs \
@@ -83,16 +87,24 @@ jobs:
             tests/tray-update-error-handling.test.mjs 2>&1 | tee ci-logs/unit-tests.log
 
       - name: Run shared renderer unit tests
-        run: npm run test:renderer 2>&1 | tee ci-logs/test-renderer.log
+        run: |
+          set -euo pipefail
+          npm run test:renderer 2>&1 | tee ci-logs/test-renderer.log
 
       - name: Type-check standalone surface
-        run: npm run type-check:standalone 2>&1 | tee ci-logs/type-check-standalone.log
+        run: |
+          set -euo pipefail
+          npm run type-check:standalone 2>&1 | tee ci-logs/type-check-standalone.log
 
       - name: Lint standalone surface
-        run: npm run lint:standalone 2>&1 | tee ci-logs/lint-standalone.log
+        run: |
+          set -euo pipefail
+          npm run lint:standalone 2>&1 | tee ci-logs/lint-standalone.log
 
       - name: Build standalone renderer
-        run: npm run build:standalone-renderer 2>&1 | tee ci-logs/build-standalone-renderer.log
+        run: |
+          set -euo pipefail
+          npm run build:standalone-renderer 2>&1 | tee ci-logs/build-standalone-renderer.log
 
       # These three package scripts (not raw `xcodegen`/`xcodebuild`) each
       # acquire the renderer build lock themselves via
@@ -101,16 +113,34 @@ jobs:
       # concurrent renderer generation (see
       # tests/standalone-renderer-lock.test.mjs).
       - name: Generate Xcode project
-        run: npm run generate:macos 2>&1 | tee ci-logs/generate-macos.log
+        run: |
+          set -euo pipefail
+          npm run generate:macos 2>&1 | tee ci-logs/generate-macos.log
 
       - name: Run Swift tests
-        run: npm run test:macos 2>&1 | tee ci-logs/test-macos.log
+        run: |
+          set -euo pipefail
+          npm run test:macos 2>&1 | tee ci-logs/test-macos.log
 
       - name: Build unsigned Seer.app
-        run: npm run build:macos 2>&1 | tee ci-logs/build-macos.log
+        run: |
+          set -euo pipefail
+          npm run build:macos 2>&1 | tee ci-logs/build-macos.log
+
+      # Runs the full standalone-boundary suite, including its own
+      # "npm run build:macos produces..." test, which redundantly rebuilds
+      # the app a second time. That redundancy is accepted here so this
+      # file always executes in full in CI rather than being partially
+      # excluded (see the explicit unit-test file list above).
+      - name: Run standalone boundary test suite
+        run: |
+          set -euo pipefail
+          node --test tests/standalone-boundary.test.mjs 2>&1 | tee ci-logs/standalone-boundary-test.log
 
       - name: Repository and built-app boundary checks
-        run: npm run check:standalone-boundary 2>&1 | tee ci-logs/check-standalone-boundary.log
+        run: |
+          set -euo pipefail
+          npm run check:standalone-boundary 2>&1 | tee ci-logs/check-standalone-boundary.log
 
       # Only the plain-text stdout/stderr logs captured above — never the
       # built Seer.app, DerivedData, or an .xcresult bundle (which can embed
@@ -118,7 +148,8 @@ jobs:
       # app binary or source.
       - name: Upload test diagnostics on failure
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        # v4.6.2
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: standalone-ci-logs
           path: ci-logs/*.log
