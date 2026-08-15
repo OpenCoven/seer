@@ -129,17 +129,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Production bootstrap
 
-    /// The real launch sequence, in order: (1) accessory activation is
-    /// already set by `ApplicationRuntime.run()` before `NSApplication.run()`
-    /// ever dispatches this method, and reasserted here defensively; (2)
-    /// settings/history load and (3) the coordinator/bridge/panel/status
-    /// item are created — `AppSnapshotCoordinator
-    /// .makeAtStartupWithScheduledUpdates` performs the settings/history
-    /// load, folds in startup diagnostics, runs Seer's one-time startup
-    /// update check, and starts the periodic update scheduler, all as part
-    /// of constructing the coordinator; (4) `beginMonitoring()` then
-    /// performs the initial agent scan and (5) begins the recurring
-    /// three-second monitor loop.
+    /// The real launch sequence, in the exact order the spec requires: (1)
+    /// accessory activation is already set by `ApplicationRuntime.run()`
+    /// before `NSApplication.run()` ever dispatches this method, and
+    /// reasserted here defensively; (2) settings/history are loaded
+    /// exactly once each — inside `AppSnapshotCoordinator
+    /// .makeAtStartupWithScheduledUpdates`, never a second time by this
+    /// method itself — while the coordinator/bridge/panel/status item are
+    /// created *without* performing any update-check network request or
+    /// starting the periodic update scheduler; (3) `beginMonitoring()`
+    /// then performs the initial agent scan/apply and (4) begins the
+    /// recurring three-second monitor loop; only once both of those have
+    /// happened does (5) `coordinator.performStartupUpdateCheckAndStartScheduler()`
+    /// run Seer's one-time startup update check and start the periodic
+    /// scheduler — so a slow/hanging network request can never delay the
+    /// menu bar icon or panel showing real monitoring state.
     private func bootstrapProduction() async {
         NSApp.setActivationPolicy(.accessory)
         NSApp.mainMenu = AppMainMenuBuilder.build(appName: "Seer") { [weak self] in
@@ -178,7 +182,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let panel = PanelController(rendererRoot: rendererRoot, clock: clock)
         let rendererSink = RendererEventSink(javaScriptCaller: panel.webView)
 
-        let initialSettings = await settingsStore.load()
+        // `includePrereleaseUpdates` starts at its default (`false`) here
+        // and is corrected immediately below, once the coordinator factory
+        // has actually loaded settings — this status item is never shown
+        // to the user before then, since building its menu requires an
+        // explicit later click. Reading `initialSettings` via a second,
+        // separate `settingsStore.load()` call here (as before) would
+        // re-read the settings file from disk a second time for no reason.
         let statusItem = StatusItemController(
             statusItem: NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength),
             actions: StatusItemController.Actions(
@@ -189,11 +199,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 quit: { [weak self] in self?.requestQuit() }
             ),
             initialSnapshot: .empty(version: appVersion),
-            includePrereleaseUpdates: initialSettings.value.includePrereleaseUpdates
+            includePrereleaseUpdates: false
         )
 
         let broadcastSink = MulticastRendererSink(sinks: [rendererSink, statusItem])
 
+        // Loads settings/history exactly once each and builds the
+        // coordinator/bridge target — performing no update-check network
+        // request and starting no scheduler yet (see this method's own
+        // documentation above for why).
         let coordinator = await AppSnapshotCoordinator.makeAtStartupWithScheduledUpdates(
             settingsStore: settingsStore,
             historyStore: historyStore,
@@ -203,6 +217,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             appVersion: appVersion,
             updateService: updateService
         )
+        statusItem.apply(includePrereleaseUpdates: await settingsStore.current.includePrereleaseUpdates)
 
         let router = StandaloneBridgeCommandRouter(
             snapshotGet: {
@@ -262,6 +277,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.webViewUserContentController = panel.userContentController
 
         await beginMonitoring()
+
+        // Only now — after the initial agent scan has applied and the
+        // recurring monitor loop has started — run Seer's one-time
+        // startup update check and start the periodic scheduler.
+        await coordinator.performStartupUpdateCheckAndStartScheduler()
     }
 
     // MARK: - Status item action wiring
@@ -326,13 +346,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// coordinator: a scan-failure diagnostic forwards to
     /// `applyScanFailure(occurredAt:)` (retaining the last known agent
     /// state); anything else forwards the freshly scanned agent list to
-    /// `applyScan(_:scannedAt:)`.
+    /// `applyScan(_:scannedAt:)`. Checked against `hasShutDown` both
+    /// immediately after `agentMonitor.scan()` resolves and again
+    /// immediately before the resulting coordinator call — `hasShutDown`
+    /// is set synchronously, ahead of any await, the instant
+    /// `performOrderlyShutdownOnce()` begins (see that method's own
+    /// documentation), so a scan already in flight (whether the very
+    /// first, directly-awaited call from `beginMonitoring()`, or one
+    /// dispatched from the recurring loop) can never publish an
+    /// `applyScan`/`applyScanFailure` transition into the coordinator once
+    /// termination has begun, however long that in-flight scan itself
+    /// takes to actually resolve.
     private func performScanTick(agentMonitor: any AgentMonitorControlling, coordinator: any AppSnapshotCoordinating) async {
         await agentMonitor.scan()
+        guard !hasShutDown else { return }
         if let diagnostic = await agentMonitor.diagnostic {
+            guard !hasShutDown else { return }
             await coordinator.applyScanFailure(occurredAt: diagnostic.occurredAt)
         } else {
             let state = await agentMonitor.state
+            guard !hasShutDown else { return }
             await coordinator.applyScan(state.agents, scannedAt: state.lastScanAt)
         }
     }
@@ -375,23 +408,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return .terminateLater
     }
 
-    /// Stops the monitor scan loop, cancels every in-flight bridge command
-    /// and removes the bridge's registration from the web view, then awaits
-    /// `AppSnapshotCoordinator.shutdown()` — which itself flushes history
-    /// and releases the power assertion. Guarded by `hasShutDown` so a
+    /// Stops the monitor scan loop — cancelling it and *awaiting its full
+    /// completion* before proceeding, so any scan tick already in flight at
+    /// the moment termination began (its coordinator call already fenced
+    /// off by `hasShutDown`, per `performScanTick`'s own documentation)
+    /// has definitely finished before shutdown continues — then stops
+    /// `agentMonitor` itself. Only *then* awaits
+    /// `AppSnapshotCoordinator.shutdown()`, which flushes history, cancels
+    /// the update scheduler, and releases the power assertion; bridge
+    /// handlers are removed from the web view only after that coordinator
+    /// shutdown has fully completed, exactly matching the required
+    /// production order (stop monitor work → coordinator shutdown →
+    /// remove bridge handlers → reply). Guarded by `hasShutDown` so a
     /// second concurrent/subsequent quit request never repeats this work.
     private func performOrderlyShutdownOnce() async {
         guard !hasShutDown else { return }
         hasShutDown = true
 
-        scanLoopTask?.cancel()
+        if let scanLoopTask {
+            scanLoopTask.cancel()
+            await scanLoopTask.value
+        }
         scanLoopTask = nil
-
         await agentMonitor?.stop()
-        bridgeMessageHandler?.cancelAll()
-        removeBridgeHandlersFromWebView()
 
         try? await coordinator?.shutdown()
+
+        bridgeMessageHandler?.cancelAll()
+        removeBridgeHandlersFromWebView()
     }
 
     private func removeBridgeHandlersFromWebView() {

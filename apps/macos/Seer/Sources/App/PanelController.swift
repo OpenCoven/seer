@@ -206,6 +206,16 @@ public final class PanelController: NSObject {
 
     private func configureWebView(_ webView: WKWebView) {
         webView.navigationDelegate = navigationDelegate
+        // Seer's document (`renderer/standalone/styles.css`) already
+        // renders a fully transparent `html`/`body`/`#root` background —
+        // but `WKWebView` itself still paints an opaque page background
+        // behind that by default, hiding the vibrant `NSVisualEffectView`
+        // this web view sits on top of entirely. `underPageBackgroundColor`
+        // is the supported public API for this (macOS 13+; Seer's
+        // deployment target is 14.0) — setting it to `.clear` lets the
+        // panel's own vibrancy show through wherever the document leaves
+        // its background transparent.
+        webView.underPageBackgroundColor = .clear
         #if DEBUG
         webView.isInspectable = true
         #else

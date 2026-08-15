@@ -99,6 +99,18 @@ final class PanelControllerTests: XCTestCase {
         XCTAssertTrue(visualEffectView?.subviews.contains(controller.webView) ?? false)
     }
 
+    func testWebViewHasAClearUnderPageBackgroundColorSoTheVibrantPanelShowsThrough() {
+        let controller = makeController(clock: MutableClock(now: 0))
+        // `NSColor.clear` and the value WKWebView reports back for
+        // `underPageBackgroundColor` can differ in color space
+        // representation (e.g. sRGB vs. generic gray) despite being
+        // visually identical fully-transparent colors, so `XCTAssertEqual`
+        // against `.clear` directly would be representation-fragile; the
+        // property that actually matters — and that this test asserts —
+        // is that the color is fully transparent (`alphaComponent == 0`).
+        XCTAssertEqual(controller.webView.underPageBackgroundColor.alphaComponent, 0, accuracy: 0.0001)
+    }
+
     // MARK: - Escape hides the panel
 
     func testEscapeHidesThePanel() {

@@ -102,6 +102,7 @@ public protocol AppSnapshotCoordinating: AnyObject {
     func setIncludePrereleaseUpdates(_ value: Bool) async throws
     @discardableResult
     func openLatestRelease() async -> Bool
+    func performStartupUpdateCheckAndStartScheduler() async
     func shutdown() async throws
 }
 
@@ -339,6 +340,20 @@ public final class AppSnapshotCoordinator {
     /// unaffected either way, since it always calls the coordinator
     /// directly).
     ///
+    /// Loads `settingsStore`/`historyStore` exactly once each (never
+    /// re-loaded by any later step) and folds in every startup diagnostic,
+    /// exactly like `makeCoordinatorWithoutStartingScheduler(...)` above —
+    /// but, deliberately, performs **no** update-check network request and
+    /// does **not** start the scheduler: `snapshot.update` is seeded purely
+    /// from `updateService.currentState()`'s already-cached value. Callers
+    /// (in production, `AppDelegate.bootstrapProduction()`) must run the
+    /// app shell's own initial agent scan and start its recurring monitor
+    /// loop first, and only then call the returned coordinator's
+    /// `performStartupUpdateCheckAndStartScheduler()` to perform Seer's
+    /// one-time startup check and start the periodic scheduler — so a slow
+    /// or hanging network request can never delay the very first thing the
+    /// menu bar icon/panel need to show.
+    ///
     /// Internally breaks the coordinator/scheduler reference cycle this
     /// wiring would otherwise create: the coordinator strongly owns the
     /// scheduler (so `shutdown()` can stop it), and the scheduler's
@@ -347,12 +362,11 @@ public final class AppSnapshotCoordinator {
     /// strongly, but the box only ever holds `coordinator` *weakly*, set
     /// once construction has actually completed — so neither the
     /// coordinator nor the scheduler ever keeps the other alive past its
-    /// own natural lifetime. The box is populated *before*
-    /// `scheduler.start()` is ever called (unlike `makeAtStartup(...)`,
-    /// which starts its injected scheduler as its very last step) so the
-    /// scheduler's very first background tick can never observe an
-    /// unregistered (`nil`) coordinator — there is no window in which its
-    /// background `Task` could run before this wiring is complete.
+    /// own natural lifetime. The box is populated before this factory
+    /// returns, so the scheduler's very first background tick (only
+    /// possible once a later `performStartupUpdateCheckAndStartScheduler()`
+    /// call actually starts it) can never observe an unregistered (`nil`)
+    /// coordinator.
     public static func makeAtStartupWithScheduledUpdates(
         settingsStore: SettingsStore,
         historyStore: HistoryStore,
@@ -363,6 +377,35 @@ public final class AppSnapshotCoordinator {
         updateService: any UpdateChecking,
         sleeper: Sleeper = TaskSleeper()
     ) async -> AppSnapshotCoordinator {
+        let settingsResult = await settingsStore.load()
+        _ = await historyStore.load()
+        let historyDiagnostic = await historyStore.lastDiagnostic
+        let historyStats = await historyStore.stats()
+
+        var diagnostics: [Diagnostic] = []
+        if let settingsDiagnostic = settingsResult.diagnostic {
+            diagnostics.append(settingsDiagnostic)
+        }
+        if let historyDiagnostic {
+            diagnostics.append(StorageDiagnosticAlias.remapForHistory(historyDiagnostic))
+        }
+
+        let monitor = AgentMonitorState(
+            active: false,
+            keepingAwake: false,
+            keepAwakeMode: settingsResult.value.keepAwakeMode,
+            agents: [],
+            lastScanAt: 0
+        )
+
+        let snapshot = AppSnapshot(
+            monitor: monitor,
+            history: historyStats,
+            update: await updateService.currentState(),
+            diagnostics: dedupedByID(diagnostics),
+            appVersion: appVersion
+        )
+
         let box = CoordinatorWeakBox()
         let scheduler = UpdateScheduler(
             clock: clock,
@@ -371,20 +414,32 @@ public final class AppSnapshotCoordinator {
             performScheduledCheck: { await box.coordinator?.checkForUpdates(force: false) ?? true }
         )
 
-        let coordinator = await makeCoordinatorWithoutStartingScheduler(
+        let coordinator = AppSnapshotCoordinator(
             settingsStore: settingsStore,
             historyStore: historyStore,
             power: power,
             renderer: renderer,
             clock: clock,
-            appVersion: appVersion,
+            initialSnapshot: snapshot,
             updateService: updateService,
             updateScheduler: scheduler
         )
 
         box.coordinator = coordinator
-        await scheduler.start()
         return coordinator
+    }
+
+    /// Performs Seer's one-time startup update check (unforced —
+    /// `checkForUpdates(force: false)`, so a very recent check still
+    /// respects the 24-hour gate) and starts the periodic `updateScheduler`
+    /// — the two steps `makeAtStartupWithScheduledUpdates(...)` above
+    /// deliberately defers out of construction. Must only be called once
+    /// the app shell's own initial agent scan has already applied and its
+    /// recurring monitor loop has already started, so a slow/hanging
+    /// startup network check can never delay either of those.
+    public func performStartupUpdateCheckAndStartScheduler() async {
+        await checkForUpdates(force: false)
+        await updateScheduler.start()
     }
 
     // MARK: - Monitor scan results

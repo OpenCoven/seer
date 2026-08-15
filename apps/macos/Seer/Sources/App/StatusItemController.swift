@@ -309,9 +309,12 @@ public enum AppMainMenuBuilder {
         appMenu.addItem(servicesItem)
         appMenu.addItem(.separator())
 
-        appMenu.addItem(ClosureMenuItem(title: "Hide \(appName)") {
+        let hideItem = ClosureMenuItem(title: "Hide \(appName)") {
             NSApp.hide(nil)
-        })
+        }
+        hideItem.keyEquivalentModifierMask = .command
+        hideItem.keyEquivalent = "h"
+        appMenu.addItem(hideItem)
         let hideOthers = ClosureMenuItem(title: "Hide Others") {
             NSApp.hideOtherApplications(nil)
         }
@@ -323,7 +326,10 @@ public enum AppMainMenuBuilder {
         })
         appMenu.addItem(.separator())
 
-        appMenu.addItem(ClosureMenuItem(title: StatusMenuLabel.quitSeer, handler: quit))
+        let quitItem = ClosureMenuItem(title: StatusMenuLabel.quitSeer, handler: quit)
+        quitItem.keyEquivalentModifierMask = .command
+        quitItem.keyEquivalent = "q"
+        appMenu.addItem(quitItem)
 
         return mainMenu
     }

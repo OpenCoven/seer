@@ -712,10 +712,14 @@ final class AppSnapshotCoordinatorTests: XCTestCase {
     /// `GatedSleeper`, never real wall-clock time) to route every
     /// scheduled, non-forced check through this very coordinator's own
     /// `checkForUpdates(force: false)`, exactly as production wiring
-    /// should. `updateService.checkResults`'s first scripted result (if
-    /// any) is consumed by the startup check `makeAtStartup` itself always
-    /// performs; any later scripted results are consumed by the
-    /// scheduler's own periodic ticks once the test releases `sleeper`.
+    /// should — then immediately calls `performStartupUpdateCheckAndStartScheduler()`
+    /// itself, mirroring `AppDelegate.bootstrapProduction()`'s required
+    /// ordering (construct without starting updates, *then* run the
+    /// startup check and start the scheduler) rather than relying on
+    /// construction to do it inline. `updateService.checkResults`'s first
+    /// scripted result (if any) is consumed by that startup check; any
+    /// later scripted results are consumed by the scheduler's own periodic
+    /// ticks once the test releases `sleeper`.
     private func makeCoordinatorWithScheduledUpdates(
         settingsFileSystem: InMemorySettingsFileSystem = InMemorySettingsFileSystem(),
         historyFileSystem: InMemorySettingsFileSystem = InMemorySettingsFileSystem(),
@@ -758,6 +762,7 @@ final class AppSnapshotCoordinatorTests: XCTestCase {
             updateService: updateService,
             sleeper: sleeper
         )
+        await coordinator.performStartupUpdateCheckAndStartScheduler()
 
         return (coordinator, renderer, sleeper)
     }

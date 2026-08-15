@@ -309,6 +309,32 @@ final class StatusItemControllerTests: XCTestCase {
         XCTAssertTrue(quit)
     }
 
+    // MARK: - Application menu keyboard shortcuts
+
+    func testAppMainMenuHideHasCmdHKeyEquivalent() {
+        let appMenu = AppMainMenuBuilder.build(appName: "Seer", quit: {}).items.first?.submenu
+        let hideItem = appMenu?.items.first { $0.title == "Hide Seer" }
+
+        XCTAssertEqual(hideItem?.keyEquivalent, "h")
+        XCTAssertEqual(hideItem?.keyEquivalentModifierMask, .command)
+    }
+
+    func testAppMainMenuHideOthersHasOptionCmdHKeyEquivalent() {
+        let appMenu = AppMainMenuBuilder.build(appName: "Seer", quit: {}).items.first?.submenu
+        let hideOthersItem = appMenu?.items.first { $0.title == "Hide Others" }
+
+        XCTAssertEqual(hideOthersItem?.keyEquivalent, "h")
+        XCTAssertEqual(hideOthersItem?.keyEquivalentModifierMask, [.command, .option])
+    }
+
+    func testAppMainMenuQuitHasCmdQKeyEquivalent() {
+        let appMenu = AppMainMenuBuilder.build(appName: "Seer", quit: {}).items.first?.submenu
+        let quitItem = appMenu?.items.first { $0.title == StatusMenuLabel.quitSeer }
+
+        XCTAssertEqual(quitItem?.keyEquivalent, "q")
+        XCTAssertEqual(quitItem?.keyEquivalentModifierMask, .command)
+    }
+
     // MARK: - Hex color parsing
 
     func testNSColorParsesHexWithAndWithoutHash() {
