@@ -7,6 +7,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -96,8 +97,8 @@ function processStartIdentityOrNull(pid) {
   }
 }
 
-function writeSyntheticLock(owner, child = null) {
-  const lockDir = join(repoRoot, ".seer-standalone-renderer.lock");
+function writeSyntheticLock(owner, child = null, root = repoRoot) {
+  const lockDir = join(root, ".seer-standalone-renderer.lock");
   rmSync(lockDir, { recursive: true, force: true });
   mkdirSync(lockDir, { mode: 0o700 });
   writeFileSync(join(lockDir, "owner.json"), `${JSON.stringify(owner)}\n`, { mode: 0o600 });
@@ -450,6 +451,130 @@ test("EEXIST followed by a disappearing lock retries across repeated handoffs", 
   for (const result of results) {
     assert.equal(result.code, 0, `handoff failed:\n${result.stdout}\n${result.stderr}`);
     assert.doesNotMatch(result.stderr, /ENOENT|no such file/i);
+  }
+});
+
+test("32 stale-lock waiters repeatedly hand off without overlap, failures, or leaked locks", async () => {
+  mkdirSync(join(repoRoot, "build"), { recursive: true });
+  const scratch = mkdtempSync(join(repoRoot, "build", "renderer-stale-lock-stress-"));
+  const fixture = createRendererFixture(scratch);
+  const waiterCount = 32;
+  const repetitions = 3;
+  try {
+    for (let repetition = 0; repetition < repetitions; repetition += 1) {
+      const tracePath = join(scratch, `trace-${repetition}.jsonl`);
+      const bootIdentity = currentBootIdentity();
+      writeSyntheticLock(
+        {
+          token: `stale-${repetition}`,
+          pid: 2147483647,
+          createdAtMs: 0,
+          bootIdentity,
+          processStartIdentity: "dead-owner",
+        },
+        null,
+        fixture.repo,
+      );
+
+      const runs = Array.from({ length: waiterCount }, (_, index) => {
+        const marker = `stale-stress-${repetition}-${index}`;
+        return runWrapper({
+          env: {
+            SEER_RENDERER_BUILD_TEST_BUILDER: testBuilderPath,
+            SEER_RENDERER_BUILD_TEST_MARKER: marker,
+            SEER_RENDERER_BUILD_TEST_TRACE: tracePath,
+            SEER_RENDERER_BUILD_TEST_CONSUMER_ROOT: fixture.repo,
+            SEER_RENDERER_LOCK_STALE_MS: "0",
+            SEER_RENDERER_LOCK_POLL_MS: "1",
+            SEER_RENDERER_LOCK_WAIT_MS: "120000",
+            SEER_RENDERER_LOCK_TEST_EEXIST_DELAY_MS: "30",
+          },
+          consumerArgs: [process.execPath, consumerPath, marker, "20"],
+          root: fixture.repo,
+          script: fixture.wrapper,
+        }).completed;
+      });
+
+      const results = await Promise.all(runs);
+      for (const result of results) {
+        assert.equal(
+          result.code,
+          0,
+          `stale-lock stress waiter failed:\n${result.stdout}\n${result.stderr}\ntrace:\n${readFileSync(tracePath, "utf8")}`,
+        );
+        assert.doesNotMatch(result.stderr, /changed identity|ENOENT|no such file/i);
+      }
+
+      const trace = readFileSync(tracePath, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      assert.equal(trace.length, waiterCount * 4);
+      let heldToken = null;
+      for (const entry of trace) {
+        if (entry.event === "start") {
+          assert.equal(heldToken, null, "renderer lock holders overlapped");
+          heldToken = entry.token;
+        } else if (entry.event === "end") {
+          assert.equal(entry.event, "end");
+          assert.equal(entry.token, heldToken, "renderer lock ownership changed before release");
+          heldToken = null;
+        } else {
+          assert.ok(["consumer-start", "consumer-end"].includes(entry.event));
+          assert.equal(entry.token, heldToken, "consumer ran outside its renderer lock");
+        }
+      }
+      assert.equal(heldToken, null);
+      assert.equal(existsSync(join(fixture.repo, ".seer-standalone-renderer.lock")), false);
+      assert.deepEqual(
+        readdirSync(fixture.repo).filter((name) => name.startsWith(".seer-standalone-renderer.lock")),
+        [],
+      );
+      assert.deepEqual(privateRendererArtifacts(fixture.repo), []);
+    }
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test("an interrupted exclusive stale-lock claim is restored and reclaimed", async () => {
+  const bootIdentity = currentBootIdentity();
+  const lockDir = writeSyntheticLock({
+    token: "stale-before-reclaim-crash",
+    pid: 2147483647,
+    createdAtMs: 0,
+    bootIdentity,
+    processStartIdentity: "dead-owner",
+  });
+  const reclaimPath = `${lockDir}.reclaiming`;
+  writeFileSync(
+    join(lockDir, "reclaim.json"),
+    `${JSON.stringify({
+      token: "dead-reclaimer",
+      pid: 2147483646,
+      createdAtMs: 0,
+      bootIdentity,
+      processStartIdentity: "dead-reclaimer",
+    })}\n`,
+    { mode: 0o600 },
+  );
+  renameSync(lockDir, reclaimPath);
+  try {
+    const result = await runWrapper({
+      env: {
+        SEER_RENDERER_BUILD_TEST_BUILDER: testBuilderPath,
+        SEER_RENDERER_BUILD_TEST_MARKER: "reclaimed-after-interruption",
+        SEER_RENDERER_LOCK_STALE_MS: "0",
+        SEER_RENDERER_LOCK_POLL_MS: "1",
+        SEER_RENDERER_LOCK_WAIT_MS: "5000",
+      },
+    }).completed;
+    assert.equal(result.code, 0, `interrupted reclamation was not recovered:\n${result.stderr}`);
+    assert.equal(existsSync(lockDir), false);
+    assert.equal(existsSync(reclaimPath), false);
+  } finally {
+    rmSync(lockDir, { recursive: true, force: true });
+    rmSync(reclaimPath, { recursive: true, force: true });
   }
 });
 
