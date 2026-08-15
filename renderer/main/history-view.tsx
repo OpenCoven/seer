@@ -3,9 +3,10 @@ import { Bot, Coffee, History as HistoryIcon, Trash2 } from "lucide-react";
 import type { ReactNode } from "react";
 
 import { useRendererBridge } from "../bridge/renderer-bridge-context";
-import type { AwakeSession } from "../bridge/types";
+import type { AppSnapshot, AwakeSession } from "../bridge/types";
 import { PanelTabs } from "../components/panel-tabs";
-import { EMPTY_STATS, formatDuration, formatSessionTime, sessionAgentNames } from "../lib/history";
+import { SnapshotAvailability } from "../components/snapshot-availability";
+import { formatDuration, formatSessionTime, sessionAgentNames } from "../lib/history";
 import { Button, EmptyState, List, ScrollPanel, Text, Toolbar, ToolbarActions, ToolbarContent } from "../ui/primitives";
 import { useAppSnapshot, writeAppSnapshot } from "./root-view";
 
@@ -30,11 +31,31 @@ function SectionLabel({ children }: { children: ReactNode }) {
   );
 }
 
+export function HistoryClearButton({
+  disabled,
+  onClear,
+}: {
+  disabled: boolean;
+  onClear: () => void;
+}) {
+  return (
+    <Button
+      variant="transparent"
+      size="small"
+      onClick={onClear}
+      disabled={disabled}
+      aria-label="Clear history"
+    >
+      <Trash2 className="size-4" />
+    </Button>
+  );
+}
+
 export function HistoryView() {
   const bridge = useRendererBridge();
   const queryClient = useQueryClient();
-  const { data: snapshot } = useAppSnapshot();
-  const stats = snapshot?.history ?? EMPTY_STATS;
+  const { data: snapshot, isPending, isError } = useAppSnapshot();
+  const stats = snapshot?.history;
 
   const clearMutation = useMutation({
     mutationFn: () => bridge.clearHistory(),
@@ -46,7 +67,8 @@ export function HistoryView() {
   };
 
   const hasHistory =
-    stats.totalAwakeMs > 0 || stats.recentSessions.length > 0 || stats.currentSession !== null;
+    stats !== undefined &&
+    (stats.totalAwakeMs > 0 || stats.recentSessions.length > 0 || stats.currentSession !== null);
 
   return (
     <ScrollPanel
@@ -57,15 +79,10 @@ export function HistoryView() {
             <PanelTabs />
           </ToolbarContent>
           <ToolbarActions>
-            <Button
-              variant="transparent"
-              size="small"
-              onClick={() => clearMutation.mutate()}
-              disabled={!hasHistory || clearMutation.isPending}
-              aria-label="Clear history"
-            >
-              <Trash2 className="size-4" />
-            </Button>
+            <HistoryClearButton
+              onClear={() => clearMutation.mutate()}
+              disabled={!snapshot || isError || !hasHistory || clearMutation.isPending}
+            />
           </ToolbarActions>
         </Toolbar>
       }
@@ -77,6 +94,50 @@ export function HistoryView() {
         </div>
       }
     >
+      <HistorySnapshotContent snapshot={snapshot} isPending={isPending} isError={isError} />
+    </ScrollPanel>
+  );
+}
+
+export function HistorySnapshotContent({
+  snapshot,
+  isPending,
+  isError,
+}: {
+  snapshot: AppSnapshot | undefined;
+  isPending: boolean;
+  isError: boolean;
+}) {
+  if (!snapshot) {
+    return (
+      <SnapshotAvailability
+        isPending={isPending}
+        loadingTitle="Loading history"
+        errorTitle="History unavailable"
+        errorDescription="Seer could not load history. Live updates will restore this view automatically."
+        media={
+          <div className="flex size-12 items-center justify-center rounded-full bg-control">
+            <HistoryIcon className="size-5 text-secondary" />
+          </div>
+        }
+      />
+    );
+  }
+
+  const stats = snapshot.history;
+  const hasHistory =
+    stats.totalAwakeMs > 0 || stats.recentSessions.length > 0 || stats.currentSession !== null;
+
+  return (
+    <>
+      {isError ? (
+        <div role="alert" className="mx-3 mb-3 rounded-xl bg-control-subtle px-3 py-2">
+          <Text variant="small-strong">History unavailable</Text>
+          <Text variant="mini" color="secondary" className="mt-0.5 block">
+            Showing last known history. Clear history will return when live updates recover.
+          </Text>
+        </div>
+      ) : null}
       {!hasHistory ? (
         <div className="relative min-h-60 px-3 pt-1 pb-3">
           <EmptyState
@@ -164,6 +225,6 @@ export function HistoryView() {
           ) : null}
         </div>
       )}
-    </ScrollPanel>
+    </>
   );
 }

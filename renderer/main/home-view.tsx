@@ -2,9 +2,9 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Bot, Coffee, Moon } from "lucide-react";
 
 import { useRendererBridge } from "../bridge/renderer-bridge-context";
-import type { ActiveAgent, KeepAwakeMode } from "../bridge/types";
+import type { ActiveAgent, AppSnapshot, KeepAwakeMode } from "../bridge/types";
 import { PanelTabs } from "../components/panel-tabs";
-import { EMPTY_STATE } from "../lib/agents";
+import { SnapshotAvailability } from "../components/snapshot-availability";
 import {
   Badge,
   Button,
@@ -33,55 +33,81 @@ export function UpdateNotice({
   checking,
   onView,
   onCheck,
+  interactionsDisabled = false,
 }: {
   availableVersion: string;
   checking: boolean;
   onView: () => void;
   onCheck: () => void;
+  interactionsDisabled?: boolean;
 }) {
   return (
     <div className="flex items-center gap-2 rounded-xl bg-control-subtle px-3 py-2">
       <Text variant="small-strong" className="min-w-0 flex-1">
         Seer {availableVersion} is available
       </Text>
-      <Button variant="muted" size="small" onClick={onView}>
+      <Button variant="muted" size="small" disabled={interactionsDisabled} onClick={onView}>
         View release
       </Button>
-      <Button variant="muted" size="small" disabled={checking} onClick={onCheck}>
+      <Button
+        variant="muted"
+        size="small"
+        disabled={interactionsDisabled || checking}
+        onClick={onCheck}
+      >
         {checking ? "Checking…" : "Check again"}
       </Button>
     </div>
   );
 }
 
-export function HomeView() {
-  const bridge = useRendererBridge();
-  const queryClient = useQueryClient();
-  const { data: snapshot, isLoading } = useAppSnapshot();
-  const state = snapshot?.monitor ?? EMPTY_STATE;
-  const update = snapshot?.update;
+export function snapshotBadgeLabel(
+  snapshot: AppSnapshot | undefined,
+  isPending: boolean,
+  isError = false,
+): string {
+  if (!snapshot || isError) return isPending ? "Loading" : "Unavailable";
+  return snapshot.monitor.keepingAwake ? "Awake" : "Sleep OK";
+}
 
-  const modeMutation = useMutation({
-    mutationFn: (mode: KeepAwakeMode) => bridge.setKeepAwakeMode(mode),
-    onSuccess: (next) => writeAppSnapshot(queryClient, next),
-  });
-  const updateMutation = useMutation({
-    mutationFn: () => bridge.requestUpdateCheck(),
-    onSuccess: (next) => writeAppSnapshot(queryClient, next),
-  });
+export function HomeSnapshotContent({
+  snapshot,
+  isPending,
+  isError,
+  modeMutationPending,
+  updateMutationPending,
+  onModeChange,
+  onViewRelease,
+  onCheckForUpdates,
+}: {
+  snapshot: AppSnapshot | undefined;
+  isPending: boolean;
+  isError: boolean;
+  modeMutationPending: boolean;
+  updateMutationPending: boolean;
+  onModeChange: (mode: KeepAwakeMode) => void;
+  onViewRelease: () => void;
+  onCheckForUpdates: () => void;
+}) {
+  if (!snapshot) {
+    return (
+      <SnapshotAvailability
+        isPending={isPending}
+        loadingTitle="Loading Seer status"
+        errorTitle="Status unavailable"
+        errorDescription="Seer could not load its current status. Live updates will restore this view automatically."
+        media={
+          <div className="flex size-12 items-center justify-center rounded-full bg-control">
+            <Bot className="size-5 text-secondary" />
+          </div>
+        }
+      />
+    );
+  }
 
-  const handleModeChange = (mode: KeepAwakeMode) => {
-    modeMutation.mutate(mode);
-  };
-
-  const handleQuit = () => {
-    void bridge.quit();
-  };
-
-  const handleViewRelease = () => {
-    void bridge.openCurrentRelease();
-  };
-
+  const state = snapshot.monitor;
+  const update = snapshot.update;
+  const interactionsDisabled = isError;
   const agents = state.agents;
   const statusTitle = state.active ? "Keeping Mac awake" : "Idle";
   const statusDescription = state.active
@@ -89,35 +115,23 @@ export function HomeView() {
     : "Sleep allowed when no agents are working";
 
   return (
-    <ScrollPanel
-      className="h-full"
-      toolbar={
-        <Toolbar>
-          <ToolbarContent>
-            <PanelTabs />
-          </ToolbarContent>
-          <ToolbarActions>
-            <Badge color={state.keepingAwake ? "green" : "secondary"}>
-              {state.keepingAwake ? "Awake" : "Sleep OK"}
-            </Badge>
-          </ToolbarActions>
-        </Toolbar>
-      }
-      footer={
-        <div className="flex items-center justify-end px-3 py-2">
-          <Button variant="muted" size="small" onClick={handleQuit}>
-            Quit
-          </Button>
-        </div>
-      }
-    >
-      <div className="flex flex-col gap-4 px-3 pt-1 pb-3">
+    <div className="flex flex-col gap-4 px-3 pt-1 pb-3">
+        {isError ? (
+          <div role="alert" className="rounded-xl bg-control-subtle px-3 py-2">
+            <Text variant="small-strong">Status unavailable</Text>
+            <Text variant="mini" color="secondary" className="mt-0.5 block">
+              Showing last known status. Controls will return when live updates recover.
+            </Text>
+          </div>
+        ) : null}
+
         {update?.availableVersion ? (
           <UpdateNotice
             availableVersion={update.availableVersion}
-            checking={update.checking || updateMutation.isPending}
-            onView={handleViewRelease}
-            onCheck={() => updateMutation.mutate()}
+            checking={update.checking || updateMutationPending}
+            interactionsDisabled={interactionsDisabled}
+            onView={onViewRelease}
+            onCheck={onCheckForUpdates}
           />
         ) : null}
 
@@ -132,7 +146,7 @@ export function HomeView() {
           <div className="min-w-0 flex-1">
             <Text variant="strong">{statusTitle}</Text>
             <Text variant="small" color="secondary" className="mt-0.5 block">
-              {isLoading ? "Scanning…" : statusDescription}
+              {statusDescription}
             </Text>
           </div>
         </div>
@@ -144,13 +158,15 @@ export function HomeView() {
           <SegmentedControl aria-label="Keep awake mode" className="w-full">
             <SegmentedControlItem
               selected={state.keepAwakeMode === "system"}
-              onSelect={() => handleModeChange("system")}
+              disabled={interactionsDisabled || modeMutationPending}
+              onSelect={() => onModeChange("system")}
             >
               System
             </SegmentedControlItem>
             <SegmentedControlItem
               selected={state.keepAwakeMode === "display"}
-              onSelect={() => handleModeChange("display")}
+              disabled={interactionsDisabled || modeMutationPending}
+              onSelect={() => onModeChange("display")}
             >
               System + Display
             </SegmentedControlItem>
@@ -201,7 +217,57 @@ export function HomeView() {
             </div>
           )}
         </div>
-      </div>
+    </div>
+  );
+}
+
+export function HomeView() {
+  const bridge = useRendererBridge();
+  const queryClient = useQueryClient();
+  const { data: snapshot, isPending, isError } = useAppSnapshot();
+
+  const modeMutation = useMutation({
+    mutationFn: (mode: KeepAwakeMode) => bridge.setKeepAwakeMode(mode),
+    onSuccess: (next) => writeAppSnapshot(queryClient, next),
+  });
+  const updateMutation = useMutation({
+    mutationFn: () => bridge.requestUpdateCheck(),
+    onSuccess: (next) => writeAppSnapshot(queryClient, next),
+  });
+
+  return (
+    <ScrollPanel
+      className="h-full"
+      toolbar={
+        <Toolbar>
+          <ToolbarContent>
+            <PanelTabs />
+          </ToolbarContent>
+          <ToolbarActions>
+            <Badge color={snapshot && !isError && snapshot.monitor.keepingAwake ? "green" : "secondary"}>
+              {snapshotBadgeLabel(snapshot, isPending, isError)}
+            </Badge>
+          </ToolbarActions>
+        </Toolbar>
+      }
+      footer={
+        <div className="flex items-center justify-end px-3 py-2">
+          <Button variant="muted" size="small" onClick={() => void bridge.quit()}>
+            Quit
+          </Button>
+        </div>
+      }
+    >
+      <HomeSnapshotContent
+        snapshot={snapshot}
+        isPending={isPending}
+        isError={isError}
+        modeMutationPending={modeMutation.isPending}
+        updateMutationPending={updateMutation.isPending}
+        onModeChange={(mode) => modeMutation.mutate(mode)}
+        onViewRelease={() => void bridge.openCurrentRelease()}
+        onCheckForUpdates={() => updateMutation.mutate()}
+      />
     </ScrollPanel>
   );
 }

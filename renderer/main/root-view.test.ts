@@ -122,3 +122,31 @@ test("bridge.subscribe pushes complete snapshots straight into the appSnapshot q
     "2.0.0",
   );
 });
+
+test("a subscription snapshot recovers a query whose initial getSnapshot failed", async () => {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  const bridge = createFakeBridge();
+  const unsubscribe = bridge.subscribe((next) => {
+    writeAppSnapshot(queryClient, next);
+  });
+
+  await assert.rejects(
+    queryClient.fetchQuery({
+      queryKey: APP_SNAPSHOT_QUERY_KEY,
+      queryFn: async () => {
+        throw new Error("snapshot unavailable");
+      },
+    }),
+  );
+  assert.equal(queryClient.getQueryState(APP_SNAPSHOT_QUERY_KEY)?.status, "error");
+  assert.equal(queryClient.getQueryData(APP_SNAPSHOT_QUERY_KEY), undefined);
+
+  const recovered = makeSnapshot({ appVersion: "7.0.0" });
+  bridge.emit(recovered);
+
+  assert.equal(queryClient.getQueryState(APP_SNAPSHOT_QUERY_KEY)?.status, "success");
+  assert.deepEqual(queryClient.getQueryData(APP_SNAPSHOT_QUERY_KEY), recovered);
+  unsubscribe();
+});
