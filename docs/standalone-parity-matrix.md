@@ -24,10 +24,11 @@ and never edit a row's `Result` without also filling in `Date`, `Tester`,
 2. Perform the exact scenario in the `Scenario` column against the Glaze
    app first, capturing a screenshot (`docs/parity-evidence/<row-slug>-glaze.png`)
    or log excerpt (`docs/parity-evidence/<row-slug>-glaze.log`) as
-   `Glaze evidence`.
+   `Glaze evidence` — **redacted** per "Evidence redaction requirements"
+   below before it is ever committed.
 3. Perform the identical scenario against the standalone app, capturing
    `docs/parity-evidence/<row-slug>-standalone.png` or `.log` as
-   `Standalone evidence`.
+   `Standalone evidence` — likewise redacted before committing.
 4. Fill in `Date` (ISO 8601), `Tester` (name/handle), and `Build commit`
    (the short SHA both builds were built from) in the `Notes` column.
 5. Set `Result` to `PASS` only if both applications' observed behavior
@@ -37,6 +38,60 @@ and never edit a row's `Result` without also filling in `Date`, `Tester`,
 `docs/parity-evidence/` does not exist yet — create it (git-tracked) only
 once the first row is actually executed; this document does not itself
 create or claim any such artifact.
+
+## Evidence redaction requirements
+
+Every artifact committed under `docs/parity-evidence/` — screenshots and
+`.log` files alike, for **every** row, not just the isolated-storage row
+detailed below — must be redacted before it is ever committed. This
+document, and the evidence it points to, is a permanent, publicly-visible
+part of this git history; it must never leak the tester's real machine,
+account, or in-progress work.
+
+- **Paths: `$HOME`-relative only, never absolute-with-real-username.**
+  Record filesystem locations as `$HOME/Library/Application Support/Seer/`
+  (literal `$HOME`, not the tester's actual resolved home directory, e.g.
+  never `/Users/alice/Library/...`). A path is "canonical" here precisely
+  because it's the same string regardless of which account/machine ran the
+  test — `$HOME`-relative satisfies that; a resolved absolute path does
+  not, since it embeds the tester's real macOS username.
+- **Synthetic sentinel identifiers/values only, never real ones.** Any
+  identifier used to tag seeded state (e.g. the isolated-storage row's
+  probe entries) must be a fixed, fictitious sentinel string committed to
+  this document itself — e.g. `SEER-PARITY-SENTINEL-GLAZE-0001` /
+  `SEER-PARITY-SENTINEL-STANDALONE-0001` — never a real working-directory
+  name, real agent session ID, or a timestamp/UUID freshly generated at
+  test time (a fresh value can't be reused as a stable "known-good"
+  comparison across future re-runs, and risks embedding real local paths
+  if derived from `pwd`).
+- **Normalized selected-field hashes/diffs, never raw file dumps.** When a
+  row's evidence must prove something about `settings.json`/`history.json`
+  contents, never `cat` (or paste) the raw file into committed evidence.
+  Instead, record only the specific fields the row is actually testing
+  (e.g. `keepAwakeMode`'s value, and whether the sentinel entry's `id` is
+  present/absent — never the entry's real working-directory-derived
+  fields), plus a `sha256sum` digest of the *entire* raw file so a future
+  re-run can prove byte-for-byte identity/difference without ever
+  re-exposing the bytes themselves.
+- **Screenshots/logs: redact personal paths and session metadata.** Crop
+  or blur any visible absolute path, real username, machine name, menu-bar
+  clock, or any other session metadata before committing a screenshot;
+  strip the equivalent from `.log` files (e.g. redact real working
+  directories embedded in a history entry's tooltip/detail text down to
+  just the sentinel identifier).
+- **Explicitly prohibited in any committed evidence:**
+  - Raw history/transcript identifiers — real agent session IDs, real
+    working-directory paths from actual agent sessions, or any other
+    identifier that could be traced back to real, in-progress work.
+  - Unredacted JSON — a full `settings.json`/`history.json` (or any other
+    application-state file) pasted or attached in its entirety. Only the
+    selected-field extract and hash described above are permitted.
+
+These requirements exist so this document can prove the two applications'
+storage is genuinely isolated (bidirectional: neither app ever observes the
+other's state) using only synthetic, redacted evidence — never by
+committing anything that could identify the tester, their machine, or the
+real work they were doing at the time.
 
 ## Matrix
 
@@ -109,6 +164,13 @@ account** on the same Mac — not two different accounts, and not two
 different machines — since the entire point of this row is proving the two
 applications never collide on that one account's storage.
 
+All evidence this row produces must follow "Evidence redaction
+requirements" above: `$HOME`-relative paths, synthetic sentinel
+identifiers, normalized selected-field hashes/diffs instead of raw file
+contents, and redacted screenshots/logs. No step below asks for (or
+permits) a raw file dump, a real working-directory path, or any other
+personally- or session-identifying value in committed evidence.
+
 ### 1. Resolve and record both applications' storage paths
 
 Both applications store `settings.json` and `history.json` (identical file
@@ -116,59 +178,76 @@ names — the isolation is entirely about the *containing directory*):
 
 | Application | Containing directory | Source |
 | --- | --- | --- |
-| Glaze (Electron) | `~/Library/Application Support/Seer/` | Electron's default `app.getPath("userData")`, derived from `productName: "Seer"` in `package.json` — see `main/services/settings-store.ts`/`main/services/history-store.ts` |
-| Standalone | `~/Library/Application Support/ai.opencoven.seer/` | `SettingsFileLocation.directoryName`/`HistoryFileLocation`'s hard-coded `"ai.opencoven.seer"` — see `apps/macos/Seer/Sources/Storage/SettingsStore.swift`/`apps/macos/Seer/Sources/History/HistoryStore.swift` |
+| Glaze (Electron) | `$HOME/Library/Application Support/Seer/` | Electron's default `app.getPath("userData")`, derived from `productName: "Seer"` in `package.json` — see `main/services/settings-store.ts`/`main/services/history-store.ts` |
+| Standalone | `$HOME/Library/Application Support/ai.opencoven.seer/` | `SettingsFileLocation.directoryName`/`HistoryFileLocation`'s hard-coded `"ai.opencoven.seer"` — see `apps/macos/Seer/Sources/Storage/SettingsStore.swift`/`apps/macos/Seer/Sources/History/HistoryStore.swift` |
 
-Record the **actual, resolved, absolute paths** you observed on the test
-Mac in the `Notes` column (not just this table) — e.g. via
+Confirm these two directories resolve as expected on the test Mac (e.g. via
 `ls -la ~/"Library/Application Support/Seer" ~/"Library/Application Support/ai.opencoven.seer"`
-run before touching either application, to also capture whether either
-directory pre-existed from earlier testing (if so, back it up or use a
-throwaway macOS account/fresh user first, since a pre-existing directory
-would make "neither app created the other's directory" unobservable).
+run before touching either application) and record only the **canonical,
+`$HOME`-relative** form shown in the table above in the `Notes` column —
+never the tester's actual resolved absolute path (which embeds their real
+macOS username). Also note in `Notes` whether either directory pre-existed
+from earlier testing (if so, back it up or use a throwaway macOS
+account/fresh user first, since a pre-existing directory would make
+"neither app created the other's directory" unobservable) — a fact you can
+record without quoting any of that pre-existing directory's actual
+contents.
 
-### 2. Seed unique, direction-tagged state in each application
+### 2. Seed unique, direction-tagged, synthetic sentinel state in each application
 
 1. Quit both applications entirely (confirm via Activity Monitor or
    `ps aux | grep -i seer`).
-2. Launch **only** Glaze. Set its keep-awake mode to **Display** and open
-   an agent session (or otherwise generate a history entry) tagged in a way
-   that is unmistakably Glaze's own — e.g. an agent working directory named
-   `~/glaze-isolation-probe-<ISO8601 timestamp>`. Quit Glaze.
-3. Capture `docs/parity-evidence/isolated-storage-glaze.log`: the full
-   contents of `~/Library/Application Support/Seer/settings.json` and
-   `history.json` at this point (`cat` both files into the log), plus
-   `ls -la ~/"Library/Application Support/ai.opencoven.seer"` showing it is
-   either absent or unchanged by this step.
+2. Launch **only** Glaze. Set its keep-awake mode to **Display** and
+   generate a history entry tagged with the fixed synthetic sentinel
+   identifier `SEER-PARITY-SENTINEL-GLAZE-0001` (e.g. by naming the probed
+   agent's working directory or session label exactly that literal string
+   — never a real project path, real agent session ID, or a freshly
+   generated timestamp/UUID). Quit Glaze.
+3. Capture `docs/parity-evidence/isolated-storage-glaze.log`: for each of
+   `settings.json` and `history.json`, record (a) a `sha256sum` digest of
+   the full raw file, and (b) only the specific fields this row tests —
+   `keepAwakeMode`'s value, and whether an entry containing
+   `SEER-PARITY-SENTINEL-GLAZE-0001` is present — never the raw file
+   contents themselves. Also record whether
+   `$HOME/Library/Application Support/ai.opencoven.seer` is absent or
+   unchanged by this step (a directory-listing summary, e.g. "absent" or
+   "present, digest unchanged from a prior baseline" — not a raw `ls -la`
+   transcript of a directory that may contain real session metadata).
 4. Launch **only** the standalone app. Set its keep-awake mode to
    **System** (the *other* mode, so the two applications' seeded state is
-   never accidentally identical) and generate a history entry tagged
-   distinctly from Glaze's — e.g.
-   `~/standalone-isolation-probe-<ISO8601 timestamp>`. Quit the standalone
-   app.
-5. Capture `docs/parity-evidence/isolated-storage-standalone.log`: the full
-   contents of `~/Library/Application Support/ai.opencoven.seer/settings.json`
-   and `history.json`, plus `ls -la ~/"Library/Application Support/Seer"`
-   showing Glaze's directory/files from step 3 are byte-for-byte unchanged
-   (compare modification timestamps and content, not merely "still
-   exists").
+   never accidentally identical) and generate a history entry tagged with
+   the fixed synthetic sentinel identifier
+   `SEER-PARITY-SENTINEL-STANDALONE-0001`. Quit the standalone app.
+5. Capture `docs/parity-evidence/isolated-storage-standalone.log`: the same
+   two things as step 3 (per-file sha256 digest plus the
+   `keepAwakeMode`/sentinel-presence extract) for
+   `$HOME/Library/Application Support/ai.opencoven.seer/settings.json` and
+   `history.json`, plus confirmation that Glaze's directory/files from step
+   3 are byte-for-byte unchanged — proven by comparing the step-3
+   `sha256sum` digests against a freshly recomputed one, not by re-pasting
+   file contents.
 
 ### 3. Relaunch both and verify neither observes the other's state
 
 6. Relaunch Glaze. In its History view, confirm **only** the
-   `glaze-isolation-probe-*` entry and **Display** keep-awake mode are
-   present — the standalone app's `standalone-isolation-probe-*` entry and
-   **System** mode must be **absent**. Screenshot as
-   `docs/parity-evidence/isolated-storage-glaze.png`.
+   `SEER-PARITY-SENTINEL-GLAZE-0001` entry and **Display** keep-awake mode
+   are present — the standalone app's
+   `SEER-PARITY-SENTINEL-STANDALONE-0001` entry and **System** mode must be
+   **absent**. Screenshot as `docs/parity-evidence/isolated-storage-glaze.png`,
+   cropped/redacted to the History view itself (no visible file paths,
+   username, machine name, or menu-bar clock).
 7. Relaunch the standalone app. In its History view, confirm **only** the
-   `standalone-isolation-probe-*` entry and **System** keep-awake mode are
-   present — Glaze's `glaze-isolation-probe-*` entry and **Display** mode
-   must be **absent**. Screenshot as
-   `docs/parity-evidence/isolated-storage-standalone.png`.
-8. Append the post-relaunch contents of both applications' `settings.json`/
-   `history.json` to their respective `.log` files from steps 3/5, so the
-   evidence directly shows each file still contains only its own
-   application's seeded state after both relaunches.
+   `SEER-PARITY-SENTINEL-STANDALONE-0001` entry and **System** keep-awake
+   mode are present — Glaze's `SEER-PARITY-SENTINEL-GLAZE-0001` entry and
+   **Display** mode must be **absent**. Screenshot as
+   `docs/parity-evidence/isolated-storage-standalone.png`, redacted the
+   same way.
+8. Append the post-relaunch `sha256sum` digests and `keepAwakeMode`/
+   sentinel-presence extracts (the same normalized form as steps 3/5 — never
+   a raw file dump) for both applications' `settings.json`/`history.json`
+   to their respective `.log` files, so the evidence directly shows each
+   file still contains only its own application's seeded state after both
+   relaunches, without ever exposing either file's actual bytes.
 
 ### Why this row must never pass on "both empty"
 
@@ -177,15 +256,16 @@ and marks this row `PASS` has proven nothing: two empty/absent directories
 are indistinguishable from "the applications share one storage location
 that happens to be empty." This row is only valid evidence once **both**
 applications have been seeded with distinct, non-empty, uniquely-tagged
-state (step 2 above) and relaunched — `PASS` requires observing that each
-application's own seeded state persisted correctly *and* that neither
-application's history/settings view ever displayed the other's tagged
-entry or keep-awake mode. Mark `FAIL` (with the exact entry/mode that
-leaked, in `Notes`) if either application ever shows the other's seeded
-state, or if either application's own seeded state failed to persist
-across its own relaunch (that would be a real regression in this row's own
-right, distinct from cross-application isolation, but must not be
-conflated with a `PASS`).
+synthetic sentinel state (step 2 above) and relaunched — `PASS` requires
+observing that each application's own seeded state persisted correctly
+*and* that neither application's history/settings view ever displayed the
+other's sentinel identifier or keep-awake mode. Mark `FAIL` (with the exact
+sentinel identifier/mode that leaked, in `Notes`) if either application
+ever shows the other's seeded state, or if either application's own seeded
+state failed to persist across its own relaunch (that would be a real
+regression in this row's own right, distinct from cross-application
+isolation, but must not be conflated with a `PASS`).
+
 
 ## What automated coverage already provides
 

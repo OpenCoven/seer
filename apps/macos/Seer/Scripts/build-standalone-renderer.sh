@@ -45,6 +45,11 @@ if ! command -v npm >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! command -v node >/dev/null 2>&1; then
+  echo "error: node not found on PATH (${PATH})" >&2
+  exit 1
+fi
+
 cd "${REPO_ROOT}"
 npm run build:standalone-renderer
 
@@ -53,20 +58,22 @@ if [ ! -f "${DOCUMENT_PATH}" ]; then
   exit 1
 fi
 
-# A lightweight source/build identity marker, copied into the bundle as an
-# ordinary resource (it lives inside the `Renderer` folder `project.yml`
-# already declares as a resources build phase input): the exact commit this
-# renderer was built from, and the moment the build finished. Read back by
+# A deterministic source/build identity marker, copied into the bundle as
+# an ordinary resource (it lives inside the `Renderer` folder `project.yml`
+# already declares as a resources build phase input): a stable content
+# digest over every file this build actually reads (the whole `renderer/`
+# source tree plus the fixed top-level config/lockfile inputs — see
+# `scripts/renderer-build-identity.mjs`, the single shared implementation
+# this script and `RendererIntegrationTests.swift`'s independent Swift
+# recomputation both rely on). Deliberately never a timestamp or `git`
+# commit SHA: a timestamp only proves *when* a build ran, not *what* it was
+# built from, and a commit SHA can't tell a clean checkout apart from one
+# with uncommitted local edits (and is simply unavailable outside a git
+# checkout at all). Read back by
 # `RendererIntegrationTests.BundledRenderer.ensureAvailable()`, which fails
-# closed if any tracked renderer source file was modified *after*
-# `builtAtEpochSeconds` — proving the bundled renderer was actually built
-# from what's on disk right now, not a stale artifact left in `build/`.
-BUILT_AT_EPOCH_SECONDS="$(date -u +%s)"
-GIT_COMMIT="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)"
-
-cat > "${MANIFEST_PATH}" <<MANIFEST
-{
-  "builtAtEpochSeconds": ${BUILT_AT_EPOCH_SECONDS},
-  "gitCommit": "${GIT_COMMIT}"
-}
-MANIFEST
+# closed if the digest it recomputes over the current checkout doesn't
+# exactly match this manifest's `digest` — proving the bundled renderer was
+# actually built from what's on disk right now, not a stale artifact left
+# in `build/` (e.g. from an earlier checkout, or `build/` restored from a
+# cache), regardless of git availability or dirty/uncommitted state.
+node "${REPO_ROOT}/scripts/renderer-build-identity.mjs" "${REPO_ROOT}" "${MANIFEST_PATH}"

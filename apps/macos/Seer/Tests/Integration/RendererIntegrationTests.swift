@@ -1,5 +1,6 @@
 import XCTest
 import WebKit
+import CryptoKit
 @testable import Seer
 
 // MARK: - The real, bundled production renderer
@@ -27,6 +28,31 @@ private enum BundledRenderer {
     private static let documentFileName = "standalone-window.html"
     private static let manifestFileName = "build-manifest.json"
 
+    /// Must match `scripts/renderer-build-identity.mjs`'s own
+    /// `RENDERER_BUILD_MANIFEST_SCHEMA_VERSION`/
+    /// `RENDERER_BUILD_MANIFEST_ALGORITHM` exactly. This Swift
+    /// recomputation and that Node implementation are two independent
+    /// implementations of the exact same digest contract — see
+    /// `RendererBuildIdentityTests` below, which proves both agree
+    /// byte-for-byte over the same committed fixture — so both must first
+    /// agree on the manifest's shape before ever comparing digests.
+    fileprivate static let manifestSchemaVersion = 1
+    fileprivate static let manifestAlgorithm = "sha256"
+
+    /// Same fixed, repo-root-relative files (outside `renderer/`) as
+    /// `scripts/renderer-build-identity.mjs`'s own `TOP_LEVEL_INPUT_FILES`
+    /// — kept in this exact spelling/order deliberately, so the two lists
+    /// are trivially diffable against each other.
+    fileprivate static let topLevelInputFiles = [
+        "standalone-window.html",
+        "vite.standalone.config.ts",
+        "package.json",
+        "package-lock.json",
+        "tsconfig.standalone.json",
+    ]
+
+    fileprivate static let rendererSourceDirName = "renderer"
+
     /// Thrown whenever the bundled renderer document is missing or stale
     /// relative to the checked-out renderer source — surfaced as a real
     /// XCTest setup failure (never `XCTSkip`), so a missing/misconfigured
@@ -50,8 +76,8 @@ private enum BundledRenderer {
     /// long-running child's stdout/stderr pipes) — it only ever *verifies*
     /// what the prebuild step already produced, and fails closed (throws
     /// `SetupFailure`, never `XCTSkip`) both when the document is entirely
-    /// absent and when `build-manifest.json`'s identity marker shows the
-    /// bundle predates the checked-out renderer source (see
+    /// absent and when `build-manifest.json`'s content digest shows the
+    /// bundle no longer corresponds to the checked-out renderer source (see
     /// `verifyManifestIsFresh` below).
     static func ensureAvailable(file: StaticString = #filePath) throws {
         let documentURL = root.url.appendingPathComponent(documentFileName)
@@ -64,21 +90,29 @@ private enum BundledRenderer {
                 apps/macos/Seer and rebuild the Seer target.
                 """)
         }
-        try verifyManifestIsFresh(file: file)
+        let repoRoot = try repoRootURL(fromTestFile: file)
+        try verifyManifestIsFresh(
+            manifestURL: root.url.appendingPathComponent(manifestFileName),
+            repoRoot: repoRoot
+        )
     }
 
-    /// Reads the `builtAtEpochSeconds` identity marker
-    /// `Scripts/build-standalone-renderer.sh` writes into
-    /// `build-manifest.json` alongside the bundled document, and fails
-    /// closed if any file under the renderer source this build actually
-    /// depends on (`renderer/`, `standalone-window.html`,
-    /// `vite.standalone.config.ts`) was modified *after* that build
-    /// completed — proof the bundled renderer genuinely corresponds to the
-    /// current source tree, not a stale artifact left over in `build/`
-    /// from an earlier checkout (e.g. the prebuild phase having been
-    /// bypassed, or `build/` restored from a cache).
-    private static func verifyManifestIsFresh(file: StaticString) throws {
-        let manifestURL = root.url.appendingPathComponent(manifestFileName)
+    /// Reads the deterministic content digest `Scripts/build-standalone-renderer.sh`
+    /// writes into `build-manifest.json` (via the single shared
+    /// `scripts/renderer-build-identity.mjs` implementation), independently
+    /// recomputes that exact same digest over the current checkout's
+    /// renderer build inputs, and fails closed unless they match exactly —
+    /// proof the bundled renderer genuinely corresponds to the current
+    /// source tree, never a stale artifact left over in `build/` from an
+    /// earlier checkout (e.g. the prebuild phase having been bypassed, or
+    /// `build/` restored from a cache). Deliberately never compares
+    /// timestamps or `git` state: a wall-clock timestamp only proves *when*
+    /// a build ran, never *what* it was built from, and a commit SHA can't
+    /// tell a clean checkout apart from one with uncommitted local edits
+    /// (and is simply unavailable outside a git checkout at all) — so this
+    /// check is exactly as strict with dirty/uncommitted renderer source or
+    /// no git repository present as it is with a clean one.
+    fileprivate static func verifyManifestIsFresh(manifestURL: URL, repoRoot: URL) throws {
         guard let data = FileManager.default.contents(atPath: manifestURL.path) else {
             throw SetupFailure(description: """
                 Bundled renderer manifest not found at \(manifestURL.path); the "Build standalone \
@@ -88,68 +122,102 @@ private enum BundledRenderer {
         }
         guard
             let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-            let builtAtEpochSeconds = json["builtAtEpochSeconds"] as? Double
+            let schemaVersion = json["schemaVersion"] as? Int,
+            let algorithm = json["algorithm"] as? String,
+            let digest = json["digest"] as? String
         else {
             throw SetupFailure(description: """
                 Bundled renderer manifest at \(manifestURL.path) is malformed: \
                 \(String(data: data, encoding: .utf8) ?? "<non-UTF8 contents>")
                 """)
         }
-        let builtAt = Date(timeIntervalSince1970: builtAtEpochSeconds)
+        guard schemaVersion == manifestSchemaVersion, algorithm == manifestAlgorithm else {
+            throw SetupFailure(description: """
+                Bundled renderer manifest at \(manifestURL.path) has an unsupported \
+                schemaVersion/algorithm (\(schemaVersion)/\(algorithm)); expected \
+                \(manifestSchemaVersion)/\(manifestAlgorithm). Regenerate it with the current "Build \
+                standalone renderer" preBuildScripts phase.
+                """)
+        }
 
-        let repoRoot = try repoRootURL(fromTestFile: file)
-        let trackedSourcePaths = [
-            repoRoot.appendingPathComponent("renderer", isDirectory: true),
-            repoRoot.appendingPathComponent("standalone-window.html"),
-            repoRoot.appendingPathComponent("vite.standalone.config.ts"),
-        ]
-
-        for path in trackedSourcePaths {
-            guard let newestModification = try latestModificationDate(under: path) else { continue }
-            guard newestModification <= builtAt else {
-                throw SetupFailure(description: """
-                    Bundled renderer at \(root.url.path) was built at \(builtAt) (per \
-                    \(manifestURL.path)), but \(path.path) has a file modified at \
-                    \(newestModification) — after that build completed. The bundled renderer is stale \
-                    relative to the current renderer source; rebuild the Seer target (its "Build \
-                    standalone renderer" preBuildScripts phase runs automatically) before running these \
-                    tests again.
-                    """)
-            }
+        let expectedDigest = try computeRendererSourceDigest(repoRoot: repoRoot)
+        guard digest.lowercased() == expectedDigest else {
+            throw SetupFailure(description: """
+                Bundled renderer at \(root.url.path) was built with content digest \(digest) (per \
+                \(manifestURL.path)), but independently recomputing that same digest over the current \
+                checkout's renderer build inputs (\(rendererSourceDirName)/, \
+                \(topLevelInputFiles.joined(separator: ", "))) yields \(expectedDigest) instead. The \
+                bundled renderer is stale relative to the current renderer source; rebuild the Seer \
+                target (its "Build standalone renderer" preBuildScripts phase runs automatically) \
+                before running these tests again.
+                """)
         }
     }
 
-    /// The latest modification date of `path` itself (if it is a file) or
-    /// of any file it recursively contains (if it is a directory); `nil`
-    /// if `path` does not exist on disk at all (nothing to compare
-    /// against — e.g. a repository layout that no longer has this path).
-    private static func latestModificationDate(under path: URL) throws -> Date? {
+    /// Independently recomputes the exact same deterministic content digest
+    /// `scripts/renderer-build-identity.mjs`'s `computeRendererBuildDigest`
+    /// computes: lowercase hex SHA-256 over a stable manifest of
+    /// `<posix-relative-path>:<sha256-hex-of-file-bytes>\n` lines — one per
+    /// file returned by `rendererBuildInputFiles`, sorted by path.
+    fileprivate static func computeRendererSourceDigest(repoRoot: URL) throws -> String {
+        let relativePaths = try rendererBuildInputFiles(repoRoot: repoRoot)
+        var manifestLines = ""
+        for relativePath in relativePaths {
+            let absoluteURL = repoRoot.appendingPathComponent(relativePath)
+            let contents = try Data(contentsOf: absoluteURL)
+            manifestLines += "\(relativePath):\(sha256Hex(contents))\n"
+        }
+        return sha256Hex(Data(manifestLines.utf8))
+    }
+
+    /// Every path (relative to `repoRoot`, POSIX-style, sorted) this
+    /// digest depends on: `renderer/` walked recursively, plus whichever of
+    /// `topLevelInputFiles` actually exist on disk. Mirrors
+    /// `rendererBuildInputFiles` in `scripts/renderer-build-identity.mjs`
+    /// exactly — never returns an absolute path.
+    fileprivate static func rendererBuildInputFiles(repoRoot: URL) throws -> [String] {
         let fileManager = FileManager.default
-        var isDirectory: ObjCBool = false
-        guard fileManager.fileExists(atPath: path.path, isDirectory: &isDirectory) else { return nil }
+        var absoluteFiles: [URL] = []
 
-        guard isDirectory.boolValue else {
-            let attributes = try fileManager.attributesOfItem(atPath: path.path)
-            return attributes[.modificationDate] as? Date
-        }
-
-        guard let enumerator = fileManager.enumerator(
-            at: path,
-            includingPropertiesForKeys: [.contentModificationDateKey, .isDirectoryKey],
+        let rendererDir = repoRoot.appendingPathComponent(rendererSourceDirName, isDirectory: true)
+        if let enumerator = fileManager.enumerator(
+            at: rendererDir,
+            includingPropertiesForKeys: [.isDirectoryKey],
             options: [.skipsHiddenFiles]
-        ) else {
-            return nil
-        }
-
-        var latest: Date?
-        for case let fileURL as URL in enumerator {
-            let values = try fileURL.resourceValues(forKeys: [.contentModificationDateKey, .isDirectoryKey])
-            guard values.isDirectory != true, let modified = values.contentModificationDate else { continue }
-            if latest == nil || modified > latest! {
-                latest = modified
+        ) {
+            for case let fileURL as URL in enumerator {
+                let values = try fileURL.resourceValues(forKeys: [.isDirectoryKey])
+                if values.isDirectory != true {
+                    absoluteFiles.append(fileURL)
+                }
             }
         }
-        return latest
+
+        for relativePath in topLevelInputFiles {
+            let absolutePath = repoRoot.appendingPathComponent(relativePath)
+            var isDirectory: ObjCBool = false
+            if fileManager.fileExists(atPath: absolutePath.path, isDirectory: &isDirectory), !isDirectory.boolValue {
+                absoluteFiles.append(absolutePath)
+            }
+        }
+
+        let relativePaths = absoluteFiles.map { posixRelativePath(of: $0, relativeTo: repoRoot) }
+        return relativePaths.sorted()
+    }
+
+    /// `fileURL`'s path relative to `repoRoot`, always using `/` — never
+    /// the absolute path, and never leaking `repoRoot`'s own on-disk
+    /// location into the (relative) result.
+    fileprivate static func posixRelativePath(of fileURL: URL, relativeTo repoRoot: URL) -> String {
+        let filePath = fileURL.standardizedFileURL.path
+        let rootPath = repoRoot.standardizedFileURL.path
+        let rootPrefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
+        guard filePath.hasPrefix(rootPrefix) else { return filePath }
+        return String(filePath.dropFirst(rootPrefix.count))
+    }
+
+    fileprivate static func sha256Hex(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     /// Derives the repository root by walking upward from this very
@@ -303,6 +371,129 @@ final class RendererIntegrationTests: XCTestCase {
             discovered.path.hasSuffix("/apps"),
             "must not undershoot to <repo>/apps, the previous fixed-depth bug's exact failure mode"
         )
+    }
+
+    /// Proves this Swift recomputation and `scripts/renderer-build-identity.mjs`'s
+    /// independent Node implementation are genuinely the same digest
+    /// contract — not two implementations that merely happen to agree with
+    /// themselves — by both reading the exact same committed fixture
+    /// (`tests/fixtures/renderer-build-identity/repo`) and its single
+    /// `expected-digest.txt` oracle (see
+    /// `tests/renderer-build-identity.test.mjs`'s
+    /// "matches the shared cross-language fixture oracle" test, which
+    /// asserts the identical thing from the Node side). Neither language
+    /// restates the expected digest value as a literal in test code, so a
+    /// change to one implementation that silently diverges from the other
+    /// shows up as a cross-language mismatch here, not a same-language
+    /// tautology.
+    func testComputeRendererSourceDigestMatchesSharedCrossLanguageFixtureOracle() throws {
+        let repoRoot = try BundledRenderer.repoRootURL(fromTestFile: #filePath)
+        let fixtureDir = repoRoot
+            .appendingPathComponent("tests", isDirectory: true)
+            .appendingPathComponent("fixtures", isDirectory: true)
+            .appendingPathComponent("renderer-build-identity", isDirectory: true)
+        let fixtureRepo = fixtureDir.appendingPathComponent("repo", isDirectory: true)
+        let expectedDigestURL = fixtureDir.appendingPathComponent("expected-digest.txt")
+
+        let expectedDigest = try String(contentsOf: expectedDigestURL, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let actualDigest = try BundledRenderer.computeRendererSourceDigest(repoRoot: fixtureRepo)
+
+        XCTAssertEqual(
+            actualDigest,
+            expectedDigest,
+            "the Swift digest must match the fixture oracle Node's independent recomputation also reads"
+        )
+    }
+
+    /// Proves `BundledRenderer.verifyManifestIsFresh` — the exact function
+    /// `ensureAvailable()`'s precondition relies on to fail closed — both
+    /// accepts a manifest whose digest genuinely matches the current
+    /// source tree, and rejects (throws `SetupFailure`, never silently
+    /// passes) one whose digest no longer matches after relevant source
+    /// changed. Exercised against a disposable copy of the shared fixture
+    /// repo, mutated in place, so this never touches the real repository's
+    /// own `renderer/` tree.
+    func testVerifyManifestIsFreshAcceptsAMatchingDigestAndRejectsAStaleOne() throws {
+        let repoRoot = try BundledRenderer.repoRootURL(fromTestFile: #filePath)
+        let fixtureRepo = repoRoot
+            .appendingPathComponent("tests", isDirectory: true)
+            .appendingPathComponent("fixtures", isDirectory: true)
+            .appendingPathComponent("renderer-build-identity", isDirectory: true)
+            .appendingPathComponent("repo", isDirectory: true)
+
+        let fileManager = FileManager.default
+        let scratchRoot = fileManager.temporaryDirectory
+            .appendingPathComponent("seer-renderer-build-identity-swift-\(UUID().uuidString)", isDirectory: true)
+        let scratchRepo = scratchRoot.appendingPathComponent("repo", isDirectory: true)
+        try fileManager.createDirectory(at: scratchRoot, withIntermediateDirectories: true)
+        try fileManager.copyItem(at: fixtureRepo, to: scratchRepo)
+        defer { try? fileManager.removeItem(at: scratchRoot) }
+
+        let manifestURL = scratchRoot.appendingPathComponent("build-manifest.json")
+        let freshDigest = try BundledRenderer.computeRendererSourceDigest(repoRoot: scratchRepo)
+        let freshManifest = """
+            {"schemaVersion": \(BundledRenderer.manifestSchemaVersion), \
+            "algorithm": "\(BundledRenderer.manifestAlgorithm)", "digest": "\(freshDigest)"}
+            """
+        try freshManifest.write(to: manifestURL, atomically: true, encoding: .utf8)
+
+        XCTAssertNoThrow(
+            try BundledRenderer.verifyManifestIsFresh(manifestURL: manifestURL, repoRoot: scratchRepo),
+            "a manifest digest that matches the current source tree must be accepted"
+        )
+
+        // Mutate a file the digest actually depends on *after* the manifest
+        // was written — the exact "stale bundle" scenario this precondition
+        // exists to catch.
+        let rendererFile = scratchRepo.appendingPathComponent("renderer/index.ts")
+        let originalContents = try String(contentsOf: rendererFile, encoding: .utf8)
+        try (originalContents + "// modified after the manifest was written\n").write(
+            to: rendererFile,
+            atomically: true,
+            encoding: .utf8
+        )
+
+        XCTAssertThrowsError(
+            try BundledRenderer.verifyManifestIsFresh(manifestURL: manifestURL, repoRoot: scratchRepo),
+            "a manifest digest that no longer matches modified source must be rejected"
+        ) { error in
+            XCTAssertTrue(
+                error is BundledRenderer.SetupFailure,
+                "expected a SetupFailure, got \(error)"
+            )
+        }
+    }
+
+    /// `verifyManifestIsFresh` must also fail closed on a manifest with an
+    /// unrecognized `schemaVersion`/`algorithm` — never silently trust a
+    /// `digest` field produced under a contract this code doesn't
+    /// implement.
+    func testVerifyManifestIsFreshRejectsAnUnsupportedSchemaVersion() throws {
+        let repoRoot = try BundledRenderer.repoRootURL(fromTestFile: #filePath)
+        let fixtureRepo = repoRoot
+            .appendingPathComponent("tests", isDirectory: true)
+            .appendingPathComponent("fixtures", isDirectory: true)
+            .appendingPathComponent("renderer-build-identity", isDirectory: true)
+            .appendingPathComponent("repo", isDirectory: true)
+
+        let fileManager = FileManager.default
+        let scratchRoot = fileManager.temporaryDirectory
+            .appendingPathComponent("seer-renderer-build-identity-schema-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: scratchRoot, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: scratchRoot) }
+
+        let manifestURL = scratchRoot.appendingPathComponent("build-manifest.json")
+        let digest = try BundledRenderer.computeRendererSourceDigest(repoRoot: fixtureRepo)
+        try """
+            {"schemaVersion": 999, "algorithm": "sha256", "digest": "\(digest)"}
+            """.write(to: manifestURL, atomically: true, encoding: .utf8)
+
+        XCTAssertThrowsError(
+            try BundledRenderer.verifyManifestIsFresh(manifestURL: manifestURL, repoRoot: fixtureRepo)
+        ) { error in
+            XCTAssertTrue(error is BundledRenderer.SetupFailure, "expected a SetupFailure, got \(error)")
+        }
     }
 
     /// One full, real Swift-side stack: a real `PanelController` (and
