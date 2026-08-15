@@ -27,7 +27,7 @@ jobs:
       prepare-runner-id: ${{ steps.release-input.outputs.prepare-runner-id }}
       unsigned-archive-sha256: ${{ steps.release-input.outputs.unsigned-archive-sha256 }}
       unsigned-attestation-sha256: ${{ steps.release-input.outputs.unsigned-attestation-sha256 }}
-      artifact-id: ${{ steps.upload-release-input.outputs.artifact-id }}
+      artifact-name: ${{ steps.release-input.outputs.artifact-name }}
     steps:
       - name: Reject invalid source, tag, build, or runner
         env:
@@ -171,6 +171,7 @@ jobs:
           BUILD_NUMBER: ${{ github.run_number }}
           SOURCE_COMMIT: ${{ github.sha }}
           PREPARE_RUNNER_ID: gha:${{ github.run_id }}:${{ github.run_attempt }}:prepare
+          ARTIFACT_NAME: seer-unsigned-release-input-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
           bash scripts/prepare-macos-release-input.sh
@@ -197,13 +198,14 @@ jobs:
           printf 'prepare-runner-id=%s\n' "${PREPARE_RUNNER_ID}" >> "${GITHUB_OUTPUT}"
           printf 'unsigned-archive-sha256=%s\n' "${archive_sha256}" >> "${GITHUB_OUTPUT}"
           printf 'unsigned-attestation-sha256=%s\n' "${attestation_sha256}" >> "${GITHUB_OUTPUT}"
+          printf 'artifact-name=%s\n' "${ARTIFACT_NAME}" >> "${GITHUB_OUTPUT}"
 
       - name: Upload only the attested unsigned release input
         id: upload-release-input
         # v4.6.2, resolved from refs/tags/v4
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: seer-unsigned-release-input-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ steps.release-input.outputs.artifact-name }}
           path: |
             build/macos/release-input/Seer-unsigned-arm64.tar
             build/macos/release-input/unsigned-app-attestation.json
@@ -357,13 +359,18 @@ jobs:
           [[ ! -e build/macos/release-input && ! -L build/macos/release-input ]]
           mkdir -p build/macos/release-input
 
+      # Downloading by exact `name:` (rather than `artifact-ids:`) makes
+      # download-artifact treat this as a single-artifact download, which it
+      # always extracts directly into `path` with no artifact-named
+      # subdirectory. Using `artifact-ids:` here would nest the two prepared
+      # files one level deeper even with a single ID, breaking the flat
+      # `release-input/{archive,attestation}` paths the signing step expects.
       - name: Download only the prepared input artifact
         # v4.3.0, resolved from refs/tags/v4
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          artifact-ids: ${{ needs.prepare.outputs.artifact-id }}
+          name: ${{ needs.prepare.outputs.artifact-name }}
           path: build/macos/release-input
-          merge-multiple: false
 
       - name: Verify attested input and distinct runner identity
         id: signing-input

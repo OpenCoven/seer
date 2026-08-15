@@ -93,13 +93,56 @@ test("prepare is credential-free, runs the complete standalone gate, and uploads
     prepare,
     /unsigned-attestation-sha256: \$\{\{ steps\.release-input\.outputs\.unsigned-attestation-sha256 \}\}/,
   );
-  assert.match(prepare, /artifact-id: \$\{\{ steps\.upload-release-input\.outputs\.artifact-id \}\}/);
+  assert.match(prepare, /artifact-name: \$\{\{ steps\.release-input\.outputs\.artifact-name \}\}/);
+  assert.match(
+    prepare,
+    /ARTIFACT_NAME: seer-unsigned-release-input-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/,
+  );
+  assert.match(prepare, /printf 'artifact-name=%s\\n' "\$\{ARTIFACT_NAME\}" >> "\$\{GITHUB_OUTPUT\}"/);
+  assert.match(prepare, /name: \$\{\{ steps\.release-input\.outputs\.artifact-name \}\}/);
   assert.match(
     prepare,
     /path: \|\n\s+build\/macos\/release-input\/Seer-unsigned-arm64\.tar\n\s+build\/macos\/release-input\/unsigned-app-attestation\.json/,
   );
   assert.equal((prepare.match(/actions\/upload-artifact@/g) ?? []).length, 1);
   assert.doesNotMatch(prepare, /build\/macos\/release-input\/\*|gh release|\bAPPLE_/);
+  assert.doesNotMatch(prepare, /artifact-id/);
+});
+
+test("prepared release input is downloaded by exact name into a flat root and checked for exactly two files before signing", () => {
+  const signing = jobBlock("sign-and-release");
+  const steps = stepBlocks(signing);
+  const downloadStep = steps.find((step) => step.includes("actions/download-artifact@"));
+  const verifyStep = steps.find((step) => step.includes("id: signing-input"));
+
+  // download-artifact only extracts directly into `path` (no artifact-named
+  // subdirectory) when it resolves a single artifact via `name:`. Passing
+  // `artifact-ids:` instead — even with one ID — nests output one directory
+  // deeper unless `merge-multiple: true` is also set, which would break the
+  // flat `release-input/{archive,attestation}` paths used below and in the
+  // prepare job's own local checks.
+  assert.ok(downloadStep, "download-artifact step must exist in the signing job");
+  assert.match(downloadStep, /name: \$\{\{ needs\.prepare\.outputs\.artifact-name \}\}/);
+  assert.doesNotMatch(downloadStep, /^\s+artifact-ids:/m);
+  assert.match(downloadStep, /path: build\/macos\/release-input/);
+
+  assert.ok(verifyStep, "signing-input verification step must exist");
+  assert.match(
+    verifyStep,
+    /entry_count="\$\(find "\$\{input_dir\}" -mindepth 1 -maxdepth 1 -print \| wc -l \| tr -d ' '\)"/,
+  );
+  assert.match(verifyStep, /\[\[ "\$\{entry_count\}" == "2" \]\]/);
+  assert.match(verifyStep, /archive="\$\{input_dir\}\/Seer-unsigned-arm64\.tar"/);
+  assert.match(verifyStep, /attestation="\$\{input_dir\}\/unsigned-app-attestation\.json"/);
+  assert.match(verifyStep, /\[\[ -f "\$\{archive\}" && ! -L "\$\{archive\}" \]\]/);
+  assert.match(verifyStep, /\[\[ -f "\$\{attestation\}" && ! -L "\$\{attestation\}" \]\]/);
+
+  // The extras-rejecting entry-count check must run before any signing or
+  // notarization step touches the downloaded input.
+  const downloadIndex = signing.indexOf(downloadStep);
+  const verifyIndex = signing.indexOf(verifyStep);
+  const signIndex = signing.indexOf("Sign and notarize attested input");
+  assert.ok(downloadIndex < verifyIndex && verifyIndex < signIndex);
 });
 
 test("signing uses a protected fresh job and rejects gates and identity mismatches before secrets", () => {
@@ -119,7 +162,8 @@ test("signing uses a protected fresh job and rejects gates and identity mismatch
   assert.match(signing, /SIGNING_RUNNER_ID: gha:\$\{\{ github\.run_id \}\}:\$\{\{ github\.run_attempt \}\}:sign/);
   assert.match(signing, /plutil -extract prepareRunnerId raw/);
   assert.match(signing, /attested_prepare_runner_id.*SIGNING_RUNNER_ID|SIGNING_RUNNER_ID.*attested_prepare_runner_id/s);
-  assert.match(signing, /artifact-ids: \$\{\{ needs\.prepare\.outputs\.artifact-id \}\}/);
+  assert.match(signing, /name: \$\{\{ needs\.prepare\.outputs\.artifact-name \}\}/);
+  assert.doesNotMatch(signing, /^\s+artifact-ids:|^\s+merge-multiple:/m);
   assert.match(signing, /unsigned-app archive SHA-256 mismatch/);
   assert.match(signing, /unsigned-app attestation SHA-256 mismatch/);
   assert.doesNotMatch(signing, /\bnpm (?:ci|install|run)\b|\bnpx\b|\bxcodegen\b|node_modules/);
