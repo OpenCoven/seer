@@ -67,6 +67,13 @@ public enum BridgeErrorCode: String, Sendable, Equatable {
     case unknownMethod = "unknown_method"
     case commandFailed = "command_failed"
     case commandUnavailable = "command_unavailable"
+    /// Reported for any bridge command dispatched at or after the exact
+    /// instant Seer's orderly termination begins — see
+    /// `BridgeMessageHandler.stopAccepting()`. Distinct from
+    /// `commandUnavailable` (a command with no real implementation
+    /// wired up at all) so the renderer can, if useful, tell "will never
+    /// work in this build" apart from "the app is quitting right now."
+    case appShuttingDown = "app_shutting_down"
 }
 
 /// Wire error payload sent back to the renderer for a failed request.

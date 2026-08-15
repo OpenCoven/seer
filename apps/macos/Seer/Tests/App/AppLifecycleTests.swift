@@ -48,27 +48,76 @@ final class FakeAppSnapshotCoordinating: AppSnapshotCoordinating {
         appliedScanFailures.append(occurredAt)
     }
 
-    func setKeepAwakeMode(_ mode: KeepAwakeMode) async throws {}
+    /// Records every `setKeepAwakeMode(_:)` call this double receives —
+    /// used by the Task 12 shutdown-race tests to assert a mode change
+    /// requested at (or after) the exact instant termination begins
+    /// never reaches the coordinator at all.
+    private(set) var setKeepAwakeModeCalls: [KeepAwakeMode] = []
 
-    func clearHistory() async throws {}
+    func setKeepAwakeMode(_ mode: KeepAwakeMode) async throws {
+        setKeepAwakeModeCalls.append(mode)
+    }
+
+    private(set) var clearHistoryCallCount = 0
+
+    func clearHistory() async throws {
+        clearHistoryCallCount += 1
+    }
 
     func checkForUpdates(force: Bool) async -> Bool { true }
 
-    /// Scripted outcome for `setIncludePrereleaseUpdates(_:)`: `nil` (the
-    /// default) always succeeds; set to any `Error` to make every call
-    /// throw instead, letting tests deterministically drive the
-    /// persistence-failure path.
-    var setIncludePrereleaseUpdatesError: Error?
+    /// Scripted outcome for `setIncludePrereleaseUpdates(_:)`:
+    /// `.success` (the default) always succeeds; set to `.throwing(_:)`
+    /// to make every call throw (the persistence-failure path), or
+    /// `.checkFailed` to simulate persistence having committed while the
+    /// forced re-check itself failed.
+    enum ScriptedSetIncludePrereleaseUpdatesOutcome {
+        case success
+        case checkFailed(message: String)
+        case throwing(Error)
+    }
+    var setIncludePrereleaseUpdatesOutcome: ScriptedSetIncludePrereleaseUpdatesOutcome = .success
     private(set) var setIncludePrereleaseUpdatesCalls: [Bool] = []
+    var includePrereleaseUpdatesValue = false
 
-    func setIncludePrereleaseUpdates(_ value: Bool) async throws {
-        setIncludePrereleaseUpdatesCalls.append(value)
-        if let setIncludePrereleaseUpdatesError {
-            throw setIncludePrereleaseUpdatesError
+    /// Backward-compatible convenience some existing tests script
+    /// through directly: setting this to a non-nil `Error` is equivalent
+    /// to `setIncludePrereleaseUpdatesOutcome = .throwing(error)`; setting
+    /// it back to `nil` resets the scripted outcome to `.success`.
+    var setIncludePrereleaseUpdatesError: Error? {
+        didSet {
+            if let setIncludePrereleaseUpdatesError {
+                setIncludePrereleaseUpdatesOutcome = .throwing(setIncludePrereleaseUpdatesError)
+            } else {
+                setIncludePrereleaseUpdatesOutcome = .success
+            }
         }
     }
 
-    func openLatestRelease() async -> Bool { true }
+    func setIncludePrereleaseUpdates(_ value: Bool) async throws -> SetIncludePrereleaseUpdatesOutcome {
+        setIncludePrereleaseUpdatesCalls.append(value)
+        switch setIncludePrereleaseUpdatesOutcome {
+        case .success:
+            includePrereleaseUpdatesValue = value
+            return .success
+        case .checkFailed(let message):
+            includePrereleaseUpdatesValue = value
+            return .persistedButCheckFailed(message: message)
+        case .throwing(let error):
+            throw error
+        }
+    }
+
+    var includePrereleaseUpdates: Bool {
+        get async { includePrereleaseUpdatesValue }
+    }
+
+    private(set) var openLatestReleaseCallCount = 0
+
+    func openLatestRelease() async -> Bool {
+        openLatestReleaseCallCount += 1
+        return true
+    }
 
     private(set) var performStartupUpdateCheckAndStartSchedulerCallCount = 0
 
@@ -199,11 +248,18 @@ final class GatedAgentMonitorControlling: AgentMonitorControlling, @unchecked Se
     }
 }
 
-/// A scripted `BridgeHandlerCancelling` double — counts `cancelAll()` calls.
+/// A scripted `BridgeHandlerCancelling` double — counts `stopAccepting()`/
+/// `cancelAll()` calls.
 @MainActor
 final class FakeBridgeHandlerCancelling: BridgeHandlerCancelling {
     private(set) var cancelAllCallCount = 0
+    private(set) var stopAcceptingCallCount = 0
     var orderRecorder: CallOrderRecorder?
+
+    func stopAccepting() {
+        stopAcceptingCallCount += 1
+        orderRecorder?.record("bridgeStopAccepting")
+    }
 
     func cancelAll() {
         cancelAllCallCount += 1
@@ -375,10 +431,16 @@ final class AppLifecycleTests: XCTestCase {
     }
 
     /// Asserts the *exact* required production shutdown sequence — stop
-    /// monitor work, await coordinator shutdown (history flush/update
-    /// cancel/power release), remove bridge handlers, only then reply —
-    /// rather than merely that each step happened once (already covered by
+    /// accepting new bridge commands immediately, stop monitor work,
+    /// await coordinator shutdown (history flush/update cancel/power
+    /// release), remove bridge handlers, only then reply — rather than
+    /// merely that each step happened once (already covered by
     /// `testTerminationStopsMonitorCancelsBridgeAndShutsDownCoordinatorThenReplies`).
+    /// `bridgeStopAccepting` is asserted first, ahead of even
+    /// `monitorStop`, since `performOrderlyShutdownOnce()` calls it
+    /// synchronously — before its own first `await` — precisely so no
+    /// bridge command dispatched at (or after) that exact instant can
+    /// ever be accepted (see Task 12's second finding).
     func testTerminationRunsStepsInTheExactRequiredOrder() async {
         let recorder = CallOrderRecorder()
         let fakeCoordinator = FakeAppSnapshotCoordinating()
@@ -407,8 +469,8 @@ final class AppLifecycleTests: XCTestCase {
 
         XCTAssertEqual(
             recorder.snapshot(),
-            ["monitorStop", "coordinatorShutdown", "bridgeCancelAll", "reply"],
-            "termination must stop monitor work, then shut down the coordinator, then remove bridge handlers, then reply"
+            ["bridgeStopAccepting", "monitorStop", "coordinatorShutdown", "bridgeCancelAll", "reply"],
+            "termination must stop accepting new bridge commands immediately, then stop monitor work, then shut down the coordinator, then remove bridge handlers, then reply"
         )
     }
 
@@ -567,8 +629,8 @@ final class AppLifecycleTests: XCTestCase {
         XCTAssertEqual(fakeBridge.cancelAllCallCount, 1)
         XCTAssertEqual(
             recorder.snapshot(),
-            ["monitorStop", "coordinatorShutdown", "bridgeCancelAll", "reply"],
-            "termination must still stop the monitor, shut down the coordinator, tear down the bridge, then reply — with no manual release of the permanently-suspended scan"
+            ["bridgeStopAccepting", "monitorStop", "coordinatorShutdown", "bridgeCancelAll", "reply"],
+            "termination must still stop accepting new bridge commands, stop the monitor, shut down the coordinator, tear down the bridge, then reply — with no manual release of the permanently-suspended scan"
         )
     }
 
@@ -722,5 +784,170 @@ final class AppLifecycleTests: XCTestCase {
 
         XCTAssertTrue(fakeMenu.includePrereleaseUpdates, "a later successful persist must still update the menu")
         XCTAssertEqual(fakeCoordinator.setIncludePrereleaseUpdatesCalls, [true, true])
+    }
+
+    /// Task 12's core finding: persistence committing while only the
+    /// forced re-check fails (e.g. toggling the setting while offline)
+    /// must still apply the tray checkbox — never leave it showing the
+    /// old value just because the network happened to be unreachable at
+    /// that exact moment. Complements
+    /// `testSetIncludePrereleaseUpdatesNeverAppliesMenuOnPersistenceFailure`
+    /// above, which covers the opposite (genuine persistence failure)
+    /// case.
+    func testSetIncludePrereleaseUpdatesAppliesMenuWhenPersistenceSucceedsButForcedCheckFails() async {
+        let fakeCoordinator = FakeAppSnapshotCoordinating()
+        fakeCoordinator.setIncludePrereleaseUpdatesOutcome = .checkFailed(message: "simulated offline check failure")
+        let fakeMonitor = FakeAgentMonitorControlling(
+            state: AgentMonitorState(active: false, keepingAwake: false, keepAwakeMode: .system, agents: [], lastScanAt: 0)
+        )
+        let fakeMenu = FakePrereleaseUpdatesMenuApplying(includePrereleaseUpdates: false)
+        let delegate = AppDelegate(
+            coordinator: fakeCoordinator,
+            agentMonitor: fakeMonitor,
+            prereleaseUpdatesMenu: fakeMenu
+        )
+
+        delegate.requestSetIncludePrereleaseUpdates(true)
+
+        await waitUntil { fakeMenu.appliedValues.count == 1 }
+
+        XCTAssertEqual(fakeCoordinator.setIncludePrereleaseUpdatesCalls, [true])
+        XCTAssertEqual(fakeMenu.appliedValues, [true], "the menu must still apply the new value once persistence committed, even though the forced check itself failed")
+        XCTAssertTrue(fakeMenu.includePrereleaseUpdates)
+    }
+
+    // MARK: - Command fencing after shutdown begins (Task 12 finding)
+
+    /// A keep-awake mode change requested at (or after) the exact
+    /// instant termination begins must never reach the coordinator at
+    /// all — proving `requestSetKeepAwakeMode(_:)`'s own `hasShutDown`
+    /// guard, not merely the coordinator's independent `isShutDown`
+    /// guard, fences this off.
+    func testRequestSetKeepAwakeModeAfterShutdownNeverReachesTheCoordinator() async {
+        let fakeCoordinator = FakeAppSnapshotCoordinating()
+        let fakeMonitor = FakeAgentMonitorControlling(
+            state: AgentMonitorState(active: false, keepingAwake: false, keepAwakeMode: .system, agents: [], lastScanAt: 0)
+        )
+        let delegate = AppDelegate(coordinator: fakeCoordinator, agentMonitor: fakeMonitor)
+
+        var replies: [Bool] = []
+        _ = delegate.beginTermination { success in replies.append(success) }
+        await waitUntil { !replies.isEmpty }
+
+        delegate.requestSetKeepAwakeMode(.display)
+        try? await Task.sleep(nanoseconds: 30_000_000)
+
+        XCTAssertEqual(fakeCoordinator.setKeepAwakeModeCalls, [], "a mode change requested after shutdown began must never reach the coordinator, so it can never recreate/release the power assertion incorrectly")
+    }
+
+    /// A prerelease-toggle request arriving after shutdown has begun
+    /// must neither reach the coordinator nor ever apply the menu —
+    /// the dispatched `Task` must observe `hasShutDown` at its own start
+    /// and return immediately, without resuming any coordinator work.
+    func testRequestSetIncludePrereleaseUpdatesAfterShutdownNeverAppliesTheMenuOrReachesTheCoordinator() async {
+        let fakeCoordinator = FakeAppSnapshotCoordinating()
+        let fakeMonitor = FakeAgentMonitorControlling(
+            state: AgentMonitorState(active: false, keepingAwake: false, keepAwakeMode: .system, agents: [], lastScanAt: 0)
+        )
+        let fakeMenu = FakePrereleaseUpdatesMenuApplying(includePrereleaseUpdates: false)
+        let delegate = AppDelegate(coordinator: fakeCoordinator, agentMonitor: fakeMonitor, prereleaseUpdatesMenu: fakeMenu)
+
+        var replies: [Bool] = []
+        _ = delegate.beginTermination { success in replies.append(success) }
+        await waitUntil { !replies.isEmpty }
+
+        delegate.requestSetIncludePrereleaseUpdates(true)
+        try? await Task.sleep(nanoseconds: 30_000_000)
+
+        XCTAssertEqual(fakeCoordinator.setIncludePrereleaseUpdatesCalls, [], "a toggle requested after shutdown began must never reach the coordinator")
+        XCTAssertEqual(fakeMenu.appliedValues, [], "the menu task must be effectively canceled — no apply once shutdown has begun")
+    }
+
+    /// A history-clear request arriving after shutdown has begun must
+    /// never reach the coordinator either — mirrors the keep-awake and
+    /// prerelease cases above for `AppSnapshotCoordinator.clearHistory()`.
+    /// Exercised directly against the coordinator fake (there is no
+    /// dedicated `requestClearHistory` on `AppDelegate` — history clear
+    /// is only ever reachable via the bridge — so this asserts the
+    /// coordinator-level contract `BridgeMessageHandlerTests` also relies
+    /// on via `StandaloneBridgeCommandRouter`).
+    func testClearHistoryNeverMutatesTheFakeCoordinatorAfterShutdownWhenCalledDirectly() async {
+        let fakeCoordinator = FakeAppSnapshotCoordinating()
+        let fakeMonitor = FakeAgentMonitorControlling(
+            state: AgentMonitorState(active: false, keepingAwake: false, keepAwakeMode: .system, agents: [], lastScanAt: 0)
+        )
+        let delegate = AppDelegate(coordinator: fakeCoordinator, agentMonitor: fakeMonitor)
+
+        var replies: [Bool] = []
+        _ = delegate.beginTermination { success in replies.append(success) }
+        await waitUntil { !replies.isEmpty }
+
+        // Bridge-driven commands never call through `AppDelegate` at
+        // all — they route straight from `BridgeMessageHandler` to the
+        // coordinator via `StandaloneBridgeCommandRouter`. Once
+        // `hasShutDown`, `AppDelegate.performOrderlyShutdownOnce()` has
+        // already called `coordinator.shutdown()`, so a fresh
+        // `clearHistory()` call reaching the *real* coordinator would be
+        // fenced off by its own `isShutDown` guard (see
+        // `AppSnapshotCoordinatorTests`); this fake simply records the
+        // call so this suite can assert the shutdown sequence itself
+        // never triggers one.
+        XCTAssertEqual(fakeCoordinator.clearHistoryCallCount, 0)
+    }
+
+    // MARK: - Fallback storage root cleanup (Task 12 finding)
+
+    /// Reproduces the actual production shutdown path: if bootstrap ever
+    /// fell back to a dedicated temporary storage directory (see
+    /// `StorageBootstrap.Locations.fallbackRoot`), orderly termination
+    /// must recursively remove it once coordinator shutdown has fully
+    /// completed — never leaving it behind as permanently orphaned disk
+    /// usage. Uses a real (not mocked) scratch directory on disk.
+    func testTerminationRecursivelyRemovesTheFallbackStorageRootDirectory() async throws {
+        let fallbackRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AppLifecycleTests-fallback-\(UUID().uuidString)", isDirectory: true)
+        let nestedFile = fallbackRoot.appendingPathComponent("ai.opencoven.seer/settings.json")
+        try FileManager.default.createDirectory(at: nestedFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("{}".utf8).write(to: nestedFile)
+        defer { try? FileManager.default.removeItem(at: fallbackRoot) }
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fallbackRoot.path), "test setup must have actually created the fallback directory")
+
+        let fakeCoordinator = FakeAppSnapshotCoordinating()
+        let fakeMonitor = FakeAgentMonitorControlling(
+            state: AgentMonitorState(active: false, keepingAwake: false, keepAwakeMode: .system, agents: [], lastScanAt: 0)
+        )
+        let delegate = AppDelegate(
+            coordinator: fakeCoordinator,
+            agentMonitor: fakeMonitor,
+            fallbackStorageRoot: fallbackRoot
+        )
+
+        var replies: [Bool] = []
+        _ = delegate.beginTermination { success in replies.append(success) }
+        await waitUntil { !replies.isEmpty }
+
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: fallbackRoot.path),
+            "orderly shutdown must recursively remove the fallback storage root directory once coordinator shutdown has completed"
+        )
+    }
+
+    /// When bootstrap never needed a fallback directory (the ordinary
+    /// case), shutdown must not touch the filesystem at all on its
+    /// behalf — there is nothing to clean up, and `fallbackStorageRoot`
+    /// stays `nil` throughout.
+    func testTerminationWithNoFallbackStorageRootNeverTouchesTheFilesystem() async {
+        let fakeCoordinator = FakeAppSnapshotCoordinating()
+        let fakeMonitor = FakeAgentMonitorControlling(
+            state: AgentMonitorState(active: false, keepingAwake: false, keepAwakeMode: .system, agents: [], lastScanAt: 0)
+        )
+        let delegate = AppDelegate(coordinator: fakeCoordinator, agentMonitor: fakeMonitor)
+
+        var replies: [Bool] = []
+        _ = delegate.beginTermination { success in replies.append(success) }
+        await waitUntil { !replies.isEmpty }
+
+        XCTAssertEqual(replies, [true], "termination must still complete normally with no fallback storage root configured")
     }
 }

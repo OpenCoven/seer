@@ -24,12 +24,20 @@ public protocol AgentMonitorControlling: AnyObject, Sendable {
 
 extension AgentMonitor: AgentMonitorControlling {}
 
-/// The one `BridgeMessageHandler` operation orderly termination depends on.
+/// The `BridgeMessageHandler` operations orderly termination depends on.
 /// Abstracted the same way as `AgentMonitorControlling` above, so
-/// `AppLifecycleTests` can assert "bridge handlers were cancelled at quit"
-/// against a fake without needing a real `WKWebView`/router stack.
+/// `AppLifecycleTests` can assert "bridge handlers stop accepting new
+/// commands, then are cancelled, at quit" against a fake without needing
+/// a real `WKWebView`/router stack.
 @MainActor
 protocol BridgeHandlerCancelling: AnyObject {
+    /// Stops accepting any *new* bridge command dispatch — see
+    /// `BridgeMessageHandler.stopAccepting()`'s own documentation.
+    /// Called synchronously at the very start of orderly termination,
+    /// before ever awaiting monitor-stop/coordinator-shutdown, so a
+    /// bridge command dispatched at (or after) that exact instant can
+    /// never be accepted in the first place.
+    func stopAccepting()
     func cancelAll()
 }
 
@@ -87,6 +95,14 @@ enum AppBootstrapDiagnosticID {
     /// or a permissions failure — so `StorageBootstrap.resolveLocations`
     /// fell back to a second, dedicated temporary directory instead.
     static let storageLocationUnresolved = "bootstrap.storage-location.unresolved"
+
+    /// Emitted when `StorageBootstrap.pruneStaleFallbackDirectories(...)`
+    /// found a stale, this-app-owned fallback directory left behind by a
+    /// previous run (e.g. one that crashed before its own orderly
+    /// shutdown could remove it) but failed to actually remove it —
+    /// logged/diagnosed rather than thrown, since a failed best-effort
+    /// prune must never block the current launch.
+    static let fallbackPruneFailed = "bootstrap.fallback-prune.failed"
 }
 
 /// Resolves the on-disk settings/history file locations `bootstrapProduction()`
@@ -99,6 +115,15 @@ enum AppBootstrapDiagnosticID {
 /// injected, specifically so this retry/fallback decision is directly
 /// unit-testable against a real (not mocked) filesystem failure.
 enum StorageBootstrap {
+    /// The fixed, safe naming prefix every temporary fallback directory
+    /// `makeTemporaryFallbackDirectory`'s default ever mints is named
+    /// with, and the *only* prefix `pruneStaleFallbackDirectories(...)`
+    /// below will ever consider removing — matching entries by anything
+    /// else (a differently-prefixed directory some other process/app
+    /// placed in the same shared temporary directory) is never touched,
+    /// no matter how old it is.
+    static let fallbackDirectoryPrefix = "ai.opencoven.seer-fallback-"
+
     /// The successfully resolved settings/history file URLs, plus any
     /// diagnostic that should be folded into the coordinator's own
     /// startup diagnostics because resolving them required falling back
@@ -107,6 +132,17 @@ enum StorageBootstrap {
         let settingsURL: URL
         let historyURL: URL
         let diagnostics: [Diagnostic]
+        /// The dedicated temporary directory settings/history were
+        /// actually relocated under, if (and only if) the primary
+        /// `applicationSupportDirectory` could not be used at all —
+        /// `nil` whenever the primary directory itself resolved usable
+        /// locations directly. `AppDelegate` retains this as its own
+        /// `fallbackStorageRoot` so it can be recursively removed once
+        /// orderly shutdown completes, and passes it as
+        /// `pruneStaleFallbackDirectories(...)`'s `excluding:` argument
+        /// so this session's own in-use fallback directory is never
+        /// mistaken for a stale one left behind by some earlier run.
+        let fallbackRoot: URL?
     }
 
     /// Attempts to resolve `settings.json`/`history.json` under
@@ -120,21 +156,30 @@ enum StorageBootstrap {
     /// that point there is truly nowhere to persist settings/history at
     /// all, and the caller must terminate cleanly rather than continue
     /// running as an invisible accessory process with no status item and
-    /// no way to quit.
+    /// no way to quit. In that doubly-failed case, whatever was already
+    /// partially created under the dedicated fallback directory (e.g. a
+    /// successful `settingsFileURL` call having already created the
+    /// containing directory before a subsequent `historyFileURL` call
+    /// failed) is recursively removed before returning, rather than left
+    /// behind as a permanently orphaned, incomplete directory tree —
+    /// best-effort: a failure removing it is silently ignored here, since
+    /// there is already a more specific originating `error` to report and
+    /// this is purely housekeeping.
     static func resolveLocations(
         applicationSupportDirectory: URL,
         now: Int64,
         makeTemporaryFallbackDirectory: () -> URL = {
             FileManager.default.temporaryDirectory
-                .appendingPathComponent("ai.opencoven.seer-fallback-\(UUID().uuidString)", isDirectory: true)
+                .appendingPathComponent("\(fallbackDirectoryPrefix)\(UUID().uuidString)", isDirectory: true)
         },
         settingsFileURL: (URL) throws -> URL = { try SettingsFileLocation.settingsFileURL(applicationSupportDirectory: $0) },
-        historyFileURL: (URL) throws -> URL = { try HistoryFileLocation.historyFileURL(applicationSupportDirectory: $0) }
+        historyFileURL: (URL) throws -> URL = { try HistoryFileLocation.historyFileURL(applicationSupportDirectory: $0) },
+        fileManager: FileManager = .default
     ) -> Result<Locations, Error> {
         do {
             let settingsURL = try settingsFileURL(applicationSupportDirectory)
             let historyURL = try historyFileURL(applicationSupportDirectory)
-            return .success(Locations(settingsURL: settingsURL, historyURL: historyURL, diagnostics: []))
+            return .success(Locations(settingsURL: settingsURL, historyURL: historyURL, diagnostics: [], fallbackRoot: nil))
         } catch let primaryError {
             let fallbackDirectory = makeTemporaryFallbackDirectory()
             do {
@@ -145,11 +190,90 @@ enum StorageBootstrap {
                     message: "Failed to prepare the settings/history storage directory; falling back to a dedicated temporary location: \(primaryError)",
                     occurredAt: now
                 )
-                return .success(Locations(settingsURL: settingsURL, historyURL: historyURL, diagnostics: [diagnostic]))
+                return .success(Locations(settingsURL: settingsURL, historyURL: historyURL, diagnostics: [diagnostic], fallbackRoot: fallbackDirectory))
             } catch {
+                try? fileManager.removeItem(at: fallbackDirectory)
                 return .failure(error)
             }
         }
+    }
+
+    /// The outcome of one `pruneStaleFallbackDirectories(...)` call:
+    /// how many stale directories were actually removed, plus any
+    /// diagnostic for a directory this call *tried but failed* to
+    /// remove — folded into `bootstrapProduction()`'s own startup
+    /// diagnostics so a persistent prune failure (e.g. permissions) is
+    /// still visible once the UI exists, rather than silently retried
+    /// forever with no trace.
+    struct PruneResult {
+        let removedCount: Int
+        let diagnostics: [Diagnostic]
+    }
+
+    /// Bounded, defensive startup housekeeping: removes directories
+    /// under `temporaryDirectory` that (a) this app itself created as a
+    /// dedicated fallback (name begins with `fallbackDirectoryPrefix` —
+    /// no other entry, however old, is ever even considered), (b) are
+    /// actually directories (never a same-named file), (c) are not
+    /// `excluding` (this session's own currently-active fallback root,
+    /// if any — always preserved regardless of age), and (d) are older
+    /// than `maxAge` seconds (a fresh, still-in-use directory from a
+    /// still-running process — vanishingly unlikely to be anything other
+    /// than `excluding` itself, but defended anyway — is left alone).
+    /// Bounded by `maxDirectoriesToPrune`: at most that many *matching*
+    /// directories are ever removed in a single call, so a temporary
+    /// directory somehow containing an enormous number of stale entries
+    /// cannot make a single launch's pruning pass unbounded.
+    ///
+    /// A directory that fails to remove is diagnosed (see `PruneResult
+    /// .diagnostics`) rather than thrown/crashed on — startup must always
+    /// proceed regardless of whether housekeeping fully succeeds.
+    /// Directories this app never created (any other name at all) are
+    /// never touched, matching or not — this is deliberately never a
+    /// broad "clean the whole temporary directory" sweep.
+    static func pruneStaleFallbackDirectories(
+        in temporaryDirectory: URL,
+        excluding activeFallbackRoot: URL?,
+        now: Date,
+        maxAge: TimeInterval = 3600,
+        maxDirectoriesToPrune: Int = 50,
+        fileManager: FileManager = .default
+    ) -> PruneResult {
+        guard let entries = try? fileManager.contentsOfDirectory(
+            at: temporaryDirectory,
+            includingPropertiesForKeys: [.isDirectoryKey, .creationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return PruneResult(removedCount: 0, diagnostics: [])
+        }
+
+        var removedCount = 0
+        var diagnostics: [Diagnostic] = []
+
+        for entry in entries {
+            guard removedCount < maxDirectoriesToPrune else { break }
+            guard entry.lastPathComponent.hasPrefix(fallbackDirectoryPrefix) else { continue }
+            guard entry.standardizedFileURL != activeFallbackRoot?.standardizedFileURL else { continue }
+
+            let resourceValues = try? entry.resourceValues(forKeys: [.isDirectoryKey, .creationDateKey])
+            guard resourceValues?.isDirectory == true else { continue }
+
+            let creationDate = resourceValues?.creationDate ?? .distantPast
+            guard now.timeIntervalSince(creationDate) >= maxAge else { continue }
+
+            do {
+                try fileManager.removeItem(at: entry)
+                removedCount += 1
+            } catch {
+                diagnostics.append(Diagnostic(
+                    id: AppBootstrapDiagnosticID.fallbackPruneFailed,
+                    message: "Failed to prune stale fallback directory at \(entry.path): \(error)",
+                    occurredAt: Int64(now.timeIntervalSince1970 * 1000)
+                ))
+            }
+        }
+
+        return PruneResult(removedCount: removedCount, diagnostics: diagnostics)
     }
 }
 
@@ -181,6 +305,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var scanLoopTask: Task<Void, Never>?
     private var terminationTask: Task<Void, Never>?
     private var hasShutDown = false
+
+    /// The dedicated temporary storage directory `bootstrapProduction()`
+    /// fell back to (via `StorageBootstrap.resolveLocations`), if any —
+    /// `nil` whenever the real Application Support directory resolved
+    /// settings/history locations directly. Recursively removed by
+    /// `cleanUpFallbackStorageRootIfNeeded()` once orderly shutdown has
+    /// fully completed, so a fallback session never leaves its directory
+    /// permanently orphaned on disk.
+    private var fallbackStorageRoot: URL?
 
     private let sleeper: any Sleeper
 
@@ -220,13 +353,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         agentMonitor: any AgentMonitorControlling,
         sleeper: any Sleeper = TaskSleeper(),
         bridgeMessageHandler: (any BridgeHandlerCancelling)? = nil,
-        prereleaseUpdatesMenu: (any PrereleaseUpdatesMenuApplying)? = nil
+        prereleaseUpdatesMenu: (any PrereleaseUpdatesMenuApplying)? = nil,
+        fallbackStorageRoot: URL? = nil
     ) {
         self.coordinator = coordinator
         self.agentMonitor = agentMonitor
         self.sleeper = sleeper
         self.bridgeMessageHandler = bridgeMessageHandler
         self.prereleaseUpdatesMenu = prereleaseUpdatesMenu
+        self.fallbackStorageRoot = fallbackStorageRoot
         self.skipsProductionBootstrap = true
         super.init()
     }
@@ -304,6 +439,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             settingsURL = locations.settingsURL
             historyURL = locations.historyURL
             bootstrapDiagnostics.append(contentsOf: locations.diagnostics)
+            fallbackStorageRoot = locations.fallbackRoot
         case .failure(let error):
             // Even a dedicated, freshly-minted temporary directory could
             // not be prepared — there is truly nowhere to persist
@@ -316,6 +452,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             terminateBootstrapFailure(reason: "Seer could not prepare a location to store its settings and history: \(error)")
             return
         }
+
+        // Bounded, defensive housekeeping: removes stale, this-app-owned
+        // fallback directories orphaned by a previous run that never
+        // reached its own orderly shutdown (e.g. a crash) — never this
+        // session's own `fallbackStorageRoot` (excluded explicitly,
+        // regardless of age), and never anything not matching
+        // `StorageBootstrap.fallbackDirectoryPrefix`. Any prune failure
+        // is folded into `bootstrapDiagnostics` rather than blocking
+        // launch.
+        let pruneResult = StorageBootstrap.pruneStaleFallbackDirectories(
+            in: FileManager.default.temporaryDirectory,
+            excluding: fallbackStorageRoot,
+            now: Date()
+        )
+        bootstrapDiagnostics.append(contentsOf: pruneResult.diagnostics)
 
         let settingsFileSystem = FileManagerSettingsFileSystem()
         let settingsStore = SettingsStore(store: AtomicJSONStore(fileURL: settingsURL, fileSystem: settingsFileSystem, clock: clock))
@@ -485,37 +636,73 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return window.convertToScreen(button.convert(button.bounds, to: nil))
     }
 
-    private func requestSetKeepAwakeMode(_ mode: KeepAwakeMode) {
-        guard let coordinator else { return }
-        Task { try? await coordinator.setKeepAwakeMode(mode) }
+    /// Internal (not `private`) so `AppLifecycleTests` can drive it
+    /// directly against injected fakes, matching
+    /// `requestSetIncludePrereleaseUpdates(_:)` below.
+    func requestSetKeepAwakeMode(_ mode: KeepAwakeMode) {
+        // Gated by `hasShutDown` both here (so a request arriving once
+        // termination has already begun never even queues a `Task`) and
+        // again inside the `Task` itself (so one dispatched *just*
+        // before `hasShutDown` flips cannot resume afterward and still
+        // reach the coordinator) — see `performOrderlyShutdownOnce()`'s
+        // documentation for why `hasShutDown` is exactly the right,
+        // synchronously-set-ahead-of-any-await flag for this. The
+        // coordinator's own `setKeepAwakeMode(_:)` independently guards
+        // on its own `isShutDown` too, so a call that slips past both
+        // checks here (a vanishingly narrow window) still can never
+        // recreate the power assertion or publish once shutdown is
+        // underway.
+        guard let coordinator, !hasShutDown else { return }
+        Task { [weak self] in
+            guard let self, !self.hasShutDown else { return }
+            try? await coordinator.setKeepAwakeMode(mode)
+        }
     }
 
     /// Persists `value` via `AppSnapshotCoordinator.setIncludePrereleaseUpdates(_:)`
-    /// and only updates the menu checkbox (`prereleaseUpdatesMenu.apply(
-    /// includePrereleaseUpdates:)`) once that persistence has actually
-    /// succeeded — never optimistically ahead of it. `includePrereleaseUpdates`
-    /// has no representation in `AppSnapshot` at all (unlike, say,
-    /// `keepAwakeMode`, which rides the coordinator's normal snapshot-
-    /// publish pipeline), so it is the only settings toggle whose menu
-    /// state `AppDelegate` must apply directly rather than merely
-    /// forwarding a coordinator mutation and letting a later snapshot
-    /// publish reflect it — and therefore the only one that can silently
-    /// drift from the authoritative persisted value if applied before
-    /// persistence is confirmed. A failure is never swallowed via `try?`
-    /// as before: it is logged so it is still visible (there is no
-    /// `AppSnapshot`/`Diagnostic` this specific failure can attach to),
-    /// and the menu is simply left showing whatever value was last
-    /// successfully persisted — the next fresh, right-click-built menu
-    /// (`StatusItemController.buildMenu`, always built from-scratch, never
-    /// mutated in place) therefore always reflects that same authoritative
-    /// persisted state. Internal (not `private`) so `AppLifecycleTests`
-    /// can drive it directly against injected fakes.
+    /// and applies the menu checkbox (`prereleaseUpdatesMenu.apply(
+    /// includePrereleaseUpdates:)`) whenever that call reports persistence
+    /// actually committed — whether or not the immediately-following
+    /// forced re-check against the newly selected release stream itself
+    /// succeeded. `includePrereleaseUpdates` has no representation in
+    /// `AppSnapshot` at all (unlike, say, `keepAwakeMode`, which rides
+    /// the coordinator's normal snapshot-publish pipeline), so it is the
+    /// only settings toggle whose menu state `AppDelegate` must apply
+    /// directly rather than merely forwarding a coordinator mutation and
+    /// letting a later snapshot publish reflect it.
+    ///
+    /// Task 12's finding: previously the menu was only ever applied once
+    /// the *entire* call — persistence *and* the forced check — resolved
+    /// without throwing, so toggling the setting while offline left the
+    /// change durably saved to disk yet the checkbox still showing the
+    /// old value. `AppSnapshotCoordinator.setIncludePrereleaseUpdates(_:)`
+    /// now distinguishes the two failure shapes: a thrown error here
+    /// means persistence itself never committed — the menu is correctly
+    /// left untouched, matching whatever is still actually on disk, and
+    /// the failure is logged (never swallowed via `try?`) since there is
+    /// no `AppSnapshot`/`Diagnostic` this specific failure can attach to.
+    /// `.persistedButCheckFailed`, by contrast, means the toggle *did*
+    /// commit — the menu is applied exactly as on outright success, with
+    /// only the check failure logged for diagnosability (it is also
+    /// already visible as a `CoordinatorDiagnosticID.updatesCheckFailed`
+    /// diagnostic on the published snapshot).
+    ///
+    /// Gated the same way as `requestSetKeepAwakeMode(_:)` above: skipped
+    /// entirely once `hasShutDown`, both before the `Task` is created and
+    /// again at its very start, so a toggle requested at (or after) the
+    /// exact instant termination begins can never apply the menu or
+    /// reach the coordinator. Internal (not `private`) so
+    /// `AppLifecycleTests` can drive it directly against injected fakes.
     func requestSetIncludePrereleaseUpdates(_ value: Bool) {
-        guard let coordinator else { return }
+        guard let coordinator, !hasShutDown else { return }
         Task { [weak self] in
+            guard let self, !self.hasShutDown else { return }
             do {
-                try await coordinator.setIncludePrereleaseUpdates(value)
-                self?.prereleaseUpdatesMenu?.apply(includePrereleaseUpdates: value)
+                let outcome = try await coordinator.setIncludePrereleaseUpdates(value)
+                self.prereleaseUpdatesMenu?.apply(includePrereleaseUpdates: value)
+                if case .persistedButCheckFailed(let message) = outcome {
+                    Self.logger.error("Persisted includePrereleaseUpdates=\(value, privacy: .public) but the forced update check failed: \(message, privacy: .public)")
+                }
             } catch {
                 Self.logger.error("Failed to persist includePrereleaseUpdates=\(value, privacy: .public): \(String(describing: error), privacy: .public)")
             }
@@ -523,8 +710,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func requestOpenLatestRelease() {
-        guard let coordinator else { return }
-        Task { await coordinator.openLatestRelease() }
+        guard let coordinator, !hasShutDown else { return }
+        Task { [weak self] in
+            guard let self, !self.hasShutDown else { return }
+            await coordinator.openLatestRelease()
+        }
     }
 
     private func requestQuit() {
@@ -652,6 +842,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// generation-based invalidation both independently fence that off,
     /// however long that stale scan keeps running afterward.
     ///
+    /// `hasShutDown` itself is flipped `true` as the very first statement,
+    /// ahead of any await — it is what every `requestX` menu/bridge-menu
+    /// entry point (`requestSetKeepAwakeMode`,
+    /// `requestSetIncludePrereleaseUpdates`, `requestOpenLatestRelease`)
+    /// checks, both before ever creating its own `Task` and again at that
+    /// `Task`'s very start, so none of them can queue (or resume) a fresh
+    /// coordinator call once termination has begun. `bridgeMessageHandler
+    /// ?.stopAccepting()` is called immediately afterward, for the exact
+    /// same reason on the bridge side: any bridge command dispatched at
+    /// or after this instant is rejected with a typed
+    /// `BridgeCommandError.shuttingDown` before it can ever reach the
+    /// router. Both of these run synchronously, before this method's own
+    /// first `await` — unlike `bridgeMessageHandler?.cancelAll()` below,
+    /// which stays at its existing required position, later in the
+    /// sequence, and only cancels/clears whatever was already in flight
+    /// *before* that point.
+    ///
     /// Only once monitor work has been cancelled/stopped does this await
     /// `AppSnapshotCoordinator.shutdown()`, which flushes history, cancels
     /// the update scheduler, and releases the power assertion; bridge
@@ -660,9 +867,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// production order (stop monitor work → coordinator shutdown →
     /// remove bridge handlers → reply). Guarded by `hasShutDown` so a
     /// second concurrent/subsequent quit request never repeats this work.
+    /// Finally, if bootstrap ever had to fall back to a dedicated
+    /// temporary storage directory (see `StorageBootstrap.Locations
+    /// .fallbackRoot`), that directory is recursively removed here, once
+    /// the coordinator's own shutdown has fully flushed history to it —
+    /// never before, and never left behind to accumulate as permanent
+    /// orphaned disk usage across every future launch that also falls
+    /// back (each such launch mints its own fresh, uniquely-named
+    /// fallback directory, so an old one is never reused/needed again
+    /// once this process exits normally).
     private func performOrderlyShutdownOnce() async {
         guard !hasShutDown else { return }
         hasShutDown = true
+        bridgeMessageHandler?.stopAccepting()
 
         scanLoopTask?.cancel()
         scanLoopTask = nil
@@ -672,12 +889,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         bridgeMessageHandler?.cancelAll()
         removeBridgeHandlersFromWebView()
+
+        cleanUpFallbackStorageRootIfNeeded()
     }
 
     private func removeBridgeHandlersFromWebView() {
         guard let controller = webViewUserContentController else { return }
         controller.removeScriptMessageHandler(forName: BridgeMessageHandler.messageHandlerName, contentWorld: BridgeContentWorld.bridge)
         controller.removeAllUserScripts()
+    }
+
+    /// Recursively removes `fallbackStorageRoot` (if bootstrap ever fell
+    /// back to one — see `StorageBootstrap.Locations.fallbackRoot`) from
+    /// disk. Best-effort: a failure here is logged, never thrown/crashed
+    /// on, since by this point in shutdown there is no `AppSnapshot`/
+    /// `Diagnostic` left to attach it to and no further recovery is
+    /// possible or necessary — `StorageBootstrap
+    /// .pruneStaleFallbackDirectories(...)`'s own bounded startup pruning
+    /// (run at the *next* launch) is the backstop for whatever a failure
+    /// here leaves behind.
+    private func cleanUpFallbackStorageRootIfNeeded() {
+        guard let fallbackStorageRoot else { return }
+        do {
+            try FileManager.default.removeItem(at: fallbackStorageRoot)
+        } catch {
+            Self.logger.error("Failed to clean up temporary fallback storage directory at shutdown: \(String(describing: error), privacy: .public)")
+        }
     }
 }
 

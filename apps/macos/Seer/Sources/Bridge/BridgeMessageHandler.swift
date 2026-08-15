@@ -254,6 +254,17 @@ public struct BridgeCommandError: Error, Equatable, Sendable {
         code: .commandUnavailable,
         message: "This command is not available in this build"
     )
+
+    /// Reported for any command dispatched at or after the exact instant
+    /// `BridgeMessageHandler.stopAccepting()` is called — always before
+    /// this handler's underlying router/coordinator is ever invoked, so
+    /// a bridge command that arrives right as Seer begins quitting fails
+    /// fast with this typed error instead of ever risking a hang against
+    /// services already being (or about to be) torn down.
+    public static let shuttingDown = BridgeCommandError(
+        code: .appShuttingDown,
+        message: "Seer is shutting down"
+    )
 }
 
 /// Typed, closed surface every bridge command routes through. One method
@@ -427,9 +438,31 @@ public final class BridgeMessageHandler: NSObject, WKScriptMessageHandler {
     /// handful of entries at once.
     private var nextInFlightToken: UInt64 = 0
 
+    /// `true` until `stopAccepting()` is called — once `false`,
+    /// `dispatch(_:)` immediately delivers a typed
+    /// `BridgeCommandError.shuttingDown` failure response for every new
+    /// request instead of ever creating an in-flight `Task`, no matter
+    /// how long any underlying command it would have routed to might
+    /// otherwise take (or hang) to resolve. Deliberately distinct from
+    /// `cancelAll()` (which only cancels/clears tasks *already* in
+    /// flight, and stays at its existing required position later in the
+    /// shutdown sequence): `AppDelegate`'s orderly termination calls
+    /// `stopAccepting()` synchronously, before ever awaiting
+    /// `AgentMonitor.stop()`/`AppSnapshotCoordinator.shutdown()`, so a
+    /// bridge command dispatched at (or after) the exact instant
+    /// termination begins can never be accepted in the first place.
+    private var isAccepting = true
+
     public init(router: any BridgeCommandHandling, responder: any BridgeResponding) {
         self.router = router
         self.responder = responder
+    }
+
+    /// Stops accepting any *new* bridge command dispatch — see
+    /// `isAccepting`'s documentation above. Idempotent; safe to call more
+    /// than once (e.g. a second, concurrent quit request).
+    public func stopAccepting() {
+        isAccepting = false
     }
 
     public func userContentController(
@@ -535,6 +568,24 @@ public final class BridgeMessageHandler: NSObject, WKScriptMessageHandler {
     }
 
     private func dispatch(_ request: BridgeRequest) {
+        // Once `stopAccepting()` has been called (Seer's orderly
+        // termination begins by calling it synchronously, before ever
+        // awaiting monitor-stop/coordinator-shutdown), no new command is
+        // ever routed through `router` at all — fail fast with a typed
+        // error instead. Whatever was previously tracked for this id (if
+        // anything) is cancelled/removed exactly as the ordinary
+        // superseding-dispatch path below does, since this response is
+        // itself the newest — and last — event this id will ever receive.
+        guard isAccepting else {
+            inFlightTasks[request.id]?.task.cancel()
+            inFlightTasks.removeValue(forKey: request.id)
+            responder.deliverResponse(.failure(
+                id: request.id,
+                error: BridgeErrorPayload(code: BridgeCommandError.shuttingDown.code, message: BridgeCommandError.shuttingDown.message)
+            ))
+            return
+        }
+
         // Cancel (but do not remove) whatever is currently tracked for
         // this id: the entry is about to be overwritten below regardless.
         inFlightTasks[request.id]?.task.cancel()

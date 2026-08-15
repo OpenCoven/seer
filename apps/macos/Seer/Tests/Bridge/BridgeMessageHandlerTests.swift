@@ -577,6 +577,73 @@ final class BridgeMessageHandlerTests: XCTestCase {
         XCTAssertEqual(responder.responses[0], .success(id: sharedID, result: .snapshot(makeSnapshot(appVersion: "second"))))
     }
 
+    // MARK: - stopAccepting() (Task 12 finding: fence commands after shutdown begins)
+
+    /// A command dispatched *after* `stopAccepting()` has been called
+    /// must never reach the router at all — it must fail fast with a
+    /// typed `BridgeCommandError.shuttingDown` response instead, never
+    /// hang waiting on a command whose underlying service may already be
+    /// (or about to be) torn down.
+    func testDispatchAfterStopAcceptingNeverCallsTheRouterAndDeliversATypedShutdownError() async {
+        let router = FakeCommandRouter()
+        let responder = FakeResponder()
+        let handler = BridgeMessageHandler(router: router, responder: responder)
+
+        handler.stopAccepting()
+        handler.handle(body: ["id": "550e8400-e29b-41d4-a716-446655440000", "version": bridgeVersion, "method": "snapshot.get", "payload": [String: Any]()])
+
+        await responder.waitForResponses(count: 1)
+
+        XCTAssertEqual(router.snapshotGetCallCount, 0, "a command dispatched after stopAccepting() must never reach the router")
+        guard case .failure(id: _, error: let error) = responder.responses[0] else {
+            XCTFail("expected a failure response")
+            return
+        }
+        XCTAssertEqual(error.code, .appShuttingDown)
+    }
+
+    /// `stopAccepting()` must reject *every* subsequent command, not just
+    /// the first — proving it is a durable, sticky gate rather than a
+    /// one-shot check.
+    func testStopAcceptingRejectsEveryCommandAfterward() async {
+        let router = FakeCommandRouter()
+        let responder = FakeResponder()
+        let handler = BridgeMessageHandler(router: router, responder: responder)
+
+        handler.stopAccepting()
+        handler.handle(body: ["id": "550e8400-e29b-41d4-a716-446655440000", "version": bridgeVersion, "method": "snapshot.get", "payload": [String: Any]()])
+        handler.handle(body: ["id": "660e8400-e29b-41d4-a716-446655440001", "version": bridgeVersion, "method": "history.clear", "payload": [String: Any]()])
+
+        await responder.waitForResponses(count: 2)
+
+        XCTAssertEqual(router.snapshotGetCallCount, 0)
+        XCTAssertEqual(router.historyClearCallCount, 0)
+        for response in responder.responses {
+            guard case .failure(id: _, error: let error) = response else {
+                XCTFail("expected every response to be a failure")
+                continue
+            }
+            XCTAssertEqual(error.code, .appShuttingDown)
+        }
+    }
+
+    /// A command dispatched *before* `stopAccepting()` is called must be
+    /// unaffected — proving the gate only ever fences off commands
+    /// dispatched at or after that exact instant, never ones already
+    /// legitimately in flight (those are `cancelAll()`'s responsibility,
+    /// exercised separately above).
+    func testDispatchBeforeStopAcceptingIsUnaffected() async {
+        let router = FakeCommandRouter()
+        let responder = FakeResponder()
+        let handler = BridgeMessageHandler(router: router, responder: responder)
+
+        handler.handle(body: ["id": "550e8400-e29b-41d4-a716-446655440000", "version": bridgeVersion, "method": "snapshot.get", "payload": [String: Any]()])
+        await responder.waitForResponses(count: 1)
+
+        XCTAssertEqual(router.snapshotGetCallCount, 1)
+        XCTAssertEqual(responder.responses[0], .success(id: "550e8400-e29b-41d4-a716-446655440000", result: .snapshot(makeSnapshot())))
+    }
+
     // MARK: - Wiring against the real Task 9 AppSnapshotCoordinator
 
     func testStandaloneBridgeCommandRouterForCoordinatorWiresSnapshotGetKeepAwakeModeSetHistoryClearAndUpdates() async {

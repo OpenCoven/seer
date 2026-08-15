@@ -78,6 +78,25 @@ public enum UpdateCheckError: Error, Equatable, Sendable {
     case timestampRepairFailed(String)
 }
 
+/// Thrown by `UpdateService.setIncludePrerelease(_:)` only when the
+/// include-prerelease toggle itself could not be durably persisted at
+/// all — the forced re-check against the newly selected stream this
+/// function otherwise always performs is never even attempted in that
+/// case, since there is nothing new to check against. Wraps the
+/// underlying `SettingsStore`/`AtomicJSONStore` failure verbatim (itself
+/// always a `StorageError` — see `SettingsStore.setIncludePrereleaseUpdates
+/// (_:)`) so callers can inspect it, while still being able to tell a
+/// *persistence* failure apart, purely by catching this distinct type,
+/// from an ordinary `UpdateCheckError` the forced `check(force: true)`
+/// step throws once persistence has already committed.
+public struct SetIncludePrereleasePersistError: Error, Equatable, Sendable {
+    public let underlying: StorageError
+
+    public init(underlying: StorageError) {
+        self.underlying = underlying
+    }
+}
+
 /// The exact GitHub release fields `UpdateService` needs. `tagName` is the
 /// raw tag (e.g. `v1.3.0`) parsed via `SemanticVersion.parse(_:)`;
 /// `htmlURL` is the human-facing release page, validated by
@@ -254,6 +273,20 @@ public actor UpdateService {
     /// setting change always succeeds independently of network
     /// reachability — but the thrown `UpdateCheckError` still propagates
     /// to the caller so it can surface the failure.
+    ///
+    /// A failure from the settings-persist step itself is always thrown
+    /// as `SetIncludePrereleasePersistError` — never as the same error
+    /// shape a forced-check failure throws — so a caller
+    /// (`AppSnapshotCoordinator`) can distinguish, purely by catching
+    /// this specific type, "the toggle itself never committed" (the
+    /// forced check below is never even attempted) from "the toggle
+    /// committed, but the immediately-following network check failed"
+    /// (an ordinary `UpdateCheckError` from `check(force:)`). This
+    /// matters because only the *former* should ever cause a caller-
+    /// visible UI (e.g. Seer's tray checkbox) to keep showing its old
+    /// value — the latter's toggle is fully authoritative regardless of
+    /// whether the network happened to be reachable at that exact
+    /// moment.
     public func setIncludePrerelease(_ value: Bool) async throws -> UpdateState {
         // Synchronously invalidate any check already in flight *before*
         // ever awaiting anything — see `generation`'s documentation for
@@ -262,7 +295,11 @@ public actor UpdateService {
         // true)` call this function goes on to make.
         generation += 1
 
-        try await settingsStore.setIncludePrereleaseUpdates(value)
+        do {
+            try await settingsStore.setIncludePrereleaseUpdates(value)
+        } catch let storageError as StorageError {
+            throw SetIncludePrereleasePersistError(underlying: storageError)
+        }
         return try await check(force: true)
     }
 

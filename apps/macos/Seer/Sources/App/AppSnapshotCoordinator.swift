@@ -99,7 +99,16 @@ public protocol AppSnapshotCoordinating: AnyObject {
     func clearHistory() async throws
     @discardableResult
     func checkForUpdates(force: Bool) async -> Bool
-    func setIncludePrereleaseUpdates(_ value: Bool) async throws
+    @discardableResult
+    func setIncludePrereleaseUpdates(_ value: Bool) async throws -> SetIncludePrereleaseUpdatesOutcome
+    /// The authoritative, durably persisted `includePrereleaseUpdates`
+    /// value, read directly from `SettingsStore.current` — never from any
+    /// cached/optimistic UI state. Lets a caller whose own
+    /// `setIncludePrereleaseUpdates(_:)` call threw (a genuine
+    /// persistence failure) resynchronize against the real on-disk value
+    /// rather than merely assuming its own previously-applied value is
+    /// still correct.
+    var includePrereleaseUpdates: Bool { get async }
     @discardableResult
     func openLatestRelease() async -> Bool
     func performStartupUpdateCheckAndStartScheduler() async
@@ -107,6 +116,32 @@ public protocol AppSnapshotCoordinating: AnyObject {
 }
 
 extension AppSnapshotCoordinator: AppSnapshotCoordinating {}
+
+/// The result `AppSnapshotCoordinator.setIncludePrereleaseUpdates(_:)`
+/// returns once the toggle has actually been durably persisted — letting
+/// the caller (`AppDelegate.requestSetIncludePrereleaseUpdates(_:)`)
+/// apply the tray checkbox regardless of whether the immediately-
+/// following forced re-check itself succeeded, while still learning
+/// about (and logging) a check failure that would otherwise only ever
+/// surface as a `CoordinatorDiagnosticID.updatesCheckFailed` diagnostic
+/// on the published snapshot. Task 12's finding: previously, *any*
+/// failure — including one from the forced check alone, with
+/// persistence having already committed — was rethrown identically,
+/// which made `AppDelegate` leave the tray checkbox showing the *old*
+/// value even though the new one was already durably saved to disk
+/// (e.g. toggling the setting while offline).
+public enum SetIncludePrereleaseUpdatesOutcome: Sendable, Equatable {
+    /// Persistence committed and the forced re-check against the newly
+    /// selected release stream also succeeded.
+    case success
+    /// Persistence committed, but the forced re-check itself failed —
+    /// already recorded as a visible `CoordinatorDiagnosticID
+    /// .updatesCheckFailed` diagnostic on the published snapshot.
+    /// `message` (diagnostic-only, from `String(describing:)` the
+    /// underlying failure) is surfaced purely so a caller can log it
+    /// too; the toggle itself is fully authoritative regardless.
+    case persistedButCheckFailed(message: String)
+}
 
 /// The single main-actor authority for Seer's visible state. Owns an
 /// immutable-per-publication `AppSnapshot`, cooperates with `SettingsStore`
@@ -649,12 +684,41 @@ public final class AppSnapshotCoordinator {
     }
 
     private func performSetKeepAwakeMode(_ requestedMode: KeepAwakeMode) async throws {
+        // Granted the gate only after `shutdown()` has already begun (see
+        // `isShutDown`'s documentation): never persist the mode, touch
+        // the power assertion, or publish once shutdown is underway,
+        // however long this call was queued behind `gate`.
+        guard !isShutDown else { return }
+
         var settingsError: Error?
         do {
             try await settingsStore.setKeepAwakeMode(requestedMode)
         } catch {
             settingsError = error
         }
+
+        // `isShutDown` is only checked once, above, *before* the
+        // `settingsStore.setKeepAwakeMode(_:)` await — but `shutdown()`
+        // can flip it `true` at any point during that await (set
+        // synchronously, ahead of `shutdown()`'s own `gate.acquire()`
+        // call, specifically so an already-*queued* call observes it the
+        // moment it is granted the gate). That guards a call still
+        // *queued* behind `gate` when shutdown begins, but not one that
+        // had already been granted the gate and was genuinely in flight
+        // inside the settings write at that moment: without re-checking
+        // here, such a call would resume — after `shutdown()`'s own
+        // `gate.acquire()` call has already run `performShutdown()` to
+        // completion, released the power assertion, and published its
+        // final snapshot — and go on to recreate/mutate the power
+        // assertion and publish its own (now moot) result on top of that
+        // already-final state. Bailing out here, before touching the
+        // power backend or publishing, keeps shutdown's own final
+        // transition the last word regardless of how this call resolves,
+        // and without rethrowing `settingsError` either — a failure that
+        // only matters because shutdown made it moot must stay silent,
+        // exactly as `performCheckForUpdates`/`performSetIncludePrereleaseUpdates`
+        // do for the same race.
+        guard !isShutDown else { return }
 
         let actualMode = await settingsStore.current.keepAwakeMode
         let monitor = snapshot.monitor
@@ -723,10 +787,22 @@ public final class AppSnapshotCoordinator {
     }
 
     private func performClearHistory() async throws {
+        // Granted the gate only after `shutdown()` has already begun:
+        // never clear/mutate history or publish once shutdown is
+        // underway, however long this call was queued behind `gate` —
+        // mirrors `performSetKeepAwakeMode`'s identical guard above.
+        guard !isShutDown else { return }
         do {
             let stats = try await historyStore.clearOrThrow()
+            // Re-checked *after* the awaited clear, before ever
+            // publishing — `shutdown()` may have flipped `isShutDown`
+            // while this call's own clear was genuinely in flight; see
+            // `performSetKeepAwakeMode`'s identical second check for why
+            // this must be re-examined rather than assumed unchanged.
+            guard !isShutDown else { return }
             publish(monitor: snapshot.monitor, history: stats, clearing: [HistoryDiagnosticID.persistFailed], upserting: [])
         } catch let error as StorageError {
+            guard !isShutDown else { return }
             let stats = await historyStore.stats()
             let diagnostic = Diagnostic(
                 id: HistoryDiagnosticID.persistFailed,
@@ -818,46 +894,86 @@ public final class AppSnapshotCoordinator {
     /// .setIncludePrerelease(_:)`) — and immediately forces a fresh check
     /// against the newly selected release stream, publishing the result
     /// through the exact same atomic transition/diagnostic handling as
-    /// `checkForUpdates(force:)`. Mirrors `setKeepAwakeMode`'s persist-
-    /// then-publish-then-rethrow contract: the persisted toggle is never
-    /// rolled back even if the forced check itself fails, but the thrown
-    /// `UpdateCheckError` still propagates to the caller after the
-    /// resulting (failure) state has been published, so the failure
-    /// remains visible both synchronously and in `snapshot.diagnostics`.
-    public func setIncludePrereleaseUpdates(_ value: Bool) async throws {
+    /// `checkForUpdates(force:)`.
+    ///
+    /// Distinguishes, by catching `UpdateService`'s own distinctly-typed
+    /// `SetIncludePrereleasePersistError`, a genuine *persistence*
+    /// failure (the toggle itself never committed — this is always
+    /// rethrown, before any snapshot mutation/publish, exactly like
+    /// `setKeepAwakeMode`'s contract) from a forced-*check* failure with
+    /// persistence already committed (never rethrown: the toggle is
+    /// fully authoritative regardless of whether the immediately-
+    /// following network check happened to succeed, so this instead
+    /// returns `.persistedButCheckFailed`, after still publishing the
+    /// same visible `CoordinatorDiagnosticID.updatesCheckFailed`
+    /// diagnostic a plain `checkForUpdates(force:)` failure would). This
+    /// closes Task 12's finding: previously, both failure shapes were
+    /// rethrown identically, which made `AppDelegate` leave its tray
+    /// checkbox showing the *old* value even after the new one was
+    /// already durably saved to disk (e.g. toggling the setting while
+    /// offline).
+    @discardableResult
+    public func setIncludePrereleaseUpdates(_ value: Bool) async throws -> SetIncludePrereleaseUpdatesOutcome {
         await gate.acquire()
         do {
-            try await performSetIncludePrereleaseUpdates(value)
+            let outcome = try await performSetIncludePrereleaseUpdates(value)
             await gate.release()
+            return outcome
         } catch {
             await gate.release()
             throw error
         }
     }
 
-    private func performSetIncludePrereleaseUpdates(_ value: Bool) async throws {
+    /// The authoritative, durably persisted `includePrereleaseUpdates`
+    /// value — see the protocol requirement's own documentation.
+    public var includePrereleaseUpdates: Bool {
+        get async { await settingsStore.current.includePrereleaseUpdates }
+    }
+
+    private func performSetIncludePrereleaseUpdates(_ value: Bool) async throws -> SetIncludePrereleaseUpdatesOutcome {
         // Granted the gate only after `shutdown()` has already begun (see
         // `isShutDown`'s documentation, and `performCheckForUpdates`'s
         // identical guard): never persist the toggle, network-check, or
         // publish once shutdown is underway, however long this tray
         // checkbox action was queued behind `gate`.
-        guard !isShutDown else { return }
+        guard !isShutDown else { return .success }
 
         var idsToClear: Set<String> = []
         var upserts: [Diagnostic] = []
-        var thrownError: Error?
         let updateState: UpdateState
+        let outcome: SetIncludePrereleaseUpdatesOutcome
         do {
             updateState = try await updateService.setIncludePrerelease(value)
             idsToClear.insert(CoordinatorDiagnosticID.updatesCheckFailed)
+            outcome = .success
+        } catch let persistError as SetIncludePrereleasePersistError {
+            // The toggle itself never committed: rethrow the same
+            // distinctly-typed error immediately, before any snapshot/
+            // diagnostic mutation or publish — the caller (`AppDelegate`)
+            // must leave the tray checkbox exactly as it was, reflecting
+            // whatever value is actually still on disk, never the
+            // requested-but-unpersisted one. Rethrown as-is (not
+            // unwrapped to `.underlying`) so a caller can, if useful,
+            // still positively identify "this was a persistence failure"
+            // purely by catching this type, exactly as it can already
+            // tell it apart from a `.persistedButCheckFailed` outcome.
+            throw persistError
         } catch {
-            thrownError = error
+            // Persistence committed (`UpdateService.setIncludePrerelease
+            // (_:)` never even attempts the forced check otherwise — see
+            // its own documentation); only that forced re-check against
+            // the newly selected stream failed. The toggle is still
+            // fully authoritative, so this must never be rethrown — only
+            // surfaced via `outcome` plus a visible diagnostic, exactly
+            // like an ordinary `checkForUpdates(force:)` failure.
             updateState = await updateService.currentState()
             upserts.append(Diagnostic(
                 id: CoordinatorDiagnosticID.updatesCheckFailed,
                 message: "Update check failed: \(error)",
                 occurredAt: clock.nowMilliseconds()
             ))
+            outcome = .persistedButCheckFailed(message: String(describing: error))
         }
 
         // `isShutDown` is only checked once, above, *before* the
@@ -878,15 +994,13 @@ public final class AppSnapshotCoordinator {
         // already-final state. Bailing out here, before any snapshot/
         // diagnostic mutation or publish, keeps shutdown's own final
         // transition the last word regardless of how this call resolves,
-        // and without rethrowing `thrownError` either: a failure that
+        // and without ever surfacing `outcome` either: a result that
         // only matters because shutdown made it moot must stay silent,
         // exactly as `performCheckForUpdates` does for the same race.
-        guard !isShutDown else { return }
+        guard !isShutDown else { return .success }
 
         publish(monitor: snapshot.monitor, history: snapshot.history, update: updateState, clearing: idsToClear, upserting: upserts)
-        if let thrownError {
-            throw thrownError
-        }
+        return outcome
     }
 
     /// Opens the most recently cached, already-validated release URL via

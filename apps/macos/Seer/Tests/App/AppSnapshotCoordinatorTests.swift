@@ -658,27 +658,67 @@ final class AppSnapshotCoordinatorTests: XCTestCase {
             lastCheckedAt: 1_700_000_002_000
         ))]
 
-        try await coordinator.setIncludePrereleaseUpdates(true)
+        let outcome = try await coordinator.setIncludePrereleaseUpdates(true)
 
+        XCTAssertEqual(outcome, .success)
         XCTAssertEqual(updateService.setIncludePrereleaseValues, [true])
         XCTAssertEqual(coordinator.snapshot.update.availableVersion, "v3.0.0-beta.1")
         XCTAssertEqual(renderer.emittedSnapshots.count, emittedBefore + 1)
     }
 
-    func testSetIncludePrereleaseUpdatesRethrowsAndPublishesAVisibleDiagnosticOnFailure() async throws {
+    /// Task 12's finding: a failure from the forced re-check alone — with
+    /// persistence of the toggle having already committed — must never
+    /// be rethrown to the caller. It is instead surfaced only via the
+    /// returned `.persistedButCheckFailed` outcome and a visible
+    /// `CoordinatorDiagnosticID.updatesCheckFailed` diagnostic, exactly
+    /// like an ordinary `checkForUpdates(force:)` failure — so a caller
+    /// (`AppDelegate`) can still apply its tray checkbox to the
+    /// already-durably-persisted value even though the network happened
+    /// to be unreachable at that exact moment (e.g. toggling the setting
+    /// while offline).
+    func testSetIncludePrereleaseUpdatesReturnsCheckFailedWithoutThrowingWhenOnlyTheForcedCheckFails() async throws {
         let updateService = FakeUpdateChecking()
-        let (coordinator, _, _) = await makeCoordinator(updateService: updateService)
+        let (coordinator, renderer, _) = await makeCoordinator(updateService: updateService)
+        let emittedBefore = renderer.emittedSnapshots.count
 
         updateService.setIncludePrereleaseResults = [.failure(FakeUpdateCheckError())]
 
+        let outcome = try await coordinator.setIncludePrereleaseUpdates(true)
+
+        guard case .persistedButCheckFailed = outcome else {
+            XCTFail("expected .persistedButCheckFailed, got \(outcome)")
+            return
+        }
+        XCTAssertTrue(coordinator.snapshot.diagnostics.contains { $0.id == CoordinatorDiagnosticID.updatesCheckFailed })
+        XCTAssertEqual(renderer.emittedSnapshots.count, emittedBefore + 1, "a check-only failure must still publish exactly one transition")
+    }
+
+    /// The other half of Task 12's finding: a failure from the
+    /// *persistence* step itself — `UpdateService.setIncludePrerelease
+    /// (_:)`'s own `SetIncludePrereleasePersistError` — must always be
+    /// rethrown, before any snapshot mutation/publish, so the caller
+    /// knows the toggle never actually committed and must leave its UI
+    /// showing the old, still-authoritative value.
+    func testSetIncludePrereleaseUpdatesRethrowsAndNeverPublishesOnAPersistenceFailure() async throws {
+        let updateService = FakeUpdateChecking()
+        let (coordinator, renderer, _) = await makeCoordinator(updateService: updateService)
+        let emittedBefore = renderer.emittedSnapshots.count
+
+        let persistError = SetIncludePrereleasePersistError(underlying: .writeFailed)
+        updateService.setIncludePrereleaseResults = [.failure(persistError)]
+
         do {
-            try await coordinator.setIncludePrereleaseUpdates(true)
-            XCTFail("expected the forced check's failure to be rethrown")
-        } catch is FakeUpdateCheckError {
-            // Expected.
+            _ = try await coordinator.setIncludePrereleaseUpdates(true)
+            XCTFail("expected the persistence failure to be rethrown")
+        } catch let error as SetIncludePrereleasePersistError {
+            XCTAssertEqual(error, persistError)
         }
 
-        XCTAssertTrue(coordinator.snapshot.diagnostics.contains { $0.id == CoordinatorDiagnosticID.updatesCheckFailed })
+        XCTAssertEqual(renderer.emittedSnapshots.count, emittedBefore, "a persistence failure must never publish any transition")
+        XCTAssertFalse(
+            coordinator.snapshot.diagnostics.contains { $0.id == CoordinatorDiagnosticID.updatesCheckFailed },
+            "a persistence failure is not a check failure and must never surface that diagnostic"
+        )
     }
 
     func testOpenLatestReleaseForwardsToUpdateServiceWithoutTouchingTheSnapshot() async {
@@ -1493,6 +1533,162 @@ final class AppSnapshotCoordinatorTests: XCTestCase {
 
         try await coordinator.shutdown()
         XCTAssertEqual(renderer.emittedSnapshots.count, emittedBefore + 2, "shutdown must still publish its own final transition afterward")
+    }
+
+    // MARK: - Task 12 finding: setKeepAwakeMode/clearHistory must also fence off after shutdown begins
+
+    /// The `setKeepAwakeMode` counterpart of
+    /// `testShutdownFlagsAnAlreadyQueuedScheduledCheckSoItNeverNetworkChecksOrPublishesAfterward`:
+    /// a keep-awake mode change already queued behind `gate` when
+    /// `shutdown()` begins must be skipped entirely — never persisting
+    /// the new mode, never touching the power assertion (so it can
+    /// neither incorrectly create nor release one), and never
+    /// publishing — exactly like an already-queued scheduled check.
+    /// Closes Task 12's finding that `setKeepAwakeMode`/`clearHistory`
+    /// had no `isShutDown` guard at all, unlike `checkForUpdates`/
+    /// `setIncludePrereleaseUpdates`.
+    func testShutdownFlagsAnAlreadyQueuedSetKeepAwakeModeCallSoItNeverTouchesPowerOrPublishesAfterward() async throws {
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let historyFS = InMemorySettingsFileSystem()
+        let powerBackend = CoordinatorFakePowerBackend()
+        let (coordinator, renderer, _) = await makeCoordinator(
+            historyFileSystem: historyFS,
+            clock: clock,
+            powerBackend: powerBackend
+        )
+
+        // Build up an open history session so the empty scan below
+        // actually performs a real disk write worth suspending — giving
+        // a genuine, controlled window in which the coordinator's gate
+        // is held by something other than the mode change or shutdown
+        // itself.
+        await coordinator.applyScan([activeAgent()], scannedAt: clock.now)
+        clock.now += 2_000
+        let createdModesBeforeRace = powerBackend.createdModes.count
+        let emittedBeforeRace = renderer.emittedSnapshots.count
+        let modeBeforeRace = coordinator.snapshot.monitor.keepAwakeMode
+
+        await historyFS.armSuspension("writeFileAndSynchronize")
+
+        // The closing scan holds the gate, suspended mid-write.
+        let scanTask = Task {
+            await coordinator.applyScan([], scannedAt: clock.now)
+        }
+        await historyFS.waitUntilEntered("writeFileAndSynchronize")
+
+        // The keep-awake mode change fires while the gate is held
+        // elsewhere, and queues behind the scan.
+        let modeChangeTask = Task<Error?, Never> {
+            do {
+                try await coordinator.setKeepAwakeMode(.display)
+                return nil
+            } catch {
+                return error
+            }
+        }
+        for _ in 0..<50 { await Task.yield() }
+
+        // Shutdown is requested next. Its own `gate.acquire()` call
+        // necessarily queues *behind* the already-queued mode change —
+        // yet it must still flag `isShutDown` immediately, without
+        // waiting for the gate.
+        let shutdownTask = Task {
+            try await coordinator.shutdown()
+        }
+        for _ in 0..<50 { await Task.yield() }
+
+        await historyFS.resumeSuspension("writeFileAndSynchronize")
+        await scanTask.value
+        let modeChangeError = await modeChangeTask.value
+        try await shutdownTask.value
+
+        XCTAssertNil(
+            modeChangeError,
+            "a mode change only granted the gate after shutdown began must silently do nothing, not throw"
+        )
+        XCTAssertEqual(
+            powerBackend.createdModes.count, createdModesBeforeRace,
+            "the already-queued mode change must never touch the power backend once shutdown has begun — it must not incorrectly create or release an assertion"
+        )
+        XCTAssertEqual(
+            renderer.emittedSnapshots.count, emittedBeforeRace + 2,
+            "only the scan's own transition and shutdown's final transition may publish — the skipped mode change must publish nothing"
+        )
+        XCTAssertEqual(
+            coordinator.snapshot.monitor.keepAwakeMode, modeBeforeRace,
+            "a mode change skipped for shutdown must never actually change the published mode"
+        )
+    }
+
+    /// The `clearHistory` counterpart of the same race: a history-clear
+    /// request already queued behind `gate` when `shutdown()` begins
+    /// must never mutate history or publish afterward.
+    func testShutdownFlagsAnAlreadyQueuedClearHistoryCallSoItNeverMutatesOrPublishesAfterward() async throws {
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let historyFS = InMemorySettingsFileSystem()
+        let (coordinator, renderer, _) = await makeCoordinator(
+            historyFileSystem: historyFS,
+            clock: clock
+        )
+
+        // Three ticks: the first opens a session with an empty `agents`
+        // list (there is no elapsed delta yet to attribute — see
+        // `HistoryStoreTests.testPerAgentAccumulationSortsDescending`);
+        // the second actually accumulates >= `HistoryStore
+        // .minimumSessionMs` of elapsed duration into that session; only
+        // the third (below, suspended mid-write) closes it, so it is
+        // actually recorded into `sessionCount` — a session with no
+        // accumulated duration is discarded entirely and would make this
+        // test's own `sessionCount` assertion vacuous regardless of the
+        // race being exercised.
+        await coordinator.applyScan([activeAgent()], scannedAt: clock.now)
+        clock.now += 2_000
+        await coordinator.applyScan([activeAgent()], scannedAt: clock.now)
+        clock.now += 2_000
+        let emittedBeforeRace = renderer.emittedSnapshots.count
+
+        await historyFS.armSuspension("writeFileAndSynchronize")
+
+        // The closing scan holds the gate, suspended mid-write.
+        let scanTask = Task {
+            await coordinator.applyScan([], scannedAt: clock.now)
+        }
+        await historyFS.waitUntilEntered("writeFileAndSynchronize")
+
+        // The history-clear request fires while the gate is held
+        // elsewhere, and queues behind the scan.
+        let clearTask = Task<Error?, Never> {
+            do {
+                try await coordinator.clearHistory()
+                return nil
+            } catch {
+                return error
+            }
+        }
+        for _ in 0..<50 { await Task.yield() }
+
+        let shutdownTask = Task {
+            try await coordinator.shutdown()
+        }
+        for _ in 0..<50 { await Task.yield() }
+
+        await historyFS.resumeSuspension("writeFileAndSynchronize")
+        await scanTask.value
+        let clearError = await clearTask.value
+        try await shutdownTask.value
+
+        XCTAssertNil(
+            clearError,
+            "a history-clear request only granted the gate after shutdown began must silently do nothing, not throw"
+        )
+        XCTAssertEqual(
+            renderer.emittedSnapshots.count, emittedBeforeRace + 2,
+            "only the scan's own transition and shutdown's final transition may publish — the skipped clear must publish nothing"
+        )
+        XCTAssertGreaterThan(
+            coordinator.snapshot.history.sessionCount, 0,
+            "a history clear skipped for shutdown must never actually reset the recorded session count to zero"
+        )
     }
 
     // MARK: - Concurrency: serialized transitions, no stale overwrite
