@@ -2129,8 +2129,6 @@ git commit -m "ci: verify standalone macOS app"
 ## Task 16: Add signed packaging and deterministic release metadata
 
 **Files:**
-- Create `scripts/prepare-macos-release-input.sh`
-- Create `scripts/macos-release-input.py`
 - Create `scripts/package-macos-release.sh`
 - Create `scripts/write-release-manifest.mjs`
 - Create `tests/release-manifest.test.mjs`
@@ -2167,7 +2165,7 @@ Expected: FAIL because the manifest script does not exist.
 
 - [ ] **Step 3: Implement manifest and checksum generation**
 
-The manifest script accepts explicit CLI arguments, reads artifact bytes, and writes
+The script accepts explicit CLI arguments, reads artifact bytes, and writes
 stable two-space JSON. `SHA256SUMS` uses:
 
 ```text
@@ -2177,49 +2175,17 @@ stable two-space JSON. `SHA256SUMS` uses:
 Reject non-semantic versions, non-40-character source SHAs, unexpected
 artifact names, and notarization states other than `accepted`.
 
-- [ ] **Step 4: Implement the isolated preparation and signing contract**
-
-The credential-free preparation job runs
-`scripts/prepare-macos-release-input.sh`. It fails if any `APPLE_*` variable is
-set, requires a nonempty hosted-VM `PREPARE_RUNNER_ID`, builds from a clean
-exact `SOURCE_COMMIT`, runs the complete Task 14 source and built-app boundary
-gate, and emits exactly:
-
-```text
-build/macos/release-input/Seer-unsigned-arm64.tar
-build/macos/release-input/unsigned-app-attestation.json
-```
-
-The signing job must execute on a distinct runner machine and receive those
-files only through workflow artifact transfer. It passes
-`UNSIGNED_APP_ARCHIVE`, `UNSIGNED_APP_ATTESTATION`, the preparation job's
-`UNSIGNED_APP_SHA256` and `UNSIGNED_APP_ATTESTATION_SHA256`, its explicit
-`PREPARE_RUNNER_ID`, and the fresh machine's `SIGNING_RUNNER_ID` to
-`scripts/package-macos-release.sh`. That script rejects equal identities and an
-attested preparation identity that does not match the explicit job output. It
-never runs dependency installation, renderer/build tooling, project
-generation, or compilation. Before credential materialization it invokes only
-fixed absolute macOS system tools and shell built-ins while validating artifact
-hashes, the canonical attestation schema and values, source commit, the exact
-archive entry allowlist, traversal/link exclusion, recursive app digest, bundle
-identity, exact arm64, and the ad-hoc codesign precondition. No repository
-JavaScript, Python, or helper process runs until credential teardown succeeds.
+- [ ] **Step 4: Implement signing and notarization script**
 
 Require:
 
 ```text
 VERSION
 BUILD_NUMBER
-PREPARE_RUNNER_ID
-SIGNING_RUNNER_ID
 APPLE_CERTIFICATE
 APPLE_CERTIFICATE_PASSWORD
 APPLE_SIGNING_IDENTITY
 APPLE_TEAM_ID
-UNSIGNED_APP_ARCHIVE
-UNSIGNED_APP_ATTESTATION
-UNSIGNED_APP_SHA256
-UNSIGNED_APP_ATTESTATION_SHA256
 ```
 
 Select exactly one complete notarization set:
@@ -2234,19 +2200,15 @@ or:
 APPLE_ID + APPLE_PASSWORD + APPLE_TEAM_ID
 ```
 
-After input validation, the script creates a temporary keychain, imports the
-certificate, signs with Hardened Runtime and timestamp, verifies with
+The script creates a temporary keychain, imports the certificate, builds the
+arm64 archive, signs with Hardened Runtime and timestamp, verifies with
 `codesign --verify --deep --strict`, creates `Seer-notarization.zip` with
 `ditto -c -k --keepParent`, submits that ZIP and waits with `notarytool`,
 deletes the ZIP after acceptance, staples and validates the app, builds a
 compressed DMG with `hdiutil`, signs the DMG, submits the DMG to `notarytool`,
 staples and validates the DMG, checks both app and DMG with `spctl`, runs
-boundary checks, and writes checksums/manifest. It explicitly destroys key
-material, the temporary keychain, API-key files, and in-memory credential
-variables before invoking repository code for final boundary checks or
-manifest generation; failed teardown blocks that code. The EXIT trap repeats
-cleanup on every failure/signal. Test tool substitution requires
-`SEER_TEST_MODE=1` and is impossible when `GITHUB_ACTIONS=true`.
+boundary checks, writes checksums/manifest, and deletes key material and the
+temporary keychain in an EXIT trap.
 
 - [ ] **Step 5: Test failure paths without credentials**
 
@@ -2300,21 +2262,14 @@ on:
       - "v*.*.*"
 ```
 
-Use a protected `macos-release` environment only on the signing job. Grant the private workflow only
+Use a protected `macos-release` environment. Grant the private workflow only
 `contents: read` and `id-token: write`; use `RELEASES_REPO_TOKEN` only for
 commands against `OpenCoven/seer-releases`.
 
-Run both jobs on separate GitHub-hosted `macos-14-xlarge` machines and assert
-arm64. Do not use self-hosted runners. Each job must independently read the
-hosted VM's `IOPlatformUUID` with fixed `/usr/sbin/ioreg`; preparation passes
-that nonempty value as `PREPARE_RUNNER_ID`, and signing passes its own as
-`SIGNING_RUNNER_ID`. Do not synthesize identities from a job name or offer a
-same-runner override. In the preparation job only, select Xcode 16.2 with the
-pinned setup action, install
-XcodeGen with Homebrew, and print both tool versions before the gate. Do not
-run the Glaze CLI; run the shared TypeScript fixture suite and all standalone
-renderer/Swift/boundary tests in preparation. The signing job must not install
-XcodeGen, npm packages, or any build dependency.
+Run on `macos-14-xlarge`, assert arm64, select Xcode 16.2 with the pinned setup
+action, install XcodeGen with Homebrew, and print both tool versions before the
+gate. Do not run the Glaze CLI on this clean release runner; run the shared
+TypeScript fixture suite and all standalone renderer/Swift/boundary tests.
 
 Immediately reject non-release tags with:
 
@@ -2325,37 +2280,20 @@ Immediately reject non-release tags with:
 }
 ```
 
-The workflow must use two distinct jobs and runner machines. The preparation
-job has no environment/secrets, uploads only the fixed unsigned archive and
-attestation, and exports `PREPARE_RUNNER_ID`, `UNSIGNED_APP_SHA256`, and
-`UNSIGNED_APP_ATTESTATION_SHA256` through trusted job outputs. The signing job
-uses `needs.prepare.outputs` for all three values, downloads the artifact into
-a fresh workspace, checks out `${{ github.sha }}` without installing
-dependencies, sets `SOURCE_COMMIT` from that same trusted context, captures its
-different `SIGNING_RUNNER_ID`, confirms both downloaded hashes equal the
-preparation outputs, and invokes the signing-only script. Never combine these
-jobs, reuse a workspace, use the same hosted VM, or use a self-hosted runner.
-
-The jobs must:
+The job must:
 
 1. verify arm64 runner
 2. verify tag equals `MARKETING_VERSION`
 3. run the complete test/build/boundary gate
-4. call `prepare-macos-release-input.sh` without secrets
-5. export the preparation VM identity and both SHA-256 values through
-   `needs.prepare.outputs`, then transfer the two fixed files to a distinct
-   signing runner
-6. capture the signing VM identity and call `package-macos-release.sh` with
-   explicit archive, attestation, both hashes, source commit, preparation
-   identity, and signing identity
-7. create a draft release in `OpenCoven/seer-releases`
-8. upload only DMG, `SHA256SUMS`, `release-manifest.json`, and release notes
-9. download those assets into a fresh directory
-10. verify checksums, attach the downloaded DMG read-only with `hdiutil`, run
+4. call `package-macos-release.sh`
+5. create a draft release in `OpenCoven/seer-releases`
+6. upload only DMG, `SHA256SUMS`, `release-manifest.json`, and release notes
+7. download those assets into a fresh directory
+8. verify checksums, attach the downloaded DMG read-only with `hdiutil`, run
    signature, Gatekeeper, Mach-O, dependency, source-map, path, and Glaze
    boundary checks against the mounted `Seer.app`, then detach it in an EXIT
    trap
-11. publish the draft only after successful re-verification
+9. publish the draft only after successful re-verification
 
 Use `gh release create --draft`, `gh release upload`, `gh release download`,
 and `gh release edit --draft=false` with `GH_REPO=OpenCoven/seer-releases`.

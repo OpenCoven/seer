@@ -416,63 +416,30 @@ App Store Connect API-key authentication is the default notarization path.
 fallback if API-key authentication is unavailable; the workflow selects one
 complete credential set and fails rather than mixing partial sets.
 
-Release preparation and signing are separate trust domains. Task 17 must use
-two distinct jobs on distinct runner machines; it must never reuse a
-self-hosted runner or workspace between them. The credential-free job runs
-`scripts/prepare-macos-release-input.sh`, which rejects every `APPLE_*`
-variable and publishes only `Seer-unsigned-arm64.tar` plus
-`unsigned-app-attestation.json`. Preparation requires a nonempty
-`PREPARE_RUNNER_ID` captured from the hosted macOS VM, runs the complete Task 14
-source and app boundary validation, and emits a canonical attestation. The
-attestation binds the preparation runner identity, exact source commit,
-recursive app digest, exact archive entry-list digest and count, arm64
-architecture, bundle identifier, archive size, and archive SHA-256. The signing
-job downloads those files through the workflow artifact service and passes
-their paths, both preparation SHA-256 outputs, and the preparation identity as
-`UNSIGNED_APP_ARCHIVE`, `UNSIGNED_APP_ATTESTATION`, and
-`UNSIGNED_APP_SHA256`, `UNSIGNED_APP_ATTESTATION_SHA256`, and
-`PREPARE_RUNNER_ID`.
-
-The signing job performs no dependency installation or build. It checks out
-the attested commit cleanly and captures its own nonempty `SIGNING_RUNNER_ID`
-from the fresh hosted macOS VM. The signing script rejects equal identities and
-an attested preparation identity that differs from the explicit preparation
-job output. Before credential materialization it uses only shell built-ins and
-fixed absolute macOS system tools to verify both artifact hashes, the canonical
-attestation schema and values, source commit, exact archive entry allowlist,
-absence of traversal and links, extracted app digest, plist identity, exact
-arm64 architecture, and the ad-hoc code-signing precondition. It runs no
-checkout-provided helper in that phase. After notarization and signature checks
-it must successfully destroy the key files and keychain and unset credential
-values before repository boundary or manifest code can run. Secret values are
-never written to artifacts or logs. Tool substitution exists only for local
-tests under `SEER_TEST_MODE=1` and is rejected when `GITHUB_ACTIONS=true`.
+The workflow creates a temporary keychain and deletes key material and the
+keychain in an `always()` cleanup step. Secret values are never written to
+artifacts or logs.
 
 The release workflow:
 
-1. Checks out the exact private source tag in a credential-free build job.
-2. Verifies the tag matches the app version and runs the complete pull-request gate.
-3. Builds the production renderer without source maps.
-4. Archives and boundary-checks an unsigned arm64 Release application for macOS 14+.
-5. Transfers only the attested unsigned archive and metadata plus trusted
-   preparation identity and hash outputs to a distinct fresh signing runner.
-6. Revalidates the archive, attestation, runner separation, source commit,
-   entry allowlist, app digest, bundle identity, arm64 slice, and ad-hoc
-   signature precondition before exposing credentials.
-7. Signs nested code and the app with Hardened Runtime and a secure timestamp.
-8. Verifies signatures with `codesign --verify --deep --strict`.
-9. Submits the app to `notarytool` and waits for acceptance.
-10. Staples and validates the notarization ticket.
-11. Builds and signs `Seer-vX.Y.Z-arm64.dmg`.
-12. Verifies Gatekeeper acceptance with `spctl`.
-13. Destroys signing material before final repository boundary/manifest code.
-14. Generates `SHA256SUMS` and a release manifest containing version, bundle
+1. Checks out the exact private source tag.
+2. verifies the tag matches the app version.
+3. Runs the complete pull-request gate.
+4. Builds the production renderer without source maps.
+5. Archives an arm64 Release application for macOS 14+.
+6. Signs nested code and the app with Hardened Runtime and a secure timestamp.
+7. Verifies signatures with `codesign --verify --deep --strict`.
+8. Submits the app to `notarytool` and waits for acceptance.
+9. Staples and validates the notarization ticket.
+10. Builds and signs `Seer-vX.Y.Z-arm64.dmg`.
+11. Verifies Gatekeeper acceptance with `spctl`.
+12. Generates `SHA256SUMS` and a release manifest containing version, bundle
     identifier, source commit, workflow run, artifact hashes, and notarization
     result.
-15. Creates a draft release in `OpenCoven/seer-releases`.
-16. Uploads only the DMG, checksum file, release manifest, and release notes.
-17. Downloads and re-verifies every uploaded artifact.
-18. Publishes the release only after all checks pass.
+13. Creates a draft release in `OpenCoven/seer-releases`.
+14. Uploads only the DMG, checksum file, release manifest, and release notes.
+15. Downloads and re-verifies every uploaded artifact.
+16. Publishes the release only after all checks pass.
 
 The public release repository contains a product README and release metadata,
 not application source. Its automatically generated source archive therefore
