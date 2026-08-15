@@ -4,13 +4,12 @@
 # never signs, notarizes, packages, or distributes it. Every step is a fixed,
 # hardcoded sequence:
 #
-#   1. Build the standalone renderer (npm run build:standalone-renderer).
-#   2. Generate the Xcode project from apps/macos/Seer/project.yml via
+#   1. Generate the Xcode project from apps/macos/Seer/project.yml via
 #      `xcodegen generate` (the generated .xcodeproj is gitignored and
 #      never committed).
-#   3. Build the Seer scheme, Release configuration by default, with
+#   2. Build the Seer scheme, Release configuration by default, with
 #      CODE_SIGNING_ALLOWED=NO (this script never signs anything).
-#   4. Stage the built Seer.app under build/macos/unsigned and publish it
+#   3. Stage the built Seer.app under build/macos/unsigned and publish it
 #      atomically with descriptor-relative, no-follow filesystem operations.
 #
 # Only CONFIGURATION and DERIVED_DATA_PATH may be overridden via the
@@ -22,6 +21,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
+
+if [ -z "${SEER_RENDERER_LOCK_HELD:-}" ]; then
+  exec node "${SCRIPT_DIR}/build-standalone-renderer.mjs" -- bash "${BASH_SOURCE[0]}"
+fi
 
 HOST_ARCH="$(uname -m)"
 if [ "${HOST_ARCH}" != "arm64" ]; then
@@ -58,9 +61,6 @@ if ! command -v xcodegen >/dev/null 2>&1; then
   echo "error: xcodegen not found on PATH" >&2
   exit 1
 fi
-
-echo "==> Building standalone renderer"
-npm run build:standalone-renderer
 
 echo "==> Generating Xcode project from ${PROJECT_SPEC}"
 xcodegen generate --spec "${PROJECT_SPEC}"

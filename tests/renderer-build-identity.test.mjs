@@ -10,6 +10,7 @@ import {
   RENDERER_BUILD_MANIFEST_ALGORITHM,
   RENDERER_BUILD_MANIFEST_SCHEMA_VERSION,
   buildRendererBuildManifest,
+  computeRendererAssetDigest,
   computeRendererBuildDigest,
   rendererBuildInputFiles,
 } from "../scripts/renderer-build-identity.mjs";
@@ -65,11 +66,24 @@ test("computeRendererBuildDigest matches the shared cross-language fixture oracl
 
 test("buildRendererBuildManifest reports the expected schema version/algorithm alongside a matching digest", () => {
   withFixtureCopy((fixtureRepo) => {
-    const manifest = buildRendererBuildManifest(fixtureRepo);
+    const rendererRoot = join(fixtureRepo, "renderer");
+    const manifest = buildRendererBuildManifest(fixtureRepo, rendererRoot);
     assert.equal(manifest.schemaVersion, RENDERER_BUILD_MANIFEST_SCHEMA_VERSION);
     assert.equal(manifest.algorithm, RENDERER_BUILD_MANIFEST_ALGORITHM);
     assert.equal(manifest.algorithm, "sha256");
-    assert.equal(manifest.digest, computeRendererBuildDigest(fixtureRepo));
+    assert.equal(manifest.sourceDigest, computeRendererBuildDigest(fixtureRepo));
+    assert.equal(manifest.assetDigest, computeRendererAssetDigest(rendererRoot));
+  });
+});
+
+test("computeRendererAssetDigest changes when an emitted asset changes and ignores build-manifest.json", () => {
+  withFixtureCopy((fixtureRepo) => {
+    const rendererRoot = join(fixtureRepo, "renderer");
+    const before = computeRendererAssetDigest(rendererRoot);
+    writeFileSync(join(rendererRoot, "build-manifest.json"), '{"untrusted":"self-reference"}\n');
+    assert.equal(computeRendererAssetDigest(rendererRoot), before);
+    writeFileSync(join(rendererRoot, "index.ts"), `${readFileSync(join(rendererRoot, "index.ts"), "utf8")}changed\n`);
+    assert.notEqual(computeRendererAssetDigest(rendererRoot), before);
   });
 });
 
@@ -225,7 +239,7 @@ test("two independent fixture copies with byte-identical relevant inputs produce
   assert.equal(digests[0], digests[1], "identical content at two different absolute locations must digest identically");
 });
 
-test("the real npm run build:standalone-renderer build writes a build-manifest.json whose digest matches an independent recomputation over the checked-out repo, with no timestamp/git-commit fields, and is stable across repeated builds", (t) => {
+test("the real renderer build manifest binds both checked-out source and emitted asset digests and is stable", (t) => {
   t.diagnostic("Running npm run build:standalone-renderer twice — this shells out to vite build");
 
   const outputDir = join(repoRoot, "build", "standalone-renderer", "Renderer");
@@ -249,12 +263,19 @@ test("the real npm run build:standalone-renderer build writes a build-manifest.j
   const manifest = JSON.parse(secondManifestText);
   assert.equal(manifest.schemaVersion, RENDERER_BUILD_MANIFEST_SCHEMA_VERSION);
   assert.equal(manifest.algorithm, "sha256");
-  assert.match(manifest.digest, HEX_SHA256);
+  assert.match(manifest.sourceDigest, HEX_SHA256);
+  assert.match(manifest.assetDigest, HEX_SHA256);
   assert.equal(
-    manifest.digest,
+    manifest.sourceDigest,
     computeRendererBuildDigest(repoRoot),
     "the bundled manifest's digest must exactly match an independent recomputation over the checked-out repo",
   );
+  assert.equal(
+    manifest.assetDigest,
+    computeRendererAssetDigest(outputDir),
+    "the bundled manifest must bind every emitted asset in the published Renderer directory",
+  );
+  assert.ok(!("digest" in manifest), "the ambiguous schema-v1 digest field must not survive");
   assert.ok(!("builtAtEpochSeconds" in manifest), "the manifest must never carry a build timestamp");
   assert.ok(!("gitCommit" in manifest), "the manifest must never carry a git commit identity marker");
 });

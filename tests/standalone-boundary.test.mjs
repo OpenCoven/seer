@@ -344,18 +344,31 @@ test("build provenance is loaded from ignored metadata outside Seer.app", () => 
   const tmpRoot = mkdtempSync(join(repoRoot, "build", "seer-build-provenance-"));
   try {
     const metadataPath = join(tmpRoot, "standalone-build-provenance.json");
+    const fixtureRepo = join(tmpRoot, "repo");
+    const fixtureApp = join(fixtureRepo, "build", "macos", "unsigned", "Seer.app");
+    const derivedData = join(tmpRoot, "DerivedData");
+    mkdirSync(fixtureApp, { recursive: true });
+    mkdirSync(derivedData, { recursive: true });
+    writeFileSync(join(fixtureApp, "asset.txt"), "bound app\n");
+    const appDigest = boundaryChecks.computeAppDigest(fixtureApp);
     writeFileSync(
       metadataPath,
       `${JSON.stringify({
-        schemaVersion: 1,
-        canonicalRepoRoot: "/Volumes/build/seer",
-        effectiveDerivedDataPath: "/private/var/build/DerivedData",
+        schemaVersion: 2,
+        algorithm: "sha256",
+        canonicalRepoRoot: fixtureRepo,
+        effectiveDerivedDataPath: derivedData,
+        appDigest,
+        generation: appDigest,
       })}\n`,
     );
-    assert.deepEqual(boundaryChecks.loadBuildProvenance(metadataPath), [
-      "/Volumes/build/seer",
-      "/private/var/build/DerivedData",
-    ]);
+    assert.deepEqual(
+      boundaryChecks.loadBuildProvenance(metadataPath, {
+        expectedRepoRoot: fixtureRepo,
+        appPath: fixtureApp,
+      }).forbiddenAbsolutePaths,
+      [fixtureRepo, derivedData],
+    );
   } finally {
     rmSync(tmpRoot, { recursive: true, force: true });
   }

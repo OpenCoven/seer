@@ -10,10 +10,9 @@ import CryptoKit
 /// (`TEST_HOST` in `Seer.xcodeproj`), so `Bundle.main` here *is* the built
 /// `Seer.app` bundle, and its own `Resources` build phase already copies
 /// `build/standalone-renderer/Renderer` — built from `renderer/standalone/
-/// index.tsx` by the `Seer` target's "Build standalone renderer"
-/// `preBuildScripts` phase (`Scripts/build-standalone-renderer.sh`, wired
-/// in `project.yml`; runs `npm run build:standalone-renderer`
-/// unconditionally, *before* the Resources phase, on every build) — into
+/// index.tsx` by the lock-owning official npm workflow before it launches
+/// xcodegen/xcodebuild, with the same lock held through Xcode's Resources
+/// phase — into
 /// it under the name `Renderer`. This is precisely the same expression
 /// `AppDelegate.bootstrapServices(...)`'s own `rendererRoot` default
 /// parameter uses (see `Sources/App/AppDelegate.swift`), so every test in
@@ -36,7 +35,7 @@ private enum BundledRenderer {
     /// `RendererBuildIdentityTests` below, which proves both agree
     /// byte-for-byte over the same committed fixture — so both must first
     /// agree on the manifest's shape before ever comparing digests.
-    fileprivate static let manifestSchemaVersion = 1
+    fileprivate static let manifestSchemaVersion = 2
     fileprivate static let manifestAlgorithm = "sha256"
 
     /// Same fixed, repo-root-relative files (outside `renderer/`) as
@@ -88,11 +87,9 @@ private enum BundledRenderer {
     }
 
     /// A deterministic precondition, run once before every test in this
-    /// file. The bundled renderer is built entirely by the `Seer` target's
-    /// own build — the "Build standalone renderer" `preBuildScripts` phase
-    /// runs `npm run build:standalone-renderer` unconditionally
-    /// (`basedOnDependencyAnalysis: false`), *before* Xcode's "Copy
-    /// Resources" phase, on every single build — so by the time
+    /// file. The bundled renderer is built by the lock-owning package
+    /// workflow before xcodebuild starts, and that wrapper keeps the same
+    /// lock through Xcode's "Copy Resources" phase — so by the time
     /// `SeerTests` even links against `Seer.app` (its `TEST_HOST`), the
     /// bundled `Renderer` folder this reads has already been produced from
     /// the current checkout. This precondition therefore never launches
@@ -108,11 +105,9 @@ private enum BundledRenderer {
         let documentURL = root.url.appendingPathComponent(documentFileName)
         guard FileManager.default.fileExists(atPath: documentURL.path) else {
             throw SetupFailure(description: """
-                Bundled renderer document not found at \(documentURL.path). The Seer target's \
-                "Build standalone renderer" preBuildScripts phase (apps/macos/Seer/Scripts/\
-                build-standalone-renderer.sh, wired in apps/macos/Seer/project.yml) should have produced \
-                this before Xcode's Resources phase ever ran. Run `xcodegen generate` in \
-                apps/macos/Seer and rebuild the Seer target.
+                Bundled renderer document not found at \(documentURL.path). Run the official \
+                `npm run test:macos` workflow so its renderer lock wrapper builds and publishes an \
+                immutable generation before xcodebuild copies resources.
                 """)
         }
         let repoRoot = try repoRootURL(fromTestFile: file)
@@ -122,8 +117,8 @@ private enum BundledRenderer {
         )
     }
 
-    /// Reads the deterministic content digest `Scripts/build-standalone-renderer.sh`
-    /// writes into `build-manifest.json` (via the single shared
+    /// Reads the deterministic content digests the lock-owning renderer
+    /// wrapper writes into `build-manifest.json` (via the single shared
     /// `scripts/renderer-build-identity.mjs` implementation), independently
     /// recomputes that exact same digest over the current checkout's
     /// renderer build inputs, and fails closed unless they match exactly —
@@ -140,16 +135,17 @@ private enum BundledRenderer {
     fileprivate static func verifyManifestIsFresh(manifestURL: URL, repoRoot: URL) throws {
         guard let data = FileManager.default.contents(atPath: manifestURL.path) else {
             throw SetupFailure(description: """
-                Bundled renderer manifest not found at \(manifestURL.path); the "Build standalone \
-                renderer" preBuildScripts phase always writes it alongside \(documentFileName). Run \
-                `xcodegen generate` in apps/macos/Seer and rebuild the Seer target.
+                Bundled renderer manifest not found at \(manifestURL.path); the official macOS npm \
+                workflows always publish it alongside \(documentFileName) before launching xcodebuild.
                 """)
         }
         guard
             let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
             let schemaVersion = json["schemaVersion"] as? Int,
             let algorithm = json["algorithm"] as? String,
-            let digest = json["digest"] as? String
+            let sourceDigest = json["sourceDigest"] as? String,
+            let assetDigest = json["assetDigest"] as? String,
+            Set(json.keys) == Set(["schemaVersion", "algorithm", "sourceDigest", "assetDigest"])
         else {
             throw SetupFailure(description: """
                 Bundled renderer manifest at \(manifestURL.path) is malformed: \
@@ -160,21 +156,31 @@ private enum BundledRenderer {
             throw SetupFailure(description: """
                 Bundled renderer manifest at \(manifestURL.path) has an unsupported \
                 schemaVersion/algorithm (\(schemaVersion)/\(algorithm)); expected \
-                \(manifestSchemaVersion)/\(manifestAlgorithm). Regenerate it with the current "Build \
-                standalone renderer" preBuildScripts phase.
+                \(manifestSchemaVersion)/\(manifestAlgorithm). Regenerate it with the current official \
+                macOS npm workflow.
                 """)
         }
 
         let expectedDigest = try computeRendererSourceDigest(repoRoot: repoRoot)
-        guard digest.lowercased() == expectedDigest else {
+        guard sourceDigest == expectedDigest else {
             throw SetupFailure(description: """
-                Bundled renderer at \(root.url.path) was built with content digest \(digest) (per \
+                Bundled renderer at \(manifestURL.deletingLastPathComponent().path) was built with source \
+                digest \(sourceDigest) (per \
                 \(manifestURL.path)), but independently recomputing that same digest over the current \
                 checkout's renderer build inputs (\(rendererSourceDirName)/, \
                 \(topLevelInputFiles.joined(separator: ", "))) yields \(expectedDigest) instead. The \
-                bundled renderer is stale relative to the current renderer source; rebuild the Seer \
-                target (its "Build standalone renderer" preBuildScripts phase runs automatically) \
-                before running these tests again.
+                bundled renderer is stale relative to the current renderer source; rerun the official \
+                macOS npm workflow before running these tests again.
+                """)
+        }
+
+        let rendererRoot = manifestURL.deletingLastPathComponent()
+        let actualAssetDigest = try computeRendererAssetDigest(rendererRoot: rendererRoot)
+        guard assetDigest == actualAssetDigest else {
+            throw SetupFailure(description: """
+                Bundled renderer assets at \(rendererRoot.path) hash to \(actualAssetDigest), but \
+                \(manifestURL.path) binds generation \(assetDigest). The bundled copy is mixed, missing, \
+                or was modified after publication.
                 """)
         }
     }
@@ -190,6 +196,44 @@ private enum BundledRenderer {
         for relativePath in relativePaths {
             let absoluteURL = repoRoot.appendingPathComponent(relativePath)
             let contents = try Data(contentsOf: absoluteURL)
+            manifestLines += "\(relativePath):\(sha256Hex(contents))\n"
+        }
+        return sha256Hex(Data(manifestLines.utf8))
+    }
+
+    /// Hashes the bundled generation itself, excluding only its manifest to
+    /// avoid self-reference. This independently verifies the exact copy that
+    /// Xcode placed in Seer.app, not the mutable repository output directory.
+    fileprivate static func computeRendererAssetDigest(rendererRoot: URL) throws -> String {
+        let fileManager = FileManager.default
+        guard let enumerator = fileManager.enumerator(
+            at: rendererRoot,
+            includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]
+        ) else {
+            throw SetupFailure(description: "Unable to enumerate bundled renderer at \(rendererRoot.path)")
+        }
+
+        var relativePaths: [String] = []
+        for case let fileURL as URL in enumerator {
+            let values = try fileURL.resourceValues(
+                forKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]
+            )
+            let relativePath = posixRelativePath(of: fileURL, relativeTo: rendererRoot)
+            if values.isSymbolicLink == true {
+                throw SetupFailure(description: "Bundled renderer asset is a symlink: \(relativePath)")
+            }
+            if values.isDirectory == true { continue }
+            guard values.isRegularFile == true else {
+                throw SetupFailure(description: "Bundled renderer asset is not a regular file: \(relativePath)")
+            }
+            if relativePath != manifestFileName {
+                relativePaths.append(relativePath)
+            }
+        }
+
+        var manifestLines = ""
+        for relativePath in relativePaths.sorted() {
+            let contents = try Data(contentsOf: rendererRoot.appendingPathComponent(relativePath))
             manifestLines += "\(relativePath):\(sha256Hex(contents))\n"
         }
         return sha256Hex(Data(manifestLines.utf8))
@@ -563,11 +607,17 @@ final class RendererIntegrationTests: XCTestCase {
         try fileManager.copyItem(at: fixtureRepo, to: scratchRepo)
         defer { try? fileManager.removeItem(at: scratchRoot) }
 
-        let manifestURL = scratchRoot.appendingPathComponent("build-manifest.json")
-        let freshDigest = try BundledRenderer.computeRendererSourceDigest(repoRoot: scratchRepo)
+        let rendererBundle = scratchRoot.appendingPathComponent("Renderer", isDirectory: true)
+        try fileManager.createDirectory(at: rendererBundle, withIntermediateDirectories: true)
+        let documentURL = rendererBundle.appendingPathComponent("standalone-window.html")
+        try "<html>fresh</html>\n".write(to: documentURL, atomically: true, encoding: .utf8)
+        let manifestURL = rendererBundle.appendingPathComponent("build-manifest.json")
+        let freshSourceDigest = try BundledRenderer.computeRendererSourceDigest(repoRoot: scratchRepo)
+        let freshAssetDigest = try BundledRenderer.computeRendererAssetDigest(rendererRoot: rendererBundle)
         let freshManifest = """
             {"schemaVersion": \(BundledRenderer.manifestSchemaVersion), \
-            "algorithm": "\(BundledRenderer.manifestAlgorithm)", "digest": "\(freshDigest)"}
+            "algorithm": "\(BundledRenderer.manifestAlgorithm)", \
+            "sourceDigest": "\(freshSourceDigest)", "assetDigest": "\(freshAssetDigest)"}
             """
         try freshManifest.write(to: manifestURL, atomically: true, encoding: .utf8)
 
@@ -596,6 +646,25 @@ final class RendererIntegrationTests: XCTestCase {
                 "expected a SetupFailure, got \(error)"
             )
         }
+
+        let refreshedSourceDigest = try BundledRenderer.computeRendererSourceDigest(repoRoot: scratchRepo)
+        let refreshedManifest = """
+            {"schemaVersion": \(BundledRenderer.manifestSchemaVersion), \
+            "algorithm": "\(BundledRenderer.manifestAlgorithm)", \
+            "sourceDigest": "\(refreshedSourceDigest)", "assetDigest": "\(freshAssetDigest)"}
+            """
+        try refreshedManifest.write(to: manifestURL, atomically: true, encoding: .utf8)
+        try "<html>tampered after publication</html>\n".write(
+            to: documentURL,
+            atomically: true,
+            encoding: .utf8
+        )
+        XCTAssertThrowsError(
+            try BundledRenderer.verifyManifestIsFresh(manifestURL: manifestURL, repoRoot: scratchRepo),
+            "a bundled asset changed after publication must be rejected"
+        ) { error in
+            XCTAssertTrue(error is BundledRenderer.SetupFailure, "expected a SetupFailure, got \(error)")
+        }
     }
 
     /// `verifyManifestIsFresh` must also fail closed on a manifest with an
@@ -619,7 +688,8 @@ final class RendererIntegrationTests: XCTestCase {
         let manifestURL = scratchRoot.appendingPathComponent("build-manifest.json")
         let digest = try BundledRenderer.computeRendererSourceDigest(repoRoot: fixtureRepo)
         try """
-            {"schemaVersion": 999, "algorithm": "sha256", "digest": "\(digest)"}
+            {"schemaVersion": 999, "algorithm": "sha256", \
+            "sourceDigest": "\(digest)", "assetDigest": "\(digest)"}
             """.write(to: manifestURL, atomically: true, encoding: .utf8)
 
         XCTAssertThrowsError(

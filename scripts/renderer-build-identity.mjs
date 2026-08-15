@@ -2,11 +2,9 @@
 // Shared, deterministic content-digest computation for the standalone macOS
 // renderer bundle's build identity marker.
 //
-// Both `Scripts/build-standalone-renderer.sh` (via this file's CLI entry
-// point below) and `tests/renderer-build-identity.test.mjs` import/invoke
-// this exact same module, so the digest a bundle is built with and the
-// digest a test/consumer independently recomputes can never drift apart
-// through duplicated-but-subtly-different logic.
+// Both the lock-owning renderer build wrapper and its tests import this exact
+// module, so the digest a bundle is built with and the digest a consumer
+// independently recomputes cannot drift through duplicated logic.
 //
 // The digest deliberately depends on nothing but the *bytes* of the files
 // this build actually reads: no `Date.now()`/`builtAtEpochSeconds`, no
@@ -25,7 +23,7 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 /** Bump only if the manifest's on-disk shape changes incompatibly. */
-export const RENDERER_BUILD_MANIFEST_SCHEMA_VERSION = 1;
+export const RENDERER_BUILD_MANIFEST_SCHEMA_VERSION = 2;
 export const RENDERER_BUILD_MANIFEST_ALGORITHM = "sha256";
 
 /**
@@ -156,12 +154,50 @@ export function computeRendererBuildDigest(repoRoot) {
   return sha256Hex(Buffer.from(manifestLines, "utf8"));
 }
 
+function collectRendererAssetFiles(rendererRoot, directory, out) {
+  const entries = readdirSync(directory, { withFileTypes: true })
+    .sort((left, right) => left.name.localeCompare(right.name));
+  for (const entry of entries) {
+    const absolutePath = join(directory, entry.name);
+    const relativePath = toPosixRelativePath(rendererRoot, absolutePath);
+    if (relativePath === "build-manifest.json") continue;
+    if (entry.isSymbolicLink()) {
+      throw new Error(`renderer asset must not be a symlink: ${relativePath}`);
+    }
+    if (entry.isDirectory()) {
+      collectRendererAssetFiles(rendererRoot, absolutePath, out);
+    } else if (entry.isFile()) {
+      out.push(relativePath);
+    } else {
+      throw new Error(`renderer asset must be a regular file or directory: ${relativePath}`);
+    }
+  }
+}
+
+/**
+ * Lowercase SHA-256 over every emitted file except build-manifest.json.
+ * Excluding the manifest avoids a self-referential digest while binding the
+ * manifest to the complete immutable generation it accompanies.
+ */
+export function computeRendererAssetDigest(rendererRoot) {
+  const relativePaths = [];
+  collectRendererAssetFiles(rendererRoot, rendererRoot, relativePaths);
+  relativePaths.sort();
+  let manifestLines = "";
+  for (const relativePath of relativePaths) {
+    const absolutePath = join(rendererRoot, ...relativePath.split("/"));
+    manifestLines += `${relativePath}:${sha256Hex(readFileSync(absolutePath))}\n`;
+  }
+  return sha256Hex(Buffer.from(manifestLines, "utf8"));
+}
+
 /** The full build-manifest object, before serialization. */
-export function buildRendererBuildManifest(repoRoot) {
+export function buildRendererBuildManifest(repoRoot, rendererRoot) {
   return {
     schemaVersion: RENDERER_BUILD_MANIFEST_SCHEMA_VERSION,
     algorithm: RENDERER_BUILD_MANIFEST_ALGORITHM,
-    digest: computeRendererBuildDigest(repoRoot),
+    sourceDigest: computeRendererBuildDigest(repoRoot),
+    assetDigest: computeRendererAssetDigest(rendererRoot),
   };
 }
 
@@ -175,7 +211,8 @@ export function serializeRendererBuildManifest(manifest) {
     {
       schemaVersion: manifest.schemaVersion,
       algorithm: manifest.algorithm,
-      digest: manifest.digest,
+      sourceDigest: manifest.sourceDigest,
+      assetDigest: manifest.assetDigest,
     },
     null,
     2,
@@ -183,13 +220,13 @@ export function serializeRendererBuildManifest(manifest) {
 }
 
 function main() {
-  const [, , repoRootArg, outputPathArg] = process.argv;
-  if (!repoRootArg || !outputPathArg) {
-    console.error("usage: node renderer-build-identity.mjs <repoRoot> <outputManifestPath>");
+  const [, , repoRootArg, rendererRootArg, outputPathArg] = process.argv;
+  if (!repoRootArg || !rendererRootArg || !outputPathArg) {
+    console.error("usage: node renderer-build-identity.mjs <repoRoot> <rendererRoot> <outputManifestPath>");
     process.exitCode = 1;
     return;
   }
-  const manifest = buildRendererBuildManifest(repoRootArg);
+  const manifest = buildRendererBuildManifest(repoRootArg, rendererRootArg);
   writeFileSync(outputPathArg, serializeRendererBuildManifest(manifest));
 }
 

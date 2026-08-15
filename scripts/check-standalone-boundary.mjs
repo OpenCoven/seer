@@ -34,6 +34,7 @@
 // established for the renderer build-identity digest).
 import { execFileSync } from "node:child_process";
 import console from "node:console";
+import { createHash } from "node:crypto";
 import {
   closeSync,
   constants as fsConstants,
@@ -42,6 +43,7 @@ import {
   openSync,
   readFileSync,
   readdirSync,
+  realpathSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative } from "node:path";
@@ -121,6 +123,7 @@ const SOURCE_SCAN_FILES = [
   "tsconfig.standalone.json",
   "scripts/build-macos-app.sh",
   "scripts/build-standalone-renderer.mjs",
+  "scripts/test-macos.sh",
   "scripts/publish-macos-app.py",
 ];
 
@@ -698,7 +701,59 @@ export function checkEntitlements(appPath, { sourceEntitlementsPath } = {}) {
  * its lstat/open identities must match so a symlink or leaf swap cannot
  * redirect the scanner.
  */
-export function loadBuildProvenance(provenancePath = DEFAULT_PROVENANCE_PATH) {
+function sha256Hex(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function collectAppDigestLines(directory, prefix, lines) {
+  const entries = readdirSync(directory, { withFileTypes: true })
+    .sort((left, right) => left.name.localeCompare(right.name));
+  for (const entry of entries) {
+    const fullPath = join(directory, entry.name);
+    const relativePath = prefix ? `${prefix}/${entry.name}` : entry.name;
+    const before = lstatSync(fullPath);
+    if (entry.isSymbolicLink() || before.isSymbolicLink()) {
+      throw new Error(`app digest entry is a symlink: ${relativePath}`);
+    }
+    if (entry.isDirectory()) {
+      if (!before.isDirectory()) throw new Error(`app digest directory changed type: ${relativePath}`);
+      collectAppDigestLines(fullPath, relativePath, lines);
+      continue;
+    }
+    if (!entry.isFile() || !before.isFile()) {
+      throw new Error(`app digest entry is not a regular file: ${relativePath}`);
+    }
+    const descriptor = openSync(fullPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    try {
+      const after = fstatSync(descriptor);
+      if (!after.isFile() || before.dev !== after.dev || before.ino !== after.ino) {
+        throw new Error(`app digest entry changed identity while being opened: ${relativePath}`);
+      }
+      lines.push(`${relativePath}:${sha256Hex(readFileSync(descriptor))}\n`);
+    } finally {
+      closeSync(descriptor);
+    }
+  }
+}
+
+/** Deterministic digest over every regular file in an app bundle. */
+export function computeAppDigest(appPath) {
+  const root = lstatSync(appPath);
+  if (root.isSymbolicLink() || !root.isDirectory()) {
+    throw new Error(`app bundle must be a real directory: ${appPath}`);
+  }
+  const lines = [];
+  collectAppDigestLines(appPath, "", lines);
+  return sha256Hex(lines.join(""));
+}
+
+export function loadBuildProvenance(
+  provenancePath = DEFAULT_PROVENANCE_PATH,
+  {
+    expectedRepoRoot = REPO_ROOT,
+    appPath = DEFAULT_APP_PATH,
+  } = {},
+) {
   const before = lstatSync(provenancePath);
   if (before.isSymbolicLink() || !before.isFile()) {
     throw new Error(`build provenance must be a regular non-symlink file: ${provenancePath}`);
@@ -717,16 +772,67 @@ export function loadBuildProvenance(provenancePath = DEFAULT_PROVENANCE_PATH) {
   }
 
   const provenance = JSON.parse(source);
-  if (provenance.schemaVersion !== 1) {
+  const expectedKeys = [
+    "algorithm",
+    "appDigest",
+    "canonicalRepoRoot",
+    "effectiveDerivedDataPath",
+    "generation",
+    "schemaVersion",
+  ];
+  if (
+    !provenance ||
+    Array.isArray(provenance) ||
+    JSON.stringify(Object.keys(provenance).sort()) !== JSON.stringify(expectedKeys)
+  ) {
+    throw new Error("build provenance schema has missing or unexpected fields");
+  }
+  if (provenance.schemaVersion !== 2) {
     throw new Error(`unsupported build provenance schemaVersion ${JSON.stringify(provenance.schemaVersion)}`);
   }
+  if (provenance.algorithm !== "sha256") {
+    throw new Error(`unsupported build provenance algorithm ${JSON.stringify(provenance.algorithm)}`);
+  }
+  if (!/^[0-9a-f]{64}$/.test(provenance.appDigest) || provenance.generation !== provenance.appDigest) {
+    throw new Error("build provenance digest/generation is malformed or mismatched");
+  }
+
+  const canonicalExpectedRepoRoot = realpathSync(expectedRepoRoot);
+  if (canonicalExpectedRepoRoot !== expectedRepoRoot) {
+    throw new Error(`actual repository root is not canonical: ${expectedRepoRoot}`);
+  }
+  if (provenance.canonicalRepoRoot !== canonicalExpectedRepoRoot) {
+    throw new Error(
+      `build provenance repository root ${JSON.stringify(provenance.canonicalRepoRoot)} ` +
+        `does not match actual repository root ${JSON.stringify(canonicalExpectedRepoRoot)}`,
+    );
+  }
+
   const paths = [provenance.canonicalRepoRoot, provenance.effectiveDerivedDataPath];
   for (const path of paths) {
     if (typeof path !== "string" || !isAbsolute(path) || path === "/") {
       throw new Error(`invalid absolute path in build provenance: ${JSON.stringify(path)}`);
     }
+    if (realpathSync(path) !== path) {
+      throw new Error(`build provenance path is not canonical: ${JSON.stringify(path)}`);
+    }
   }
-  return [...new Set(paths)];
+  const derivedInfo = lstatSync(provenance.effectiveDerivedDataPath);
+  if (derivedInfo.isSymbolicLink() || !derivedInfo.isDirectory()) {
+    throw new Error("build provenance DerivedData path must be a real directory");
+  }
+
+  const actualDigest = computeAppDigest(appPath);
+  if (actualDigest !== provenance.appDigest) {
+    throw new Error(
+      `current app digest ${actualDigest} does not match provenance generation ${provenance.appDigest}; ` +
+        "the app/provenance pair is mismatched or tampered",
+    );
+  }
+  return {
+    ...provenance,
+    forbiddenAbsolutePaths: [...new Set(paths)],
+  };
 }
 
 function main() {
@@ -744,7 +850,10 @@ function main() {
 
   let forbiddenAbsolutePaths = [];
   try {
-    forbiddenAbsolutePaths = loadBuildProvenance(provenancePath);
+    forbiddenAbsolutePaths = loadBuildProvenance(provenancePath, {
+      expectedRepoRoot: REPO_ROOT,
+      appPath,
+    }).forbiddenAbsolutePaths;
   } catch (error) {
     offenders.push(`unable to load private build provenance from ${provenancePath}: ${error.message}`);
   }

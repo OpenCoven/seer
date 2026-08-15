@@ -1,6 +1,12 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
+import process from "node:process";
+
+const privateOutDir = process.env.SEER_RENDERER_PRIVATE_OUT_DIR;
+if (!privateOutDir) {
+  throw new Error("SEER_RENDERER_PRIVATE_OUT_DIR must identify the lock owner's private generation");
+}
 
 /**
  * Production build config for the standalone macOS renderer bundle.
@@ -15,7 +21,7 @@ export default defineConfig({
   base: "./",
   plugins: [react(), tailwindcss()],
   build: {
-    outDir: "build/standalone-renderer/Renderer",
+    outDir: privateOutDir,
     emptyOutDir: true,
     sourcemap: false,
     rollupOptions: {
