@@ -453,7 +453,7 @@ final class AppSnapshotCoordinatorTests: XCTestCase {
         XCTAssertEqual(powerBackend.releasedIDs, [], "the old assertion must never be released while every replacement attempt keeps failing")
     }
 
-    func testDeactivateAfterDoubleReleaseFailureReportsInactiveUntilCleanupDiagnosticClears() async throws {
+    func testDeactivateAfterDoubleReleaseFailureReportsUncertainAwakeUntilCleanupDiagnosticClears() async throws {
         let clock = MutableClock(now: 1_700_000_000_000)
         let powerBackend = CoordinatorFakePowerBackend()
         let (coordinator, _, _) = await makeCoordinator(clock: clock, powerBackend: powerBackend)
@@ -472,10 +472,10 @@ final class AppSnapshotCoordinatorTests: XCTestCase {
         await coordinator.applyScan([], scannedAt: clock.now)
 
         XCTAssertFalse(coordinator.snapshot.monitor.active)
-        XCTAssertFalse(coordinator.snapshot.monitor.keepingAwake)
+        XCTAssertTrue(coordinator.snapshot.monitor.keepingAwake)
         XCTAssertTrue(
             coordinator.snapshot.diagnostics.contains { $0.id == PowerDiagnosticID.assertionFailed },
-            "cleanup uncertainty must remain diagnosed even though desired keepingAwake is false"
+            "cleanup uncertainty must remain diagnosed while the OS assertion may still be live"
         )
 
         clock.now += 10
@@ -1151,7 +1151,7 @@ final class AppSnapshotCoordinatorTests: XCTestCase {
         } catch {
             // Expected.
         }
-        XCTAssertFalse(coordinator.snapshot.monitor.keepingAwake)
+        XCTAssertTrue(coordinator.snapshot.monitor.keepingAwake)
         XCTAssertTrue(coordinator.snapshot.diagnostics.contains { $0.id == PowerDiagnosticID.assertionFailed })
 
         try await coordinator.shutdown()

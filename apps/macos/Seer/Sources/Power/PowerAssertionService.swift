@@ -185,9 +185,10 @@ public final class PowerAssertionService {
     public var pendingReleaseAssertionIDs: [UInt32] { pendingReleaseIDs.sorted() }
     public var hasPendingReleases: Bool { !pendingReleaseIDs.isEmpty }
 
-    /// Whether desired state has an active assertion. Cleanup uncertainty
-    /// never changes this semantic.
-    public var isActive: Bool { activeAssertionID != nil }
+    /// Whether an assertion is known or may still be active at the OS
+    /// boundary. A failed release remains active for presentation purposes
+    /// until a later reconciliation confirms that every pending id cleared.
+    public var isActive: Bool { activeAssertionID != nil || !pendingReleaseIDs.isEmpty }
 
     public init(backend: any PowerAssertionBackend, reason: String = PowerAssertionReason.stable) {
         self.backend = backend
@@ -232,8 +233,8 @@ public final class PowerAssertionService {
             try requirePendingReleasesResolved(firstFailure: pendingRetry.firstFailure)
             return pendingRetry.invoked
         }
-        // Desired state changes immediately. A failed OS release is cleanup
-        // uncertainty, not permission to report keepingAwake as desired.
+        // Desired state changes immediately, but a failed OS release remains
+        // visible through `isActive` until reconciliation confirms cleanup.
         activeAssertionID = nil
         activeMode = nil
         do {

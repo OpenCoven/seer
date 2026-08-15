@@ -219,7 +219,7 @@ final class PowerAssertionServiceTests: XCTestCase {
         XCTAssertNil(service.activeMode)
     }
 
-    func testDeactivateFailureReportsInactiveAndTracksPendingRelease() throws {
+    func testDeactivateFailureReportsPotentiallyActiveAndTracksPendingRelease() throws {
         let backend = FakeAssertionBackend()
         let service = PowerAssertionService(backend: backend)
         try service.setDesired(active: true, mode: .system)
@@ -232,7 +232,7 @@ final class PowerAssertionServiceTests: XCTestCase {
             XCTAssertEqual(actualID, 1)
             XCTAssertEqual(actualMode, .system)
         }
-        XCTAssertFalse(service.isActive)
+        XCTAssertTrue(service.isActive, "a pending release means the OS assertion may still be live")
         XCTAssertNil(service.activeAssertionID)
         XCTAssertNil(service.activeMode)
         XCTAssertEqual(service.pendingReleaseAssertionIDs, [1])
@@ -353,7 +353,7 @@ final class PowerAssertionServiceTests: XCTestCase {
         backend.releaseFailuresByID[2] = .releaseFailed(ioReturnCode: -7)
         XCTAssertThrowsError(try service.setDesired(active: false, mode: .display))
 
-        XCTAssertFalse(service.isActive, "desired inactive semantics must not be overwritten by cleanup uncertainty")
+        XCTAssertTrue(service.isActive, "cleanup uncertainty must remain visible as potentially active")
         XCTAssertNil(service.activeAssertionID)
         XCTAssertNil(service.activeMode)
         XCTAssertEqual(service.pendingReleaseAssertionIDs, [1, 2])
@@ -434,7 +434,7 @@ final class PowerAssertionServiceTests: XCTestCase {
                 return XCTFail("expected .releaseFailed, got \(error)")
             }
         }
-        XCTAssertFalse(service.isActive, "shutdown changes desired state immediately even when OS cleanup is uncertain")
+        XCTAssertTrue(service.isActive, "shutdown must report a potentially live assertion until release is confirmed")
         XCTAssertEqual(service.pendingReleaseAssertionIDs, [1])
     }
 
@@ -449,7 +449,7 @@ final class PowerAssertionServiceTests: XCTestCase {
         backend.releaseFailuresByID[1] = .releaseFailed(ioReturnCode: -3)
         backend.releaseFailuresByID[2] = .releaseFailed(ioReturnCode: -4)
         XCTAssertThrowsError(try service.shutdown())
-        XCTAssertFalse(service.isActive)
+        XCTAssertTrue(service.isActive)
         XCTAssertEqual(service.pendingReleaseAssertionIDs, [1, 2])
 
         try service.shutdown()
@@ -505,7 +505,7 @@ final class PowerAssertionServiceTests: XCTestCase {
             XCTAssertEqual(actualID, 1)
             XCTAssertEqual(actualMode, .system)
         }
-        XCTAssertFalse(service.isActive)
+        XCTAssertTrue(service.isActive, "the foreign release failure is just as uncertain as a typed one")
         XCTAssertNil(service.activeAssertionID)
         XCTAssertNil(service.activeMode)
         XCTAssertEqual(service.pendingReleaseAssertionIDs, [1])
