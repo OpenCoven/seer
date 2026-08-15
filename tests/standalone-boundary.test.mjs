@@ -24,6 +24,9 @@ import {
   classifyMachOFiles,
   DEFAULT_APP_PATH,
   EXPECTED_EXECUTABLE_RELATIVE_PATH,
+  findBundleSymlinkOffender,
+  isAllowedDependencyPath,
+  listStandaloneSourceFiles,
   parseOtoolDependencies,
   scanBundle,
   scanFilesForForbiddenPatterns,
@@ -96,6 +99,52 @@ test("the source pattern scan flags each forbidden Glaze reference when present"
   }
 });
 
+test("scanSourceBoundary flags a source-tree symlink pointing outside the fixture root and never dereferences it, even once dangling", () => {
+  const tmpRoot = mkdtempSync(join(tmpdir(), "seer-source-symlink-"));
+  const outsideRoot = mkdtempSync(join(tmpdir(), "seer-source-symlink-outside-"));
+  try {
+    mkdirSync(join(tmpRoot, "renderer"), { recursive: true });
+    const outsideTarget = join(outsideRoot, "secret.ts");
+    writeFileSync(outsideTarget, 'import x from "@glaze/core"; // outside-only secret, must never be read\n');
+    const linkPath = join(tmpRoot, "renderer", "escape-link.ts");
+    symlinkSync(outsideTarget, linkPath);
+
+    // Deleting the outside target after creating the symlink makes it
+    // dangling: if scanSourceBoundary ever actually dereferenced it (e.g.
+    // via readFileSync following the link), that call would throw ENOENT
+    // and this test would fail with an uncaught exception instead of a
+    // clean, deterministic offender list — proving the scan never reads
+    // through it.
+    rmSync(outsideTarget);
+
+    const offenders = scanSourceBoundary(tmpRoot);
+    assert.equal(offenders.length, 1);
+    assert.match(offenders[0], /renderer\/escape-link\.ts/);
+    assert.match(offenders[0], /symlink/);
+  } finally {
+    rmSync(tmpRoot, { recursive: true, force: true });
+    rmSync(outsideRoot, { recursive: true, force: true });
+  }
+});
+
+test("scanSourceBoundary flags a symlinked source-scan root directory itself (not just a nested symlinked file)", () => {
+  const tmpRoot = mkdtempSync(join(tmpdir(), "seer-source-symlink-root-"));
+  const outsideRoot = mkdtempSync(join(tmpdir(), "seer-source-symlink-root-outside-"));
+  try {
+    writeFileSync(join(outsideRoot, "leak.ts"), 'import x from "@glaze/core";\n');
+    symlinkSync(outsideRoot, join(tmpRoot, "renderer"));
+
+    const { files, offenders } = listStandaloneSourceFiles(tmpRoot);
+    assert.deepEqual(files, []);
+    assert.equal(offenders.length, 1);
+    assert.match(offenders[0], /^renderer:/);
+    assert.match(offenders[0], /symlink/);
+  } finally {
+    rmSync(tmpRoot, { recursive: true, force: true });
+    rmSync(outsideRoot, { recursive: true, force: true });
+  }
+});
+
 test("the bundle walker rejects a symlink anywhere in the bundle", () => {
   const tmpRoot = mkdtempSync(join(tmpdir(), "seer-bundle-symlink-"));
   try {
@@ -110,6 +159,90 @@ test("the bundle walker rejects a symlink anywhere in the bundle", () => {
     );
   } finally {
     rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test("scanBundle rejects a symlinked app bundle root before ever calling readdirSync/file/otool through it", () => {
+  const tmpRoot = mkdtempSync(join(tmpdir(), "seer-bundle-root-symlink-"));
+  const outsideRoot = mkdtempSync(join(tmpdir(), "seer-bundle-root-outside-"));
+  try {
+    mkdirSync(join(outsideRoot, "Contents", "MacOS"), { recursive: true });
+    writeFakeMachO(join(outsideRoot, "Contents", "MacOS", "Seer"));
+    const appLink = join(tmpRoot, "Seer.app");
+    symlinkSync(outsideRoot, appLink);
+
+    const offenders = scanBundle(appLink);
+    assert.equal(offenders.length, 1);
+    assert.match(offenders[0], /app bundle root/);
+    assert.match(offenders[0], /symlink/);
+  } finally {
+    rmSync(tmpRoot, { recursive: true, force: true });
+    rmSync(outsideRoot, { recursive: true, force: true });
+  }
+});
+
+test("findBundleSymlinkOffender flags a symlinked Contents directory reached from a real app bundle root", () => {
+  const tmpRoot = mkdtempSync(join(tmpdir(), "seer-contents-symlink-"));
+  const outsideRoot = mkdtempSync(join(tmpdir(), "seer-contents-symlink-outside-"));
+  try {
+    mkdirSync(outsideRoot, { recursive: true });
+    symlinkSync(outsideRoot, join(tmpRoot, "Contents"));
+
+    const offender = findBundleSymlinkOffender(tmpRoot, "Contents/Info.plist");
+    assert.ok(offender, "expected a symlink offender");
+    assert.match(offender, /Contents/);
+    assert.match(offender, /symlink/);
+  } finally {
+    rmSync(tmpRoot, { recursive: true, force: true });
+    rmSync(outsideRoot, { recursive: true, force: true });
+  }
+});
+
+test("checkInfoPlist rejects a symlinked Contents/Info.plist before ever running plutil through it", () => {
+  const tmpRoot = mkdtempSync(join(tmpdir(), "seer-infoplist-symlink-"));
+  const outsideRoot = mkdtempSync(join(tmpdir(), "seer-infoplist-outside-"));
+  try {
+    mkdirSync(join(tmpRoot, "Contents"), { recursive: true });
+    mkdirSync(outsideRoot, { recursive: true });
+    const outsidePlist = join(outsideRoot, "Info.plist");
+    execFileSync("/usr/bin/plutil", ["-create", "xml1", outsidePlist]);
+    execFileSync("/usr/bin/plutil", ["-replace", "CFBundleIdentifier", "-string", "ai.opencoven.seer", outsidePlist]);
+    symlinkSync(outsidePlist, join(tmpRoot, "Contents", "Info.plist"));
+
+    const offenders = checkInfoPlist(tmpRoot);
+    assert.equal(offenders.length, 1);
+    assert.match(offenders[0], /Info\.plist/);
+    assert.match(offenders[0], /symlink/);
+  } finally {
+    rmSync(tmpRoot, { recursive: true, force: true });
+    rmSync(outsideRoot, { recursive: true, force: true });
+  }
+});
+
+test("scanBundle rejects a symlinked Contents/MacOS/Seer executable without ever classifying/running file or otool on it", () => {
+  const tmpRoot = mkdtempSync(join(tmpdir(), "seer-executable-symlink-"));
+  const outsideRoot = mkdtempSync(join(tmpdir(), "seer-executable-symlink-outside-"));
+  try {
+    mkdirSync(join(tmpRoot, "Contents", "MacOS"), { recursive: true });
+    mkdirSync(outsideRoot, { recursive: true });
+    const outsideBinary = join(outsideRoot, "outside-binary");
+    writeFakeMachO(outsideBinary);
+    symlinkSync(outsideBinary, join(tmpRoot, "Contents", "MacOS", "Seer"));
+
+    const offenders = scanBundle(tmpRoot);
+    assert.ok(
+      offenders.some((o) => o.includes("Contents/MacOS/Seer") && o.includes("symlink")),
+      `expected a symlinked-executable offender, got: ${JSON.stringify(offenders)}`,
+    );
+    // The symlink is skipped before classifyMachOFiles ever runs, so no
+    // real Mach-O is ever found in its place either.
+    assert.ok(
+      offenders.some((o) => /found 0/.test(o)),
+      `expected an "exactly one Mach-O...found 0" offender, got: ${JSON.stringify(offenders)}`,
+    );
+  } finally {
+    rmSync(tmpRoot, { recursive: true, force: true });
+    rmSync(outsideRoot, { recursive: true, force: true });
   }
 });
 
@@ -276,6 +409,75 @@ test("parseOtoolDependencies allows only /System/Library and /usr/lib, and rejec
   assert.match(outsideOffenders[0], /outside \/System\/Library and \/usr\/lib/);
 });
 
+test("parseOtoolDependencies rejects a sibling directory that merely shares the /usr/lib or /System/Library prefix text", () => {
+  const usrLibEvil = [
+    "/some/path/to/Seer:",
+    "\t/usr/libevil/malicious.dylib (compatibility version 1.0.0, current version 1.0.0)",
+  ].join("\n");
+  const usrLibEvilOffenders = parseOtoolDependencies(usrLibEvil);
+  assert.equal(usrLibEvilOffenders.length, 1);
+  assert.match(usrLibEvilOffenders[0], /usr\/libevil/);
+
+  const systemLibraryEvil = [
+    "/some/path/to/Seer:",
+    "\t/System/Libraryevil/malicious.framework/Versions/A/malicious (compatibility version 1.0.0, current version 1.0.0)",
+  ].join("\n");
+  const systemLibraryEvilOffenders = parseOtoolDependencies(systemLibraryEvil);
+  assert.equal(systemLibraryEvilOffenders.length, 1);
+  assert.match(systemLibraryEvilOffenders[0], /System\/Libraryevil/);
+});
+
+test("parseOtoolDependencies rejects a normalized-traversal dependency path that only lexically escapes the allowed roots", () => {
+  const traversal = [
+    "/some/path/to/Seer:",
+    "\t/usr/lib/../../etc/evil.dylib (compatibility version 1.0.0, current version 1.0.0)",
+  ].join("\n");
+  const offenders = parseOtoolDependencies(traversal);
+  assert.equal(offenders.length, 1);
+  assert.match(offenders[0], /usr\/lib\/\.\.\/\.\.\/etc\/evil\.dylib/);
+
+  // Even though path.posix.normalize would collapse this down to
+  // "/etc/evil.dylib" (clearly outside the allowlist), the check must
+  // reject the raw ".."-containing string itself rather than relying on
+  // normalization producing a safe-looking allowed prefix by chance.
+  const trickyTraversal = [
+    "/some/path/to/Seer:",
+    "\t/usr/lib/good/../../lib/evil.dylib (compatibility version 1.0.0, current version 1.0.0)",
+  ].join("\n");
+  const trickyOffenders = parseOtoolDependencies(trickyTraversal);
+  assert.equal(trickyOffenders.length, 1);
+});
+
+test("parseOtoolDependencies rejects @loader_path and @executable_path embedded references, not only @rpath", () => {
+  const loaderPath = [
+    "/some/path/to/Seer:",
+    "\t@loader_path/../Frameworks/EmbeddedRuntime.framework/EmbeddedRuntime (compatibility version 1.0.0, current version 1.0.0)",
+  ].join("\n");
+  const loaderOffenders = parseOtoolDependencies(loaderPath);
+  assert.equal(loaderOffenders.length, 1);
+  assert.match(loaderOffenders[0], /@loader_path/);
+
+  const executablePath = [
+    "/some/path/to/Seer:",
+    "\t@executable_path/../Frameworks/EmbeddedRuntime.framework/EmbeddedRuntime (compatibility version 1.0.0, current version 1.0.0)",
+  ].join("\n");
+  const executableOffenders = parseOtoolDependencies(executablePath);
+  assert.equal(executableOffenders.length, 1);
+  assert.match(executableOffenders[0], /@executable_path/);
+});
+
+test("isAllowedDependencyPath allows only exact, lexically-standardized descendants of /usr/lib/ and /System/Library/", () => {
+  assert.equal(isAllowedDependencyPath("/usr/lib/libSystem.B.dylib"), true);
+  assert.equal(isAllowedDependencyPath("/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit"), true);
+
+  assert.equal(isAllowedDependencyPath("/usr/libevil/malicious.dylib"), false);
+  assert.equal(isAllowedDependencyPath("/System/Libraryevil/malicious"), false);
+  assert.equal(isAllowedDependencyPath("/usr/lib/../../etc/evil.dylib"), false);
+  assert.equal(isAllowedDependencyPath("/usr/lib"), false); // no trailing descendant
+  assert.equal(isAllowedDependencyPath("@rpath/EmbeddedRuntime.framework/EmbeddedRuntime"), false);
+  assert.equal(isAllowedDependencyPath("relative/lib.dylib"), false);
+});
+
 test("scanBundle composes the walk and Mach-O/otool checks into a single clean pass on a well-formed synthetic bundle", () => {
   const tmpRoot = mkdtempSync(join(tmpdir(), "seer-scan-bundle-clean-"));
   try {
@@ -307,6 +509,7 @@ test("checkInfoPlist validates bundle id, executable name, minimum system versio
       execFileSync("/usr/bin/plutil", ["-replace", key, `-${type}`, value, join(contentsDir, "Info.plist")]);
     set("CFBundleIdentifier", "string", "ai.opencoven.seer");
     set("CFBundleExecutable", "string", "Seer");
+    set("CFBundleDisplayName", "string", "Seer");
     set("LSMinimumSystemVersion", "string", "14.0");
     set("LSUIElement", "bool", "true");
 
@@ -316,6 +519,33 @@ test("checkInfoPlist validates bundle id, executable name, minimum system versio
     const offenders = checkInfoPlist(tmpRoot);
     assert.equal(offenders.length, 1);
     assert.match(offenders[0], /CFBundleIdentifier/);
+  } finally {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test("checkInfoPlist flags a CFBundleDisplayName mismatch", () => {
+  const tmpRoot = mkdtempSync(join(tmpdir(), "seer-info-plist-display-name-"));
+  try {
+    const contentsDir = join(tmpRoot, "Contents");
+    mkdirSync(contentsDir, { recursive: true });
+    execFileSync("/usr/bin/plutil", [
+      "-create",
+      "xml1",
+      join(contentsDir, "Info.plist"),
+    ]);
+    const set = (key, type, value) =>
+      execFileSync("/usr/bin/plutil", ["-replace", key, `-${type}`, value, join(contentsDir, "Info.plist")]);
+    set("CFBundleIdentifier", "string", "ai.opencoven.seer");
+    set("CFBundleExecutable", "string", "Seer");
+    set("CFBundleDisplayName", "string", "NotSeer");
+    set("LSMinimumSystemVersion", "string", "14.0");
+    set("LSUIElement", "bool", "true");
+
+    const offenders = checkInfoPlist(tmpRoot);
+    assert.equal(offenders.length, 1);
+    assert.match(offenders[0], /CFBundleDisplayName/);
+    assert.match(offenders[0], /NotSeer/);
   } finally {
     rmSync(tmpRoot, { recursive: true, force: true });
   }

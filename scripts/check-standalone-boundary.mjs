@@ -33,11 +33,27 @@
 // established for the renderer build-identity digest).
 import { execFileSync } from "node:child_process";
 import console from "node:console";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { lstatSync, readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, relative } from "node:path";
+import { normalize as posixNormalize } from "node:path/posix";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+
+/**
+ * Lstat's `path` (never following a symlink, unlike `existsSync`/`statSync`)
+ * and returns its `Stats`, or `null` if nothing exists at `path` at all.
+ * Used everywhere a path's existence/symlink-ness must be checked without
+ * ever transparently resolving through a symlink as a side effect of the
+ * check itself.
+ */
+function lstatOrNull(path) {
+  try {
+    return lstatSync(path);
+  } catch {
+    return null;
+  }
+}
 
 const here = dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = dirname(here);
@@ -92,6 +108,7 @@ const SOURCE_SCAN_FILES = [
   "standalone-window.html",
   "tsconfig.standalone.json",
   "scripts/build-macos-app.sh",
+  "scripts/lib/safe-build-destination.sh",
 ];
 
 /**
@@ -110,8 +127,17 @@ const EXCLUDED_SOURCE_FILES = new Set([
 
 const EXCLUDED_SOURCE_DIRS = ["renderer/dev"];
 
-/** Recursively collects root-relative file paths under `directory`, skipping excluded dirs/files. */
-function walkFiles(directory, root, excludedDirs, excludedFiles, out = []) {
+/**
+ * Recursively collects root-relative file paths under `directory`, skipping
+ * excluded dirs/files. Uses `readdirSync(..., { withFileTypes: true })`'s
+ * `Dirent`, which reports a symlink entry as a symlink (`isSymbolicLink()`)
+ * without following it — a symlinked entry is never treated as a directory
+ * to recurse into nor as a plain file to later `readFileSync`; it is
+ * pushed to `offenders` and otherwise skipped entirely, so a source-tree
+ * symlink pointing outside the repository (or anywhere else) can never be
+ * dereferenced by this scan.
+ */
+function walkFiles(directory, root, excludedDirs, excludedFiles, out, offenders) {
   for (const entry of readdirSync(directory, { withFileTypes: true })) {
     const fullPath = join(directory, entry.name);
     const relPath = relative(root, fullPath);
@@ -119,8 +145,12 @@ function walkFiles(directory, root, excludedDirs, excludedFiles, out = []) {
     if (excludedDirs.some((dir) => relPath === dir || relPath.startsWith(`${dir}/`))) {
       continue;
     }
+    if (entry.isSymbolicLink()) {
+      offenders.push(`${relPath}: symlink in source tree (not allowed; skipped, never followed)`);
+      continue;
+    }
     if (entry.isDirectory()) {
-      walkFiles(fullPath, root, excludedDirs, excludedFiles, out);
+      walkFiles(fullPath, root, excludedDirs, excludedFiles, out, offenders);
       continue;
     }
     if (excludedFiles.has(relPath)) {
@@ -128,7 +158,6 @@ function walkFiles(directory, root, excludedDirs, excludedFiles, out = []) {
     }
     out.push(relPath);
   }
-  return out;
 }
 
 /**
@@ -139,20 +168,45 @@ function walkFiles(directory, root, excludedDirs, excludedFiles, out = []) {
  * also works unmodified against a partial, synthetic fixture root (e.g. a
  * disposable directory containing only a `renderer/` subtree) — never
  * only against a full repository checkout.
+ *
+ * Every `SOURCE_SCAN_DIRS`/`SOURCE_SCAN_FILES` entry is `lstat`'d (never
+ * `existsSync`/`statSync`, which follow symlinks) before it is walked or
+ * read: a symlinked scan root or scan file is recorded in `offenders` and
+ * skipped, never traversed or read through, so a symlink cannot be used to
+ * redirect this scan outside the repository — including a dangling
+ * symlink whose target does not exist or is not readable at all.
  */
 export function listStandaloneSourceFiles(repoRoot) {
   const files = [];
+  const offenders = [];
   for (const dir of SOURCE_SCAN_DIRS) {
-    if (existsSync(join(repoRoot, dir))) {
-      files.push(...walkFiles(join(repoRoot, dir), repoRoot, EXCLUDED_SOURCE_DIRS, EXCLUDED_SOURCE_FILES));
+    const fullDirPath = join(repoRoot, dir);
+    const stat = lstatOrNull(fullDirPath);
+    if (!stat) {
+      continue;
     }
+    if (stat.isSymbolicLink()) {
+      offenders.push(`${dir}: symlink in source tree (not allowed; skipped, never followed)`);
+      continue;
+    }
+    walkFiles(fullDirPath, repoRoot, EXCLUDED_SOURCE_DIRS, EXCLUDED_SOURCE_FILES, files, offenders);
   }
   for (const file of SOURCE_SCAN_FILES) {
-    if (!EXCLUDED_SOURCE_FILES.has(file) && existsSync(join(repoRoot, file))) {
-      files.push(file);
+    if (EXCLUDED_SOURCE_FILES.has(file)) {
+      continue;
     }
+    const fullFilePath = join(repoRoot, file);
+    const stat = lstatOrNull(fullFilePath);
+    if (!stat) {
+      continue;
+    }
+    if (stat.isSymbolicLink()) {
+      offenders.push(`${file}: symlink in source tree (not allowed; skipped, never followed)`);
+      continue;
+    }
+    files.push(file);
   }
-  return files;
+  return { files, offenders };
 }
 
 /**
@@ -179,11 +233,13 @@ export function scanFilesForForbiddenPatterns(files, root, patterns = SOURCE_FOR
 
 /**
  * Scans every standalone-safe source file for `SOURCE_FORBIDDEN_PATTERNS`,
- * returning one offender string per match. An empty array means the source
- * boundary is clean.
+ * returning one offender string per match, plus one offender per symlink
+ * `listStandaloneSourceFiles` found and skipped. An empty array means the
+ * source boundary is clean.
  */
 export function scanSourceBoundary(repoRoot = REPO_ROOT) {
-  return scanFilesForForbiddenPatterns(listStandaloneSourceFiles(repoRoot), repoRoot);
+  const { files, offenders } = listStandaloneSourceFiles(repoRoot);
+  return [...offenders, ...scanFilesForForbiddenPatterns(files, repoRoot)];
 }
 
 /**
@@ -213,6 +269,49 @@ const BUNDLE_FORBIDDEN_CONTENT_PATTERNS = [
 ];
 
 /**
+ * Lstat's every path component from `appPath` (the app bundle root) down to
+ * `appPath/relativePath` inclusive — never `appPath`'s or any intermediate
+ * component's resolved target — and returns an offender string for the
+ * first (root-most) component found to be a symlink, or `null` if every
+ * component that currently exists is a real, non-symlink directory/file.
+ * A missing component is not itself an offender here; the caller's own
+ * subsequent `plutil`/`file`/`otool`/`codesign` call is left to report a
+ * normal "not found" failure for that case.
+ *
+ * This exists because `scanBundle`'s recursive `walkBundle` already checks
+ * every component *below* `appPath` via `Dirent.isSymbolicLink()` as it
+ * descends, but `appPath` itself — and any function invoked independently
+ * of `walkBundle`, such as `checkInfoPlist` and `checkEntitlements` calling
+ * straight into `plutil`/`codesign` — is not otherwise protected: without
+ * this check, a symlinked bundle root, or a symlinked `Contents`/
+ * `Contents/Info.plist` reached only through such a standalone call, would
+ * be transparently followed by the OS the moment `plutil`/`codesign` opens
+ * it.
+ */
+export function findBundleSymlinkOffender(appPath, relativePath = "") {
+  let current = appPath;
+  const candidates = [current];
+  if (relativePath) {
+    for (const segment of relativePath.split("/")) {
+      current = join(current, segment);
+      candidates.push(current);
+    }
+  }
+
+  for (const candidatePath of candidates) {
+    const stat = lstatOrNull(candidatePath);
+    if (!stat) {
+      return null;
+    }
+    if (stat.isSymbolicLink()) {
+      const label = candidatePath === appPath ? "app bundle root" : relative(appPath, candidatePath);
+      return `${label}: symlink in bundle path (not allowed; refusing to read/run tools through it)`;
+    }
+  }
+  return null;
+}
+
+/**
  * Walks `appPath` with `fs` APIs that never follow symlinks
  * (`readdirSync(..., { withFileTypes: true })`'s `Dirent` reports a
  * symlink as a symlink, not as whatever it points at, and this function
@@ -221,6 +320,13 @@ const BUNDLE_FORBIDDEN_CONTENT_PATTERNS = [
  * forbidden name, and forbidden content match found; `regularFiles` is
  * every plain file's bundle-relative path, for the caller's Mach-O/otool
  * pass.
+ *
+ * Callers must check `findBundleSymlinkOffender(appPath)` (or otherwise
+ * know `appPath` itself is not a symlink) before calling this — `visit`
+ * below calls `readdirSync(appPath)` directly for the root, which (like
+ * any `fs` call given a path, as opposed to a `Dirent` already reported by
+ * a previous `readdirSync`) transparently follows `appPath` if it is
+ * itself a symlink.
  */
 export function walkBundle(appPath) {
   const offenders = [];
@@ -318,15 +424,62 @@ export function checkArchitecture(machOEntry) {
 }
 
 /**
+ * Dependency path prefixes that must never appear in `otool -L` output
+ * regardless of the absolute-path allowlist below: `@rpath`/`@loader_path`/
+ * `@executable_path` are all resolved relative to the *loading* binary (or
+ * an `LC_RPATH` search list baked into it), so any of them can point to an
+ * arbitrary embedded/co-located file chosen entirely by whoever built the
+ * dependency graph — never a fixed, inspectable system path.
+ */
+const FORBIDDEN_DEPENDENCY_LOADER_PREFIXES = ["@rpath", "@loader_path", "@executable_path"];
+
+/** Absolute directory roots a dependency's *lexically standardized* path may live under (trailing slash required — see `isAllowedDependencyPath`). */
+const ALLOWED_DEPENDENCY_ROOTS = ["/usr/lib/", "/System/Library/"];
+
+/**
+ * Returns whether `depPath` (an absolute filesystem path from `otool -L`,
+ * already confirmed not to start with a forbidden `@`-relative loader
+ * token) is an exact descendant of `/usr/lib/` or `/System/Library/` after
+ * *lexical* standardization — never a mere string-prefix check, which
+ * would also incorrectly admit a sibling directory that simply shares the
+ * same prefix text (`/usr/libevil/...`, `/System/Libraryevil/...`) or a
+ * traversal form that only lexically escapes the allowed root
+ * (`/usr/lib/../../etc/evil`).
+ *
+ * A path is rejected outright — before any normalization — if it is not
+ * absolute, or if it contains a literal `.` or `..` segment; only a path
+ * that was already in fully standardized form (no `.`/`..`, no repeated
+ * slashes — `path.posix.normalize` is a no-op on it) can ever be allowed,
+ * so a caller-controlled dependency string can never rely on lexical
+ * collapsing tricks to reach outside the allowlisted roots.
+ */
+export function isAllowedDependencyPath(depPath) {
+  if (!depPath.startsWith("/")) {
+    return false;
+  }
+  const segments = depPath.split("/");
+  if (segments.includes("..") || segments.includes(".")) {
+    return false;
+  }
+  if (posixNormalize(depPath) !== depPath) {
+    return false;
+  }
+  return ALLOWED_DEPENDENCY_ROOTS.some((root) => depPath.startsWith(root));
+}
+
+/**
  * Parses raw `otool -L <path>` output (the first line is always the
  * queried path itself, echoed back; every following line is a genuine
  * dependency — unlike a dylib, an ordinary Mach-O executable has no
  * separate "self" install-name line to skip) and asserts every dependency
- * is under `/System/Library` or `/usr/lib`, with no `@rpath`-relative
- * embedded framework. Kept independent of the `otool` subprocess call
- * itself so it can be exercised directly against captured/synthetic
- * `otool -L` text (e.g. by tests simulating an embedded runtime
- * dependency) without needing a real, fully linked Mach-O binary on disk.
+ * is an exact, lexically-standardized descendant of `/System/Library/` or
+ * `/usr/lib/` (see `isAllowedDependencyPath`), with no `@rpath`/
+ * `@loader_path`/`@executable_path`-relative embedded reference. Kept
+ * independent of the `otool` subprocess call itself so it can be exercised
+ * directly against captured/synthetic `otool -L` text (e.g. by tests
+ * simulating an embedded runtime dependency, a `/usr/libevil` sibling
+ * directory, or a `..` traversal attempt) without needing a real, fully
+ * linked Mach-O binary on disk.
  */
 export function parseOtoolDependencies(output) {
   const lines = output
@@ -339,11 +492,13 @@ export function parseOtoolDependencies(output) {
   for (const line of lines) {
     const match = line.match(/^(.*?)\s+\(compatibility version/);
     const depPath = match ? match[1] : line;
-    if (depPath.includes("@rpath")) {
-      offenders.push(`otool -L: embedded @rpath dependency not allowed: ${depPath}`);
+
+    const forbiddenLoaderPrefix = FORBIDDEN_DEPENDENCY_LOADER_PREFIXES.find((prefix) => depPath.startsWith(prefix));
+    if (forbiddenLoaderPrefix) {
+      offenders.push(`otool -L: embedded ${forbiddenLoaderPrefix} dependency not allowed: ${depPath}`);
       continue;
     }
-    if (!(depPath.startsWith("/System/Library") || depPath.startsWith("/usr/lib"))) {
+    if (!isAllowedDependencyPath(depPath)) {
       offenders.push(`otool -L: dependency outside /System/Library and /usr/lib: ${depPath}`);
     }
   }
@@ -365,8 +520,18 @@ export function checkOtoolDependencies(executableAbsPath) {
  * Full bundle scan: symlinks/forbidden names/forbidden content (via
  * `walkBundle`), then the structural Mach-O/otool checks. Returns every
  * offender found; an empty array means the bundle boundary is clean.
+ *
+ * `appPath` itself is `lstat`'d first — if it is a symlink, this returns
+ * immediately without ever calling `readdirSync`/`file`/`otool` through it
+ * (which would otherwise transparently follow it to wherever it points,
+ * including outside the repository).
  */
 export function scanBundle(appPath, { expectedExecutableRelPath = EXPECTED_EXECUTABLE_RELATIVE_PATH } = {}) {
+  const rootOffender = findBundleSymlinkOffender(appPath);
+  if (rootOffender) {
+    return [rootOffender];
+  }
+
   const { offenders, regularFiles } = walkBundle(appPath);
 
   const machOFiles = classifyMachOFiles(appPath, regularFiles);
@@ -386,8 +551,21 @@ export function scanBundle(appPath, { expectedExecutableRelPath = EXPECTED_EXECU
  * "Process Info.plist" build phase has already substituted every
  * `$(BUILD_SETTING)` token in the source `Config/Info.plist` by the time
  * this reads the built bundle).
+ *
+ * `appPath`, `appPath/Contents`, and `appPath/Contents/Info.plist` are
+ * each `lstat`'d first via `findBundleSymlinkOffender` — this function is
+ * called independently of `scanBundle`/`walkBundle` (directly by `main()`
+ * and by tests), so it cannot rely on `walkBundle`'s recursive
+ * `Dirent`-based symlink checks; without its own check here, a symlinked
+ * bundle root, `Contents` directory, or `Info.plist` file would be
+ * transparently followed by `plutil` itself.
  */
 export function checkInfoPlist(appPath) {
+  const symlinkOffender = findBundleSymlinkOffender(appPath, "Contents/Info.plist");
+  if (symlinkOffender) {
+    return [symlinkOffender];
+  }
+
   const plistPath = join(appPath, "Contents", "Info.plist");
   const json = execFileSync("/usr/bin/plutil", ["-convert", "json", "-o", "-", plistPath], { encoding: "utf8" });
   const plist = JSON.parse(json);
@@ -395,6 +573,7 @@ export function checkInfoPlist(appPath) {
   const expectations = {
     CFBundleIdentifier: "ai.opencoven.seer",
     CFBundleExecutable: "Seer",
+    CFBundleDisplayName: "Seer",
     LSMinimumSystemVersion: "14.0",
     LSUIElement: true,
   };
@@ -440,27 +619,32 @@ export function checkInfoPlist(appPath) {
  */
 export function checkEntitlements(appPath, { sourceEntitlementsPath } = {}) {
   const offenders = [];
-  let stdout = "";
-  let stderr = "";
-  let failed = false;
-  try {
-    stdout = execFileSync("/usr/bin/codesign", ["-d", "--entitlements", "-", "--xml", appPath], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-  } catch (error) {
-    failed = true;
-    stdout = String(error.stdout ?? "");
-    stderr = String(error.stderr ?? "");
-  }
+  const rootOffender = findBundleSymlinkOffender(appPath);
+  if (rootOffender) {
+    offenders.push(rootOffender);
+  } else {
+    let stdout = "";
+    let stderr = "";
+    let failed = false;
+    try {
+      stdout = execFileSync("/usr/bin/codesign", ["-d", "--entitlements", "-", "--xml", appPath], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (error) {
+      failed = true;
+      stdout = String(error.stdout ?? "");
+      stderr = String(error.stderr ?? "");
+    }
 
-  if (failed) {
-    offenders.push(`unable to inspect effective entitlements via codesign: ${stderr.trim() || "unknown error"}`);
-  } else if (/<plist/.test(stdout) && /com\.apple\.security\.app-sandbox/.test(stdout)) {
-    offenders.push("effective (codesign) entitlements declare com.apple.security.app-sandbox");
+    if (failed) {
+      offenders.push(`unable to inspect effective entitlements via codesign: ${stderr.trim() || "unknown error"}`);
+    } else if (/<plist/.test(stdout) && /com\.apple\.security\.app-sandbox/.test(stdout)) {
+      offenders.push("effective (codesign) entitlements declare com.apple.security.app-sandbox");
+    }
+    // else: codesign succeeded with no entitlements plist at all — valid,
+    // sandbox-free state for an unsigned ad-hoc-linker-signed build.
   }
-  // else: codesign succeeded with no entitlements plist at all — valid,
-  // sandbox-free state for an unsigned ad-hoc-linker-signed build.
 
   if (sourceEntitlementsPath) {
     const source = readFileSync(sourceEntitlementsPath, "utf8");
@@ -478,9 +662,7 @@ function main() {
 
   const offenders = [...scanSourceBoundary(REPO_ROOT)];
 
-  try {
-    readdirSync(appPath);
-  } catch {
+  if (!lstatOrNull(appPath)) {
     console.error(`error: app bundle not found at ${appPath} (run \`npm run build:macos\` first)`);
     process.exitCode = 1;
     return;

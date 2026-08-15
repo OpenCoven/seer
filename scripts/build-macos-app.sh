@@ -21,8 +21,11 @@
 # invalid xcodebuild argument, not execute as a shell fragment.
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
+
+# shellcheck source=lib/safe-build-destination.sh
+source "${SCRIPT_DIR}/lib/safe-build-destination.sh"
 
 HOST_ARCH="$(uname -m)"
 if [ "${HOST_ARCH}" != "arm64" ]; then
@@ -49,7 +52,14 @@ esac
 
 PROJECT_SPEC="${REPO_ROOT}/apps/macos/Seer/project.yml"
 XCODEPROJ="${REPO_ROOT}/apps/macos/Seer/Seer.xcodeproj"
-UNSIGNED_DIR="${REPO_ROOT}/build/macos/unsigned"
+
+# Resolves REPO_ROOT/build, REPO_ROOT/build/macos, and
+# REPO_ROOT/build/macos/unsigned one component at a time — never `mkdir
+# -p` — rejecting outright if any existing component along the way is a
+# symlink (which could otherwise silently redirect the cleanup/copy below
+# to an arbitrary directory outside this checkout). See
+# scripts/lib/safe-build-destination.sh for the full threat model.
+UNSIGNED_DIR="$(seer_prepare_unsigned_dir "${REPO_ROOT}")"
 DEST_APP="${UNSIGNED_DIR}/Seer.app"
 
 cd "${REPO_ROOT}"
@@ -94,11 +104,18 @@ if [ ! -d "${BUILT_APP}" ]; then
 fi
 
 echo "==> Copying ${BUILT_APP} -> ${DEST_APP}"
-mkdir -p "${UNSIGNED_DIR}"
+# UNSIGNED_DIR was already created (or verified to already exist as a real,
+# non-symlink directory) above, one component at a time, with its whole
+# ancestor chain re-verified against symlinks — so no further mkdir/mkdir -p
+# is needed or performed here.
+#
 # Remove exactly the destination app bundle — a fixed, known path, never a
 # caller-influenced fragment — so the copy below can never mix in files
 # left over from an earlier build (a stale resource, a previous binary,
 # etc.). Never removes UNSIGNED_DIR itself or any sibling it might contain.
+# Guarded by seer_assert_dest_app_not_symlink so a symlinked DEST_APP leaf
+# is rejected outright rather than rm -rf/cp -R ever touching it.
+seer_assert_dest_app_not_symlink "${DEST_APP}"
 rm -rf "${DEST_APP}"
 cp -R "${BUILT_APP}" "${DEST_APP}"
 
