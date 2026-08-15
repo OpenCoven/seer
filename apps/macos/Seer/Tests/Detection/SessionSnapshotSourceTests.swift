@@ -369,6 +369,30 @@ final class SessionSnapshotSourceTests: XCTestCase {
         XCTAssertEqual(events[0]["kept"] as? Int, 1)
     }
 
+    func testParseTailLinesDropsBisectedUTF8BeforeDecodingLaterEvents() {
+        for scalar in ["é", "€", "🧙"] {
+            let bytes = Array(scalar.utf8)
+            XCTAssertTrue((2...4).contains(bytes.count))
+            for split in 1..<bytes.count {
+                var tail = Data(bytes.dropFirst(split))
+                tail.append(Data(" partial line\n{\"kept\":\"\(scalar)\"}\n".utf8))
+
+                let events = SessionSnapshotSource.parseTailLines(tail, droppedPartialFirstLine: true)
+
+                XCTAssertEqual(events.count, 1, "failed for \(bytes.count)-byte scalar split at byte \(split)")
+                XCTAssertEqual(events.first?["kept"] as? String, scalar)
+            }
+        }
+    }
+
+    func testParseTailLinesAtOffsetZeroDecodesWholeUnicodeData() {
+        let data = Data("{\"kept\":\"🧙 café €\"}\n".utf8)
+
+        let events = SessionSnapshotSource.parseTailLines(data, droppedPartialFirstLine: false)
+
+        XCTAssertEqual(events.first?["kept"] as? String, "🧙 café €")
+    }
+
     func testReadHeadIsBoundedAndExtractsCodexCwd() throws {
         let base = makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: base) }

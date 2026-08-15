@@ -116,7 +116,39 @@ public struct LibProcProcessBackend: ProcessBackend {
     /// `String` allocations downstream.
     public static let maximumCommandLength = 4096
 
-    public init() {}
+    private let maximumPIDs: Int
+    private let listAllPIDs: @Sendable (UnsafeMutableBufferPointer<pid_t>) -> Int32
+    private let samplePID: @Sendable (pid_t) -> RawProcessSample?
+
+    public init() {
+        maximumPIDs = Self.maximumEnumeratedPIDs
+        listAllPIDs = { buffer in
+            guard let baseAddress = buffer.baseAddress else { return 0 }
+            return proc_listallpids(
+                baseAddress,
+                Int32(buffer.count * MemoryLayout<pid_t>.size)
+            )
+        }
+        samplePID = { pid in
+            guard let executablePath = Self.executablePath(for: pid) else { return nil }
+            return RawProcessSample(
+                pid: pid,
+                command: Self.commandLine(for: pid, executablePath: executablePath),
+                cpuTimeNanoseconds: Self.cumulativeCPUTimeNanoseconds(for: pid),
+                identityToken: Self.startTimeIdentityToken(for: pid)
+            )
+        }
+    }
+
+    init(
+        maximumEnumeratedPIDs: Int,
+        listAllPIDs: @escaping @Sendable (UnsafeMutableBufferPointer<pid_t>) -> Int32,
+        samplePID: @escaping @Sendable (pid_t) -> RawProcessSample?
+    ) {
+        maximumPIDs = max(0, min(maximumEnumeratedPIDs, Self.maximumEnumeratedPIDs))
+        self.listAllPIDs = listAllPIDs
+        self.samplePID = samplePID
+    }
 
     public func monotonicNowNanoseconds() -> UInt64 {
         DispatchTime.now().uptimeNanoseconds
@@ -127,14 +159,15 @@ public struct LibProcProcessBackend: ProcessBackend {
     }
 
     public func sampleAll() throws -> [RawProcessSample] {
-        var pids = [pid_t](repeating: 0, count: Self.maximumEnumeratedPIDs)
-        let bufferSizeBytes = Int32(pids.count * MemoryLayout<pid_t>.size)
-        let bytesReturned = proc_listallpids(&pids, bufferSizeBytes)
-        guard bytesReturned > 0 else {
+        var pids = [pid_t](repeating: 0, count: maximumPIDs)
+        let returnedCount = pids.withUnsafeMutableBufferPointer { buffer in
+            listAllPIDs(buffer)
+        }
+        guard returnedCount > 0 else {
             throw ProcessBackendError.enumerationFailed("proc_listallpids failed (errno \(errno))")
         }
 
-        let count = min(Int(bytesReturned) / MemoryLayout<pid_t>.size, pids.count)
+        let count = min(Int(returnedCount), pids.count)
         var samples: [RawProcessSample] = []
         samples.reserveCapacity(count)
 
@@ -151,16 +184,8 @@ public struct LibProcProcessBackend: ProcessBackend {
             // as a scan failure. `proc_pidpath` is the required primary
             // identity check: no resolvable executable path means no
             // usable sample for this pid.
-            guard let executablePath = Self.executablePath(for: pid) else { continue }
-            let command = Self.commandLine(for: pid, executablePath: executablePath)
-            let cpuTime = Self.cumulativeCPUTimeNanoseconds(for: pid)
-            let identity = Self.startTimeIdentityToken(for: pid)
-            samples.append(RawProcessSample(
-                pid: pid,
-                command: command,
-                cpuTimeNanoseconds: cpuTime,
-                identityToken: identity
-            ))
+            guard let sample = samplePID(pid) else { continue }
+            samples.append(sample)
         }
 
         return samples

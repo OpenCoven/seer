@@ -324,11 +324,13 @@ enum SessionSnapshotSource {
     /// Parses newline-delimited JSON tolerating corrupt/partial lines,
     /// mirroring the production TypeScript tail reader's leniency exactly.
     static func parseTailLines(_ data: Data, droppedPartialFirstLine: Bool) -> [JSONObject] {
-        guard let text = String(data: data, encoding: .utf8) else { return [] }
-        var lines = text.components(separatedBy: "\n")
-        if droppedPartialFirstLine, !lines.isEmpty {
-            lines.removeFirst()
+        var completeLines = data
+        if droppedPartialFirstLine {
+            guard let newline = completeLines.firstIndex(of: 0x0A) else { return [] }
+            completeLines = completeLines.subdata(in: completeLines.index(after: newline)..<completeLines.endIndex)
         }
+        guard let text = String(data: completeLines, encoding: .utf8) else { return [] }
+        let lines = text.components(separatedBy: "\n")
 
         var events: [JSONObject] = []
         for line in lines {

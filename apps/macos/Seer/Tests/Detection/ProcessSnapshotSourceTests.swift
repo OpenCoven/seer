@@ -5,6 +5,34 @@ import XCTest
 /// math against a fully synthetic `ProcessBackend` double — this suite must
 /// never enumerate real OS processes (see `FakeProcessBackend`).
 final class ProcessSnapshotSourceTests: XCTestCase {
+    private final class PIDEnumerationFixture: @unchecked Sendable {
+        let pids: [pid_t]
+        let returnedCount: Int32
+        private(set) var sampledPIDs: [pid_t] = []
+
+        init(pids: [pid_t], returnedCount: Int32? = nil) {
+            self.pids = pids
+            self.returnedCount = returnedCount ?? Int32(pids.count)
+        }
+
+        func list(into buffer: UnsafeMutableBufferPointer<pid_t>) -> Int32 {
+            for (index, pid) in pids.prefix(buffer.count).enumerated() {
+                buffer[index] = pid
+            }
+            return returnedCount
+        }
+
+        func sample(pid: pid_t) -> RawProcessSample? {
+            sampledPIDs.append(pid)
+            return RawProcessSample(
+                pid: pid,
+                command: "pid-\(pid)",
+                cpuTimeNanoseconds: nil,
+                identityToken: nil
+            )
+        }
+    }
+
     private final class FakeProcessBackend: ProcessBackend, @unchecked Sendable {
         var samplesQueue: [[RawProcessSample]] = []
         var nowQueue: [UInt64] = []
@@ -29,6 +57,52 @@ final class ProcessSnapshotSourceTests: XCTestCase {
 
     private func sample(pid: Int32, command: String, cpuTimeNs: UInt64?, identity: Int64? = 1) -> RawProcessSample {
         RawProcessSample(pid: pid, command: command, cpuTimeNanoseconds: cpuTimeNs, identityToken: identity)
+    }
+
+    // MARK: - libproc PID-count semantics
+
+    func testLibProcBackendEnumeratesEveryReturnedPIDCount() throws {
+        let fixture = PIDEnumerationFixture(pids: [11, 22, 33, 44])
+        let backend = LibProcProcessBackend(
+            maximumEnumeratedPIDs: 8,
+            listAllPIDs: fixture.list,
+            samplePID: fixture.sample
+        )
+
+        let samples = try backend.sampleAll()
+
+        XCTAssertEqual(samples.map(\.pid), [11, 22, 33, 44])
+        XCTAssertEqual(fixture.sampledPIDs, [11, 22, 33, 44])
+    }
+
+    func testLibProcBackendCapsReturnedPIDCountAtAllocatedCapacity() throws {
+        let fixture = PIDEnumerationFixture(pids: [11, 22, 33], returnedCount: 99)
+        let backend = LibProcProcessBackend(
+            maximumEnumeratedPIDs: 3,
+            listAllPIDs: fixture.list,
+            samplePID: fixture.sample
+        )
+
+        let samples = try backend.sampleAll()
+
+        XCTAssertEqual(samples.map(\.pid), [11, 22, 33])
+        XCTAssertEqual(fixture.sampledPIDs, [11, 22, 33], "a kernel count larger than capacity must never index beyond the PID buffer")
+    }
+
+    func testLibProcBackendRejectsNonpositivePIDCount() {
+        let fixture = PIDEnumerationFixture(pids: [], returnedCount: 0)
+        let backend = LibProcProcessBackend(
+            maximumEnumeratedPIDs: 3,
+            listAllPIDs: fixture.list,
+            samplePID: fixture.sample
+        )
+
+        XCTAssertThrowsError(try backend.sampleAll()) { error in
+            guard case ProcessBackendError.enumerationFailed = error else {
+                return XCTFail("expected enumeration failure, got \(error)")
+            }
+        }
+        XCTAssertTrue(fixture.sampledPIDs.isEmpty)
     }
 
     // MARK: - First sample semantics
