@@ -284,6 +284,48 @@ final class ImmediateBridgeResponder: BridgeResponding {
     }
 }
 
+/// A test-only gate whose `wait()` call suspends indefinitely until the
+/// test explicitly calls `release()` — mirrors `GatedSleeper`
+/// (`UpdateServiceTests.swift`)/`GatedAgentMonitorControlling
+/// .waitForRelease()` above, adapted to plug directly into a
+/// `BootstrapSuspensionHooks` closure: lets `AppLifecycleTests`
+/// deterministically suspend `AppDelegate.bootstrapServices(...)` at
+/// exactly one of its two `await`s (`loadStartupSnapshot`/
+/// `loadIncludePrereleaseUpdates`), drive `beginTermination(reply:)` to
+/// completion while still suspended there, then resume bootstrap and
+/// assert nothing it built afterward was ever installed onto `self`. An
+/// `actor` (not `@MainActor`) since the hook closures themselves run on
+/// the main actor but must hop off it to suspend here, exactly like a
+/// real disk read would.
+actor BootstrapAwaitGate {
+    private(set) var waitCallCount = 0
+    private var pendingContinuation: CheckedContinuation<Void, Never>?
+    private var availableReleases = 0
+
+    func wait() async {
+        waitCallCount += 1
+        if availableReleases > 0 {
+            availableReleases -= 1
+            return
+        }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            self.pendingContinuation = continuation
+        }
+    }
+
+    /// Wakes the currently suspended `wait()` call, or — if none is
+    /// suspended yet — banks a credit so the *next* call returns
+    /// immediately instead of suspending.
+    func release() {
+        if let continuation = pendingContinuation {
+            pendingContinuation = nil
+            continuation.resume()
+        } else {
+            availableReleases += 1
+        }
+    }
+}
+
 // MARK: - Tests
 
 @MainActor
@@ -302,6 +344,58 @@ final class AppLifecycleTests: XCTestCase {
             try? await Task.sleep(nanoseconds: 5_000_000)
         }
     }
+
+    /// Identical to `waitUntil(timeout:_:)` above but for an `async`
+    /// condition — used by the bootstrap-race tests below to poll a
+    /// `BootstrapAwaitGate`'s actor-isolated `waitCallCount`.
+    private func waitUntilAsync(timeout: TimeInterval = 2, _ condition: () async -> Bool) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while await !condition(), Date() < deadline {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+    }
+
+    /// Builds the same cheap, disk-backed `SettingsStore`/`HistoryStore`/
+    /// `PowerAssertionService`/`UpdateService` quartet `bootstrapProduction()`
+    /// builds for real, pointed at file URLs under a fresh scratch
+    /// directory that is never actually read from in the bootstrap-race
+    /// tests below (every `BootstrapSuspensionHooks` closure they install
+    /// fully substitutes for the `await` that would otherwise touch
+    /// them) — constructing real instances only because `bootstrapServices(
+    /// ...)`'s parameter types require them, never because their real
+    /// load behavior is exercised here.
+    private func makeBootstrapDependencies() -> (
+        settingsStore: SettingsStore,
+        historyStore: HistoryStore,
+        power: PowerAssertionService,
+        updateService: any UpdateChecking
+    ) {
+        let clock = SystemClock()
+        let scratchRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AppLifecycleTests-bootstrap-deps-\(UUID().uuidString)", isDirectory: true)
+        let fileSystem = FileManagerSettingsFileSystem()
+        let settingsStore = SettingsStore(store: AtomicJSONStore(
+            fileURL: scratchRoot.appendingPathComponent("settings.json"),
+            fileSystem: fileSystem,
+            clock: clock
+        ))
+        let historyStore = HistoryStore(
+            store: AtomicJSONStore(fileURL: scratchRoot.appendingPathComponent("history.json"), fileSystem: fileSystem, clock: clock),
+            clock: clock
+        )
+        let power = PowerAssertionService(backend: IOKitPowerAssertionBackend())
+        let updateService = UpdateService(
+            settingsStore: settingsStore,
+            session: UpdateService.makeDefaultSession(),
+            clock: clock,
+            currentVersion: "1.0.0-test"
+        )
+        return (settingsStore, historyStore, power, updateService)
+    }
+
+    private static let unusedRendererRoot = SeerRendererRoot(
+        url: URL(fileURLWithPath: "/nonexistent/AppLifecycleTests-Renderer", isDirectory: true)
+    )
 
     // MARK: - Launch sequence (steps 4 & 5)
 
@@ -1024,5 +1118,139 @@ final class AppLifecycleTests: XCTestCase {
         await waitUntil { !replies.isEmpty }
 
         XCTAssertEqual(replies, [true], "termination must still complete normally with no fallback storage root configured")
+    }
+
+    // MARK: - Bootstrap suspension race (Task 12 final finding)
+
+    /// Reproduces termination beginning while `bootstrapServices(...)` is
+    /// still suspended at its very first `await` — `hooks
+    /// .loadStartupSnapshot(...)`, standing in for
+    /// `AppSnapshotCoordinator.loadStartupSnapshot(...)`'s real
+    /// settings/history disk load. Before this fix, resuming from that
+    /// suspension went straight on to build and install a fresh
+    /// coordinator/agentMonitor/panel/status item/bridge onto `self`
+    /// with no further check at all, even though `performOrderlyShutdownOnce()`
+    /// had, by then, already run to completion against the `nil`
+    /// services bootstrap had not yet assigned — resurrecting a fully
+    /// live app with no remaining way to tear it down. `bootstrapServices(
+    /// ...)` must instead observe `hasShutDown` immediately on resume and
+    /// return having installed nothing at all, after also releasing the
+    /// fallback storage root/lease it is holding at that point exactly
+    /// as `bootstrapProduction()` would (assigned before any `await`, in
+    /// the same way `StorageBootstrap.resolveLocations(...)`'s result
+    /// is).
+    func testTerminationDuringStartupSnapshotLoadInstallsNothingAndReleasesTheFallbackRoot() async throws {
+        let delegate = AppDelegate()
+
+        let fallbackRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AppLifecycleTests-bootstrap-race-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: fallbackRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: fallbackRoot) }
+        delegate.fallbackStorageRoot = fallbackRoot
+        delegate.fallbackStorageLease = try StorageBootstrap.FallbackRootLease.acquire(at: fallbackRoot)
+
+        let dependencies = makeBootstrapDependencies()
+        let gate = BootstrapAwaitGate()
+        let hooks = BootstrapSuspensionHooks(loadStartupSnapshot: { _, _, _, _, _ in
+            await gate.wait()
+            return .empty(version: "1.0.0-test")
+        })
+
+        let bootstrapTask = Task {
+            await delegate.bootstrapServices(
+                settingsStore: dependencies.settingsStore,
+                historyStore: dependencies.historyStore,
+                power: dependencies.power,
+                updateService: dependencies.updateService,
+                appVersion: "1.0.0-test",
+                clock: SystemClock(),
+                bootstrapDiagnostics: [],
+                rendererRoot: Self.unusedRendererRoot,
+                hooks: hooks
+            )
+        }
+
+        await waitUntilAsync { await gate.waitCallCount >= 1 }
+
+        var replies: [Bool] = []
+        _ = delegate.beginTermination { success in replies.append(success) }
+        await waitUntil { !replies.isEmpty }
+
+        // Only now let the still-suspended startup-snapshot load resolve
+        // — shutdown has already fully completed by this point.
+        await gate.release()
+        await bootstrapTask.value
+
+        XCTAssertNil(delegate.coordinator, "no coordinator may ever be installed once shutdown was observed on resume")
+        XCTAssertNil(delegate.agentMonitor, "no agent monitor may ever be installed once shutdown was observed on resume")
+        XCTAssertNil(delegate.panelController, "no panel may ever be installed once shutdown was observed on resume")
+        XCTAssertNil(delegate.statusItemController, "no status item may ever be installed once shutdown was observed on resume")
+        XCTAssertNil(delegate.bridgeMessageHandler, "no bridge handler may ever be installed once shutdown was observed on resume")
+        XCTAssertNil(delegate.fallbackStorageRoot, "the fallback storage root must be released once shutdown was observed on resume")
+        XCTAssertNil(delegate.fallbackStorageLease, "the fallback storage lease must be released once shutdown was observed on resume")
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: fallbackRoot.path),
+            "the fallback storage root directory must actually be removed from disk"
+        )
+    }
+
+    /// Reproduces termination beginning while `bootstrapServices(...)` is
+    /// suspended at its *second* `await` — `hooks
+    /// .loadIncludePrereleaseUpdates(...)`, standing in for
+    /// `settingsStore.current.includePrereleaseUpdates` — which happens
+    /// only *after* the raw `NSStatusItem` has already been pulled from
+    /// `NSStatusBar.system` but *before* any `StatusItemController` has
+    /// been built to own it. Before this fix, resuming here went
+    /// straight on to build a `StatusItemController` around that
+    /// already-real, already-visible menu-bar item and install the rest
+    /// of the coordinator/bridge/monitor group regardless of shutdown —
+    /// with no later cleanup, since `performOrderlyShutdownOnce()` only
+    /// ever tears down `self.statusItemController`, never a raw
+    /// `NSStatusItem` bootstrap alone is still holding. This suspension
+    /// must be followed by the same `hasShutDown` check, this time also
+    /// removing that orphaned raw status item, before returning having
+    /// installed nothing.
+    func testTerminationDuringIncludePrereleaseUpdatesLoadInstallsNothingAtAll() async {
+        let delegate = AppDelegate()
+        let dependencies = makeBootstrapDependencies()
+        let gate = BootstrapAwaitGate()
+        let hooks = BootstrapSuspensionHooks(loadIncludePrereleaseUpdates: { _ in
+            await gate.wait()
+            return false
+        })
+
+        let bootstrapTask = Task {
+            await delegate.bootstrapServices(
+                settingsStore: dependencies.settingsStore,
+                historyStore: dependencies.historyStore,
+                power: dependencies.power,
+                updateService: dependencies.updateService,
+                appVersion: "1.0.0-test",
+                clock: SystemClock(),
+                bootstrapDiagnostics: [],
+                rendererRoot: Self.unusedRendererRoot,
+                hooks: hooks
+            )
+        }
+
+        await waitUntilAsync { await gate.waitCallCount >= 1 }
+
+        var replies: [Bool] = []
+        _ = delegate.beginTermination { success in replies.append(success) }
+        await waitUntil { !replies.isEmpty }
+
+        // Only now let the still-suspended includePrereleaseUpdates load
+        // resolve — shutdown has already fully completed by this point.
+        await gate.release()
+        await bootstrapTask.value
+
+        XCTAssertNil(delegate.coordinator, "no coordinator may ever be installed once shutdown was observed on resume")
+        XCTAssertNil(delegate.agentMonitor, "no agent monitor may ever be installed once shutdown was observed on resume")
+        XCTAssertNil(delegate.panelController, "no panel may ever be installed once shutdown was observed on resume")
+        XCTAssertNil(
+            delegate.statusItemController,
+            "no status item may ever be installed once shutdown was observed on resume, and the orphaned raw NSStatusItem must be removed from the menu bar"
+        )
+        XCTAssertNil(delegate.bridgeMessageHandler, "no bridge handler may ever be installed once shutdown was observed on resume")
     }
 }

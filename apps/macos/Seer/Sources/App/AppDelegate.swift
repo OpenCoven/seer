@@ -441,6 +441,41 @@ enum StorageBootstrap {
     }
 }
 
+/// Test-only injection seam for the two `await`s inside
+/// `AppDelegate.bootstrapServices(...)` that a `beginTermination(reply:)`
+/// call racing against bootstrap can suspend behind —
+/// `AppSnapshotCoordinator.loadStartupSnapshot(...)` and
+/// `settingsStore.current.includePrereleaseUpdates`. Both default to the
+/// real production calls, so production code never constructs this with
+/// anything but the default; `AppLifecycleTests` overrides one or the
+/// other with a closure that suspends on a `CheckedContinuation` under
+/// test control, so it can deterministically land `beginTermination(
+/// reply:)` in the exact narrow window between either suspension and its
+/// corresponding `hasShutDown` check, without ever racing against real
+/// disk I/O timing.
+@MainActor
+struct BootstrapSuspensionHooks {
+    var loadStartupSnapshot: (
+        _ settingsStore: SettingsStore,
+        _ historyStore: HistoryStore,
+        _ updateService: any UpdateChecking,
+        _ appVersion: String,
+        _ extraDiagnostics: [Diagnostic]
+    ) async -> AppSnapshot = { settingsStore, historyStore, updateService, appVersion, extraDiagnostics in
+        await AppSnapshotCoordinator.loadStartupSnapshot(
+            settingsStore: settingsStore,
+            historyStore: historyStore,
+            updateService: updateService,
+            appVersion: appVersion,
+            extraDiagnostics: extraDiagnostics
+        )
+    }
+
+    var loadIncludePrereleaseUpdates: (_ settingsStore: SettingsStore) async -> Bool = { settingsStore in
+        await settingsStore.current.includePrereleaseUpdates
+    }
+}
+
 /// Root application delegate. Wires every service from Tasks 2–11 into the
 /// real menu-bar app shell: an accessory-activation launch that loads
 /// settings/history, builds the coordinator/bridge/panel/status item,
@@ -451,12 +486,18 @@ enum StorageBootstrap {
 /// quit.
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private var coordinator: (any AppSnapshotCoordinating)?
-    private var agentMonitor: (any AgentMonitorControlling)?
-    private var bridgeMessageHandler: (any BridgeHandlerCancelling)?
-    private weak var webViewUserContentController: WKUserContentController?
-    private var panelController: PanelController?
-    private var statusItemController: StatusItemController?
+    // Every stored property below that a bootstrap-race test needs to
+    // read directly (to assert it was never installed once `hasShutDown`
+    // is observed) is `internal` rather than `private` for exactly that
+    // reason — mirroring `beginMonitoring()`/`requestSetKeepAwakeMode(_:)`
+    // above, already `internal` for the same "so `AppLifecycleTests` can
+    // drive/inspect this directly" purpose.
+    var coordinator: (any AppSnapshotCoordinating)?
+    var agentMonitor: (any AgentMonitorControlling)?
+    var bridgeMessageHandler: (any BridgeHandlerCancelling)?
+    weak var webViewUserContentController: WKUserContentController?
+    var panelController: PanelController?
+    var statusItemController: StatusItemController?
     /// The narrow seam `requestSetIncludePrereleaseUpdates(_:)` applies
     /// the persisted toggle through — set to the same `StatusItemController`
     /// instance as `statusItemController` in production, but injected
@@ -464,7 +505,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// assert exactly when the menu checkbox is (and is not) updated
     /// relative to persistence succeeding, without needing a real
     /// `NSStatusItem`.
-    private var prereleaseUpdatesMenu: (any PrereleaseUpdatesMenuApplying)?
+    var prereleaseUpdatesMenu: (any PrereleaseUpdatesMenuApplying)?
 
     private var scanLoopTask: Task<Void, Never>?
     private var terminationTask: Task<Void, Never>?
@@ -477,8 +518,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// `cleanUpFallbackStorageRootIfNeeded()` once orderly shutdown has
     /// fully completed, so a fallback session never leaves its directory
     /// permanently orphaned on disk.
-    private var fallbackStorageRoot: URL?
-    private var fallbackStorageLease: StorageBootstrap.FallbackRootLease?
+    var fallbackStorageRoot: URL?
+    var fallbackStorageLease: StorageBootstrap.FallbackRootLease?
 
     private let sleeper: any Sleeper
 
@@ -630,26 +671,123 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             currentVersion: appVersion
         )
 
+        await bootstrapServices(
+            settingsStore: settingsStore,
+            historyStore: historyStore,
+            power: power,
+            updateService: updateService,
+            appVersion: appVersion,
+            clock: clock,
+            bootstrapDiagnostics: bootstrapDiagnostics
+        )
+    }
+
+    /// The remainder of `bootstrapProduction()`'s required launch order —
+    /// from step (2)'s settings/history load through step (6)'s startup
+    /// update check/scheduler start — extracted into its own method,
+    /// `internal` rather than `private`, purely so `AppLifecycleTests`
+    /// can drive it directly against cheap, disk-backed-but-never-
+    /// actually-loaded `SettingsStore`/`HistoryStore`/`UpdateService`
+    /// instances plus a scripted `hooks` (see `BootstrapSuspensionHooks`)
+    /// that deterministically suspends at exactly one of this method's
+    /// two `await`s, call `beginTermination(reply:)` to completion, then
+    /// resume and assert nothing this method built afterward was ever
+    /// installed onto `self` — never a real, timing-dependent race
+    /// against actual disk I/O.
+    ///
+    /// Task 12's final finding: neither suspension point here was ever
+    /// checked against `hasShutDown` on resume. If termination began
+    /// while suspended at either one, this method used to resume
+    /// completely unaware, still building — and, worse, *installing* —
+    /// a fresh coordinator/agentMonitor/panel/status item/bridge onto
+    /// `self`, even though `performOrderlyShutdownOnce()` had already
+    /// run to completion against the `nil` services bootstrap had not
+    /// yet assigned; nothing ever cleaned any of that up afterward, so a
+    /// "shut down" app could resurrect a fully live status item/monitor/
+    /// bridge with no remaining path to tear it down again. Both
+    /// suspensions are now followed by a `hasShutDown` guard that
+    /// returns immediately — before ever assigning anything to `self` —
+    /// after releasing whatever this method alone had, by that point,
+    /// locally acquired and not yet handed off: the fallback storage
+    /// root/lease (via `cleanUpFallbackStorageRootIfNeeded()`) after the
+    /// first suspension, and additionally the raw `NSStatusItem` already
+    /// pulled from `NSStatusBar.system` — real, already-visible menu-bar
+    /// state no `StatusItemController` yet owns, and therefore invisible
+    /// to `performOrderlyShutdownOnce()`, which only ever tears down
+    /// `self.statusItemController` — after the second. Every other
+    /// locally-built value at either point (`panel`, `rendererSink`, and
+    /// the not-yet-constructed coordinator/bridge/agentMonitor) simply
+    /// falls out of scope unassigned and deinitializes normally; none of
+    /// them acquire any real resource of their own before construction
+    /// completes, and `AppSnapshotCoordinator.makeWithScheduledUpdates(
+    /// ...)` in particular starts neither a power assertion nor the
+    /// update scheduler until installed and explicitly told to.
+    func bootstrapServices(
+        settingsStore: SettingsStore,
+        historyStore: HistoryStore,
+        power: PowerAssertionService,
+        updateService: any UpdateChecking,
+        appVersion: String,
+        clock: Clock,
+        bootstrapDiagnostics: [Diagnostic],
+        rendererRoot: SeerRendererRoot = SeerRendererRoot(
+            url: Bundle.main.resourceURL!.appendingPathComponent("Renderer", isDirectory: true)
+        ),
+        hooks: BootstrapSuspensionHooks = BootstrapSuspensionHooks()
+    ) async {
         // Step (2) of the required launch order: settings/history are
         // loaded exactly once each, here, before any panel/status item/
         // bridge — every one of which is genuine user-visible UI — is
         // ever constructed. `startupSnapshot` seeds both the coordinator
         // built below and the status item's initial prerelease-updates
         // toggle; no later step ever reloads either store.
-        let startupSnapshot = await AppSnapshotCoordinator.loadStartupSnapshot(
-            settingsStore: settingsStore,
-            historyStore: historyStore,
-            updateService: updateService,
-            appVersion: appVersion,
-            extraDiagnostics: bootstrapDiagnostics
+        let startupSnapshot = await hooks.loadStartupSnapshot(
+            settingsStore,
+            historyStore,
+            updateService,
+            appVersion,
+            bootstrapDiagnostics
         )
 
-        let rendererRoot = SeerRendererRoot(url: Bundle.main.resourceURL!.appendingPathComponent("Renderer", isDirectory: true))
+        // First suspension check: a quit requested while the load above
+        // was still in flight must never let this method go on to build
+        // (let alone install) any settings/history-dependent UI at all
+        // — see this method's own documentation above for the exact
+        // race this closes. The only resource this method could have
+        // locally acquired by this point is the fallback storage root/
+        // lease, already released here if `performOrderlyShutdownOnce()`
+        // has not already done so itself.
+        guard !hasShutDown else {
+            cleanUpFallbackStorageRootIfNeeded()
+            return
+        }
+
         let panel = PanelController(rendererRoot: rendererRoot, clock: clock)
         let rendererSink = RendererEventSink(javaScriptCaller: panel.webView)
 
+        // The `NSStatusItem` itself must be requested from
+        // `NSStatusBar.system` synchronously, before the
+        // `includePrereleaseUpdates` load below can ever suspend — so a
+        // shutdown observed immediately afterward finds this method
+        // still holding a real, already-visible menu-bar item that no
+        // `StatusItemController` has been built to own yet.
+        let rawStatusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        let includePrereleaseUpdates = await hooks.loadIncludePrereleaseUpdates(settingsStore)
+
+        // Second suspension check: identical reasoning to the first,
+        // plus explicit removal of `rawStatusItem` — the one piece of
+        // real, already-visible UI this method has created but not yet
+        // handed off to a `StatusItemController`, and therefore the one
+        // resource `performOrderlyShutdownOnce()` could never discover
+        // or remove on this method's behalf.
+        guard !hasShutDown else {
+            NSStatusBar.system.removeStatusItem(rawStatusItem)
+            cleanUpFallbackStorageRootIfNeeded()
+            return
+        }
+
         let statusItem = StatusItemController(
-            statusItem: NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength),
+            statusItem: rawStatusItem,
             actions: StatusItemController.Actions(
                 togglePanel: { [weak self] in self?.toggleFromStatusItem() },
                 setKeepAwakeMode: { [weak self] mode in self?.requestSetKeepAwakeMode(mode) },
@@ -658,7 +796,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 quit: { [weak self] in self?.requestQuit() }
             ),
             initialSnapshot: startupSnapshot,
-            includePrereleaseUpdates: await settingsStore.current.includePrereleaseUpdates
+            includePrereleaseUpdates: includePrereleaseUpdates
         )
 
         let broadcastSink = MulticastRendererSink(sinks: [rendererSink, statusItem])
