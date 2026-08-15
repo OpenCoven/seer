@@ -64,6 +64,18 @@ public enum UpdateCheckError: Error, Equatable, Sendable {
     /// A `200` response's body could not be decoded as the expected
     /// GitHub release (or release-list) JSON shape.
     case malformedReleasePayload
+    /// `check(force:)` found a corrupt (future-dated) persisted
+    /// `lastUpdateCheckAt` (see `SafeTime.normalizedLastCheckedAt(_:now:)`)
+    /// and attempting to persist the repaired value through
+    /// `SettingsStore.recordUpdateCheck(etag:lastCheckedAt:release:)`
+    /// itself failed. `SettingsStore`/`AtomicJSONStore` retain their
+    /// previous persisted value on any failed write, so treating this as
+    /// a success would falsely report the gate as satisfied while the
+    /// corrupt future timestamp remains on disk — silently delaying
+    /// every subsequent real check by another full interval, and
+    /// performing no network request at all this call. `message` is
+    /// diagnostic-only.
+    case timestampRepairFailed(String)
 }
 
 /// The exact GitHub release fields `UpdateService` needs. `tagName` is the
@@ -286,6 +298,11 @@ public actor UpdateService {
     /// - Any other status, a non-HTTP response, an undecodable body, or a
     ///   transport-level failure throws a typed `UpdateCheckError` and
     ///   leaves every persisted field exactly as it was before the call.
+    /// - A corrupt (future-dated) persisted `lastUpdateCheckAt` whose
+    ///   repair-persist itself fails throws
+    ///   `UpdateCheckError.timestampRepairFailed` and performs no network
+    ///   request, leaving every persisted field exactly as it was before
+    ///   the call — see the repair block below.
     public func check(force: Bool) async throws -> UpdateState {
         let now = clock.nowMilliseconds()
         var settings = await settingsStore.current
@@ -304,13 +321,31 @@ public actor UpdateService {
             // check — fixes that: every later gate check measures real
             // elapsed time from this point forward, bounding the very
             // next actual check to one ordinary interval from now.
+            //
+            // That repair-persist can itself fail (e.g. a transient disk
+            // write error) — and `SettingsStore` deliberately retains its
+            // previous (still corrupt/future) value on any failed write
+            // (see `SettingsStore.applyUpdate(_:)`). Silently ignoring
+            // that failure (as a bare `try?` once did) and proceeding to
+            // treat `settings.lastUpdateCheckAt` as repaired anyway would
+            // report this call as gated/successful — with no network
+            // request — while the corrupt timestamp is still exactly
+            // what's on disk, delaying every subsequent real check by
+            // another full interval indefinitely, with no visible
+            // failure anywhere. Instead, surface a typed error and adopt
+            // the normalized value locally only once persistence has
+            // actually confirmed it.
             let normalized = SafeTime.normalizedLastCheckedAt(lastCheckedAt, now: now)
             if normalized != lastCheckedAt {
-                try? await settingsStore.recordUpdateCheck(
-                    etag: settings.updateETag,
-                    lastCheckedAt: normalized,
-                    release: settings.lastRelease
-                )
+                do {
+                    try await settingsStore.recordUpdateCheck(
+                        etag: settings.updateETag,
+                        lastCheckedAt: normalized,
+                        release: settings.lastRelease
+                    )
+                } catch {
+                    throw UpdateCheckError.timestampRepairFailed(String(describing: error))
+                }
                 settings.lastUpdateCheckAt = normalized
             }
             // Saturating subtraction so an extreme-past value (e.g.

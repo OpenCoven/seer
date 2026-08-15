@@ -473,6 +473,88 @@ final class UpdateServiceTests: XCTestCase {
         XCTAssertEqual(due.availableVersion, "v1.1.0")
     }
 
+    /// Regression test for a corrupted/future-dated persisted
+    /// `lastUpdateCheckAt` whose repair-persist itself fails (e.g. a
+    /// transient disk write error). Before the fix, `check(force:)`
+    /// swallowed that failure via `try?`, then unconditionally treated the
+    /// in-memory `settings.lastUpdateCheckAt` as though the repair had
+    /// persisted — returning the gated ("no network request") cached
+    /// state as if the call had succeeded, even though `SettingsStore`
+    /// (which retains its previous value on a failed write) still had the
+    /// corrupt future timestamp on disk. That combination silently
+    /// reported false success while delaying every real check by another
+    /// full interval, with no visible failure anywhere. The fix instead
+    /// throws a typed `UpdateCheckError.timestampRepairFailed`, performs
+    /// no network request, and leaves `SettingsStore`'s persisted/current
+    /// state exactly as it was — and a later call, once the underlying
+    /// write recovers, can still repair and (eventually) check normally.
+    func testFutureTimestampRepairPersistenceFailureThrowsInsteadOfFalseSuccess() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let settingsStore = makeSettingsStore(fileSystem: fileSystem, clock: clock)
+        try await settingsStore.recordUpdateCheck(etag: nil, lastCheckedAt: Int64.max, release: nil)
+        let service = UpdateService(
+            settingsStore: settingsStore,
+            session: makeMockSession(),
+            clock: clock,
+            currentVersion: "1.0.0"
+        )
+
+        // Arm exactly one failing write — the repair-persist attempt
+        // inside `check(force:)` below is the only write this test
+        // performs before that arm is consumed.
+        await fileSystem.setFailNextWrite(SettingsFileSystemError.other("disk full"))
+
+        do {
+            _ = try await service.check(force: false)
+            XCTFail("expected the repair-persist failure to throw instead of reporting false success")
+        } catch let error as UpdateCheckError {
+            guard case .timestampRepairFailed = error else {
+                return XCTFail("expected .timestampRepairFailed, got \(error)")
+            }
+        }
+
+        XCTAssertEqual(
+            MockURLProtocol.recordedRequests.count,
+            0,
+            "a failed repair-persist must never fall through to a network request"
+        )
+
+        // `SettingsStore` must retain exactly its previous (corrupt,
+        // future) value — never silently advanced to look repaired
+        // despite the failed write.
+        let stateAfterFailure = await service.currentState()
+        XCTAssertEqual(
+            stateAfterFailure.lastCheckedAt,
+            Int64.max,
+            "a failed repair-persist must leave the corrupt future timestamp exactly as it was"
+        )
+
+        // Once persistence recovers (no `failNextWrite` armed this time),
+        // the exact same corrupt state must be repairable again: no
+        // permanent false-failure wedge from the earlier thrown error.
+        let recovered = try await service.check(force: false)
+        XCTAssertEqual(
+            MockURLProtocol.recordedRequests.count,
+            0,
+            "the freshly repaired timestamp normalizes to 'now', so this call remains correctly gated"
+        )
+        XCTAssertEqual(recovered.lastCheckedAt, 1_700_000_000_000, "the repair must actually have persisted this time")
+
+        // And with that repaired timestamp actually on disk, a real check
+        // becomes due exactly one bounded interval later — proving this
+        // was a genuine, working recovery rather than a still-corrupt or
+        // still-gated-forever state.
+        clock.now += UpdateService.checkIntervalMs
+        MockURLProtocol.enqueueStub(
+            statusCode: 200,
+            body: releaseJSON(tag: "v1.1.0", htmlURL: "https://github.com/OpenCoven/seer/releases/tag/v1.1.0")
+        )
+        let due = try await service.check(force: false)
+        XCTAssertEqual(MockURLProtocol.recordedRequests.count, 1, "recovery must not suppress real checks once actually due")
+        XCTAssertEqual(due.availableVersion, "v1.1.0")
+    }
+
     /// Regression test for a corrupted/extreme-past persisted
     /// `lastUpdateCheckAt` (e.g. `Int64.min`). Before the fix, `now -
     /// Int64.min` overflows `Int64` and traps, crashing the app on the
