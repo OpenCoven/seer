@@ -141,10 +141,19 @@ jobs:
       - name: Install locked standalone dependencies
         run: npm ci
 
+      # --test-concurrency=1 serializes these files: tests/standalone-renderer.test.mjs
+      # and tests/standalone-renderer-lock.test.mjs both drive
+      # scripts/build-standalone-renderer.mjs against this repository's real
+      # .seer-standalone-renderer.lock directory (the lock test intentionally
+      # overwrites that directory to simulate stale/synthetic lock owners).
+      # Node's test runner otherwise executes test files in parallel worker
+      # processes by default, which races both files over the same physical
+      # lock directory and build/standalone-renderer output, producing
+      # nondeterministic EEXIST/owner-mismatch failures.
       - name: Run standalone-safe unit tests
         run: |
           set -euo pipefail
-          node --test \
+          node --test --test-concurrency=1 \
             tests/identity.test.mjs \
             tests/renderer-build-identity.test.mjs \
             tests/standalone-renderer.test.mjs \
@@ -179,7 +188,7 @@ jobs:
         run: npm run build:macos
 
       - name: Run standalone boundary test suite
-        run: node --test tests/standalone-boundary.test.mjs
+        run: node --test --test-concurrency=1 tests/standalone-boundary.test.mjs
 
       - name: Check repository and built-app boundary
         run: npm run check:standalone-boundary

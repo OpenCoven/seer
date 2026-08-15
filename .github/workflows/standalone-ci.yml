@@ -74,10 +74,19 @@ jobs:
       # sibling is exercised via the "Run shared renderer unit tests" step
       # instead). Release packaging tests stub every signing/notarization
       # tool and never use credentials or contact Apple services.
+      # --test-concurrency=1 serializes these files: tests/standalone-renderer.test.mjs
+      # and tests/standalone-renderer-lock.test.mjs both drive
+      # scripts/build-standalone-renderer.mjs against this repository's real
+      # .seer-standalone-renderer.lock directory (the lock test intentionally
+      # overwrites that directory to simulate stale/synthetic lock owners).
+      # Node's test runner otherwise executes test files in parallel worker
+      # processes by default, which races both files over the same physical
+      # lock directory and build/standalone-renderer output, producing
+      # nondeterministic EEXIST/owner-mismatch failures.
       - name: Run standalone-safe unit tests (identity, renderer, publication, packaging, agent-detection, update)
         run: |
           set -euo pipefail
-          node --test \
+          node --test --test-concurrency=1 \
             tests/identity.test.mjs \
             tests/renderer-build-identity.test.mjs \
             tests/standalone-renderer.test.mjs \
@@ -137,7 +146,7 @@ jobs:
       - name: Run standalone boundary test suite
         run: |
           set -euo pipefail
-          node --test tests/standalone-boundary.test.mjs 2>&1 | tee ci-logs/standalone-boundary-test.log
+          node --test --test-concurrency=1 tests/standalone-boundary.test.mjs 2>&1 | tee ci-logs/standalone-boundary-test.log
 
       - name: Repository and built-app boundary checks
         run: |
