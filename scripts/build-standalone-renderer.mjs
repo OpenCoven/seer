@@ -231,11 +231,14 @@ function recordedChildGroupState(childRecord, owner) {
     !Number.isSafeInteger(child.pid) ||
     child.pid <= 0 ||
     typeof child.bootIdentity !== "string" ||
-    typeof child.processStartIdentity !== "string" ||
-    !owner ||
-    typeof owner.token !== "string" ||
-    child.token !== owner.token
+    typeof child.processStartIdentity !== "string"
   ) {
+    return {
+      state: "unknown",
+      diagnostic: "recorded child process-group identity cannot be proven stale",
+    };
+  }
+  if (owner && (typeof owner.token !== "string" || child.token !== owner.token)) {
     return {
       state: "unknown",
       diagnostic: "recorded child process-group identity cannot be proven stale",
@@ -290,19 +293,23 @@ function removeVerifiedDirectory(directoryPath, expectedDirectory, knownEntries,
   if (JSON.stringify(names) !== JSON.stringify(expectedNames)) {
     throw new Error(`${label} contains unexpected entries: ${names.join(", ")}`);
   }
-  for (const [name, expectedInfo] of knownEntries) {
+  const orderedEntries = [...knownEntries].sort(([left], [right]) => {
+    if (left === right) return 0;
+    if (left === "owner.json") return 1;
+    if (right === "owner.json") return -1;
+    return left.localeCompare(right);
+  });
+  for (const [name, expectedInfo] of orderedEntries) {
     const path = join(directoryPath, name);
     const current = lstatSync(path);
     if (current.isSymbolicLink() || !current.isFile() || !sameIdentity(expectedInfo, current)) {
       throw new Error(`${label} ${name} changed identity before cleanup`);
     }
     unlinkSync(path);
+    fsyncDirectory(directoryPath);
   }
   rmdirSync(directoryPath);
-}
-
-function removeVerifiedLock(expectedDirectory, knownEntries) {
-  removeVerifiedDirectory(lockDir, expectedDirectory, knownEntries, "renderer lock");
+  fsyncDirectory(dirname(directoryPath));
 }
 
 function runReclaimTestHook(phase) {
@@ -316,6 +323,68 @@ function runReclaimTestHook(phase) {
   if (result.status !== 0) {
     throw new Error(`renderer reclaim test hook exited with status ${result.status}`);
   }
+}
+
+function runReleaseTestHook(phase) {
+  const hookPath = process.env.SEER_RENDERER_RELEASE_TEST_HOOK;
+  if (!hookPath || process.env.SEER_RENDERER_RELEASE_TEST_PHASE !== phase) return;
+  const result = spawnSync(process.execPath, [hookPath, phase], {
+    env: process.env,
+    stdio: "inherit",
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(`renderer release test hook exited with status ${result.status}`);
+  }
+}
+
+function quarantineAndRemoveOwnedLock(expectedDirectory, ownerInfo) {
+  const currentDirectory = lstatSync(lockDir);
+  assertOwnedDirectory(currentDirectory, "renderer lock");
+  if (!sameDirectoryIdentity(expectedDirectory, currentDirectory)) {
+    throw new Error("renderer lock changed identity before release");
+  }
+  const names = readdirSync(lockDir);
+  if (names.length !== 1 || names[0] !== "owner.json") {
+    throw new Error(`renderer lock contains unexpected entries before release: ${names.join(", ")}`);
+  }
+  const currentOwner = lstatSync(ownerPath);
+  if (
+    currentOwner.isSymbolicLink() ||
+    !currentOwner.isFile() ||
+    !sameIdentity(ownerInfo, currentOwner)
+  ) {
+    throw new Error("renderer lock owner metadata changed identity before release");
+  }
+  if (lstatOrNull(reclaimPath)) {
+    throw new Error("refusing to release renderer lock over an existing reclamation");
+  }
+
+  renameSync(lockDir, reclaimPath);
+  runReleaseTestHook("lock-quarantined");
+  fsyncDirectory(repoRoot);
+  runReleaseTestHook("quarantine-fsynced");
+
+  const quarantinedDirectory = lstatSync(reclaimPath);
+  if (!sameDirectoryIdentity(expectedDirectory, quarantinedDirectory)) {
+    throw new Error("quarantined renderer lock changed identity");
+  }
+  const quarantinedOwnerPath = join(reclaimPath, "owner.json");
+  const quarantinedOwner = lstatSync(quarantinedOwnerPath);
+  if (
+    quarantinedOwner.isSymbolicLink() ||
+    !quarantinedOwner.isFile() ||
+    !sameIdentity(ownerInfo, quarantinedOwner)
+  ) {
+    throw new Error("quarantined renderer lock owner metadata changed identity");
+  }
+  unlinkSync(quarantinedOwnerPath);
+  runReleaseTestHook("owner-unlinked");
+  fsyncDirectory(reclaimPath);
+  runReleaseTestHook("owner-fsynced");
+  rmdirSync(reclaimPath);
+  runReleaseTestHook("quarantine-removed");
+  fsyncDirectory(repoRoot);
 }
 
 function assertReclaimTemp(directoryPath, directoryInfo, name) {
@@ -867,6 +936,7 @@ async function acquireLock() {
           } finally {
             if (descriptor !== null) closeSync(descriptor);
           }
+          fsyncDirectory(lockDir);
           return childProcessStartIdentity;
         },
         clearChild() {
@@ -880,7 +950,10 @@ async function acquireLock() {
             throw new Error("renderer lock child metadata changed identity before cleanup");
           }
           unlinkSync(childPath);
+          runReleaseTestHook("child-unlinked");
+          fsyncDirectory(lockDir);
           activeChildInfo = null;
+          runReleaseTestHook("child-fsynced");
         },
         release() {
           if (activeChildInfo) {
@@ -897,7 +970,7 @@ async function acquireLock() {
           ) {
             throw new Error("refusing to release a renderer lock owned by another process");
           }
-          removeVerifiedLock(directoryInfo, new Map([["owner.json", current.info]]));
+          quarantineAndRemoveOwnedLock(directoryInfo, current.info);
         },
       };
     } catch (error) {

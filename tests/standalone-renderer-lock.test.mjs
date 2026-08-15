@@ -32,6 +32,7 @@ const failingProcessGroupPath = join(here, "helpers", "renderer-failing-process-
 const exitedLeaderGroupPath = join(here, "helpers", "renderer-exited-leader-group.mjs");
 const publicationKillHookPath = join(here, "helpers", "renderer-publication-kill-hook.mjs");
 const reclaimKillHookPath = join(here, "helpers", "renderer-reclaim-kill-hook.mjs");
+const releaseKillHookPath = join(here, "helpers", "renderer-release-kill-hook.mjs");
 
 function runWrapper({ env = {}, consumerArgs = [], root = repoRoot, script = wrapperPath } = {}) {
   const args = [script];
@@ -610,6 +611,131 @@ test("hard kills at every atomic reclaim metadata phase recover without leaking 
     }
   } finally {
     rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test("hard kills at every lock release cleanup phase recover automatically", async () => {
+  mkdirSync(join(repoRoot, "build"), { recursive: true });
+  const scratch = mkdtempSync(join(repoRoot, "build", "renderer-release-kill-test-"));
+  const phases = [
+    "child-unlinked",
+    "child-fsynced",
+    "lock-quarantined",
+    "quarantine-fsynced",
+    "owner-unlinked",
+    "owner-fsynced",
+    "quarantine-removed",
+  ];
+  try {
+    for (const phase of phases) {
+      const fixture = createRendererFixture(join(scratch, phase));
+      const readyPath = join(scratch, `${phase}.ready`);
+      const killed = await runWrapper({
+        env: {
+          SEER_RENDERER_BUILD_TEST_BUILDER: testBuilderPath,
+          SEER_RENDERER_BUILD_TEST_MARKER: `killed-${phase}`,
+          SEER_RENDERER_RELEASE_TEST_HOOK: releaseKillHookPath,
+          SEER_RENDERER_RELEASE_TEST_PHASE: phase,
+          SEER_RENDERER_RELEASE_TEST_READY_PATH: readyPath,
+          SEER_RENDERER_LOCK_STALE_MS: "0",
+          SEER_RENDERER_LOCK_POLL_MS: "1",
+          SEER_RENDERER_LOCK_WAIT_MS: "5000",
+        },
+        root: fixture.repo,
+        script: fixture.wrapper,
+      }).completed;
+      assert.equal(killed.signal, "SIGKILL", `${phase} did not hard-kill:\n${killed.stderr}`);
+      assert.equal(readFileSync(readyPath, "utf8"), `${phase}\n`);
+
+      const recovered = await runWrapper({
+        env: {
+          SEER_RENDERER_BUILD_TEST_BUILDER: testBuilderPath,
+          SEER_RENDERER_BUILD_TEST_MARKER: `recovered-${phase}`,
+          SEER_RENDERER_LOCK_STALE_MS: "0",
+          SEER_RENDERER_LOCK_POLL_MS: "1",
+          SEER_RENDERER_LOCK_WAIT_MS: "5000",
+        },
+        root: fixture.repo,
+        script: fixture.wrapper,
+      }).completed;
+      assert.equal(recovered.code, 0, `${phase} recovery failed:\n${recovered.stderr}`);
+      assert.deepEqual(
+        readdirSync(fixture.repo).filter((name) =>
+          name.startsWith(".seer-standalone-renderer.lock"),
+        ),
+        [],
+      );
+      assert.deepEqual(privateRendererArtifacts(fixture.repo), []);
+    }
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test("a legacy child-only lock is recovered only after its recorded process is dead", async () => {
+  const token = "legacy-child-only";
+  const lockDir = writeSyntheticLock(
+    {
+      token,
+      pid: 2147483646,
+      createdAtMs: 0,
+      bootIdentity: currentBootIdentity(),
+      processStartIdentity: "dead-owner",
+    },
+    {
+      token,
+      pid: 2147483647,
+      processGroupId: 2147483647,
+      createdAtMs: 0,
+      bootIdentity: currentBootIdentity(),
+      processStartIdentity: "dead-child",
+    },
+  );
+  rmSync(join(lockDir, "owner.json"));
+  try {
+    const recovered = await runWrapper({
+      env: {
+        SEER_RENDERER_BUILD_TEST_BUILDER: testBuilderPath,
+        SEER_RENDERER_BUILD_TEST_MARKER: "legacy-child-only-recovered",
+        SEER_RENDERER_LOCK_STALE_MS: "0",
+        SEER_RENDERER_LOCK_POLL_MS: "1",
+        SEER_RENDERER_LOCK_WAIT_MS: "5000",
+      },
+    }).completed;
+    assert.equal(recovered.code, 0, `legacy child-only recovery failed:\n${recovered.stderr}`);
+    assert.equal(existsSync(lockDir), false);
+
+    writeSyntheticLock(
+      {
+        token,
+        pid: 2147483646,
+        createdAtMs: 0,
+        bootIdentity: currentBootIdentity(),
+        processStartIdentity: "dead-owner",
+      },
+      {
+        token,
+        pid: process.pid,
+        processGroupId: process.pid,
+        createdAtMs: 0,
+        bootIdentity: currentBootIdentity(),
+        processStartIdentity: processStartIdentity(process.pid),
+      },
+    );
+    rmSync(join(lockDir, "owner.json"));
+    const blocked = await runWrapper({
+      env: {
+        SEER_RENDERER_BUILD_TEST_BUILDER: testBuilderPath,
+        SEER_RENDERER_LOCK_STALE_MS: "0",
+        SEER_RENDERER_LOCK_POLL_MS: "1",
+        SEER_RENDERER_LOCK_WAIT_MS: "100",
+      },
+    }).completed;
+    assert.notEqual(blocked.code, 0);
+    assert.match(blocked.stderr, /recorded renderer child .*still alive/i);
+    assert.equal(existsSync(join(lockDir, "child.json")), true);
+  } finally {
+    rmSync(lockDir, { recursive: true, force: true });
   }
 });
 
