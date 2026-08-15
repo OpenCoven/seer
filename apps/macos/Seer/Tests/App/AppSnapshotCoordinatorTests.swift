@@ -1460,6 +1460,87 @@ final class AppSnapshotCoordinatorTests: XCTestCase {
         )
     }
 
+    /// Reproduces the *narrower* half of the Task 12 scheduler race the
+    /// previous test does not cover: there, `shutdown()` runs to
+    /// completion entirely *before* `updateScheduler.start()` is ever
+    /// called (the in-flight step is the preceding `checkForUpdates`
+    /// call), so the pre-`start()` `!isShutDown` guard alone is enough to
+    /// skip it. Here, the startup `checkForUpdates(force:)` call already
+    /// resolved and the guard already passed — `updateScheduler.start()`
+    /// itself is the call still genuinely in flight when `shutdown()`
+    /// runs. Because `SuspendableUpdateSchedulerControlling` is an actor,
+    /// `shutdown()`'s own `updateScheduler.stop()` call is free to run
+    /// (and fully complete, setting `isActive = false`) *while* that
+    /// `start()` call is still suspended — exactly the "shutdown's stop
+    /// executes before pending start" ordering the fix must survive.
+    /// Without rechecking `isShutDown` immediately after `await
+    /// updateScheduler.start()` returns and compensating with an
+    /// immediate `updateScheduler.stop()` if shutdown raced, `start()`
+    /// resuming afterward would set `isActive = true` again, leaving the
+    /// scheduler running despite an already-completed shutdown.
+    func testPerformStartupUpdateCheckAndStartSchedulerStopsTheSchedulerAgainIfShutdownRacedWhileStartItselfWasStillInFlight() async throws {
+        let updateService = FakeUpdateChecking()
+        let updateScheduler = SuspendableUpdateSchedulerControlling()
+        let (coordinator, _, _) = await makeCoordinator(
+            updateService: updateService,
+            updateScheduler: updateScheduler
+        )
+        // `makeAtStartup(...)` (via `makeCoordinator`) already started the
+        // scheduler once, auto-resolved by
+        // `SuspendableUpdateSchedulerControlling`'s own construction-time
+        // special case.
+        let startCallCountBeforeStartupPhase = await updateScheduler.startCallCount
+        XCTAssertEqual(startCallCountBeforeStartupPhase, 1)
+
+        // Mirrors `AppDelegate.bootstrapProduction()`'s own step (6). Its
+        // `checkForUpdates(force: false)` call resolves synchronously
+        // (`FakeUpdateChecking` never suspends), passes the pre-`start()`
+        // `!isShutDown` guard, and calls through to
+        // `updateScheduler.start()` — which, being this fake's *second*
+        // call, genuinely suspends until this test releases it below.
+        let startupTask = Task {
+            await coordinator.performStartupUpdateCheckAndStartScheduler()
+        }
+        await updateScheduler.waitForStartCall()
+
+        // Shutdown is requested and runs to completion next — including
+        // its own `updateScheduler.stop()` call — entirely while the
+        // startup phase's `start()` call above is still suspended inside
+        // the scheduler actor.
+        try await coordinator.shutdown()
+        let stopCallCountAfterShutdown = await updateScheduler.stopCallCount
+        XCTAssertEqual(
+            stopCallCountAfterShutdown, 1,
+            "shutdown must stop the scheduler even while a start() call raced against it is still in flight"
+        )
+        let isActiveAfterShutdown = await updateScheduler.isActive
+        XCTAssertFalse(isActiveAfterShutdown, "the scheduler must already be inactive once shutdown itself has completed")
+
+        // Only now does the long-suspended start() call resume.
+        await updateScheduler.releaseStart()
+        await startupTask.value
+
+        let isActiveAfterStartupCompletes = await updateScheduler.isActive
+        XCTAssertFalse(
+            isActiveAfterStartupCompletes,
+            "the scheduler must end up inactive: a start() call that resumes after shutdown already completed must be compensated with an immediate stop(), never left running"
+        )
+        let stopCallCountAfterStartupCompletes = await updateScheduler.stopCallCount
+        XCTAssertEqual(
+            stopCallCountAfterStartupCompletes, 2,
+            "the raced start() must be followed by exactly one compensating stop() once it resumes and observes isShutDown"
+        )
+
+        // Idempotence: a second shutdown() call must not stop the
+        // scheduler again.
+        try await coordinator.shutdown()
+        let stopCallCountAfterSecondShutdown = await updateScheduler.stopCallCount
+        XCTAssertEqual(
+            stopCallCountAfterSecondShutdown, 2,
+            "a second shutdown() call must not stop the already-stopped scheduler again"
+        )
+    }
+
     /// The `setIncludePrereleaseUpdates` counterpart of
     /// `testShutdownFlagsAnAlreadyQueuedScheduledCheckSoItNeverNetworkChecksOrPublishesAfterward`:
     /// a tray checkbox toggle already queued behind `gate` when

@@ -221,3 +221,89 @@ actor SuspendableUpdateChecking: UpdateChecking {
         pendingSetIncludePrereleaseContinuation = nil
     }
 }
+
+/// A controllable `UpdateSchedulerControlling` test double whose `start()`
+/// call suspends indefinitely — genuinely, via a `CheckedContinuation`, not
+/// merely a `Task.yield()` loop — until the test explicitly `releaseStart()`s
+/// it. Lets a test hold a coordinator's `performStartupUpdateCheckAndStartScheduler()`
+/// suspended *inside* `updateScheduler.start()` itself (as opposed to
+/// `SuspendableUpdateChecking`, which holds it suspended inside the
+/// preceding `checkForUpdates(force:)` call) so it can reproduce the
+/// narrower Task 12 race: `shutdown()` — and its own `updateScheduler
+/// .stop()` call — running to completion *while a `start()` call is still
+/// genuinely in flight*, rather than only ever before or after it. An
+/// `actor` (not `@unchecked Sendable`) since its state is genuinely
+/// accessed both by the coordinator's in-flight `start()`/`stop()` calls
+/// and by the test's own `waitForStartCall()`/`releaseStart()`.
+///
+/// The very first `start()` call resolves immediately: `AppSnapshotCoordinator
+/// .makeAtStartup(...)` (which `AppSnapshotCoordinatorTests.makeCoordinator`
+/// always goes through) itself calls `updateScheduler.start()` once as part
+/// of *constructing* the coordinator, awaiting its result before ever
+/// returning — so a fake that suspended unconditionally on every call would
+/// hang that construction forever, with no continuation ever registered for
+/// a test to resolve. Only the *second* and later calls (i.e. whichever
+/// explicit `performStartupUpdateCheckAndStartScheduler()` call a test
+/// itself triggers, once it already holds a constructed coordinator)
+/// actually suspend.
+actor SuspendableUpdateSchedulerControlling: UpdateSchedulerControlling {
+    private(set) var startCallCount = 0
+    private(set) var stopCallCount = 0
+    /// Whether the scheduler is currently active — set `true` only once a
+    /// `start()` call has actually *returned* (not merely been called),
+    /// and `false` the instant a `stop()` call is made — so a test can
+    /// assert the final settled state regardless of how `start()`/`stop()`
+    /// calls happened to interleave.
+    private(set) var isActive = false
+
+    private var pendingStartContinuation: CheckedContinuation<Void, Never>?
+    private var waitingForStartCallContinuation: CheckedContinuation<Void, Never>?
+    /// How many suspended (i.e. not auto-resolved) `start()` calls have
+    /// been made so far — distinct from `startCallCount`, which also
+    /// counts the auto-resolved construction-time call.
+    private var suspendedStartCallCount = 0
+
+    func start() async {
+        startCallCount += 1
+
+        // The first call — `makeAtStartup(...)`'s own construction-time
+        // start — resolves immediately; see this type's documentation
+        // above.
+        guard startCallCount > 1 else {
+            isActive = true
+            return
+        }
+
+        suspendedStartCallCount += 1
+        waitingForStartCallContinuation?.resume()
+        waitingForStartCallContinuation = nil
+        await withCheckedContinuation { continuation in
+            self.pendingStartContinuation = continuation
+        }
+        isActive = true
+    }
+
+    func stop() async {
+        stopCallCount += 1
+        isActive = false
+    }
+
+    /// Suspends until a (non-construction) `start()` call has actually
+    /// been made — and is therefore itself now suspended awaiting
+    /// `releaseStart()` — at least once, so a test can be certain that
+    /// call has already passed the coordinator's own pre-await
+    /// `!isShutDown` guard before proceeding.
+    func waitForStartCall() async {
+        if suspendedStartCallCount > 0 { return }
+        await withCheckedContinuation { continuation in
+            self.waitingForStartCallContinuation = continuation
+        }
+    }
+
+    /// Resolves the currently-suspended `start()` call (if any), letting
+    /// it proceed to set `isActive = true`.
+    func releaseStart() {
+        pendingStartContinuation?.resume()
+        pendingStartContinuation = nil
+    }
+}

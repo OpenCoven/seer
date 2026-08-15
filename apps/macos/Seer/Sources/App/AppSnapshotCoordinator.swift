@@ -578,10 +578,30 @@ public final class AppSnapshotCoordinator {
     /// this same main actor, synchronously, with no way to un-set it
     /// again — so a single read here needs no further serialization to be
     /// race-free.
+    ///
+    /// Also rechecks `isShutDown` immediately after `updateScheduler
+    /// .start()` itself returns. `start()` is a genuine cross-actor await
+    /// — `updateScheduler` runs on its own actor — so this call can
+    /// suspend *at* that call, letting `shutdown()` run (and fully
+    /// complete, including its own `updateScheduler.stop()`) entirely
+    /// while `start()` is still in flight; `updateScheduler`'s reentrancy
+    /// then lets that `stop()` finish *before* the still-suspended
+    /// `start()` call does. Without this second recheck, `start()`
+    /// resuming afterward would leave the scheduler running despite an
+    /// already-completed shutdown. Since `start()` already ran, undoing
+    /// that (rather than skipping it, as the pre-`start()` guard above
+    /// does) requires an immediate compensating `updateScheduler.stop()`
+    /// call — a surgical, deterministic fix; the ideal would be an
+    /// atomic "start-unless-already-stopped" primitive on
+    /// `UpdateSchedulerControlling` itself, but this compensation needs
+    /// no protocol change and settles on the exact same end state.
     public func performStartupUpdateCheckAndStartScheduler() async {
         await checkForUpdates(force: false)
         guard !isShutDown else { return }
         await updateScheduler.start()
+        if isShutDown {
+            await updateScheduler.stop()
+        }
     }
 
     // MARK: - Monitor scan results
