@@ -17,6 +17,44 @@ applications and attached real evidence (a screenshot path or a log path)
 and never edit a row's `Result` without also filling in `Date`, `Tester`,
 `Build commit`, and the evidence paths for both applications.
 
+## Task 18 automated evidence (not manual parity)
+
+This evidence records the local automated gate without changing any manual
+matrix result. Date: **2026-08-14** · Tester: **Cody** · Implementation HEAD:
+**`b259509fbffc63db17db00da6df50812d5bd906b`**. Logs are ignored,
+worktree-relative files under `build/test-results/task18/`; paths in the logs
+are redacted to `$REPO`/`$HOME`, and no log is a release artifact.
+
+| Surface | Command | Result | Local log |
+| --- | --- | --- | --- |
+| Locked dependency install | `npm ci` | PASS (local) | `build/test-results/task18/npm-ci.log` |
+| Node suite, including release-manifest, package, draft-policy, and workflow static tests | `npm test` | PASS (local) | `build/test-results/task18/npm-test.log` |
+| Shared renderer tests | `npm run test:renderer` | PASS (local) | `build/test-results/task18/test-renderer.log` |
+| Glaze reference type-check | `npm run type-check` | PASS (local) | `build/test-results/task18/type-check.log` |
+| Glaze reference lint | `npm run lint` | PASS with 8 warnings (local; 0 errors) | `build/test-results/task18/lint.log` |
+| Glaze reference build | `npm run build` | PASS (local) | `build/test-results/task18/build.log` |
+| Standalone renderer build | `npm run build:standalone-renderer` | PASS (local) | `build/test-results/task18/build-standalone-renderer.log` |
+| Native Swift tests | `npm run test:macos` | PASS, 590 tests (local) | `build/test-results/task18/test-macos.log` |
+| Unsigned native app build | `npm run build:macos` | PASS (local) | `build/test-results/task18/build-macos.log` |
+| Repository/bundle boundary scan | `npm run check:standalone-boundary` | PASS (local) | `build/test-results/task18/check-standalone-boundary.log` |
+| Standalone boundary suite | `node --test tests/standalone-boundary.test.mjs` | PASS, 32 tests (local) | `build/test-results/task18/standalone-boundary-test.log` |
+| Patch whitespace validation | `git diff --check` | PASS (local) | `build/test-results/task18/git-diff-check.log` |
+| Unsigned launch/accessory smoke | `open build/macos/unsigned/Seer.app` | PASS (local process/identity check only) | `build/test-results/task18/smoke.log` |
+
+The smoke check observed a live exact-bundle process with bundle identifier
+`ai.opencoven.seer`, `LSUIElement=true`, and Launch Services
+`ApplicationType=UIElement`. Only that recorded PID was sent `SIGTERM`; no
+exact-path process or Seer power assertion remained afterward. This does
+**not** claim that a human observed the tray, panel, routes, modes, Escape, or
+blur behavior.
+
+The local host was Apple Silicon, but reported macOS 26.6.1, Xcode 26.6, and
+XcodeGen 2.45.4 rather than the prescribed clean release toolchain (macOS 14+,
+Xcode 16.2, pinned XcodeGen 2.46.0). These local PASS results therefore do not
+set `CLEAN_MACHINE_VERIFIED_COMMIT` or approve a release. A real
+signing/notarization run was not attempted without credentials; `npm test`
+uses only stubbed packaging tools.
+
 ## How to execute a row
 
 1. Build the Glaze (Electron) app and the standalone app from the **same**
@@ -125,6 +163,30 @@ real work they were doing at the time.
 | Update notification (both apps checked against the same stubbed GitHub releases response — see note below) | TODO: `docs/parity-evidence/update-notification-glaze.png` or `.log` | TODO: `docs/parity-evidence/update-notification-standalone.png` or `.log` | TODO | Date: TODO · Tester: TODO · Build commit: TODO |
 | Clean quit (Quit menu item / Cmd+Q terminates promptly, releases the power assertion, and flushes history) | TODO: `docs/parity-evidence/clean-quit-glaze.png` | TODO: `docs/parity-evidence/clean-quit-standalone.png` | TODO | Date: TODO · Tester: TODO · Build commit: TODO |
 | Power-assertion release on quit/deactivation is externally observable (`pmset -g assertions` shows no lingering Seer assertion after quit) | TODO: `docs/parity-evidence/assertion-release-glaze.log` | TODO: `docs/parity-evidence/assertion-release-standalone.log` | TODO | Date: TODO · Tester: TODO · Build commit: TODO |
+
+## Clean-machine work still pending
+
+Every matrix row above remains `TODO` and requires same-commit, human-observed
+Glaze/standalone evidence. In addition, release approval still requires these
+clean-machine checks on the pinned toolchain:
+
+- Launch the standalone app on a fresh Apple Silicon macOS 14+ account with
+  neither Glaze nor Node.js installed.
+- Confirm fresh standalone storage is created only at
+  `$HOME/Library/Application Support/ai.opencoven.seer/`, then execute the
+  bidirectional isolated-storage row against Glaze.
+- Observe idle/active tray identity, left/right click behavior, Status and
+  History routes, both keep-awake modes and live mode replacement, history,
+  relaunch persistence, Escape, blur, notify-only updates, and clean quit.
+- Exercise each supported agent-family row with its approved fixture and
+  capture redacted evidence for both targets.
+- Observe power assertions during real active-agent work and prove assertion
+  release after mode changes and quit with `pmset -g assertions`.
+- Install and assess a genuinely Developer-ID-signed, notarized, and stapled
+  DMG with Gatekeeper. Static/stubbed packaging tests are not a substitute.
+
+Until those checks have evidence and approval, `PARITY_MATRIX_APPROVED` and
+`CLEAN_MACHINE_VERIFIED_COMMIT` must not be set for public release.
 
 ## Update-notification row detail
 
