@@ -40,6 +40,7 @@ const ownerPath = join(lockDir, "owner.json");
 const childPath = join(lockDir, "child.json");
 const reclaimPath = `${lockDir}.reclaiming`;
 const reclaimOwnerName = "reclaim.json";
+const reclaimTempNamePattern = /^\.reclaim-([1-9][0-9]*)-[0-9a-f]{32}\.tmp$/;
 const rendererBuildRoot = join(repoRoot, "build", "standalone-renderer");
 const publishedRenderer = join(rendererBuildRoot, "Renderer");
 const publicationJournalPath = join(rendererBuildRoot, ".renderer-publication-transaction.json");
@@ -304,117 +305,362 @@ function removeVerifiedLock(expectedDirectory, knownEntries) {
   removeVerifiedDirectory(lockDir, expectedDirectory, knownEntries, "renderer lock");
 }
 
-function removeReclaimFileIfOwned(expectedDirectory, expectedReclaimInfo) {
-  const currentDirectory = lstatOrNull(lockDir);
-  if (!currentDirectory || !sameDirectoryIdentity(expectedDirectory, currentDirectory)) return;
-  const reclaimFile = join(lockDir, reclaimOwnerName);
-  const currentReclaim = lstatOrNull(reclaimFile);
+function runReclaimTestHook(phase) {
+  const hookPath = process.env.SEER_RENDERER_RECLAIM_TEST_HOOK;
+  if (!hookPath || process.env.SEER_RENDERER_RECLAIM_TEST_PHASE !== phase) return;
+  const result = spawnSync(process.execPath, [hookPath, phase], {
+    env: process.env,
+    stdio: "inherit",
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(`renderer reclaim test hook exited with status ${result.status}`);
+  }
+}
+
+function assertReclaimTemp(directoryPath, directoryInfo, name) {
+  const match = name.match(reclaimTempNamePattern);
+  if (!match) throw new Error(`renderer lock contains unexpected entry: ${name}`);
+  const currentDirectory = lstatSync(directoryPath);
+  assertOwnedDirectory(currentDirectory, "renderer lock reclaim temp parent");
+  if (!sameDirectoryIdentity(directoryInfo, currentDirectory)) {
+    throw new Error("renderer lock changed identity while inspecting reclaim temp");
+  }
+  const path = join(directoryPath, name);
+  const before = lstatSync(path);
   if (
-    currentReclaim &&
-    currentReclaim.isFile() &&
-    !currentReclaim.isSymbolicLink() &&
-    sameIdentity(expectedReclaimInfo, currentReclaim)
+    before.isSymbolicLink() ||
+    !before.isFile() ||
+    (typeof process.getuid === "function" && before.uid !== process.getuid())
   ) {
-    unlinkSync(reclaimFile);
+    throw new Error("renderer lock reclaim temp must be a regular non-symlink file owned by the current uid");
+  }
+  const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const opened = fstatSync(descriptor);
+    if (!opened.isFile() || !sameIdentity(before, opened)) {
+      throw new Error("renderer lock reclaim temp changed identity");
+    }
+  } finally {
+    closeSync(descriptor);
+  }
+  return { info: before, path, pid: Number(match[1]) };
+}
+
+function cleanupAbandonedReclaimTemps(directoryPath, directoryInfo) {
+  let names;
+  try {
+    names = readdirSync(directoryPath).filter((name) => name.startsWith(".reclaim-"));
+  } catch (error) {
+    if (error.code === "ENOENT" || error.code === "ENOTDIR") {
+      return { cleaned: false, diagnostic: "renderer lock changed during reclaim temp cleanup" };
+    }
+    throw error;
+  }
+  if (names.length === 0) return { cleaned: true, diagnostic: null };
+  const temps = [];
+  for (const name of names) {
+    try {
+      temps.push(assertReclaimTemp(directoryPath, directoryInfo, name));
+    } catch (error) {
+      if (error.code === "ENOENT" || error.code === "ENOTDIR") {
+        return { cleaned: false, diagnostic: "renderer lock changed during reclaim temp cleanup" };
+      }
+      throw error;
+    }
+  }
+  for (const temp of temps) {
+    if (isPidAlive(temp.pid)) {
+      return {
+        cleaned: false,
+        diagnostic: `renderer lock reclaim temp belongs to live process ${temp.pid}`,
+      };
+    }
+    if (Date.now() - temp.info.mtimeMs < lockInitializationGraceMs) {
+      return {
+        cleaned: false,
+        diagnostic: "renderer lock reclaim temp is within its initialization grace period",
+      };
+    }
+  }
+  let changed = false;
+  for (const temp of temps) {
+    const current = lstatOrNull(temp.path);
+    if (!current) continue;
+    if (
+      current.isSymbolicLink() ||
+      !current.isFile() ||
+      !sameIdentity(temp.info, current)
+    ) {
+      throw new Error("renderer lock reclaim temp changed before cleanup");
+    }
+    try {
+      unlinkSync(temp.path);
+      changed = true;
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  }
+  if (changed) {
+    try {
+      fsyncDirectory(directoryPath);
+    } catch (error) {
+      if (error.code !== "ENOENT" && error.code !== "ENOTDIR") throw error;
+      return { cleaned: false, diagnostic: "renderer lock changed during reclaim temp cleanup" };
+    }
+  }
+  return { cleaned: true, diagnostic: null };
+}
+
+function quarantineReclaimFile(directoryPath, directoryInfo, reclaimInfo) {
+  const reclaimFile = join(directoryPath, reclaimOwnerName);
+  const quarantineName =
+    `.reclaim-${process.pid}-${randomUUID().replaceAll("-", "")}.tmp`;
+  const quarantinePath = join(directoryPath, quarantineName);
+  const currentDirectory = lstatSync(directoryPath);
+  if (!sameDirectoryIdentity(directoryInfo, currentDirectory)) {
+    return false;
+  }
+  const currentReclaim = lstatOrNull(reclaimFile);
+  if (!currentReclaim) return false;
+  if (
+    currentReclaim.isSymbolicLink() ||
+    !currentReclaim.isFile() ||
+    !sameIdentity(reclaimInfo, currentReclaim)
+  ) {
+    throw new Error("renderer lock reclaim metadata changed before quarantine");
+  }
+  try {
+    renameSync(reclaimFile, quarantinePath);
+  } catch (error) {
+    if (error.code === "ENOENT" || error.code === "ENOTDIR") return false;
+    throw error;
+  }
+  fsyncDirectory(directoryPath);
+  const quarantined = lstatSync(quarantinePath);
+  if (
+    quarantined.isSymbolicLink() ||
+    !quarantined.isFile() ||
+    !sameIdentity(reclaimInfo, quarantined)
+  ) {
+    throw new Error("quarantined renderer reclaim metadata changed identity");
+  }
+  unlinkSync(quarantinePath);
+  fsyncDirectory(directoryPath);
+  return true;
+}
+
+function persistReclaimMetadata(directoryInfo, reclaimer) {
+  const tempName = `.reclaim-${process.pid}-${randomUUID().replaceAll("-", "")}.tmp`;
+  const tempPath = join(reclaimPath, tempName);
+  const reclaimFile = join(reclaimPath, reclaimOwnerName);
+  let descriptor = null;
+  let tempInfo = null;
+  try {
+    descriptor = openSync(
+      tempPath,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    );
+    tempInfo = fstatSync(descriptor);
+    runReclaimTestHook("temp-created");
+    writeFileSync(descriptor, `${JSON.stringify(reclaimer)}\n`, "utf8");
+    runReclaimTestHook("temp-written");
+    fsyncSync(descriptor);
+    runReclaimTestHook("temp-fsynced");
+    closeSync(descriptor);
+    descriptor = null;
+
+    const currentDirectory = lstatSync(reclaimPath);
+    if (!sameDirectoryIdentity(directoryInfo, currentDirectory)) {
+      throw new Error("renderer lock reclamation changed identity before metadata commit");
+    }
+    if (lstatOrNull(reclaimFile)) {
+      throw new Error("renderer lock reclamation metadata already exists");
+    }
+    const currentTemp = lstatSync(tempPath);
+    if (
+      currentTemp.isSymbolicLink() ||
+      !currentTemp.isFile() ||
+      !sameIdentity(tempInfo, currentTemp)
+    ) {
+      throw new Error("renderer lock reclaim temp changed before metadata commit");
+    }
+    renameSync(tempPath, reclaimFile);
+    runReclaimTestHook("claim-renamed");
+    fsyncDirectory(reclaimPath);
+    const reclaimInfo = lstatSync(reclaimFile);
+    if (
+      reclaimInfo.isSymbolicLink() ||
+      !reclaimInfo.isFile() ||
+      !sameIdentity(tempInfo, reclaimInfo)
+    ) {
+      throw new Error("renderer lock reclaim metadata changed after commit");
+    }
+    return reclaimInfo;
+  } catch (error) {
+    if (descriptor !== null) closeSync(descriptor);
+    if (tempInfo) {
+      const currentTemp = lstatOrNull(tempPath);
+      if (
+        currentTemp &&
+        currentTemp.isFile() &&
+        !currentTemp.isSymbolicLink() &&
+        sameIdentity(tempInfo, currentTemp)
+      ) {
+        unlinkSync(tempPath);
+        fsyncDirectory(reclaimPath);
+      }
+    }
+    throw error;
   }
 }
 
 function claimAndRemoveStaleLock(directoryInfo, knownEntries, reclaimer) {
-  const reclaimFile = join(lockDir, reclaimOwnerName);
   const directoryBeforeClaim = lstatOrNull(lockDir);
   if (!directoryBeforeClaim || !sameDirectoryIdentity(directoryInfo, directoryBeforeClaim)) {
     return false;
   }
-  let descriptor = null;
-  let reclaimInfo = null;
+  const names = readdirSync(lockDir).sort();
+  const expectedNames = [...knownEntries.keys()].sort();
+  if (JSON.stringify(names) !== JSON.stringify(expectedNames)) {
+    throw new Error(`renderer lock contains unexpected entries: ${names.join(", ")}`);
+  }
+  for (const [name, expectedInfo] of knownEntries) {
+    const current = lstatSync(join(lockDir, name));
+    if (current.isSymbolicLink() || !current.isFile() || !sameIdentity(expectedInfo, current)) {
+      throw new Error(`renderer lock ${name} changed identity before reclamation`);
+    }
+  }
+
   try {
-    descriptor = openSync(
-      reclaimFile,
-      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
-      0o600,
-    );
-    reclaimInfo = fstatSync(descriptor);
-    writeFileSync(descriptor, `${JSON.stringify(reclaimer)}\n`, "utf8");
-    fsyncSync(descriptor);
+    renameSync(lockDir, reclaimPath);
   } catch (error) {
-    if (descriptor !== null) closeSync(descriptor);
-    if (error.code === "EEXIST" || error.code === "ENOENT" || error.code === "ENOTDIR") {
+    if (
+      error.code === "EEXIST" ||
+      error.code === "ENOTEMPTY" ||
+      error.code === "ENOENT" ||
+      error.code === "ENOTDIR"
+    ) {
       return false;
     }
     throw error;
   }
-  closeSync(descriptor);
-
-  try {
-    const currentDirectory = lstatSync(lockDir);
-    if (!sameDirectoryIdentity(directoryInfo, currentDirectory)) {
-      removeReclaimFileIfOwned(currentDirectory, reclaimInfo);
-      return false;
-    }
-    const expectedWithClaim = new Map(knownEntries);
-    expectedWithClaim.set(reclaimOwnerName, reclaimInfo);
-    const names = readdirSync(lockDir).sort();
-    const expectedNames = [...expectedWithClaim.keys()].sort();
-    if (JSON.stringify(names) !== JSON.stringify(expectedNames)) {
-      throw new Error(`renderer lock contains unexpected entries: ${names.join(", ")}`);
-    }
-    for (const [name, expectedInfo] of expectedWithClaim) {
-      const current = lstatSync(join(lockDir, name));
-      if (current.isSymbolicLink() || !current.isFile() || !sameIdentity(expectedInfo, current)) {
-        throw new Error(`renderer lock ${name} changed identity before reclamation`);
-      }
-    }
-
-    try {
-      renameSync(lockDir, reclaimPath);
-    } catch (error) {
-      if (error.code === "EEXIST" || error.code === "ENOENT" || error.code === "ENOTDIR") {
-        removeReclaimFileIfOwned(directoryInfo, reclaimInfo);
-        return false;
-      }
-      throw error;
-    }
-    removeVerifiedDirectory(
-      reclaimPath,
-      directoryInfo,
-      expectedWithClaim,
-      "renderer lock reclamation",
-    );
-    return true;
-  } catch (error) {
-    removeReclaimFileIfOwned(directoryInfo, reclaimInfo);
-    throw error;
+  const movedDirectory = lstatSync(reclaimPath);
+  if (!sameDirectoryIdentity(directoryInfo, movedDirectory)) {
+    throw new Error("renderer lock changed identity while claiming reclamation");
   }
+  const reclaimInfo = persistReclaimMetadata(directoryInfo, reclaimer);
+  const expectedWithClaim = new Map(knownEntries);
+  expectedWithClaim.set(reclaimOwnerName, reclaimInfo);
+  removeVerifiedDirectory(
+    reclaimPath,
+    directoryInfo,
+    expectedWithClaim,
+    "renderer lock reclamation",
+  );
+  fsyncDirectory(repoRoot);
+  return true;
+}
+
+function inspectStaleLockDirectory(directoryPath, directoryInfo, label) {
+  const freshnessMs = Math.max(directoryInfo.mtimeMs, directoryInfo.ctimeMs);
+  let ownerRecord = null;
+  let childRecord = null;
+  try {
+    ownerRecord = readJsonFileNoFollow(
+      join(directoryPath, "owner.json"),
+      `${label} owner metadata`,
+    );
+  } catch (error) {
+    if (Date.now() - freshnessMs < lockInitializationGraceMs) {
+      return { stale: false, diagnostic: `${label} owner metadata is not yet stale` };
+    }
+    if (error.code !== "ENOENT") {
+      if (!error.verifiedFileInfo) throw error;
+      ownerRecord = { info: error.verifiedFileInfo, value: null };
+    }
+  }
+  try {
+    childRecord = readJsonFileNoFollow(
+      join(directoryPath, "child.json"),
+      `${label} child metadata`,
+    );
+  } catch (error) {
+    if (error.code !== "ENOENT" && Date.now() - freshnessMs < staleMs) {
+      return { stale: false, diagnostic: `${label} child metadata is not yet stale` };
+    }
+    if (error.code !== "ENOENT") {
+      if (!error.verifiedFileInfo) throw error;
+      childRecord = { info: error.verifiedFileInfo, value: null };
+    }
+  }
+
+  const owner = ownerRecord?.value;
+  if (recordedProcessIsLive(owner)) {
+    return {
+      stale: false,
+      diagnostic: `recorded renderer lock owner ${owner.pid} is still alive`,
+    };
+  }
+  const childGroup = recordedChildGroupState(childRecord, owner);
+  if (childGroup.state !== "stale") {
+    return { stale: false, diagnostic: childGroup.diagnostic };
+  }
+  const createdAtMs = Number.isSafeInteger(owner?.createdAtMs)
+    ? owner.createdAtMs
+    : freshnessMs;
+  if (Date.now() - createdAtMs < staleMs) {
+    return { stale: false, diagnostic: `${label} has not reached its stale age` };
+  }
+  const tempCleanup = cleanupAbandonedReclaimTemps(directoryPath, directoryInfo);
+  if (!tempCleanup.cleaned) {
+    return { stale: false, diagnostic: tempCleanup.diagnostic };
+  }
+  return { stale: true, diagnostic: null, ownerRecord, childRecord };
 }
 
 function inspectReclamation() {
   const directoryInfo = lstatOrNull(reclaimPath);
   if (!directoryInfo) return { present: false, restored: false, diagnostic: null };
   assertOwnedDirectory(directoryInfo, "renderer lock reclamation");
-  let reclaimRecord;
+  let reclaimRecord = null;
   try {
     reclaimRecord = readJsonFileNoFollow(
       join(reclaimPath, reclaimOwnerName),
       "renderer lock reclamation owner metadata",
     );
   } catch (error) {
-    if (error.code === "ENOENT" || error.code === "ENOTDIR") {
-      return { present: true, restored: false, diagnostic: "renderer lock reclamation changed" };
-    }
-    if (Date.now() - directoryInfo.mtimeMs < lockInitializationGraceMs) {
+    const freshnessMs = Math.max(directoryInfo.mtimeMs, directoryInfo.ctimeMs);
+    if (Date.now() - freshnessMs < lockInitializationGraceMs) {
       return {
         present: true,
         restored: false,
         diagnostic: "renderer lock reclamation owner metadata is initializing",
       };
     }
-    throw error;
+    if (error.code !== "ENOENT" && error.code !== "ENOTDIR") {
+      if (!error.verifiedFileInfo) throw error;
+      reclaimRecord = { info: error.verifiedFileInfo, value: null };
+    }
   }
-  if (recordedProcessIsLive(reclaimRecord.value)) {
+  if (reclaimRecord && recordedProcessIsLive(reclaimRecord.value)) {
     return {
       present: true,
       restored: false,
       diagnostic: `renderer lock is being reclaimed by process ${reclaimRecord.value.pid}`,
+    };
+  }
+  const staleState = inspectStaleLockDirectory(
+    reclaimPath,
+    directoryInfo,
+    "renderer lock reclamation",
+  );
+  if (!staleState.stale) {
+    return {
+      present: true,
+      restored: false,
+      diagnostic: staleState.diagnostic,
     };
   }
 
@@ -448,6 +694,7 @@ function inspectReclamation() {
     knownEntries,
     "abandoned renderer lock reclamation",
   );
+  fsyncDirectory(repoRoot);
   return { present: true, restored: false, diagnostic: null };
 }
 
@@ -455,50 +702,11 @@ function inspectAndMaybeRemoveStaleLock(reclaimer) {
   const directoryInfo = lstatOrNull(lockDir);
   if (!directoryInfo) return { removed: true, diagnostic: null };
   assertOwnedDirectory(directoryInfo, "renderer lock");
-
-  let ownerRecord = null;
-  let childRecord = null;
-  try {
-    ownerRecord = readJsonFileNoFollow(ownerPath, "renderer lock owner metadata");
-  } catch (error) {
-    if (Date.now() - directoryInfo.mtimeMs < lockInitializationGraceMs) {
-      return { removed: false, diagnostic: "renderer lock owner metadata is not yet stale" };
-    }
-    if (error.code !== "ENOENT") {
-      if (!error.verifiedFileInfo) throw error;
-      ownerRecord = { info: error.verifiedFileInfo, value: null };
-    }
+  const staleState = inspectStaleLockDirectory(lockDir, directoryInfo, "renderer lock");
+  if (!staleState.stale) {
+    return { removed: false, diagnostic: staleState.diagnostic };
   }
-  try {
-    childRecord = readJsonFileNoFollow(childPath, "renderer lock child metadata");
-  } catch (error) {
-    if (error.code !== "ENOENT" && Date.now() - directoryInfo.mtimeMs < staleMs) {
-      return { removed: false, diagnostic: "renderer lock child metadata is not yet stale" };
-    }
-    if (error.code !== "ENOENT") {
-      if (!error.verifiedFileInfo) throw error;
-      childRecord = { info: error.verifiedFileInfo, value: null };
-    }
-  }
-
-  const owner = ownerRecord?.value;
-  if (recordedProcessIsLive(owner)) {
-    return {
-      removed: false,
-      diagnostic: `recorded renderer lock owner ${owner.pid} is still alive`,
-    };
-  }
-  const childGroup = recordedChildGroupState(childRecord, owner);
-  if (childGroup.state !== "stale") {
-    return { removed: false, diagnostic: childGroup.diagnostic };
-  }
-
-  const createdAtMs = Number.isSafeInteger(owner?.createdAtMs)
-    ? owner.createdAtMs
-    : directoryInfo.mtimeMs;
-  if (Date.now() - createdAtMs < staleMs) {
-    return { removed: false, diagnostic: "renderer lock has not reached its stale age" };
-  }
+  const { ownerRecord, childRecord } = staleState;
 
   const reclaimFile = join(lockDir, reclaimOwnerName);
   const existingReclaimInfo = lstatOrNull(reclaimFile);
@@ -516,7 +724,13 @@ function inspectAndMaybeRemoveStaleLock(reclaimer) {
       if (Date.now() - directoryInfo.mtimeMs < lockInitializationGraceMs) {
         return { removed: false, diagnostic: "renderer lock reclamation metadata is initializing" };
       }
-      throw error;
+      if (!error.verifiedFileInfo) throw error;
+      const quarantined = quarantineReclaimFile(
+        lockDir,
+        directoryInfo,
+        error.verifiedFileInfo,
+      );
+      return { removed: quarantined, diagnostic: quarantined ? null : "renderer lock changed" };
     }
     if (recordedProcessIsLive(reclaimRecord.value)) {
       return {
@@ -524,18 +738,8 @@ function inspectAndMaybeRemoveStaleLock(reclaimer) {
         diagnostic: `renderer lock is being reclaimed by process ${reclaimRecord.value.pid}`,
       };
     }
-    const currentDirectory = lstatOrNull(lockDir);
-    const currentReclaim = lstatOrNull(reclaimFile);
-    if (
-      !currentDirectory ||
-      !sameDirectoryIdentity(directoryInfo, currentDirectory) ||
-      !currentReclaim ||
-      !sameIdentity(existingReclaimInfo, currentReclaim)
-    ) {
-      return { removed: true, diagnostic: null };
-    }
-    unlinkSync(reclaimFile);
-    return { removed: true, diagnostic: null };
+    const quarantined = quarantineReclaimFile(lockDir, directoryInfo, existingReclaimInfo);
+    return { removed: quarantined, diagnostic: quarantined ? null : "renderer lock changed" };
   }
 
   const knownEntries = new Map();

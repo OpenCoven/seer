@@ -11,6 +11,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
@@ -30,6 +31,7 @@ const consumerPath = join(here, "helpers", "assert-renderer-generation.mjs");
 const failingProcessGroupPath = join(here, "helpers", "renderer-failing-process-group.mjs");
 const exitedLeaderGroupPath = join(here, "helpers", "renderer-exited-leader-group.mjs");
 const publicationKillHookPath = join(here, "helpers", "renderer-publication-kill-hook.mjs");
+const reclaimKillHookPath = join(here, "helpers", "renderer-reclaim-kill-hook.mjs");
 
 function runWrapper({ env = {}, consumerArgs = [], root = repoRoot, script = wrapperPath } = {}) {
   const args = [script];
@@ -475,6 +477,15 @@ test("32 stale-lock waiters repeatedly hand off without overlap, failures, or le
         null,
         fixture.repo,
       );
+      writeFileSync(
+        join(
+          fixture.repo,
+          ".seer-standalone-renderer.lock",
+          `.reclaim-2147483647-${String(repetition).padStart(32, "a")}.tmp`,
+        ),
+        '{"partial":',
+        { mode: 0o600 },
+      );
 
       const runs = Array.from({ length: waiterCount }, (_, index) => {
         const marker = `stale-stress-${repetition}-${index}`;
@@ -533,6 +544,156 @@ test("32 stale-lock waiters repeatedly hand off without overlap, failures, or le
       assert.deepEqual(privateRendererArtifacts(fixture.repo), []);
     }
   } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test("hard kills at every atomic reclaim metadata phase recover without leaking a claim", async () => {
+  mkdirSync(join(repoRoot, "build"), { recursive: true });
+  const scratch = mkdtempSync(join(repoRoot, "build", "renderer-reclaim-kill-test-"));
+  const phases = ["temp-created", "temp-written", "temp-fsynced", "claim-renamed"];
+  try {
+    for (const phase of phases) {
+      const fixture = createRendererFixture(join(scratch, phase));
+      const readyPath = join(scratch, `${phase}.ready`);
+      const lockDir = writeSyntheticLock(
+        {
+          token: `stale-${phase}`,
+          pid: 2147483647,
+          createdAtMs: 0,
+          bootIdentity: currentBootIdentity(),
+          processStartIdentity: "dead-owner",
+        },
+        null,
+        fixture.repo,
+      );
+      const reclaimPath = `${lockDir}.reclaiming`;
+      const killed = await runWrapper({
+        env: {
+          SEER_RENDERER_RECLAIM_TEST_HOOK: reclaimKillHookPath,
+          SEER_RENDERER_RECLAIM_TEST_PHASE: phase,
+          SEER_RENDERER_RECLAIM_TEST_READY_PATH: readyPath,
+          SEER_RENDERER_LOCK_STALE_MS: "0",
+          SEER_RENDERER_LOCK_POLL_MS: "1",
+          SEER_RENDERER_LOCK_WAIT_MS: "5000",
+        },
+        root: fixture.repo,
+        script: fixture.wrapper,
+      }).completed;
+      assert.equal(killed.signal, "SIGKILL", `${phase} did not hard-kill:\n${killed.stderr}`);
+      assert.equal(readFileSync(readyPath, "utf8"), `${phase}\n`);
+      assert.equal(existsSync(reclaimPath), true);
+      const reclaimEntries = readdirSync(reclaimPath);
+      if (phase === "claim-renamed") {
+        assert.ok(reclaimEntries.includes("reclaim.json"));
+      } else {
+        assert.ok(
+          reclaimEntries.some((name) => /^\.reclaim-[1-9][0-9]*-[0-9a-f]{32}\.tmp$/.test(name)),
+        );
+        assert.ok(!reclaimEntries.includes("reclaim.json"));
+      }
+
+      const recovered = await runWrapper({
+        env: {
+          SEER_RENDERER_BUILD_TEST_BUILDER: testBuilderPath,
+          SEER_RENDERER_BUILD_TEST_MARKER: `recovered-${phase}`,
+          SEER_RENDERER_LOCK_STALE_MS: "0",
+          SEER_RENDERER_LOCK_POLL_MS: "1",
+          SEER_RENDERER_LOCK_WAIT_MS: "5000",
+        },
+        root: fixture.repo,
+        script: fixture.wrapper,
+      }).completed;
+      assert.equal(recovered.code, 0, `${phase} recovery failed:\n${recovered.stderr}`);
+      assert.equal(existsSync(lockDir), false);
+      assert.equal(existsSync(reclaimPath), false);
+    }
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test("a malformed legacy reclaim claim is quarantined after grace only when its lock is stale", async () => {
+  const lockDir = writeSyntheticLock({
+    token: "stale-malformed-legacy-claim",
+    pid: 2147483647,
+    createdAtMs: 0,
+    bootIdentity: currentBootIdentity(),
+    processStartIdentity: "dead-owner",
+  });
+  const reclaimFile = join(lockDir, "reclaim.json");
+  writeFileSync(reclaimFile, '{"partial":', { mode: 0o600 });
+  utimesSync(reclaimFile, 0, 0);
+  utimesSync(lockDir, 0, 0);
+  try {
+    const result = await runWrapper({
+      env: {
+        SEER_RENDERER_BUILD_TEST_BUILDER: testBuilderPath,
+        SEER_RENDERER_BUILD_TEST_MARKER: "recovered-malformed-legacy-claim",
+        SEER_RENDERER_LOCK_STALE_MS: "0",
+        SEER_RENDERER_LOCK_POLL_MS: "1",
+        SEER_RENDERER_LOCK_WAIT_MS: "5000",
+      },
+    }).completed;
+    assert.equal(result.code, 0, `malformed legacy claim was not recovered:\n${result.stderr}`);
+    assert.equal(existsSync(lockDir), false);
+  } finally {
+    rmSync(lockDir, { recursive: true, force: true });
+  }
+});
+
+test("a malicious reclaim symlink fails closed without touching its canary or live lock", async () => {
+  mkdirSync(join(repoRoot, "build"), { recursive: true });
+  const scratch = mkdtempSync(join(repoRoot, "build", "renderer-reclaim-symlink-test-"));
+  const canary = join(scratch, "canary.txt");
+  writeFileSync(canary, "do-not-touch\n");
+  const lockDir = writeSyntheticLock({
+    token: "live-symlink-lock",
+    pid: process.pid,
+    createdAtMs: 0,
+    bootIdentity: currentBootIdentity(),
+    processStartIdentity: processStartIdentity(process.pid),
+  });
+  const reclaimFile = join(lockDir, "reclaim.json");
+  symlinkSync(canary, reclaimFile);
+  utimesSync(lockDir, 0, 0);
+  try {
+    const result = await runWrapper({
+      env: {
+        SEER_RENDERER_BUILD_TEST_BUILDER: testBuilderPath,
+        SEER_RENDERER_LOCK_STALE_MS: "0",
+        SEER_RENDERER_LOCK_POLL_MS: "1",
+        SEER_RENDERER_LOCK_WAIT_MS: "100",
+      },
+    }).completed;
+    assert.notEqual(result.code, 0);
+    assert.match(result.stderr, /still alive|timed out/i);
+    assert.equal(readFileSync(canary, "utf8"), "do-not-touch\n");
+    assert.equal(existsSync(reclaimFile), true);
+
+    writeSyntheticLock({
+      token: "stale-symlink-lock",
+      pid: 2147483647,
+      createdAtMs: 0,
+      bootIdentity: currentBootIdentity(),
+      processStartIdentity: "dead-owner",
+    });
+    symlinkSync(canary, reclaimFile);
+    utimesSync(lockDir, 0, 0);
+    const staleResult = await runWrapper({
+      env: {
+        SEER_RENDERER_BUILD_TEST_BUILDER: testBuilderPath,
+        SEER_RENDERER_LOCK_STALE_MS: "0",
+        SEER_RENDERER_LOCK_POLL_MS: "1",
+        SEER_RENDERER_LOCK_WAIT_MS: "5000",
+      },
+    }).completed;
+    assert.notEqual(staleResult.code, 0);
+    assert.match(staleResult.stderr, /symlink/i);
+    assert.equal(readFileSync(canary, "utf8"), "do-not-touch\n");
+    assert.equal(existsSync(reclaimFile), true);
+  } finally {
+    rmSync(lockDir, { recursive: true, force: true });
     rmSync(scratch, { recursive: true, force: true });
   }
 });
