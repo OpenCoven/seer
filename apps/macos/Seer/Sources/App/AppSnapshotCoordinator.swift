@@ -141,6 +141,9 @@ public enum SetIncludePrereleaseUpdatesOutcome: Sendable, Equatable {
     /// underlying failure) is surfaced purely so a caller can log it
     /// too; the toggle itself is fully authoritative regardless.
     case persistedButCheckFailed(message: String)
+    /// The destination file and in-memory authoritative value were updated,
+    /// but syncing the containing directory could not be confirmed.
+    case persistedButDurabilityUncertain(message: String)
 }
 
 /// The single main-actor authority for Seer's visible state. Owns an
@@ -946,7 +949,16 @@ public final class AppSnapshotCoordinator {
         do {
             updateState = try await updateService.setIncludePrerelease(value)
             idsToClear.insert(CoordinatorDiagnosticID.updatesCheckFailed)
+            idsToClear.insert(StorageDiagnosticID.durabilityUncertain)
             outcome = .success
+        } catch let durabilityError as SetIncludePrereleaseDurabilityUncertainError {
+            updateState = await updateService.currentState()
+            upserts.append(Diagnostic(
+                id: StorageDiagnosticID.durabilityUncertain,
+                message: "The prerelease setting was saved, but directory durability could not be confirmed: \(durabilityError)",
+                occurredAt: clock.nowMilliseconds()
+            ))
+            outcome = .persistedButDurabilityUncertain(message: String(describing: durabilityError))
         } catch let persistError as SetIncludePrereleasePersistError {
             // The toggle itself never committed: rethrow the same
             // distinctly-typed error immediately, before any snapshot/

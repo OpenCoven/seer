@@ -74,6 +74,7 @@ final class FakeAppSnapshotCoordinating: AppSnapshotCoordinating {
     enum ScriptedSetIncludePrereleaseUpdatesOutcome {
         case success
         case checkFailed(message: String)
+        case durabilityUncertain(message: String)
         case throwing(Error)
     }
     var setIncludePrereleaseUpdatesOutcome: ScriptedSetIncludePrereleaseUpdatesOutcome = .success
@@ -103,13 +104,20 @@ final class FakeAppSnapshotCoordinating: AppSnapshotCoordinating {
         case .checkFailed(let message):
             includePrereleaseUpdatesValue = value
             return .persistedButCheckFailed(message: message)
+        case .durabilityUncertain(let message):
+            includePrereleaseUpdatesValue = value
+            return .persistedButDurabilityUncertain(message: message)
         case .throwing(let error):
             throw error
         }
     }
 
+    private(set) var includePrereleaseUpdatesReadCount = 0
     var includePrereleaseUpdates: Bool {
-        get async { includePrereleaseUpdatesValue }
+        get async {
+            includePrereleaseUpdatesReadCount += 1
+            return includePrereleaseUpdatesValue
+        }
     }
 
     private(set) var openLatestReleaseCallCount = 0
@@ -267,6 +275,15 @@ final class FakeBridgeHandlerCancelling: BridgeHandlerCancelling {
     }
 }
 
+@MainActor
+final class ImmediateBridgeResponder: BridgeResponding {
+    private(set) var responses: [BridgeResponse] = []
+
+    func deliverResponse(_ response: BridgeResponse) {
+        responses.append(response)
+    }
+}
+
 // MARK: - Tests
 
 @MainActor
@@ -351,6 +368,41 @@ final class AppLifecycleTests: XCTestCase {
         let result = delegate.beginTermination { _ in }
 
         XCTAssertEqual(result, .terminateLater)
+    }
+
+    func testBridgeMessageImmediatelyAfterBeginTerminationIsRejectedSynchronously() {
+        var routerCallCount = 0
+        let router = StandaloneBridgeCommandRouter(
+            snapshotGet: {
+                routerCallCount += 1
+                return .success(.empty(version: "test"))
+            },
+            keepAwakeModeSet: { _ in .success(.empty(version: "test")) },
+            historyClear: { .success(.empty(version: "test")) }
+        )
+        let responder = ImmediateBridgeResponder()
+        let handler = BridgeMessageHandler(router: router, responder: responder)
+        let delegate = AppDelegate(
+            coordinator: FakeAppSnapshotCoordinating(),
+            agentMonitor: FakeAgentMonitorControlling(
+                state: AgentMonitorState(active: false, keepingAwake: false, keepAwakeMode: .system, agents: [], lastScanAt: 0)
+            ),
+            bridgeMessageHandler: handler
+        )
+
+        _ = delegate.beginTermination { _ in }
+        handler.handle(body: [
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "version": bridgeVersion,
+            "method": "snapshot.get",
+            "payload": [String: Any](),
+        ])
+
+        XCTAssertEqual(routerCallCount, 0)
+        guard case .failure(_, let error) = responder.responses.first else {
+            return XCTFail("the post-termination message must be rejected immediately")
+        }
+        XCTAssertEqual(error.code, .appShuttingDown)
     }
 
     func testTerminationStopsMonitorCancelsBridgeAndShutsDownCoordinatorThenReplies() async {
@@ -816,6 +868,27 @@ final class AppLifecycleTests: XCTestCase {
         XCTAssertTrue(fakeMenu.includePrereleaseUpdates)
     }
 
+    func testSetIncludePrereleaseUpdatesAppliesAuthoritativeMenuValueWhenDurabilityIsUncertain() async {
+        let fakeCoordinator = FakeAppSnapshotCoordinating()
+        fakeCoordinator.setIncludePrereleaseUpdatesOutcome = .durabilityUncertain(message: "directory fsync failed")
+        let fakeMonitor = FakeAgentMonitorControlling(
+            state: AgentMonitorState(active: false, keepingAwake: false, keepAwakeMode: .system, agents: [], lastScanAt: 0)
+        )
+        let fakeMenu = FakePrereleaseUpdatesMenuApplying(includePrereleaseUpdates: false)
+        let delegate = AppDelegate(
+            coordinator: fakeCoordinator,
+            agentMonitor: fakeMonitor,
+            prereleaseUpdatesMenu: fakeMenu
+        )
+
+        delegate.requestSetIncludePrereleaseUpdates(true)
+        await waitUntil { fakeMenu.appliedValues.count == 1 }
+
+        XCTAssertEqual(fakeCoordinator.includePrereleaseUpdatesReadCount, 1)
+        XCTAssertEqual(fakeMenu.appliedValues, [true])
+        XCTAssertTrue(fakeMenu.includePrereleaseUpdates)
+    }
+
     // MARK: - Command fencing after shutdown begins (Task 12 finding)
 
     /// A keep-awake mode change requested at (or after) the exact
@@ -910,6 +983,7 @@ final class AppLifecycleTests: XCTestCase {
         try FileManager.default.createDirectory(at: nestedFile.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data("{}".utf8).write(to: nestedFile)
         defer { try? FileManager.default.removeItem(at: fallbackRoot) }
+        let fallbackLease = try StorageBootstrap.FallbackRootLease.acquire(at: fallbackRoot)
 
         XCTAssertTrue(FileManager.default.fileExists(atPath: fallbackRoot.path), "test setup must have actually created the fallback directory")
 
@@ -920,7 +994,8 @@ final class AppLifecycleTests: XCTestCase {
         let delegate = AppDelegate(
             coordinator: fakeCoordinator,
             agentMonitor: fakeMonitor,
-            fallbackStorageRoot: fallbackRoot
+            fallbackStorageRoot: fallbackRoot,
+            fallbackStorageLease: fallbackLease
         )
 
         var replies: [Bool] = []

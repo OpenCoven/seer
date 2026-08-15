@@ -101,20 +101,39 @@ enum SeerWebViewFactory {
 /// `didReceiveServerRedirectForProvisionalNavigation`, so that redirect is
 /// instead stopped outright via `webView.stopLoading()` the moment it is
 /// reported.
+@MainActor
 final class SeerWebViewNavigationDelegate: NSObject, WKNavigationDelegate {
+    private let onDecision: (@MainActor (URL, WKNavigationActionPolicy) -> Void)?
+    private let onServerRedirect: (@MainActor () -> Void)?
+
+    init(
+        onDecision: (@MainActor (URL, WKNavigationActionPolicy) -> Void)? = nil,
+        onServerRedirect: (@MainActor () -> Void)? = nil
+    ) {
+        self.onDecision = onDecision
+        self.onServerRedirect = onServerRedirect
+    }
+
     func webView(
         _ webView: WKWebView,
         decidePolicyFor navigationAction: WKNavigationAction,
-        decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+        decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void
     ) {
+        guard let url = navigationAction.request.url else {
+            decisionHandler(.cancel)
+            return
+        }
         let request = SeerNavigationRequest(
-            url: navigationAction.request.url ?? SeerNavigationPolicy.allowedInitialDocumentURL,
+            url: url,
             targetFrameIsMain: navigationAction.targetFrame?.isMainFrame
         )
-        decisionHandler(SeerNavigationPolicy.decide(request) == .allow ? .allow : .cancel)
+        let policy: WKNavigationActionPolicy = SeerNavigationPolicy.decide(request) == .allow ? .allow : .cancel
+        onDecision?(url, policy)
+        decisionHandler(policy)
     }
 
     func webView(_ webView: WKWebView, didReceiveServerRedirectForProvisionalNavigation navigation: WKNavigation!) {
+        onServerRedirect?()
         let request = SeerNavigationRequest(
             url: webView.url ?? SeerNavigationPolicy.allowedInitialDocumentURL,
             targetFrameIsMain: true,

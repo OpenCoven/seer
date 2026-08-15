@@ -676,6 +676,7 @@ public enum StorageDiagnosticID {
     /// quarantine move is aborted and the file is left untouched,
     /// read-only, rather than risk moving/overwriting newer content.
     public static let concurrentChange = "storage.settings.concurrent-change"
+    public static let durabilityUncertain = "storage.settings.durability-uncertain"
 }
 
 /// Loads and saves a single versioned JSON document at a fixed file URL,

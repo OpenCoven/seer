@@ -79,8 +79,10 @@ public enum UpdateCheckError: Error, Equatable, Sendable {
 }
 
 /// Thrown by `UpdateService.setIncludePrerelease(_:)` only when the
-/// include-prerelease toggle itself could not be durably persisted at
-/// all — the forced re-check against the newly selected stream this
+/// include-prerelease toggle did not commit. A committed rename followed
+/// by a failed directory sync uses
+/// `SetIncludePrereleaseDurabilityUncertainError` instead. The forced
+/// re-check against the newly selected stream this
 /// function otherwise always performs is never even attempted in that
 /// case, since there is nothing new to check against. Wraps the
 /// underlying `SettingsStore`/`AtomicJSONStore` failure verbatim (itself
@@ -93,6 +95,17 @@ public struct SetIncludePrereleasePersistError: Error, Equatable, Sendable {
     public let underlying: StorageError
 
     public init(underlying: StorageError) {
+        self.underlying = underlying
+    }
+}
+
+/// The prerelease toggle reached the destination file, but syncing its
+/// containing directory failed. This is committed state, not a failed write;
+/// callers must adopt the value while keeping the durability warning visible.
+public struct SetIncludePrereleaseDurabilityUncertainError: Error, Equatable, Sendable {
+    public let underlying: StorageError
+
+    public init(underlying: StorageError = .durabilityUncertain) {
         self.underlying = underlying
     }
 }
@@ -274,9 +287,10 @@ public actor UpdateService {
     /// reachability — but the thrown `UpdateCheckError` still propagates
     /// to the caller so it can surface the failure.
     ///
-    /// A failure from the settings-persist step itself is always thrown
-    /// as `SetIncludePrereleasePersistError` — never as the same error
-    /// shape a forced-check failure throws — so a caller
+    /// A noncommitting failure from the settings-persist step is thrown as
+    /// `SetIncludePrereleasePersistError`; committed-but-uncertain
+    /// durability has its own error above. Neither uses the same shape a
+    /// forced-check failure throws, so a caller
     /// (`AppSnapshotCoordinator`) can distinguish, purely by catching
     /// this specific type, "the toggle itself never committed" (the
     /// forced check below is never even attempted) from "the toggle
@@ -297,6 +311,8 @@ public actor UpdateService {
 
         do {
             try await settingsStore.setIncludePrereleaseUpdates(value)
+        } catch StorageError.durabilityUncertain {
+            throw SetIncludePrereleaseDurabilityUncertainError()
         } catch let storageError as StorageError {
             throw SetIncludePrereleasePersistError(underlying: storageError)
         }

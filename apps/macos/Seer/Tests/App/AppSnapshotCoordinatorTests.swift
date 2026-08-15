@@ -241,18 +241,15 @@ final class AppSnapshotCoordinatorTests: XCTestCase {
     }
 
     /// Asserts the coordinator's stable diagnostic id vocabulary is
-    /// exactly the approved/reserved set — no more, no less. In
-    /// particular there is deliberately no id here for a settings-write
-    /// failure during `setKeepAwakeMode`: Task 9's plan approved no such
-    /// id, and `CoordinatorDiagnosticID` must never grow one outside that
-    /// closed list (see `testSetKeepAwakeModePersistenceFailure...` below
-    /// for what a settings persist failure surfaces instead).
+    /// the approved/reserved values, including Task 12's distinct
+    /// committed-but-durability-uncertain settings diagnostic.
     func testStableDiagnosticIDsMatchThePlanExactly() {
         XCTAssertEqual(AgentMonitorDiagnosticID.scanFailed, "monitor.scan.failed")
         XCTAssertEqual(PowerDiagnosticID.assertionFailed, "power.assertion.failed")
         XCTAssertEqual(StorageDiagnosticID.corrupt, "storage.settings.corrupt")
         XCTAssertEqual(StorageDiagnosticID.unsupportedVersion, "storage.settings.unsupported-version")
         XCTAssertEqual(StorageDiagnosticID.readFailed, "storage.settings.read-failed")
+        XCTAssertEqual(StorageDiagnosticID.durabilityUncertain, "storage.settings.durability-uncertain")
         XCTAssertEqual(CoordinatorDiagnosticID.updatesCheckFailed, "updates.check.failed")
 
         let corrupt = Diagnostic(id: StorageDiagnosticID.corrupt, message: "m", occurredAt: 0)
@@ -719,6 +716,60 @@ final class AppSnapshotCoordinatorTests: XCTestCase {
             coordinator.snapshot.diagnostics.contains { $0.id == CoordinatorDiagnosticID.updatesCheckFailed },
             "a persistence failure is not a check failure and must never surface that diagnostic"
         )
+    }
+
+    func testSetIncludePrereleaseUpdatesPublishesCommittedValueAndDurabilityDiagnosticWhenDirectorySyncFails() async throws {
+        let settingsFileSystem = InMemorySettingsFileSystem()
+        let historyFileSystem = InMemorySettingsFileSystem()
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let settingsStore = SettingsStore(store: AtomicJSONStore<SettingsDocument>(
+            fileURL: settingsURL,
+            fileSystem: settingsFileSystem,
+            clock: clock
+        ))
+        let historyStore = HistoryStore(
+            store: AtomicJSONStore<HistoryDocument>(
+                fileURL: historyURL,
+                fileSystem: historyFileSystem,
+                clock: clock
+            ),
+            clock: clock,
+            scheduler: ManualHistoryScheduler(),
+            idGenerator: SequentialHistorySessionIDGenerator()
+        )
+        let updateService = UpdateService(
+            settingsStore: settingsStore,
+            session: UpdateService.makeDefaultSession(),
+            clock: clock,
+            currentVersion: "1.0.0"
+        )
+        let startupSnapshot = await AppSnapshotCoordinator.loadStartupSnapshot(
+            settingsStore: settingsStore,
+            historyStore: historyStore,
+            updateService: updateService,
+            appVersion: "1.0.0-test"
+        )
+        let renderer = FakeRendererSink()
+        let coordinator = AppSnapshotCoordinator.makeWithScheduledUpdates(
+            settingsStore: settingsStore,
+            historyStore: historyStore,
+            power: PowerAssertionService(backend: CoordinatorFakePowerBackend()),
+            renderer: renderer,
+            clock: clock,
+            updateService: updateService,
+            startupSnapshot: startupSnapshot
+        )
+        await settingsFileSystem.setFailNextDirectorySync(SettingsFileSystemError.other("directory fsync failed"))
+
+        let outcome = try await coordinator.setIncludePrereleaseUpdates(true)
+
+        guard case .persistedButDurabilityUncertain = outcome else {
+            return XCTFail("expected committed durability-uncertain outcome, got \(outcome)")
+        }
+        let authoritativeValue = await coordinator.includePrereleaseUpdates
+        XCTAssertTrue(authoritativeValue)
+        XCTAssertTrue(coordinator.snapshot.diagnostics.contains { $0.id == StorageDiagnosticID.durabilityUncertain })
+        XCTAssertEqual(renderer.emittedSnapshots.last, coordinator.snapshot)
     }
 
     func testOpenLatestReleaseForwardsToUpdateServiceWithoutTouchingTheSnapshot() async {

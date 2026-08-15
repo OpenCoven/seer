@@ -221,6 +221,36 @@ final class StorageBootstrapTests: XCTestCase {
         XCTAssertEqual(locations.fallbackRoot, fallbackDirectory)
     }
 
+    func testApplicationSupportResolverFailureImmediatelyUsesOwnedPrefixedFallback() {
+        struct ResolverFailure: Error {}
+        let scratchTemp = makeScratchDirectory()
+        let fallbackDirectory = scratchTemp.appendingPathComponent(
+            "\(StorageBootstrap.fallbackDirectoryPrefix)resolver-failure",
+            isDirectory: true
+        )
+
+        let result = StorageBootstrap.resolveLocations(
+            now: 1_700_000_000_000,
+            applicationSupportDirectoryResolver: { throw ResolverFailure() },
+            makeTemporaryFallbackDirectory: { fallbackDirectory }
+        )
+
+        guard case .success(let locations) = result else {
+            return XCTFail("the dedicated owned fallback should recover resolver failure")
+        }
+        XCTAssertEqual(locations.fallbackRoot, fallbackDirectory)
+        XCTAssertNotNil(locations.fallbackLease)
+        XCTAssertEqual(locations.diagnostics.map(\.id), [AppBootstrapDiagnosticID.applicationSupportUnresolved])
+        XCTAssertTrue(locations.settingsURL.path.hasPrefix(fallbackDirectory.path + "/"))
+        XCTAssertTrue(locations.historyURL.path.hasPrefix(fallbackDirectory.path + "/"))
+        XCTAssertNotEqual(
+            locations.settingsURL.deletingLastPathComponent(),
+            scratchTemp.appendingPathComponent(SettingsFileLocation.directoryName, isDirectory: true),
+            "the shared temporary directory must never be passed through as a raw primary root"
+        )
+        locations.fallbackLease?.release()
+    }
+
     // MARK: - Fallback directory naming
 
     func testDefaultTemporaryFallbackDirectoryIsUniquelyNamedUnderTheRealTemporaryDirectory() {
@@ -374,5 +404,76 @@ final class StorageBootstrapTests: XCTestCase {
         XCTAssertEqual(result.removedCount, 0)
         XCTAssertTrue(FileManager.default.fileExists(atPath: matchingFilePath.path))
     }
-}
 
+    func testPruningPreservesLockedOldRootPrunesUnlockedStaleRootAndPrunesAfterRelease() throws {
+        let scratchTemp = makeScratchDirectory()
+        let locked = makeDirectory(named: "\(StorageBootstrap.fallbackDirectoryPrefix)LOCKED", under: scratchTemp)
+        let unlocked = makeDirectory(named: "\(StorageBootstrap.fallbackDirectoryPrefix)UNLOCKED", under: scratchTemp)
+        let unrelated = makeDirectory(named: "unrelated", under: scratchTemp)
+        let lease = try StorageBootstrap.FallbackRootLease.acquire(at: locked)
+        let farFuture = Date().addingTimeInterval(100_000)
+
+        let whileLocked = StorageBootstrap.pruneStaleFallbackDirectories(
+            in: scratchTemp,
+            excluding: nil,
+            now: farFuture,
+            maxAge: 60
+        )
+
+        XCTAssertEqual(whileLocked.removedCount, 1)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: locked.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: unlocked.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: unrelated.path))
+
+        lease.release()
+        let afterRelease = StorageBootstrap.pruneStaleFallbackDirectories(
+            in: scratchTemp,
+            excluding: nil,
+            now: farFuture,
+            maxAge: 60
+        )
+
+        XCTAssertEqual(afterRelease.removedCount, 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: locked.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: unrelated.path))
+    }
+
+    func testPruningNeverFollowsPrefixedSymlinkToUnrelatedDirectory() throws {
+        let scratchTemp = makeScratchDirectory()
+        let unrelated = makeDirectory(named: "valuable-unrelated-data", under: scratchTemp)
+        let marker = unrelated.appendingPathComponent("keep.txt")
+        try Data("keep".utf8).write(to: marker)
+        let symlink = scratchTemp.appendingPathComponent("\(StorageBootstrap.fallbackDirectoryPrefix)SYMLINK")
+        try FileManager.default.createSymbolicLink(at: symlink, withDestinationURL: unrelated)
+
+        let result = StorageBootstrap.pruneStaleFallbackDirectories(
+            in: scratchTemp,
+            excluding: nil,
+            now: Date().addingTimeInterval(100_000),
+            maxAge: 60
+        )
+
+        XCTAssertEqual(result.removedCount, 0)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: symlink.path))
+    }
+
+    func testPruningScanIsBoundedEvenWhenEntriesAreUnrelated() {
+        let scratchTemp = makeScratchDirectory()
+        for index in 0..<20 {
+            _ = makeDirectory(named: "unrelated-\(index)", under: scratchTemp)
+        }
+
+        let result = StorageBootstrap.pruneStaleFallbackDirectories(
+            in: scratchTemp,
+            excluding: nil,
+            now: Date().addingTimeInterval(100_000),
+            maxAge: 60,
+            maxEntriesToScan: 3
+        )
+
+        XCTAssertLessThanOrEqual(result.scannedCount, 3)
+        XCTAssertEqual(result.removedCount, 0)
+        XCTAssertEqual((try? FileManager.default.contentsOfDirectory(atPath: scratchTemp.path).count), 20)
+    }
+}

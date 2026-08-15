@@ -1,4 +1,5 @@
 import Cocoa
+import Darwin
 import WebKit
 import os
 
@@ -123,6 +124,83 @@ enum StorageBootstrap {
     /// placed in the same shared temporary directory) is never touched,
     /// no matter how old it is.
     static let fallbackDirectoryPrefix = "ai.opencoven.seer-fallback-"
+    static let fallbackLeaseFileName = ".ownership.lock"
+
+    final class FallbackRootLease {
+        let rootURL: URL
+        private let descriptor: OSAllocatedUnfairLock<Int32?>
+
+        private init(rootURL: URL, descriptor: Int32) {
+            self.rootURL = rootURL
+            self.descriptor = OSAllocatedUnfairLock(initialState: descriptor)
+        }
+
+        static func acquire(at rootURL: URL, fileManager: FileManager = .default) throws -> FallbackRootLease {
+            guard let lease = try tryAcquire(at: rootURL, createRoot: true, fileManager: fileManager) else {
+                throw POSIXError(.EWOULDBLOCK)
+            }
+            return lease
+        }
+
+        static func tryAcquire(
+            at rootURL: URL,
+            createRoot: Bool = false,
+            fileManager: FileManager = .default
+        ) throws -> FallbackRootLease? {
+            if createRoot {
+                try fileManager.createDirectory(at: rootURL, withIntermediateDirectories: true)
+            }
+
+            var rootStat = stat()
+            guard lstat(rootURL.path, &rootStat) == 0,
+                  rootStat.st_mode & S_IFMT == S_IFDIR
+            else {
+                if errno == ENOENT { return nil }
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+
+            let lockURL = rootURL.appendingPathComponent(fallbackLeaseFileName, isDirectory: false)
+            let fd = open(lockURL.path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, S_IRUSR | S_IWUSR)
+            guard fd >= 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+
+            var lockStat = stat()
+            guard fstat(fd, &lockStat) == 0,
+                  lockStat.st_mode & S_IFMT == S_IFREG,
+                  lockStat.st_nlink == 1
+            else {
+                let savedErrno = errno
+                close(fd)
+                throw POSIXError(POSIXErrorCode(rawValue: savedErrno) ?? .EIO)
+            }
+
+            guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+                let savedErrno = errno
+                close(fd)
+                if savedErrno == EWOULDBLOCK || savedErrno == EAGAIN {
+                    return nil
+                }
+                throw POSIXError(POSIXErrorCode(rawValue: savedErrno) ?? .EIO)
+            }
+
+            return FallbackRootLease(rootURL: rootURL, descriptor: fd)
+        }
+
+        func release() {
+            let fd = descriptor.withLock { descriptor -> Int32? in
+                defer { descriptor = nil }
+                return descriptor
+            }
+            guard let fd else { return }
+            _ = flock(fd, LOCK_UN)
+            close(fd)
+        }
+
+        deinit {
+            release()
+        }
+    }
 
     /// The successfully resolved settings/history file URLs, plus any
     /// diagnostic that should be folded into the coordinator's own
@@ -143,6 +221,7 @@ enum StorageBootstrap {
         /// so this session's own in-use fallback directory is never
         /// mistaken for a stale one left behind by some earlier run.
         let fallbackRoot: URL?
+        let fallbackLease: FallbackRootLease?
     }
 
     /// Attempts to resolve `settings.json`/`history.json` under
@@ -179,22 +258,88 @@ enum StorageBootstrap {
         do {
             let settingsURL = try settingsFileURL(applicationSupportDirectory)
             let historyURL = try historyFileURL(applicationSupportDirectory)
-            return .success(Locations(settingsURL: settingsURL, historyURL: historyURL, diagnostics: [], fallbackRoot: nil))
+            return .success(Locations(
+                settingsURL: settingsURL,
+                historyURL: historyURL,
+                diagnostics: [],
+                fallbackRoot: nil,
+                fallbackLease: nil
+            ))
         } catch let primaryError {
-            let fallbackDirectory = makeTemporaryFallbackDirectory()
-            do {
-                let settingsURL = try settingsFileURL(fallbackDirectory)
-                let historyURL = try historyFileURL(fallbackDirectory)
-                let diagnostic = Diagnostic(
-                    id: AppBootstrapDiagnosticID.storageLocationUnresolved,
-                    message: "Failed to prepare the settings/history storage directory; falling back to a dedicated temporary location: \(primaryError)",
-                    occurredAt: now
-                )
-                return .success(Locations(settingsURL: settingsURL, historyURL: historyURL, diagnostics: [diagnostic], fallbackRoot: fallbackDirectory))
-            } catch {
-                try? fileManager.removeItem(at: fallbackDirectory)
-                return .failure(error)
-            }
+            return resolveDedicatedFallback(
+                now: now,
+                diagnosticID: AppBootstrapDiagnosticID.storageLocationUnresolved,
+                diagnosticMessage: "Failed to prepare the settings/history storage directory; falling back to a dedicated temporary location: \(primaryError)",
+                makeTemporaryFallbackDirectory: makeTemporaryFallbackDirectory,
+                settingsFileURL: settingsFileURL,
+                historyFileURL: historyFileURL,
+                fileManager: fileManager
+            )
+        }
+    }
+
+    static func resolveLocations(
+        now: Int64,
+        applicationSupportDirectoryResolver: () throws -> URL = {
+            try SettingsFileLocation.resolveApplicationSupportDirectory()
+        },
+        makeTemporaryFallbackDirectory: () -> URL = {
+            FileManager.default.temporaryDirectory
+                .appendingPathComponent("\(fallbackDirectoryPrefix)\(UUID().uuidString)", isDirectory: true)
+        },
+        settingsFileURL: (URL) throws -> URL = { try SettingsFileLocation.settingsFileURL(applicationSupportDirectory: $0) },
+        historyFileURL: (URL) throws -> URL = { try HistoryFileLocation.historyFileURL(applicationSupportDirectory: $0) },
+        fileManager: FileManager = .default
+    ) -> Result<Locations, Error> {
+        do {
+            return resolveLocations(
+                applicationSupportDirectory: try applicationSupportDirectoryResolver(),
+                now: now,
+                makeTemporaryFallbackDirectory: makeTemporaryFallbackDirectory,
+                settingsFileURL: settingsFileURL,
+                historyFileURL: historyFileURL,
+                fileManager: fileManager
+            )
+        } catch {
+            return resolveDedicatedFallback(
+                now: now,
+                diagnosticID: AppBootstrapDiagnosticID.applicationSupportUnresolved,
+                diagnosticMessage: "Failed to resolve the Application Support directory; falling back to a dedicated temporary location: \(error)",
+                makeTemporaryFallbackDirectory: makeTemporaryFallbackDirectory,
+                settingsFileURL: settingsFileURL,
+                historyFileURL: historyFileURL,
+                fileManager: fileManager
+            )
+        }
+    }
+
+    private static func resolveDedicatedFallback(
+        now: Int64,
+        diagnosticID: String,
+        diagnosticMessage: String,
+        makeTemporaryFallbackDirectory: () -> URL,
+        settingsFileURL: (URL) throws -> URL,
+        historyFileURL: (URL) throws -> URL,
+        fileManager: FileManager
+    ) -> Result<Locations, Error> {
+        let fallbackDirectory = makeTemporaryFallbackDirectory()
+        var lease: FallbackRootLease?
+        do {
+            lease = try FallbackRootLease.acquire(at: fallbackDirectory, fileManager: fileManager)
+            let settingsURL = try settingsFileURL(fallbackDirectory)
+            let historyURL = try historyFileURL(fallbackDirectory)
+            let diagnostic = Diagnostic(id: diagnosticID, message: diagnosticMessage, occurredAt: now)
+            return .success(Locations(
+                settingsURL: settingsURL,
+                historyURL: historyURL,
+                diagnostics: [diagnostic],
+                fallbackRoot: fallbackDirectory,
+                fallbackLease: lease
+            ))
+        } catch {
+            try? fileManager.removeItem(at: fallbackDirectory)
+            lease?.release()
+            return .failure(error)
         }
     }
 
@@ -208,6 +353,7 @@ enum StorageBootstrap {
     struct PruneResult {
         let removedCount: Int
         let diagnostics: [Diagnostic]
+        let scannedCount: Int
     }
 
     /// Bounded, defensive startup housekeeping: removes directories
@@ -237,31 +383,49 @@ enum StorageBootstrap {
         now: Date,
         maxAge: TimeInterval = 3600,
         maxDirectoriesToPrune: Int = 50,
+        maxEntriesToScan: Int = 200,
         fileManager: FileManager = .default
     ) -> PruneResult {
-        guard let entries = try? fileManager.contentsOfDirectory(
+        guard maxDirectoriesToPrune > 0,
+              maxEntriesToScan > 0,
+              let enumerator = fileManager.enumerator(
             at: temporaryDirectory,
             includingPropertiesForKeys: [.isDirectoryKey, .creationDateKey],
-            options: [.skipsHiddenFiles]
+            options: [.skipsHiddenFiles, .skipsSubdirectoryDescendants]
         ) else {
-            return PruneResult(removedCount: 0, diagnostics: [])
+            return PruneResult(removedCount: 0, diagnostics: [], scannedCount: 0)
         }
 
         var removedCount = 0
         var diagnostics: [Diagnostic] = []
+        var scannedCount = 0
+        let expectedParent = temporaryDirectory.standardizedFileURL
 
-        for entry in entries {
+        while scannedCount < maxEntriesToScan,
+              let entry = enumerator.nextObject() as? URL
+        {
+            scannedCount += 1
             guard removedCount < maxDirectoriesToPrune else { break }
-            guard entry.lastPathComponent.hasPrefix(fallbackDirectoryPrefix) else { continue }
+            let name = entry.lastPathComponent
+            guard name.hasPrefix(fallbackDirectoryPrefix),
+                  name.count > fallbackDirectoryPrefix.count,
+                  entry.deletingLastPathComponent().standardizedFileURL == expectedParent
+            else { continue }
             guard entry.standardizedFileURL != activeFallbackRoot?.standardizedFileURL else { continue }
 
-            let resourceValues = try? entry.resourceValues(forKeys: [.isDirectoryKey, .creationDateKey])
-            guard resourceValues?.isDirectory == true else { continue }
+            let resourceValues = try? entry.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey, .creationDateKey])
+            guard resourceValues?.isDirectory == true,
+                  resourceValues?.isSymbolicLink != true,
+                  let creationDate = resourceValues?.creationDate
+            else { continue }
 
-            let creationDate = resourceValues?.creationDate ?? .distantPast
             guard now.timeIntervalSince(creationDate) >= maxAge else { continue }
 
             do {
+                guard let lease = try FallbackRootLease.tryAcquire(at: entry, fileManager: fileManager) else {
+                    continue
+                }
+                defer { lease.release() }
                 try fileManager.removeItem(at: entry)
                 removedCount += 1
             } catch {
@@ -273,7 +437,7 @@ enum StorageBootstrap {
             }
         }
 
-        return PruneResult(removedCount: removedCount, diagnostics: diagnostics)
+        return PruneResult(removedCount: removedCount, diagnostics: diagnostics, scannedCount: scannedCount)
     }
 }
 
@@ -314,6 +478,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// fully completed, so a fallback session never leaves its directory
     /// permanently orphaned on disk.
     private var fallbackStorageRoot: URL?
+    private var fallbackStorageLease: StorageBootstrap.FallbackRootLease?
 
     private let sleeper: any Sleeper
 
@@ -354,7 +519,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sleeper: any Sleeper = TaskSleeper(),
         bridgeMessageHandler: (any BridgeHandlerCancelling)? = nil,
         prereleaseUpdatesMenu: (any PrereleaseUpdatesMenuApplying)? = nil,
-        fallbackStorageRoot: URL? = nil
+        fallbackStorageRoot: URL? = nil,
+        fallbackStorageLease: StorageBootstrap.FallbackRootLease? = nil
     ) {
         self.coordinator = coordinator
         self.agentMonitor = agentMonitor
@@ -362,6 +528,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.bridgeMessageHandler = bridgeMessageHandler
         self.prereleaseUpdatesMenu = prereleaseUpdatesMenu
         self.fallbackStorageRoot = fallbackStorageRoot
+        self.fallbackStorageLease = fallbackStorageLease
         self.skipsProductionBootstrap = true
         super.init()
     }
@@ -414,32 +581,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0.0"
         let clock = SystemClock()
 
-        // Resolves the real Application Support directory, falling back
-        // to a temporary directory — rather than aborting bootstrap
-        // silently — if it cannot be resolved at all; the failure is
-        // folded into the coordinator's own startup diagnostics below so
-        // it is still visibly surfaced once the UI exists.
         var bootstrapDiagnostics: [Diagnostic] = []
-        let applicationSupportDirectory: URL
-        do {
-            applicationSupportDirectory = try SettingsFileLocation.resolveApplicationSupportDirectory()
-        } catch {
-            applicationSupportDirectory = FileManager.default.temporaryDirectory
-            bootstrapDiagnostics.append(Diagnostic(
-                id: AppBootstrapDiagnosticID.applicationSupportUnresolved,
-                message: "Failed to resolve the Application Support directory; falling back to a temporary location: \(error)",
-                occurredAt: clock.nowMilliseconds()
-            ))
-        }
-
         let settingsURL: URL
         let historyURL: URL
-        switch StorageBootstrap.resolveLocations(applicationSupportDirectory: applicationSupportDirectory, now: clock.nowMilliseconds()) {
+        switch StorageBootstrap.resolveLocations(now: clock.nowMilliseconds()) {
         case .success(let locations):
             settingsURL = locations.settingsURL
             historyURL = locations.historyURL
             bootstrapDiagnostics.append(contentsOf: locations.diagnostics)
             fallbackStorageRoot = locations.fallbackRoot
+            fallbackStorageLease = locations.fallbackLease
         case .failure(let error):
             // Even a dedicated, freshly-minted temporary directory could
             // not be prepared — there is truly nowhere to persist
@@ -699,9 +850,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self, !self.hasShutDown else { return }
             do {
                 let outcome = try await coordinator.setIncludePrereleaseUpdates(value)
-                self.prereleaseUpdatesMenu?.apply(includePrereleaseUpdates: value)
+                let authoritativeValue = await coordinator.includePrereleaseUpdates
+                guard !self.hasShutDown else { return }
+                self.prereleaseUpdatesMenu?.apply(includePrereleaseUpdates: authoritativeValue)
                 if case .persistedButCheckFailed(let message) = outcome {
                     Self.logger.error("Persisted includePrereleaseUpdates=\(value, privacy: .public) but the forced update check failed: \(message, privacy: .public)")
+                } else if case .persistedButDurabilityUncertain(let message) = outcome {
+                    Self.logger.error("Persisted includePrereleaseUpdates=\(authoritativeValue, privacy: .public) but directory durability is uncertain: \(message, privacy: .public)")
                 }
             } catch {
                 Self.logger.error("Failed to persist includePrereleaseUpdates=\(value, privacy: .public): \(String(describing: error), privacy: .public)")
@@ -727,8 +882,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// three-second monitor loop (step 5) — unless shutdown has already
     /// begun by the time the initial scan returns. `hasShutDown` is set
     /// synchronously, ahead of any await, the instant
-    /// `performOrderlyShutdownOnce()` begins (see that method's own
-    /// documentation), so a quit requested while the initial scan above
+    /// `beginTermination(reply:)` is called, so a quit requested while the
+    /// initial scan above
     /// was still in flight is reliably observed here, immediately after
     /// that scan resolves and before the recurring loop is ever started.
     /// Without this check, `startScanLoop` would still start the
@@ -767,8 +922,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// immediately after `agentMonitor.scan()` resolves and again
     /// immediately before the resulting coordinator call — `hasShutDown`
     /// is set synchronously, ahead of any await, the instant
-    /// `performOrderlyShutdownOnce()` begins (see that method's own
-    /// documentation), so a scan already in flight (whether the very
+    /// `beginTermination(reply:)` is called, so a scan already in flight
+    /// (whether the very
     /// first, directly-awaited call from `beginMonitoring()`, or one
     /// dispatched from the recurring loop) can never publish an
     /// `applyScan`/`applyScanFailure` transition into the coordinator once
@@ -803,13 +958,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// fully completed. Internal (not `private`) so `AppLifecycleTests`
     /// can call this directly with a capturing `reply` closure instead of
     /// ever driving real `NSApplication`/`NSApp.reply(
-    /// toApplicationShouldTerminate:)` termination machinery.
+    /// toApplicationShouldTerminate:)` termination machinery. On the first
+    /// call, the termination flag and bridge acceptance fence are both set
+    /// synchronously before the cleanup task is created.
     @discardableResult
     func beginTermination(reply: @escaping (Bool) -> Void) -> NSApplication.TerminateReply {
         let sharedTask: Task<Void, Never>
         if let existing = terminationTask {
             sharedTask = existing
         } else {
+            hasShutDown = true
+            bridgeMessageHandler?.stopAccepting()
             let newTask = Task<Void, Never> { [weak self] in
                 guard let self else { return }
                 await self.performOrderlyShutdownOnce()
@@ -842,8 +1001,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// generation-based invalidation both independently fence that off,
     /// however long that stale scan keeps running afterward.
     ///
-    /// `hasShutDown` itself is flipped `true` as the very first statement,
-    /// ahead of any await — it is what every `requestX` menu/bridge-menu
+    /// `hasShutDown` is already `true` before this asynchronous cleanup is
+    /// scheduled — it is what every `requestX` menu/bridge-menu
     /// entry point (`requestSetKeepAwakeMode`,
     /// `requestSetIncludePrereleaseUpdates`, `requestOpenLatestRelease`)
     /// checks, both before ever creating its own `Task` and again at that
@@ -865,8 +1024,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// handlers are removed from the web view only after that coordinator
     /// shutdown has fully completed, exactly matching the required
     /// production order (stop monitor work → coordinator shutdown →
-    /// remove bridge handlers → reply). Guarded by `hasShutDown` so a
-    /// second concurrent/subsequent quit request never repeats this work.
+    /// remove bridge handlers → reply). `beginTermination` shares one
+    /// `terminationTask`, so later quit requests never repeat this work.
     /// Finally, if bootstrap ever had to fall back to a dedicated
     /// temporary storage directory (see `StorageBootstrap.Locations
     /// .fallbackRoot`), that directory is recursively removed here, once
@@ -877,10 +1036,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// fallback directory, so an old one is never reused/needed again
     /// once this process exits normally).
     private func performOrderlyShutdownOnce() async {
-        guard !hasShutDown else { return }
-        hasShutDown = true
-        bridgeMessageHandler?.stopAccepting()
-
         scanLoopTask?.cancel()
         scanLoopTask = nil
         await agentMonitor?.stop()
@@ -910,6 +1065,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// here leaves behind.
     private func cleanUpFallbackStorageRootIfNeeded() {
         guard let fallbackStorageRoot else { return }
+        defer {
+            fallbackStorageLease?.release()
+            fallbackStorageLease = nil
+            self.fallbackStorageRoot = nil
+        }
         do {
             try FileManager.default.removeItem(at: fallbackStorageRoot)
         } catch {

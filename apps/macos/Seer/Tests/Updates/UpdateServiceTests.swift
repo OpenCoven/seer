@@ -1071,6 +1071,33 @@ final class UpdateServiceTests: XCTestCase {
         XCTAssertEqual(state.availableVersion, "v1.2.0-beta.1")
     }
 
+    func testSetIncludePrereleaseReportsCommittedDurabilityUncertainSeparately() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let settingsStore = makeSettingsStore(fileSystem: fileSystem, clock: clock)
+        let service = UpdateService(
+            settingsStore: settingsStore,
+            session: makeMockSession(),
+            clock: clock,
+            currentVersion: "1.0.0"
+        )
+        await fileSystem.setFailNextDirectorySync(SettingsFileSystemError.other("directory fsync failed"))
+
+        do {
+            _ = try await service.setIncludePrerelease(true)
+            XCTFail("expected committed-but-durability-uncertain error")
+        } catch let error as SetIncludePrereleaseDurabilityUncertainError {
+            XCTAssertEqual(error.underlying, .durabilityUncertain)
+        }
+
+        let currentSettings = await settingsStore.current
+        let savedBytes = await fileSystem.contents(at: settingsURL)
+        XCTAssertTrue(currentSettings.includePrereleaseUpdates)
+        let saved = try XCTUnwrap(savedBytes)
+        XCTAssertTrue(try JSONDecoder().decode(SettingsDocument.self, from: saved).includePrereleaseUpdates)
+        XCTAssertEqual(MockURLProtocol.recordedRequests.count, 0, "an uncertain persist must remain visible instead of continuing as ordinary success")
+    }
+
     // MARK: - Concurrency: the later-started check wins, never the later-completed one
 
     /// `UpdateService` is an actor, but actors are reentrant across

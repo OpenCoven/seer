@@ -1,8 +1,45 @@
 import XCTest
+import WebKit
 @testable import Seer
 
 @MainActor
 final class PanelControllerTests: XCTestCase {
+    private final class HTMLSchemeHandler: NSObject, WKURLSchemeHandler {
+        func webView(_ webView: WKWebView, start urlSchemeTask: any WKURLSchemeTask) {
+            let url = urlSchemeTask.request.url!
+            let data = Data("<!doctype html><title>Seer navigation test</title>".utf8)
+            urlSchemeTask.didReceive(URLResponse(
+                url: url,
+                mimeType: "text/html",
+                expectedContentLength: data.count,
+                textEncodingName: "utf-8"
+            ))
+            urlSchemeTask.didReceive(data)
+            urlSchemeTask.didFinish()
+        }
+
+        func webView(_ webView: WKWebView, stop urlSchemeTask: any WKURLSchemeTask) {}
+    }
+
+    private final class StopTrackingWebView: WKWebView {
+        private(set) var stopLoadingCallCount = 0
+
+        override func stopLoading() {
+            stopLoadingCallCount += 1
+            super.stopLoading()
+        }
+    }
+
+    private func waitUntil(
+        timeout: TimeInterval = 2,
+        _ condition: @escaping @MainActor () -> Bool
+    ) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition(), Date() < deadline {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+    }
+
     private func makeController(clock: MutableClock) -> PanelController {
         PanelController(rendererRoot: SeerRendererRoot(url: URL(fileURLWithPath: "/nonexistent/PanelControllerTests-Renderer")), clock: clock)
     }
@@ -109,6 +146,54 @@ final class PanelControllerTests: XCTestCase {
         // property that actually matters — and that this test asserts —
         // is that the color is fully transparent (`alphaComponent == 0`).
         XCTAssertEqual(controller.webView.underPageBackgroundColor.alphaComponent, 0, accuracy: 0.0001)
+    }
+
+    func testRealWKWebViewInvokesNavigationDelegateAndAppliesEveryDecision() async {
+        let configuration = WKWebViewConfiguration()
+        configuration.setURLSchemeHandler(HTMLSchemeHandler(), forURLScheme: "seer")
+        let webView = WKWebView(frame: .zero, configuration: configuration)
+        var decisions: [URL: WKNavigationActionPolicy] = [:]
+        let delegate = SeerWebViewNavigationDelegate { url, policy in
+            decisions[url] = policy
+        }
+        webView.navigationDelegate = delegate
+        XCTAssertTrue(delegate.responds(
+            to: NSSelectorFromString("webView:decidePolicyForNavigationAction:decisionHandler:")
+        ))
+
+        let cases: [(URL, WKNavigationActionPolicy)] = [
+            (SeerNavigationPolicy.allowedInitialDocumentURL, .allow),
+            (URL(string: "https://example.com/blocked")!, .cancel),
+            (URL(fileURLWithPath: "/etc/hosts"), .cancel),
+            (URL(string: "seer://unknown/standalone-window.html")!, .cancel),
+        ]
+
+        for (url, expectedPolicy) in cases {
+            webView.load(URLRequest(url: url))
+            await waitUntil { decisions[url] != nil }
+            XCTAssertEqual(decisions[url], expectedPolicy, "unexpected decision for \(url)")
+        }
+
+        let javascriptURL = URL(string: "javascript:void(document.body.dataset.blocked = 'no')")!
+        XCTAssertEqual(
+            SeerNavigationPolicy.decide(SeerNavigationRequest(url: javascriptURL, targetFrameIsMain: true)),
+            .cancel
+        )
+    }
+
+    func testNavigationDelegateStopsServerRedirectCallbacks() {
+        let webView = StopTrackingWebView(frame: .zero, configuration: WKWebViewConfiguration())
+        var redirectCount = 0
+        let delegate = SeerWebViewNavigationDelegate(
+            onDecision: { _, _ in },
+            onServerRedirect: { redirectCount += 1 }
+        )
+        webView.navigationDelegate = delegate
+
+        delegate.webView(webView, didReceiveServerRedirectForProvisionalNavigation: nil)
+
+        XCTAssertEqual(redirectCount, 1)
+        XCTAssertEqual(webView.stopLoadingCallCount, 1)
     }
 
     // MARK: - Escape hides the panel
