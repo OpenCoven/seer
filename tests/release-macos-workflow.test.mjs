@@ -18,16 +18,16 @@ function jobBlock(name, nextName) {
 }
 
 function stepBlocks(job) {
-  const starts = [...job.matchAll(/^      - name: /gm)].map(({ index }) => index);
+  const starts = [...job.matchAll(/^ {6}- name: /gm)].map(({ index }) => index);
   return starts.map((start, index) => job.slice(start, starts[index + 1] ?? job.length));
 }
 
 test("release workflow exists and has only the protected tag trigger and minimal permissions", () => {
   assert.ok(existsSync(workflowPath), ".github/workflows/release-macos.yml must exist");
-  assert.match(source, /^on:\n  push:\n    tags:\n      - "v\*\.\*\.\*"\n\npermissions:\n  contents: read\n  id-token: write$/m);
+  assert.match(source, /^on:\n {2}push:\n {4}tags:\n {6}- "v\*\.\*\.\*"\n\npermissions:\n {2}contents: read\n {2}id-token: write$/m);
   assert.doesNotMatch(source, /\b(?:pull_request|workflow_dispatch|schedule):/);
   assert.deepEqual(
-    [...source.matchAll(/^  ([a-z][a-z0-9-]*):\n    (?:name|needs|runs-on):/gm)].map((match) => match[1]),
+    [...source.matchAll(/^ {2}([a-z][a-z0-9-]*):\n {4}(?:name|needs|runs-on):/gm)].map((match) => match[1]),
     ["prepare", "sign-and-release"],
   );
 });
