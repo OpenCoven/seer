@@ -4,6 +4,7 @@ import { spawn, spawnSync } from "node:child_process";
 import {
   chmodSync,
   copyFileSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -36,7 +37,14 @@ function makeFixtureApp(path, marker) {
   writeFileSync(join(path, "Contents", "Info.plist"), "<plist/>\n");
 }
 
-function publicationArgs({ fixtureRepo, sourceApp, derivedData, testHook, testFailpoint }) {
+function publicationArgs({
+  fixtureRepo,
+  sourceApp,
+  derivedData,
+  testHook,
+  testHookPhase,
+  testFailpoint,
+}) {
   const args = [
     helperPath,
     "--repo-root",
@@ -48,6 +56,9 @@ function publicationArgs({ fixtureRepo, sourceApp, derivedData, testHook, testFa
   ];
   if (testHook) {
     args.push("--test-hook", testHook);
+  }
+  if (testHookPhase) {
+    args.push("--test-hook-phase", testHookPhase);
   }
   if (testFailpoint) {
     args.push("--test-failpoint", testFailpoint);
@@ -65,8 +76,13 @@ function publish(options) {
 }
 
 function publishAsync(options) {
-  const { env = {} } = options;
+  return spawnPublisher(options).completion;
+}
+
+function spawnPublisher(options) {
+  const { detached = false, env = {} } = options;
   const child = spawn("/usr/bin/python3", publicationArgs(options), {
+    detached,
     encoding: "utf8",
     env: { ...process.env, ...env },
     stdio: ["ignore", "pipe", "pipe"],
@@ -81,10 +97,63 @@ function publishAsync(options) {
   child.stderr.on("data", (chunk) => {
     stderr += chunk;
   });
-  return new Promise((resolve, reject) => {
+  const completion = new Promise((resolve, reject) => {
     child.on("error", reject);
-    child.on("close", (status) => resolve({ status, stdout, stderr }));
+    child.on("close", (status, signal) => resolve({ status, signal, stdout, stderr }));
   });
+  return { child, completion };
+}
+
+async function waitForPath(path, child) {
+  const deadline = Date.now() + 5000;
+  while (!existsSync(path)) {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      throw new Error(`publisher exited before creating ${path}`);
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`timed out waiting for ${path}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+function makeBlockingHook(scratch) {
+  const hookPath = join(scratch, "block-publisher.sh");
+  const readyPath = join(scratch, "hook-ready");
+  const releasePath = join(scratch, "hook-release");
+  writeFileSync(
+    hookPath,
+    [
+      "#!/bin/bash",
+      "set -euo pipefail",
+      'printf "ready\\n" > "${SEER_TEST_READY_PATH}"',
+      'while [[ ! -f "${SEER_TEST_RELEASE_PATH}" ]]; do sleep 0.01; done',
+      "",
+    ].join("\n"),
+  );
+  chmodSync(hookPath, 0o755);
+  return {
+    hookPath,
+    readyPath,
+    releasePath,
+    env: {
+      SEER_TEST_READY_PATH: readyPath,
+      SEER_TEST_RELEASE_PATH: releasePath,
+    },
+  };
+}
+
+function transactionArtifacts(fixtureRepo) {
+  const macosDir = join(fixtureRepo, "build", "macos");
+  const unsignedDir = join(macosDir, "unsigned");
+  return [
+    ...readdirSync(macosDir)
+      .filter((name) => name.startsWith(".seer-") && name !== ".seer-publication.lock")
+      .map((name) => join(macosDir, name)),
+    ...readdirSync(unsignedDir)
+      .filter((name) => name.startsWith(".seer-"))
+      .map((name) => join(unsignedDir, name)),
+  ];
 }
 
 test("publication atomically replaces the old app and writes private provenance outside unsigned/", () => {
@@ -372,6 +441,206 @@ test("a source-copy failure removes its verified private staging directory", () 
     assert.match(result.stderr, /symlink/i);
     const unsignedDir = join(fixtureRepo, "build", "macos", "unsigned");
     assert.deepEqual(readdirSync(unsignedDir).filter((name) => name.startsWith(".seer-stage-")), []);
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test("SIGINT during source copy rolls back the pair and exits 130", async () => {
+  mkdirSync(join(repoRoot, "build"), { recursive: true });
+  const scratch = mkdtempSync(join(repoRoot, "build", "safe-publication-sigint-"));
+  try {
+    const fixtureRepo = join(scratch, "repo");
+    const oldSource = join(scratch, "old-source", "Seer.app");
+    const newSource = join(scratch, "new-source", "Seer.app");
+    const derivedData = join(scratch, "derived-data");
+    const unsignedDir = join(fixtureRepo, "build", "macos", "unsigned");
+    const provenancePath = join(fixtureRepo, "build", "macos", "standalone-build-provenance.json");
+    mkdirSync(fixtureRepo, { recursive: true });
+    makeFixtureApp(oldSource, "old\n");
+    makeFixtureApp(newSource, "new\n");
+    mkdirSync(derivedData, { recursive: true });
+    assert.equal(publish({ fixtureRepo, sourceApp: oldSource, derivedData }).status, 0);
+    const oldProvenance = readFileSync(provenancePath, "utf8");
+    const hook = makeBlockingHook(scratch);
+
+    const running = spawnPublisher({
+      fixtureRepo,
+      sourceApp: newSource,
+      derivedData,
+      testHook: hook.hookPath,
+      testHookPhase: "during-copy",
+      detached: true,
+      env: hook.env,
+    });
+    await waitForPath(hook.readyPath, running.child);
+    process.kill(-running.child.pid, "SIGINT");
+    writeFileSync(hook.releasePath, "release\n");
+    const result = await running.completion;
+
+    assert.equal(result.status, 130, `unexpected result:\n${result.stdout}\n${result.stderr}`);
+    assert.equal(result.signal, null);
+    assert.equal(readFileSync(join(unsignedDir, "Seer.app", "Contents", "marker.txt"), "utf8"), "old\n");
+    assert.equal(readFileSync(provenancePath, "utf8"), oldProvenance);
+    assert.doesNotThrow(() =>
+      loadBuildProvenance(provenancePath, {
+        expectedRepoRoot: fixtureRepo,
+        appPath: join(unsignedDir, "Seer.app"),
+      }),
+    );
+    assert.deepEqual(transactionArtifacts(fixtureRepo), []);
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test("SIGTERM between app and provenance swaps rolls back the pair and exits 143", async () => {
+  mkdirSync(join(repoRoot, "build"), { recursive: true });
+  const scratch = mkdtempSync(join(repoRoot, "build", "safe-publication-sigterm-"));
+  try {
+    const fixtureRepo = join(scratch, "repo");
+    const oldSource = join(scratch, "old-source", "Seer.app");
+    const newSource = join(scratch, "new-source", "Seer.app");
+    const derivedData = join(scratch, "derived-data");
+    const unsignedDir = join(fixtureRepo, "build", "macos", "unsigned");
+    const provenancePath = join(fixtureRepo, "build", "macos", "standalone-build-provenance.json");
+    mkdirSync(fixtureRepo, { recursive: true });
+    makeFixtureApp(oldSource, "old\n");
+    makeFixtureApp(newSource, "new\n");
+    mkdirSync(derivedData, { recursive: true });
+    assert.equal(publish({ fixtureRepo, sourceApp: oldSource, derivedData }).status, 0);
+    const oldProvenance = readFileSync(provenancePath, "utf8");
+    const hook = makeBlockingHook(scratch);
+
+    const running = spawnPublisher({
+      fixtureRepo,
+      sourceApp: newSource,
+      derivedData,
+      testHook: hook.hookPath,
+      testHookPhase: "after-app-publish",
+      detached: true,
+      env: hook.env,
+    });
+    await waitForPath(hook.readyPath, running.child);
+    process.kill(-running.child.pid, "SIGTERM");
+    writeFileSync(hook.releasePath, "release\n");
+    const result = await running.completion;
+
+    assert.equal(result.status, 143, `unexpected result:\n${result.stdout}\n${result.stderr}`);
+    assert.equal(result.signal, null);
+    assert.equal(readFileSync(join(unsignedDir, "Seer.app", "Contents", "marker.txt"), "utf8"), "old\n");
+    assert.equal(readFileSync(provenancePath, "utf8"), oldProvenance);
+    assert.doesNotThrow(() =>
+      loadBuildProvenance(provenancePath, {
+        expectedRepoRoot: fixtureRepo,
+        appPath: join(unsignedDir, "Seer.app"),
+      }),
+    );
+    assert.deepEqual(transactionArtifacts(fixtureRepo), []);
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test("the next publisher recovers a SIGKILL-abandoned paired swap before staging", async () => {
+  mkdirSync(join(repoRoot, "build"), { recursive: true });
+  const scratch = mkdtempSync(join(repoRoot, "build", "safe-publication-sigkill-"));
+  try {
+    const fixtureRepo = join(scratch, "repo");
+    const oldSource = join(scratch, "old-source", "Seer.app");
+    const newSource = join(scratch, "new-source", "Seer.app");
+    const failingSource = join(scratch, "failing-source", "Seer.app");
+    const derivedData = join(scratch, "derived-data");
+    const unsignedDir = join(fixtureRepo, "build", "macos", "unsigned");
+    const provenancePath = join(fixtureRepo, "build", "macos", "standalone-build-provenance.json");
+    mkdirSync(fixtureRepo, { recursive: true });
+    makeFixtureApp(oldSource, "old\n");
+    makeFixtureApp(newSource, "new\n");
+    makeFixtureApp(failingSource, "must not publish\n");
+    symlinkSync("/does-not-matter", join(failingSource, "Contents", "forbidden-link"));
+    mkdirSync(derivedData, { recursive: true });
+    assert.equal(publish({ fixtureRepo, sourceApp: oldSource, derivedData }).status, 0);
+    const oldProvenance = readFileSync(provenancePath, "utf8");
+    const hook = makeBlockingHook(scratch);
+
+    const running = spawnPublisher({
+      fixtureRepo,
+      sourceApp: newSource,
+      derivedData,
+      testHook: hook.hookPath,
+      testHookPhase: "after-app-publish",
+      env: hook.env,
+    });
+    await waitForPath(hook.readyPath, running.child);
+    assert.equal(running.child.kill("SIGKILL"), true);
+    writeFileSync(hook.releasePath, "release\n");
+    const killed = await running.completion;
+    assert.equal(killed.signal, "SIGKILL");
+
+    const recovery = publish({ fixtureRepo, sourceApp: failingSource, derivedData });
+    assert.notEqual(recovery.status, 0);
+    assert.match(recovery.stderr, /symlink/i);
+    assert.equal(readFileSync(join(unsignedDir, "Seer.app", "Contents", "marker.txt"), "utf8"), "old\n");
+    assert.equal(readFileSync(provenancePath, "utf8"), oldProvenance);
+    assert.doesNotThrow(() =>
+      loadBuildProvenance(provenancePath, {
+        expectedRepoRoot: fixtureRepo,
+        appPath: join(unsignedDir, "Seer.app"),
+      }),
+    );
+    assert.deepEqual(transactionArtifacts(fixtureRepo), []);
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test("a malicious abandoned journal path is rejected without touching its canary", () => {
+  mkdirSync(join(repoRoot, "build"), { recursive: true });
+  const scratch = mkdtempSync(join(repoRoot, "build", "safe-publication-journal-"));
+  try {
+    const fixtureRepo = join(scratch, "repo");
+    const oldSource = join(scratch, "old-source", "Seer.app");
+    const newSource = join(scratch, "new-source", "Seer.app");
+    const derivedData = join(scratch, "derived-data");
+    const macosDir = join(fixtureRepo, "build", "macos");
+    const unsignedDir = join(macosDir, "unsigned");
+    const provenancePath = join(macosDir, "standalone-build-provenance.json");
+    const canary = join(scratch, "canary.txt");
+    mkdirSync(fixtureRepo, { recursive: true });
+    makeFixtureApp(oldSource, "old\n");
+    makeFixtureApp(newSource, "new\n");
+    mkdirSync(derivedData, { recursive: true });
+    writeFileSync(canary, "do-not-touch\n");
+    assert.equal(publish({ fixtureRepo, sourceApp: oldSource, derivedData }).status, 0);
+    const oldProvenance = readFileSync(provenancePath, "utf8");
+    writeFileSync(
+      join(macosDir, ".seer-publication-transaction.json"),
+      `${JSON.stringify({
+        schemaVersion: 1,
+        phase: "staging",
+        paths: {
+          publicationParent: macosDir,
+          unsignedParent: unsignedDir,
+          app: join(unsignedDir, "Seer.app"),
+          provenance: provenancePath,
+          stage: canary,
+          appBackup: join(unsignedDir, `.seer-backup-${"a".repeat(32)}`),
+          provenanceTemp: join(macosDir, `.seer-provenance-${"b".repeat(32)}.json`),
+          provenanceBackup: join(macosDir, `.seer-provenance-backup-${"c".repeat(32)}.json`),
+        },
+        oldApp: { present: null, identity: null },
+        oldProvenance: { present: null, identity: null },
+        newAppIdentity: null,
+        newProvenanceIdentity: null,
+      })}\n`,
+    );
+
+    const result = publish({ fixtureRepo, sourceApp: newSource, derivedData });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /journal|transaction|path|publication parent/i);
+    assert.equal(readFileSync(canary, "utf8"), "do-not-touch\n");
+    assert.equal(readFileSync(join(unsignedDir, "Seer.app", "Contents", "marker.txt"), "utf8"), "old\n");
+    assert.equal(readFileSync(provenancePath, "utf8"), oldProvenance);
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }

@@ -6,7 +6,9 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import secrets
+import signal
 import stat
 import subprocess
 import sys
@@ -19,12 +21,62 @@ if O_NOFOLLOW is None:
 DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | O_NOFOLLOW
 PROVENANCE_FILE = "standalone-build-provenance.json"
 PUBLICATION_LOCK_FILE = ".seer-publication.lock"
+TRANSACTION_JOURNAL_FILE = ".seer-publication-transaction.json"
+TRANSACTION_JOURNAL_TEMP_FILE = ".seer-publication-transaction.new"
+TRANSACTION_JOURNAL_SCHEMA_VERSION = 1
+TRANSACTION_JOURNAL_MAX_BYTES = 64 * 1024
 PROVENANCE_SCHEMA_VERSION = 2
 PROVENANCE_ALGORITHM = "sha256"
+TRANSACTION_PHASES = {
+    "staging",
+    "prepared",
+    "app-backed-up",
+    "provenance-backed-up",
+    "app-published",
+    "pair-published",
+    "cleanup",
+    "rolling-back",
+}
+STAGE_NAME_PATTERN = re.compile(r"\.seer-stage-[0-9a-f]{32}\Z")
+APP_BACKUP_NAME_PATTERN = re.compile(r"\.seer-backup-[0-9a-f]{32}\Z")
+PROVENANCE_TEMP_NAME_PATTERN = re.compile(r"\.seer-provenance-[0-9a-f]{32}\.json\Z")
+PROVENANCE_BACKUP_NAME_PATTERN = re.compile(
+    r"\.seer-provenance-backup-[0-9a-f]{32}\.json\Z"
+)
 
 
 class PublicationError(RuntimeError):
     pass
+
+
+class DeferredSignal(BaseException):
+    def __init__(self, signal_number):
+        super().__init__("interrupted by {}".format(signal.Signals(signal_number).name))
+        self.signal_number = signal_number
+
+
+class SignalDeferral:
+    def __init__(self):
+        self.pending_signal = None
+        self.previous_handlers = {}
+
+    def _handle(self, signal_number, _frame):
+        if self.pending_signal is None:
+            self.pending_signal = signal_number
+
+    def install(self):
+        for signal_number in (signal.SIGINT, signal.SIGTERM):
+            self.previous_handlers[signal_number] = signal.getsignal(signal_number)
+            signal.signal(signal_number, self._handle)
+
+    def restore(self):
+        for signal_number, handler in self.previous_handlers.items():
+            signal.signal(signal_number, handler)
+        self.previous_handlers.clear()
+
+    def raise_if_pending(self):
+        if self.pending_signal is not None:
+            raise DeferredSignal(self.pending_signal)
 
 
 def identity(info):
@@ -149,7 +201,7 @@ def reopen_and_verify_output_chain(repo_root, expected_repo, expected_chain):
         raise
 
 
-def copy_regular_file(source_fd, destination_fd, name, source_info):
+def copy_regular_file(source_fd, destination_fd, name, source_info, copy_hook=None):
     source_file = os.open(name, os.O_RDONLY | O_NOFOLLOW, dir_fd=source_fd)
     try:
         verify_identity(os.fstat(source_file), source_info, "source file {}".format(name))
@@ -160,6 +212,8 @@ def copy_regular_file(source_fd, destination_fd, name, source_info):
             dir_fd=destination_fd,
         )
         try:
+            if copy_hook is not None:
+                copy_hook()
             while True:
                 chunk = os.read(source_file, 1024 * 1024)
                 if not chunk:
@@ -175,7 +229,7 @@ def copy_regular_file(source_fd, destination_fd, name, source_info):
         os.close(source_file)
 
 
-def copy_tree_contents(source_fd, destination_fd):
+def copy_tree_contents(source_fd, destination_fd, copy_hook=None):
     for name in os.listdir(source_fd):
         source_info = lstat_at(source_fd, name)
         if source_info is None:
@@ -183,7 +237,7 @@ def copy_tree_contents(source_fd, destination_fd):
         if stat.S_ISLNK(source_info.st_mode):
             raise PublicationError("source entry {!r} is a symlink; bundle copies never follow symlinks".format(name))
         if stat.S_ISREG(source_info.st_mode):
-            copy_regular_file(source_fd, destination_fd, name, source_info)
+            copy_regular_file(source_fd, destination_fd, name, source_info, copy_hook)
             continue
         if stat.S_ISDIR(source_info.st_mode):
             os.mkdir(name, mode=0o700, dir_fd=destination_fd)
@@ -198,7 +252,7 @@ def copy_tree_contents(source_fd, destination_fd):
                 "staged directory {}".format(name),
             )
             try:
-                copy_tree_contents(source_child, destination_child)
+                copy_tree_contents(source_child, destination_child, copy_hook)
                 os.fchmod(destination_child, stat.S_IMODE(source_info.st_mode))
                 os.fsync(destination_child)
             finally:
@@ -208,7 +262,7 @@ def copy_tree_contents(source_fd, destination_fd):
         raise PublicationError("source entry {!r} is neither a regular file nor a directory".format(name))
 
 
-def stage_source_app(source_app, unsigned_fd):
+def stage_source_app(source_app, unsigned_fd, stage_name, copy_hook=None):
     source_before = os.lstat(source_app)
     if stat.S_ISLNK(source_before.st_mode) or not stat.S_ISDIR(source_before.st_mode):
         raise PublicationError("source app must be a real directory, not a symlink")
@@ -216,7 +270,6 @@ def stage_source_app(source_app, unsigned_fd):
     source_after = os.fstat(source_fd)
     try:
         verify_identity(source_after, source_before, "source app")
-        stage_name = ".seer-stage-{}".format(secrets.token_hex(16))
         os.mkdir(stage_name, mode=0o700, dir_fd=unsigned_fd)
         stage_fd, stage_info = open_checked_directory_at(
             unsigned_fd,
@@ -231,29 +284,27 @@ def stage_source_app(source_app, unsigned_fd):
                 "staged Seer.app",
             )
             try:
-                copy_tree_contents(source_fd, staged_app_fd)
+                copy_tree_contents(source_fd, staged_app_fd, copy_hook)
                 os.fchmod(staged_app_fd, stat.S_IMODE(source_before.st_mode))
                 os.fsync(staged_app_fd)
             finally:
                 os.close(staged_app_fd)
             os.fsync(stage_fd)
             return stage_name, stage_fd, stage_info, staged_app_info
-        except Exception as original_error:
+        except BaseException:
             os.close(stage_fd)
-            try:
-                remove_tree_verified(unsigned_fd, stage_name, stage_info)
-                os.fsync(unsigned_fd)
-            except Exception as cleanup_error:
-                raise PublicationError(
-                    "staging failed ({}) and cleanup was uncertain ({}); retained private staging "
-                    "leaf {!r}".format(original_error, cleanup_error, stage_name)
-                ) from original_error
             raise
     finally:
         os.close(source_fd)
 
 
-def write_provenance_temp(macos_fd, canonical_repo_root, effective_derived_data_path, app_digest):
+def write_provenance_temp(
+    macos_fd,
+    temp_name,
+    canonical_repo_root,
+    effective_derived_data_path,
+    app_digest,
+):
     payload = {
         "schemaVersion": PROVENANCE_SCHEMA_VERSION,
         "algorithm": PROVENANCE_ALGORITHM,
@@ -263,7 +314,6 @@ def write_provenance_temp(macos_fd, canonical_repo_root, effective_derived_data_
         "generation": app_digest,
     }
     encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    temp_name = ".seer-provenance-{}.json".format(secrets.token_hex(16))
     descriptor = os.open(
         temp_name,
         os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW,
@@ -442,13 +492,429 @@ def remove_tree_verified(parent_fd, name, expected):
     os.rmdir(name, dir_fd=parent_fd)
 
 
-def run_test_hook(hook_path, unsigned_path, stage_name):
-    if not hook_path:
+def encoded_identity(info):
+    return [info.st_dev, info.st_ino]
+
+
+def identity_matches(info, expected):
+    return info is not None and expected is not None and encoded_identity(info) == expected
+
+
+def validate_encoded_identity(value, label):
+    if value is None:
+        return
+    if (
+        not isinstance(value, list)
+        or len(value) != 2
+        or any(not isinstance(part, int) or isinstance(part, bool) or part < 0 for part in value)
+    ):
+        raise PublicationError("transaction journal {} identity is invalid".format(label))
+
+
+def read_small_json_at(parent_fd, name, label):
+    before = lstat_at(parent_fd, name)
+    if before is None:
+        return None, None
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise PublicationError("{} must be a regular non-symlink file".format(label))
+    if before.st_uid != os.geteuid():
+        raise PublicationError("{} must be owned by uid {}".format(label, os.geteuid()))
+    if before.st_size > TRANSACTION_JOURNAL_MAX_BYTES:
+        raise PublicationError("{} exceeds the size limit".format(label))
+    descriptor = os.open(name, os.O_RDONLY | O_NOFOLLOW, dir_fd=parent_fd)
+    try:
+        opened = os.fstat(descriptor)
+        verify_identity(opened, before, label)
+        chunks = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, 8192)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > TRANSACTION_JOURNAL_MAX_BYTES:
+                raise PublicationError("{} exceeds the size limit".format(label))
+            chunks.append(chunk)
+    finally:
+        os.close(descriptor)
+    try:
+        payload = json.loads(b"".join(chunks).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise PublicationError("{} is not valid UTF-8 JSON: {}".format(label, error))
+    return payload, before
+
+
+def require_canonical_recorded_path(path, publication_parent, label):
+    if not isinstance(path, str) or not os.path.isabs(path) or os.path.normpath(path) != path:
+        raise PublicationError("transaction journal {} path is not canonical".format(label))
+    try:
+        within_parent = os.path.commonpath((publication_parent, path)) == publication_parent
+    except ValueError:
+        within_parent = False
+    if not within_parent:
+        raise PublicationError(
+            "transaction journal {} path is outside the expected publication parent".format(label)
+        )
+
+
+def validate_transaction_journal(payload, macos_path, unsigned_path):
+    if not isinstance(payload, dict):
+        raise PublicationError("transaction journal root must be an object")
+    if payload.get("schemaVersion") != TRANSACTION_JOURNAL_SCHEMA_VERSION:
+        raise PublicationError("unsupported transaction journal schema")
+    if payload.get("phase") not in TRANSACTION_PHASES:
+        raise PublicationError("transaction journal phase is invalid")
+    paths = payload.get("paths")
+    if not isinstance(paths, dict):
+        raise PublicationError("transaction journal paths must be an object")
+
+    expected_fixed = {
+        "publicationParent": macos_path,
+        "unsignedParent": unsigned_path,
+        "app": os.path.join(unsigned_path, "Seer.app"),
+        "provenance": os.path.join(macos_path, PROVENANCE_FILE),
+    }
+    for key, expected in expected_fixed.items():
+        actual = paths.get(key)
+        require_canonical_recorded_path(actual, macos_path, key)
+        if actual != expected:
+            raise PublicationError(
+                "transaction journal {} path does not match the fixed publication path".format(key)
+            )
+
+    dynamic_paths = {
+        "stage": (unsigned_path, STAGE_NAME_PATTERN),
+        "appBackup": (unsigned_path, APP_BACKUP_NAME_PATTERN),
+        "provenanceTemp": (macos_path, PROVENANCE_TEMP_NAME_PATTERN),
+        "provenanceBackup": (macos_path, PROVENANCE_BACKUP_NAME_PATTERN),
+    }
+    for key, (expected_parent, pattern) in dynamic_paths.items():
+        path = paths.get(key)
+        require_canonical_recorded_path(path, macos_path, key)
+        if os.path.dirname(path) != expected_parent or pattern.fullmatch(os.path.basename(path)) is None:
+            raise PublicationError("transaction journal {} path is not a valid private leaf".format(key))
+
+    for key in ("oldApp", "oldProvenance"):
+        record = payload.get(key)
+        if not isinstance(record, dict) or record.get("present") not in (None, True, False):
+            raise PublicationError("transaction journal {} record is invalid".format(key))
+        present = record.get("present")
+        if present is not None and type(present) is not bool:
+            raise PublicationError("transaction journal {} presence flag is invalid".format(key))
+        validate_encoded_identity(record.get("identity"), key)
+        if present is True and record.get("identity") is None:
+            raise PublicationError("transaction journal {} is missing its identity".format(key))
+        if present is False and record.get("identity") is not None:
+            raise PublicationError("transaction journal {} has an unexpected identity".format(key))
+    validate_encoded_identity(payload.get("newAppIdentity"), "new app")
+    validate_encoded_identity(payload.get("newProvenanceIdentity"), "new provenance")
+    return payload
+
+
+def validate_recovery_artifacts(payload, macos_fd, unsigned_fd):
+    directory_entries = [
+        (unsigned_fd, os.path.basename(payload["paths"]["stage"]), "private staging directory"),
+        (unsigned_fd, os.path.basename(payload["paths"]["appBackup"]), "private app backup"),
+    ]
+    file_entries = [
+        (macos_fd, os.path.basename(payload["paths"]["provenanceTemp"]), "private provenance temp"),
+        (macos_fd, os.path.basename(payload["paths"]["provenanceBackup"]), "private provenance backup"),
+    ]
+    if payload["oldApp"]["present"] is not None:
+        directory_entries.append((unsigned_fd, "Seer.app", "published app"))
+    if payload["oldProvenance"]["present"] is not None:
+        file_entries.append((macos_fd, PROVENANCE_FILE, "published provenance"))
+    for parent_fd, name, label in directory_entries:
+        info = lstat_at(parent_fd, name)
+        if info is None:
+            continue
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise PublicationError("{} must be a real directory during recovery".format(label))
+        if info.st_uid != os.geteuid():
+            raise PublicationError("{} is not owned by uid {}".format(label, os.geteuid()))
+    for parent_fd, name, label in file_entries:
+        info = lstat_at(parent_fd, name)
+        if info is None:
+            continue
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise PublicationError("{} must be a regular non-symlink file during recovery".format(label))
+        if info.st_uid != os.geteuid():
+            raise PublicationError("{} is not owned by uid {}".format(label, os.geteuid()))
+
+
+def persist_transaction_journal(macos_fd, payload):
+    encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    if len(encoded) > TRANSACTION_JOURNAL_MAX_BYTES:
+        raise PublicationError("transaction journal exceeds the size limit")
+    if lstat_at(macos_fd, TRANSACTION_JOURNAL_TEMP_FILE) is not None:
+        raise PublicationError("transaction journal temporary file already exists")
+    descriptor = os.open(
+        TRANSACTION_JOURNAL_TEMP_FILE,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW,
+        0o600,
+        dir_fd=macos_fd,
+    )
+    try:
+        offset = 0
+        while offset < len(encoded):
+            offset += os.write(descriptor, encoded[offset:])
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.rename(
+        TRANSACTION_JOURNAL_TEMP_FILE,
+        TRANSACTION_JOURNAL_FILE,
+        src_dir_fd=macos_fd,
+        dst_dir_fd=macos_fd,
+    )
+    os.fsync(macos_fd)
+
+
+def load_transaction_journal(macos_fd, unsigned_fd, macos_path, unsigned_path):
+    temp_payload, temp_info = read_small_json_at(
+        macos_fd,
+        TRANSACTION_JOURNAL_TEMP_FILE,
+        "transaction journal temporary file",
+    )
+    if temp_payload is not None:
+        validate_transaction_journal(temp_payload, macos_path, unsigned_path)
+
+    payload, journal_info = read_small_json_at(
+        macos_fd,
+        TRANSACTION_JOURNAL_FILE,
+        "transaction journal",
+    )
+    if payload is not None:
+        validate_transaction_journal(payload, macos_path, unsigned_path)
+        validate_recovery_artifacts(payload, macos_fd, unsigned_fd)
+
+    if temp_info is not None:
+        unlink_verified(macos_fd, TRANSACTION_JOURNAL_TEMP_FILE, temp_info)
+        os.fsync(macos_fd)
+    return payload, journal_info
+
+
+def remove_recovery_entry(parent_fd, name, expected_identity, label, directory):
+    info = lstat_at(parent_fd, name)
+    if info is None:
+        return
+    if expected_identity is not None and not identity_matches(info, expected_identity):
+        raise PublicationError("{} changed identity during recovery".format(label))
+    if directory:
+        remove_tree_verified(parent_fd, name, info)
+    else:
+        unlink_verified(parent_fd, name, info)
+
+
+def restore_old_entry(
+    parent_fd,
+    destination_name,
+    backup_name,
+    old_record,
+    new_identity,
+    label,
+    directory,
+):
+    destination = lstat_at(parent_fd, destination_name)
+    backup = lstat_at(parent_fd, backup_name)
+    old_present = old_record["present"]
+    old_identity = old_record["identity"]
+    if old_present is None:
+        if backup is not None:
+            raise PublicationError("unexpected {} backup before transaction preparation".format(label))
+        return
+    if old_present:
+        if identity_matches(destination, old_identity):
+            if backup is not None:
+                raise PublicationError("duplicate old {} found during recovery".format(label))
+            return
+        if not identity_matches(backup, old_identity):
+            raise PublicationError("old {} backup is missing or changed during recovery".format(label))
+        if destination is not None:
+            if not identity_matches(destination, new_identity):
+                raise PublicationError("new {} changed identity during recovery".format(label))
+            if directory:
+                remove_tree_verified(parent_fd, destination_name, destination)
+            else:
+                unlink_verified(parent_fd, destination_name, destination)
+        os.rename(backup_name, destination_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        return
+    if backup is not None:
+        raise PublicationError("unexpected {} backup for an initially absent entry".format(label))
+    if destination is not None:
+        if not identity_matches(destination, new_identity):
+            raise PublicationError("new {} changed identity during recovery".format(label))
+        if directory:
+            remove_tree_verified(parent_fd, destination_name, destination)
+        else:
+            unlink_verified(parent_fd, destination_name, destination)
+
+
+def remove_transaction_journal(macos_fd, unsigned_fd):
+    journal_info = lstat_at(macos_fd, TRANSACTION_JOURNAL_FILE)
+    if journal_info is None:
+        raise PublicationError("transaction journal disappeared before recovery completed")
+    unlink_verified(macos_fd, TRANSACTION_JOURNAL_FILE, journal_info)
+    os.fsync(unsigned_fd)
+    os.fsync(macos_fd)
+
+
+def rollback_transaction(payload, macos_fd, unsigned_fd):
+    paths = payload["paths"]
+    restore_old_entry(
+        macos_fd,
+        PROVENANCE_FILE,
+        os.path.basename(paths["provenanceBackup"]),
+        payload["oldProvenance"],
+        payload.get("newProvenanceIdentity"),
+        "provenance",
+        False,
+    )
+    restore_old_entry(
+        unsigned_fd,
+        "Seer.app",
+        os.path.basename(paths["appBackup"]),
+        payload["oldApp"],
+        payload.get("newAppIdentity"),
+        "app",
+        True,
+    )
+    remove_recovery_entry(
+        macos_fd,
+        os.path.basename(paths["provenanceTemp"]),
+        payload.get("newProvenanceIdentity"),
+        "private provenance temp",
+        False,
+    )
+    remove_recovery_entry(
+        unsigned_fd,
+        os.path.basename(paths["stage"]),
+        None,
+        "private staging directory",
+        True,
+    )
+    os.fsync(unsigned_fd)
+    os.fsync(macos_fd)
+    remove_transaction_journal(macos_fd, unsigned_fd)
+
+
+def finish_committed_transaction(payload, macos_fd, unsigned_fd):
+    paths = payload["paths"]
+    app_info = lstat_at(unsigned_fd, "Seer.app")
+    provenance_info = lstat_at(macos_fd, PROVENANCE_FILE)
+    if not identity_matches(app_info, payload.get("newAppIdentity")):
+        raise PublicationError("committed app is missing or changed during recovery")
+    if not identity_matches(provenance_info, payload.get("newProvenanceIdentity")):
+        raise PublicationError("committed provenance is missing or changed during recovery")
+
+    if payload["phase"] != "cleanup":
+        payload["phase"] = "cleanup"
+        persist_transaction_journal(macos_fd, payload)
+    remove_recovery_entry(
+        unsigned_fd,
+        os.path.basename(paths["appBackup"]),
+        payload["oldApp"]["identity"],
+        "private app backup",
+        True,
+    )
+    remove_recovery_entry(
+        macos_fd,
+        os.path.basename(paths["provenanceBackup"]),
+        payload["oldProvenance"]["identity"],
+        "private provenance backup",
+        False,
+    )
+    remove_recovery_entry(
+        macos_fd,
+        os.path.basename(paths["provenanceTemp"]),
+        payload.get("newProvenanceIdentity"),
+        "private provenance temp",
+        False,
+    )
+    remove_recovery_entry(
+        unsigned_fd,
+        os.path.basename(paths["stage"]),
+        None,
+        "private staging directory",
+        True,
+    )
+    remove_transaction_journal(macos_fd, unsigned_fd)
+
+
+def recover_abandoned_transaction(
+    macos_fd,
+    unsigned_fd,
+    macos_path,
+    unsigned_path,
+    force_rollback=False,
+):
+    payload, _ = load_transaction_journal(
+        macos_fd,
+        unsigned_fd,
+        macos_path,
+        unsigned_path,
+    )
+    if payload is None:
+        return
+    if force_rollback or payload["phase"] not in ("pair-published", "cleanup"):
+        if payload["phase"] != "rolling-back":
+            payload["phase"] = "rolling-back"
+            persist_transaction_journal(macos_fd, payload)
+        rollback_transaction(payload, macos_fd, unsigned_fd)
+    else:
+        finish_committed_transaction(payload, macos_fd, unsigned_fd)
+
+
+def new_transaction_journal(macos_path, unsigned_path):
+    token = secrets.token_hex(16)
+    provenance_token = secrets.token_hex(16)
+    provenance_backup_token = secrets.token_hex(16)
+    return {
+        "schemaVersion": TRANSACTION_JOURNAL_SCHEMA_VERSION,
+        "phase": "staging",
+        "paths": {
+            "publicationParent": macos_path,
+            "unsignedParent": unsigned_path,
+            "app": os.path.join(unsigned_path, "Seer.app"),
+            "provenance": os.path.join(macos_path, PROVENANCE_FILE),
+            "stage": os.path.join(unsigned_path, ".seer-stage-{}".format(token)),
+            "appBackup": os.path.join(unsigned_path, ".seer-backup-{}".format(secrets.token_hex(16))),
+            "provenanceTemp": os.path.join(
+                macos_path,
+                ".seer-provenance-{}.json".format(provenance_token),
+            ),
+            "provenanceBackup": os.path.join(
+                macos_path,
+                ".seer-provenance-backup-{}.json".format(provenance_backup_token),
+            ),
+        },
+        "oldApp": {"present": None, "identity": None},
+        "oldProvenance": {"present": None, "identity": None},
+        "newAppIdentity": None,
+        "newProvenanceIdentity": None,
+    }
+
+
+def run_test_hook(
+    hook_path,
+    configured_phase,
+    current_phase,
+    unsigned_path,
+    stage_name,
+    interruptions,
+):
+    if not hook_path or configured_phase != current_phase:
         return
     environment = dict(os.environ)
     environment["SEER_PUBLISH_PARENT_PATH"] = unsigned_path
     environment["SEER_PUBLISH_STAGE_NAME"] = stage_name
-    subprocess.run([hook_path], check=True, env=environment)
+    environment["SEER_PUBLISH_HOOK_PHASE"] = current_phase
+    try:
+        subprocess.run([hook_path], check=True, env=environment)
+    except BaseException:
+        interruptions.raise_if_pending()
+        raise
+    interruptions.raise_if_pending()
 
 
 def publish(args):
@@ -465,218 +931,233 @@ def publish(args):
 
     repo_fd, repo_info = open_repo_root(canonical_repo_root)
     chain = []
-    stage_name = None
     stage_fd = None
-    stage_info = None
-    provenance_temp = None
     publication_lock_fd = None
-    recovery_uncertain = False
+    interruptions = None
+    transaction_started = False
+    transaction_committed = False
+    macos_path = os.path.join(canonical_repo_root, "build", "macos")
+    unsigned_path = os.path.join(macos_path, "unsigned")
     try:
         chain = open_output_chain(repo_fd, create=True)
         macos_fd = chain[1][0]
         unsigned_fd = chain[2][0]
         publication_lock_fd = acquire_publication_lock(macos_fd)
+        interruptions = SignalDeferral()
+        interruptions.install()
 
-        stage_name, stage_fd, stage_info, staged_app_info = stage_source_app(args.source_app, unsigned_fd)
+        recover_abandoned_transaction(
+            macos_fd,
+            unsigned_fd,
+            macos_path,
+            unsigned_path,
+        )
+        interruptions.raise_if_pending()
 
-        unsigned_path = os.path.join(canonical_repo_root, "build", "macos", "unsigned")
-        run_test_hook(args.test_hook, unsigned_path, stage_name)
+        journal = new_transaction_journal(macos_path, unsigned_path)
+        persist_transaction_journal(macos_fd, journal)
+        transaction_started = True
+        stage_name = os.path.basename(journal["paths"]["stage"])
+        copy_hook_ran = False
+
+        def run_copy_hook_once():
+            nonlocal copy_hook_ran
+            if copy_hook_ran:
+                return
+            copy_hook_ran = True
+            run_test_hook(
+                args.test_hook,
+                args.test_hook_phase,
+                "during-copy",
+                unsigned_path,
+                stage_name,
+                interruptions,
+            )
+
+        stage_name, stage_fd, _, staged_app_info = stage_source_app(
+            args.source_app,
+            unsigned_fd,
+            stage_name,
+            run_copy_hook_once,
+        )
+        interruptions.raise_if_pending()
+        run_test_hook(
+            args.test_hook,
+            args.test_hook_phase,
+            "after-staging",
+            unsigned_path,
+            stage_name,
+            interruptions,
+        )
+        interruptions.raise_if_pending()
 
         fresh_repo_fd, fresh_chain = reopen_and_verify_output_chain(
             canonical_repo_root,
             repo_info,
             chain,
         )
-        backup_name = None
-        backup_info = None
-        provenance_backup_name = None
-        provenance_backup_info = None
-        new_app_published = False
-        new_provenance_published = False
         try:
             fresh_macos_fd = fresh_chain[1][0]
             fresh_unsigned_fd = fresh_chain[2][0]
 
             app_digest = compute_staged_app_digest(stage_fd)
-            provenance_temp = write_provenance_temp(
+            try:
+                validate_staged_architecture(stage_fd, unsigned_path, stage_name)
+            except BaseException:
+                interruptions.raise_if_pending()
+                raise
+            interruptions.raise_if_pending()
+            provenance_temp_name = os.path.basename(journal["paths"]["provenanceTemp"])
+            write_provenance_temp(
                 fresh_macos_fd,
+                provenance_temp_name,
                 canonical_repo_root,
                 effective_derived_data_path,
                 app_digest,
             )
-            try:
-                destination_info = lstat_at(fresh_unsigned_fd, "Seer.app")
-                if destination_info is not None:
-                    if stat.S_ISLNK(destination_info.st_mode):
-                        raise PublicationError("destination Seer.app is a symlink; refusing to replace it")
-                    backup_name = ".seer-backup-{}".format(secrets.token_hex(16))
-                    os.rename(
-                        "Seer.app",
-                        backup_name,
-                        src_dir_fd=fresh_unsigned_fd,
-                        dst_dir_fd=fresh_unsigned_fd,
-                    )
-                    backup_info = lstat_at(fresh_unsigned_fd, backup_name)
-                    if backup_info is None:
-                        raise PublicationError("old Seer.app disappeared while moving it to backup")
-                    verify_identity(backup_info, destination_info, "private app backup")
+            provenance_temp_info = lstat_at(fresh_macos_fd, provenance_temp_name)
+            if provenance_temp_info is None:
+                raise PublicationError("private provenance temp disappeared")
+            interruptions.raise_if_pending()
 
-                old_provenance_info = lstat_at(fresh_macos_fd, PROVENANCE_FILE)
-                if old_provenance_info is not None:
-                    if stat.S_ISLNK(old_provenance_info.st_mode) or not stat.S_ISREG(old_provenance_info.st_mode):
-                        raise PublicationError("existing provenance must be a regular non-symlink file")
-                    provenance_backup_name = ".seer-provenance-backup-{}.json".format(secrets.token_hex(16))
-                    os.rename(
-                        PROVENANCE_FILE,
-                        provenance_backup_name,
-                        src_dir_fd=fresh_macos_fd,
-                        dst_dir_fd=fresh_macos_fd,
+            destination_info = lstat_at(fresh_unsigned_fd, "Seer.app")
+            if destination_info is not None:
+                if stat.S_ISLNK(destination_info.st_mode) or not stat.S_ISDIR(destination_info.st_mode):
+                    raise PublicationError(
+                        "destination Seer.app is a symlink or non-directory; refusing to replace it"
                     )
-                    provenance_backup_info = lstat_at(fresh_macos_fd, provenance_backup_name)
-                    verify_identity(provenance_backup_info, old_provenance_info, "private provenance backup")
+            old_provenance_info = lstat_at(fresh_macos_fd, PROVENANCE_FILE)
+            if old_provenance_info is not None:
+                if stat.S_ISLNK(old_provenance_info.st_mode) or not stat.S_ISREG(
+                    old_provenance_info.st_mode
+                ):
+                    raise PublicationError("existing provenance must be a regular non-symlink file")
 
-                validate_staged_architecture(stage_fd, unsigned_path, stage_name)
+            journal["oldApp"] = {
+                "present": destination_info is not None,
+                "identity": encoded_identity(destination_info) if destination_info is not None else None,
+            }
+            journal["oldProvenance"] = {
+                "present": old_provenance_info is not None,
+                "identity": (
+                    encoded_identity(old_provenance_info)
+                    if old_provenance_info is not None
+                    else None
+                ),
+            }
+            journal["newAppIdentity"] = encoded_identity(staged_app_info)
+            journal["newProvenanceIdentity"] = encoded_identity(provenance_temp_info)
+            journal["phase"] = "prepared"
+            persist_transaction_journal(fresh_macos_fd, journal)
+
+            app_backup_name = os.path.basename(journal["paths"]["appBackup"])
+            if destination_info is not None:
                 os.rename(
                     "Seer.app",
-                    "Seer.app",
-                    src_dir_fd=stage_fd,
+                    app_backup_name,
+                    src_dir_fd=fresh_unsigned_fd,
                     dst_dir_fd=fresh_unsigned_fd,
                 )
-                new_app_published = True
-                published_info = lstat_at(fresh_unsigned_fd, "Seer.app")
-                if published_info is None:
-                    raise PublicationError("published Seer.app disappeared")
-                verify_identity(published_info, staged_app_info, "published Seer.app")
+                app_backup_info = lstat_at(fresh_unsigned_fd, app_backup_name)
+                if app_backup_info is None:
+                    raise PublicationError("old Seer.app disappeared while moving it to backup")
+                verify_identity(app_backup_info, destination_info, "private app backup")
+                os.fsync(fresh_unsigned_fd)
+            journal["phase"] = "app-backed-up"
+            persist_transaction_journal(fresh_macos_fd, journal)
 
-                if args.test_failpoint == "after-app-publish":
-                    raise PublicationError("injected failure after app publication")
-
+            provenance_backup_name = os.path.basename(journal["paths"]["provenanceBackup"])
+            if old_provenance_info is not None:
                 os.rename(
-                    provenance_temp,
                     PROVENANCE_FILE,
+                    provenance_backup_name,
                     src_dir_fd=fresh_macos_fd,
                     dst_dir_fd=fresh_macos_fd,
                 )
-                published_provenance_temp = provenance_temp
-                provenance_temp = None
-                new_provenance_published = True
                 os.fsync(fresh_macos_fd)
-                os.fsync(fresh_unsigned_fd)
-            except Exception as error:
-                rollback_errors = []
-                if new_provenance_published:
-                    try:
-                        os.rename(
-                            PROVENANCE_FILE,
-                            published_provenance_temp,
-                            src_dir_fd=fresh_macos_fd,
-                            dst_dir_fd=fresh_macos_fd,
-                        )
-                        provenance_temp = published_provenance_temp
-                        new_provenance_published = False
-                    except Exception as rollback_error:
-                        rollback_errors.append("new provenance: {}".format(rollback_error))
-                if provenance_backup_name is not None:
-                    try:
-                        os.rename(
-                            provenance_backup_name,
-                            PROVENANCE_FILE,
-                            src_dir_fd=fresh_macos_fd,
-                            dst_dir_fd=fresh_macos_fd,
-                        )
-                        provenance_backup_name = None
-                    except Exception as rollback_error:
-                        rollback_errors.append("old provenance: {}".format(rollback_error))
-                if new_app_published:
-                    try:
-                        os.rename(
-                            "Seer.app",
-                            "Seer.app",
-                            src_dir_fd=fresh_unsigned_fd,
-                            dst_dir_fd=stage_fd,
-                        )
-                        new_app_published = False
-                    except Exception as rollback_error:
-                        rollback_errors.append("new app: {}".format(rollback_error))
-                if backup_name is not None:
-                    try:
-                        os.rename(
-                            backup_name,
-                            "Seer.app",
-                            src_dir_fd=fresh_unsigned_fd,
-                            dst_dir_fd=fresh_unsigned_fd,
-                        )
-                        backup_name = None
-                    except Exception as rollback_error:
-                        rollback_errors.append("old app: {}".format(rollback_error))
-                try:
-                    os.fsync(fresh_macos_fd)
-                    os.fsync(fresh_unsigned_fd)
-                except Exception as rollback_error:
-                    rollback_errors.append("parent fsync: {}".format(rollback_error))
-                if rollback_errors:
-                    recovery_uncertain = True
-                    raise PublicationError(
-                        "publication failed ({}) and rollback was uncertain ({}); staging retained".format(
-                            error,
-                            "; ".join(rollback_errors),
-                        )
-                    )
-                raise
+            journal["phase"] = "provenance-backed-up"
+            persist_transaction_journal(fresh_macos_fd, journal)
 
-            if backup_name is not None:
-                remove_tree_verified(fresh_unsigned_fd, backup_name, backup_info)
-            if provenance_backup_name is not None:
-                unlink_verified(fresh_macos_fd, provenance_backup_name, provenance_backup_info)
+            os.rename(
+                "Seer.app",
+                "Seer.app",
+                src_dir_fd=stage_fd,
+                dst_dir_fd=fresh_unsigned_fd,
+            )
+            os.fsync(fresh_unsigned_fd)
+            published_info = lstat_at(fresh_unsigned_fd, "Seer.app")
+            if published_info is None:
+                raise PublicationError("published Seer.app disappeared")
+            verify_identity(published_info, staged_app_info, "published Seer.app")
+            journal["phase"] = "app-published"
+            persist_transaction_journal(fresh_macos_fd, journal)
 
+            run_test_hook(
+                args.test_hook,
+                args.test_hook_phase,
+                "after-app-publish",
+                unsigned_path,
+                stage_name,
+                interruptions,
+            )
+            if args.test_failpoint == "after-app-publish":
+                raise PublicationError("injected failure after app publication")
+            interruptions.raise_if_pending()
+
+            os.rename(
+                provenance_temp_name,
+                PROVENANCE_FILE,
+                src_dir_fd=fresh_macos_fd,
+                dst_dir_fd=fresh_macos_fd,
+            )
+            os.fsync(fresh_macos_fd)
+            os.fsync(fresh_unsigned_fd)
+            interruptions.raise_if_pending()
+            journal["phase"] = "pair-published"
+            persist_transaction_journal(fresh_macos_fd, journal)
+            transaction_committed = True
             os.close(stage_fd)
             stage_fd = None
-            current_stage = lstat_at(fresh_unsigned_fd, stage_name)
-            if current_stage is None:
-                raise PublicationError("private staging directory disappeared before cleanup")
-            verify_identity(current_stage, stage_info, "private staging directory")
-            os.rmdir(stage_name, dir_fd=fresh_unsigned_fd)
-            stage_name = None
-            os.fsync(fresh_unsigned_fd)
+            recover_abandoned_transaction(
+                fresh_macos_fd,
+                fresh_unsigned_fd,
+                macos_path,
+                unsigned_path,
+            )
+            transaction_started = False
+            interruptions.raise_if_pending()
         finally:
             for descriptor, _ in reversed(fresh_chain):
                 os.close(descriptor)
             os.close(fresh_repo_fd)
-    except Exception as original_error:
-        if provenance_temp is not None and len(chain) >= 2:
+    except BaseException as original_error:
+        if stage_fd is not None:
+            os.close(stage_fd)
+            stage_fd = None
+        if transaction_started and len(chain) >= 3:
             try:
-                temp_info = lstat_at(chain[1][0], provenance_temp)
-                if temp_info is not None:
-                    unlink_verified(chain[1][0], provenance_temp, temp_info)
-            except Exception:
-                pass
-        if stage_name is not None and not recovery_uncertain and len(chain) >= 3:
-            if stage_fd is not None:
-                os.close(stage_fd)
-                stage_fd = None
-            try:
-                remove_tree_verified(chain[2][0], stage_name, stage_info)
-                os.fsync(chain[2][0])
-                stage_name = None
-            except Exception as cleanup_error:
-                recovery_uncertain = True
+                recover_abandoned_transaction(
+                    chain[1][0],
+                    chain[2][0],
+                    macos_path,
+                    unsigned_path,
+                    force_rollback=not transaction_committed,
+                )
+                transaction_started = False
+            except BaseException as cleanup_error:
                 raise PublicationError(
-                    "publication failed ({}) and verified staging cleanup was uncertain ({}); "
-                    "staging retained".format(original_error, cleanup_error)
+                    "publication failed ({}) and transaction recovery was uncertain ({}); "
+                    "journal and private artifacts retained".format(original_error, cleanup_error)
                 ) from original_error
-        if stage_name is not None and recovery_uncertain:
-            print(
-                "error: publication recovery is genuinely uncertain; retained private staging leaf "
-                "{!r} for scoped recovery".format(
-                    stage_name
-                ),
-                file=sys.stderr,
-            )
+        if interruptions is not None:
+            interruptions.raise_if_pending()
         raise
     finally:
         if publication_lock_fd is not None:
             fcntl.flock(publication_lock_fd, fcntl.LOCK_UN)
             os.close(publication_lock_fd)
+        if interruptions is not None:
+            interruptions.restore()
         if stage_fd is not None:
             os.close(stage_fd)
         for descriptor, _ in reversed(chain):
@@ -690,6 +1171,12 @@ def parse_args():
     parser.add_argument("--source-app", required=True)
     parser.add_argument("--derived-data-path", required=True)
     parser.add_argument("--test-hook", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--test-hook-phase",
+        choices=["during-copy", "after-staging", "after-app-publish"],
+        default="after-staging",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--test-failpoint", choices=["after-app-publish"], help=argparse.SUPPRESS)
     return parser.parse_args()
 
@@ -697,6 +1184,12 @@ def parse_args():
 def main():
     try:
         publish(parse_args())
+    except DeferredSignal as interruption:
+        print("error: {}".format(interruption), file=sys.stderr)
+        return 128 + interruption.signal_number
+    except KeyboardInterrupt:
+        print("error: interrupted by SIGINT", file=sys.stderr)
+        return 128 + signal.SIGINT
     except (OSError, PublicationError, subprocess.SubprocessError) as error:
         print("error: {}".format(error), file=sys.stderr)
         return 1
