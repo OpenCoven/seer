@@ -4,7 +4,13 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { AGENT_KINDS, assessDetectionFixture, matchAgentKind } from "../main/services/agent-detection-policy.ts";
+import {
+  AGENT_KINDS,
+  TIMESTAMP_FUTURE_SKEW_MS,
+  assessDetectionFixture,
+  isRecentTimestamp,
+  matchAgentKind,
+} from "../main/services/agent-detection-policy.ts";
 
 /**
  * Characterizes `assessDetectionFixture` (the pure policy extracted from
@@ -127,6 +133,31 @@ test("shared fixture oracle proves the 25.0 process-only CPU threshold for Aider
 test("shared fixture oracle rows have unique ids", () => {
   const ids = oracle.cases.map((testCase) => testCase.id);
   assert.equal(new Set(ids).size, ids.length);
+});
+
+test("shared fixture oracle covers bounded skew and extreme future evidence for every assessor path", () => {
+  const ids = new Set(oracle.cases.map(({ id }) => id));
+  for (const prefix of ["claude", "codex", "grok", "generic-mtime", "cursor"]) {
+    assert.ok(ids.has(`${prefix}-bounded-future-skew`), `${prefix} is missing bounded skew coverage`);
+    assert.ok(ids.has(`${prefix}-extreme-future`), `${prefix} is missing extreme future coverage`);
+  }
+  for (const prefix of ["codex-fallback", "grok-fallback"]) {
+    assert.ok(ids.has(`${prefix}-bounded-future-skew`), `${prefix} is missing bounded skew coverage`);
+    assert.ok(ids.has(`${prefix}-extreme-future`), `${prefix} is missing extreme future coverage`);
+  }
+});
+
+test("isRecentTimestamp rejects invalid ranges and permits only bounded future skew", () => {
+  const timestampNow = 1_786_449_620_000;
+  assert.equal(isRecentTimestamp(timestampNow - 45_000, timestampNow, 45_000), true);
+  assert.equal(isRecentTimestamp(timestampNow - 45_001, timestampNow, 45_000), false);
+  assert.equal(isRecentTimestamp(timestampNow + TIMESTAMP_FUTURE_SKEW_MS, timestampNow, 45_000), true);
+  assert.equal(isRecentTimestamp(timestampNow + TIMESTAMP_FUTURE_SKEW_MS + 1, timestampNow, 45_000), false);
+  for (const value of [Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, Number.NaN, Number.MAX_VALUE]) {
+    assert.equal(isRecentTimestamp(value, timestampNow, 45_000), false);
+  }
+  assert.equal(isRecentTimestamp(timestampNow, Number.POSITIVE_INFINITY, 45_000), false);
+  assert.equal(isRecentTimestamp(timestampNow, timestampNow, -1), false);
 });
 
 for (const testCase of oracle.cases) {

@@ -28,6 +28,9 @@ export const CODEX_TAIL_QUIET_MS = 15_000;
 export const PROCESS_ONLY_CPU_THRESHOLD = 25.0;
 /** Generic logs only get a short window — better false negatives than caffeinating idle CLIs. */
 export const GENERIC_MTIME_WINDOW_MS = 20_000;
+/** Tolerates small wall-clock/filesystem skew without trusting far-future evidence. */
+export const TIMESTAMP_FUTURE_SKEW_MS = 5_000;
+const MAX_SUPPORTED_TIMESTAMP_MS = 8_640_000_000_000_000;
 
 /**
  * Grok CLI brackets every turn with turn_started … turn_ended in events.jsonl,
@@ -344,6 +347,32 @@ export function parseTimestamp(value: unknown, fallbackMs: number): number {
   return fallbackMs;
 }
 
+/**
+ * Shared recency predicate for transcript timestamps and filesystem mtimes.
+ * The supported range matches ECMAScript Date's finite millisecond range, so
+ * subtraction cannot overflow even when untrusted JSON supplies huge numbers.
+ */
+export function isRecentTimestamp(timestampMs: number, now: number, graceMs: number): boolean {
+  if (
+    !Number.isFinite(timestampMs) ||
+    !Number.isFinite(now) ||
+    !Number.isFinite(graceMs) ||
+    Math.abs(timestampMs) > MAX_SUPPORTED_TIMESTAMP_MS ||
+    Math.abs(now) > MAX_SUPPORTED_TIMESTAMP_MS ||
+    graceMs < 0 ||
+    graceMs > MAX_SUPPORTED_TIMESTAMP_MS
+  ) {
+    return false;
+  }
+
+  const age = now - timestampMs;
+  return (
+    Number.isFinite(age) &&
+    age >= -TIMESTAMP_FUTURE_SKEW_MS &&
+    age <= graceMs
+  );
+}
+
 export function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" ? (value as Record<string, unknown>) : null;
 }
@@ -358,8 +387,6 @@ export function assessClaudeTurn(events: unknown[], mtimeMs: number, now: number
     if (CLAUDE_METADATA_TYPES.has(type)) continue;
 
     const timestamp = parseTimestamp(record.timestamp, mtimeMs);
-    const age = now - timestamp;
-
     if (type === "system") {
       const subtype = typeof record.subtype === "string" ? record.subtype : "";
       if (subtype === "turn_duration" || subtype === "away_summary") {
@@ -383,36 +410,40 @@ export function assessClaudeTurn(events: unknown[], mtimeMs: number, now: number
       }
 
       if (stopReason === "tool_use") {
+        const active = isRecentTimestamp(timestamp, now, TOOL_TURN_GRACE_MS);
         return {
-          active: age <= TOOL_TURN_GRACE_MS,
+          active,
           lastActivityAt: timestamp,
-          reason: age <= TOOL_TURN_GRACE_MS ? "tool_use in progress" : "stale tool_use",
+          reason: active ? "tool_use in progress" : "stale tool_use",
         };
       }
 
       // Streaming / incomplete assistant chunk without an end marker.
+      const active = isRecentTimestamp(timestamp, now, TURN_ACTIVE_GRACE_MS);
       return {
-        active: age <= TURN_ACTIVE_GRACE_MS,
+        active,
         lastActivityAt: timestamp,
-        reason: age <= TURN_ACTIVE_GRACE_MS ? "assistant output" : "stale assistant output",
+        reason: active ? "assistant output" : "stale assistant output",
       };
     }
 
     if (type === "user") {
       const hasToolResult = "toolUseResult" in record;
       if (hasToolResult) {
+        const active = isRecentTimestamp(timestamp, now, TOOL_TURN_GRACE_MS);
         return {
-          active: age <= TOOL_TURN_GRACE_MS,
+          active,
           lastActivityAt: timestamp,
-          reason: age <= TOOL_TURN_GRACE_MS ? "awaiting model after tool" : "stale tool result",
+          reason: active ? "awaiting model after tool" : "stale tool result",
         };
       }
 
       // Fresh human prompt starts a turn.
+      const active = isRecentTimestamp(timestamp, now, TURN_ACTIVE_GRACE_MS);
       return {
-        active: age <= TURN_ACTIVE_GRACE_MS,
+        active,
         lastActivityAt: timestamp,
-        reason: age <= TURN_ACTIVE_GRACE_MS ? "user prompt" : "stale user prompt",
+        reason: active ? "user prompt" : "stale user prompt",
       };
     }
   }
@@ -565,23 +596,21 @@ export function assessCodexTurn(
 
   if (lastActivityAt < 0) {
     // Tail held nothing recognizable (huge single records) — trust fresh writes only.
-    const age = now - mtimeMs;
+    const active = isRecentTimestamp(mtimeMs, now, CODEX_TAIL_QUIET_MS);
     return {
-      active: age <= CODEX_TAIL_QUIET_MS,
+      active,
       lastActivityAt: mtimeMs,
-      reason: age <= CODEX_TAIL_QUIET_MS ? "recent session write" : "no turn events",
+      reason: active ? "recent session write" : "no turn events",
       label,
     };
   }
-
-  const age = now - lastActivityAt;
 
   if (latest?.role === "await-user") {
     return { active: false, lastActivityAt, reason: "waiting for approval", label };
   }
 
   if (startedAt > endedAt) {
-    const active = age <= CODEX_OPEN_TURN_GRACE_MS;
+    const active = isRecentTimestamp(lastActivityAt, now, CODEX_OPEN_TURN_GRACE_MS);
     const reason = codexSignalReason(latest);
     return { active, lastActivityAt, reason: active ? reason : `stale ${reason}`, label };
   }
@@ -590,7 +619,7 @@ export function assessCodexTurn(
   if (latest && latest.at > endedAt && (latest.role === "stream" || latest.role === "tool")) {
     const grace = latest.role === "tool" ? TOOL_TURN_GRACE_MS : TURN_ACTIVE_GRACE_MS;
     const reason = codexSignalReason(latest);
-    return { active: age <= grace, lastActivityAt, reason, label };
+    return { active: isRecentTimestamp(lastActivityAt, now, grace), lastActivityAt, reason, label };
   }
 
   return { active: false, lastActivityAt, reason: endedAt >= 0 ? "turn complete" : "idle", label };
@@ -665,15 +694,14 @@ export function assessGrokTurn(events: unknown[], mtimeMs: number, now: number):
   }
 
   if (lastActivityAt < 0) {
-    const age = now - mtimeMs;
+    const active = isRecentTimestamp(mtimeMs, now, GROK_TAIL_QUIET_MS);
     return {
-      active: age <= GROK_TAIL_QUIET_MS,
+      active,
       lastActivityAt: mtimeMs,
-      reason: age <= GROK_TAIL_QUIET_MS ? "recent session write" : "no turn events",
+      reason: active ? "recent session write" : "no turn events",
     };
   }
 
-  const age = now - lastActivityAt;
   const reason = latest?.kind ?? "turn in progress";
 
   if (latest?.role === "await-user") {
@@ -681,7 +709,7 @@ export function assessGrokTurn(events: unknown[], mtimeMs: number, now: number):
   }
 
   if (startedAt > endedAt) {
-    const active = age <= GROK_OPEN_TURN_GRACE_MS;
+    const active = isRecentTimestamp(lastActivityAt, now, GROK_OPEN_TURN_GRACE_MS);
     return { active, lastActivityAt, reason: active ? reason : `stale ${reason}` };
   }
 
@@ -696,18 +724,18 @@ export function assessGrokTurn(events: unknown[], mtimeMs: number, now: number):
     (latest.role === "stream" || latest.role === "tool")
   ) {
     const grace = latest.role === "tool" ? TOOL_TURN_GRACE_MS : TURN_ACTIVE_GRACE_MS;
-    return { active: age <= grace, lastActivityAt, reason };
+    return { active: isRecentTimestamp(lastActivityAt, now, grace), lastActivityAt, reason };
   }
 
   return { active: false, lastActivityAt, reason: endedAt >= 0 ? "turn complete" : "idle" };
 }
 
 export function assessGenericMtime(mtimeMs: number, now: number): TurnAssessment {
-  const age = now - mtimeMs;
+  const active = isRecentTimestamp(mtimeMs, now, GENERIC_MTIME_WINDOW_MS);
   return {
-    active: age <= GENERIC_MTIME_WINDOW_MS,
+    active,
     lastActivityAt: mtimeMs,
-    reason: age <= GENERIC_MTIME_WINDOW_MS ? "recent session write" : "stale session write",
+    reason: active ? "recent session write" : "stale session write",
   };
 }
 
@@ -792,7 +820,12 @@ export function assessCursorComposerRecord(
     else if (typeof record.unifiedMode === "string" && record.unifiedMode === "agent") {
       reason = "agent generating";
     }
-    return { active: true, lastActivityAt, reason, label };
+    return {
+      active: isRecentTimestamp(lastActivityAt, now, SESSION_CANDIDATE_WINDOW_MS),
+      lastActivityAt,
+      reason,
+      label,
+    };
   }
 
   const headers = Array.isArray(record.fullConversationHeadersOnly)
@@ -859,7 +892,7 @@ export function assessCursorComposerRecord(
 
   if (runningTool) {
     return {
-      active: true,
+      active: isRecentTimestamp(lastActivityAt, now, TOOL_TURN_GRACE_MS),
       lastActivityAt,
       reason: "tool_call in progress",
       label,
@@ -867,9 +900,8 @@ export function assessCursorComposerRecord(
   }
 
   if (openUserTurnAt != null && !sawCompletedTurnAfterUser) {
-    const age = now - lastActivityAt;
     const grace = openTurnTouchesTools ? TOOL_TURN_GRACE_MS : TURN_ACTIVE_GRACE_MS;
-    if (age <= grace) {
+    if (isRecentTimestamp(lastActivityAt, now, grace)) {
       return {
         active: true,
         lastActivityAt,

@@ -1,0 +1,11 @@
+{
+  "composerKey": "cursor-future-composer",
+  "record": {
+    "status": "generating",
+    "workspaceIdentifier": {
+      "uri": { "fsPath": "/tmp/seer-fixtures/agent-detection/cursor-future-project" }
+    },
+    "lastUpdatedAt": 1e300,
+    "generatingBubbleIds": ["bubble-future"]
+  }
+}

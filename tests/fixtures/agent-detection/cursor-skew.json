@@ -1,0 +1,11 @@
+{
+  "composerKey": "cursor-skew-composer",
+  "record": {
+    "status": "generating",
+    "workspaceIdentifier": {
+      "uri": { "fsPath": "/tmp/seer-fixtures/agent-detection/cursor-skew-project" }
+    },
+    "lastUpdatedAt": "2026-08-10T12:10:05.000Z",
+    "generatingBubbleIds": ["bubble-skew"]
+  }
+}

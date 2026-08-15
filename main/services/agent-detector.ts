@@ -16,6 +16,7 @@ import {
   buildFriendlyDetail,
   codexProjectLabelFromPath,
   friendlySessionLabel,
+  isRecentTimestamp,
   matchAgentKind,
   PROCESS_ONLY_CPU_THRESHOLD,
   SESSION_CANDIDATE_WINDOW_MS,
@@ -148,8 +149,7 @@ async function walkRecentSessions(
 
       try {
         const stat = await fs.stat(fullPath);
-        const age = now - stat.mtimeMs;
-        if (age <= SESSION_CANDIDATE_WINDOW_MS) {
+        if (isRecentTimestamp(stat.mtimeMs, now, SESSION_CANDIDATE_WINDOW_MS)) {
           hits.push({
             filePath: fullPath,
             mtimeMs: stat.mtimeMs,

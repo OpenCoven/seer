@@ -122,6 +122,210 @@
       }
     },
     {
+      "id": "claude-bounded-future-skew",
+      "family": "claude-code",
+      "kind": "session",
+      "format": "claude",
+      "fixtureFile": "claude-skew.jsonl",
+      "identity": "/tmp/seer-fixtures/agent-detection/claude-skew-project/session.jsonl",
+      "mtimeMs": "2026-08-10T12:10:00.000Z",
+      "expected": {
+        "active": true,
+        "source": "session",
+        "detail": "Claude Skew Project · Running tools",
+        "id": "claude-code:/tmp/seer-fixtures/agent-detection/claude-skew-project/session.jsonl"
+      }
+    },
+    {
+      "id": "claude-extreme-future",
+      "family": "claude-code",
+      "kind": "session",
+      "format": "claude",
+      "fixtureFile": "claude-future.jsonl",
+      "identity": "/tmp/seer-fixtures/agent-detection/claude-future-project/session.jsonl",
+      "mtimeMs": "2026-08-10T12:10:00.000Z",
+      "expected": {
+        "active": false,
+        "source": "session",
+        "detail": "Claude Future Project · Running tools",
+        "id": "claude-code:/tmp/seer-fixtures/agent-detection/claude-future-project/session.jsonl"
+      }
+    },
+    {
+      "id": "codex-bounded-future-skew",
+      "family": "codex",
+      "kind": "session",
+      "format": "codex",
+      "fixtureFile": "codex-skew.jsonl",
+      "identity": "/tmp/seer-fixtures/agent-detection/codex-skew.jsonl",
+      "mtimeMs": "2026-08-10T12:10:00.000Z",
+      "expected": {
+        "active": true,
+        "source": "session",
+        "detail": "Codex Skew Project · Started",
+        "id": "codex:/tmp/seer-fixtures/agent-detection/codex-skew.jsonl"
+      }
+    },
+    {
+      "id": "codex-extreme-future",
+      "family": "codex",
+      "kind": "session",
+      "format": "codex",
+      "fixtureFile": "codex-future.jsonl",
+      "identity": "/tmp/seer-fixtures/agent-detection/codex-future.jsonl",
+      "mtimeMs": "2026-08-10T12:10:00.000Z",
+      "expected": {
+        "active": false,
+        "source": "session",
+        "detail": "Codex Future Project · Started",
+        "id": "codex:/tmp/seer-fixtures/agent-detection/codex-future.jsonl"
+      }
+    },
+    {
+      "id": "codex-fallback-bounded-future-skew",
+      "family": "codex",
+      "kind": "session",
+      "format": "codex",
+      "fixtureFile": "fallback-meta.jsonl",
+      "identity": "/tmp/seer-fixtures/agent-detection/codex-fallback-skew.jsonl",
+      "mtimeMs": "2026-08-10T12:10:05.000Z",
+      "expected": {
+        "active": true,
+        "source": "session",
+        "detail": "Agent Detection · Active",
+        "id": "codex:/tmp/seer-fixtures/agent-detection/codex-fallback-skew.jsonl"
+      }
+    },
+    {
+      "id": "codex-fallback-extreme-future",
+      "family": "codex",
+      "kind": "session",
+      "format": "codex",
+      "fixtureFile": "fallback-meta.jsonl",
+      "identity": "/tmp/seer-fixtures/agent-detection/codex-fallback-future.jsonl",
+      "mtimeMs": "9999-12-31T23:59:59.999Z",
+      "expected": {
+        "active": false,
+        "source": "session",
+        "detail": "Agent Detection · Working",
+        "id": "codex:/tmp/seer-fixtures/agent-detection/codex-fallback-future.jsonl"
+      }
+    },
+    {
+      "id": "grok-bounded-future-skew",
+      "family": "grok",
+      "kind": "session",
+      "format": "grok",
+      "fixtureFile": "grok-skew.jsonl",
+      "identity": "/tmp/seer-fixtures/agent-detection/grok/sessions/%2Ftmp%2Fseer-fixtures%2Fgrok-skew-project/session-skew/events.jsonl",
+      "mtimeMs": "2026-08-10T12:10:00.000Z",
+      "expected": {
+        "active": true,
+        "source": "session",
+        "detail": "Grok Skew Project · Started",
+        "id": "grok:/tmp/seer-fixtures/agent-detection/grok/sessions/%2Ftmp%2Fseer-fixtures%2Fgrok-skew-project/session-skew/events.jsonl"
+      }
+    },
+    {
+      "id": "grok-extreme-future",
+      "family": "grok",
+      "kind": "session",
+      "format": "grok",
+      "fixtureFile": "grok-future.jsonl",
+      "identity": "/tmp/seer-fixtures/agent-detection/grok/sessions/%2Ftmp%2Fseer-fixtures%2Fgrok-future-project/session-future/events.jsonl",
+      "mtimeMs": "2026-08-10T12:10:00.000Z",
+      "expected": {
+        "active": false,
+        "source": "session",
+        "detail": "Grok Future Project · Started",
+        "id": "grok:/tmp/seer-fixtures/agent-detection/grok/sessions/%2Ftmp%2Fseer-fixtures%2Fgrok-future-project/session-future/events.jsonl"
+      }
+    },
+    {
+      "id": "grok-fallback-bounded-future-skew",
+      "family": "grok",
+      "kind": "session",
+      "format": "grok",
+      "fixtureFile": "fallback-meta.jsonl",
+      "identity": "/tmp/seer-fixtures/agent-detection/grok/sessions/%2Ftmp%2Fseer-fixtures%2Fgrok-fallback-skew/session-skew/events.jsonl",
+      "mtimeMs": "2026-08-10T12:10:05.000Z",
+      "expected": {
+        "active": true,
+        "source": "session",
+        "detail": "Grok Fallback Skew · Active",
+        "id": "grok:/tmp/seer-fixtures/agent-detection/grok/sessions/%2Ftmp%2Fseer-fixtures%2Fgrok-fallback-skew/session-skew/events.jsonl"
+      }
+    },
+    {
+      "id": "grok-fallback-extreme-future",
+      "family": "grok",
+      "kind": "session",
+      "format": "grok",
+      "fixtureFile": "fallback-meta.jsonl",
+      "identity": "/tmp/seer-fixtures/agent-detection/grok/sessions/%2Ftmp%2Fseer-fixtures%2Fgrok-fallback-future/session-future/events.jsonl",
+      "mtimeMs": "9999-12-31T23:59:59.999Z",
+      "expected": {
+        "active": false,
+        "source": "session",
+        "detail": "Grok Fallback Future · Working",
+        "id": "grok:/tmp/seer-fixtures/agent-detection/grok/sessions/%2Ftmp%2Fseer-fixtures%2Fgrok-fallback-future/session-future/events.jsonl"
+      }
+    },
+    {
+      "id": "generic-mtime-bounded-future-skew",
+      "family": "gemini",
+      "kind": "session",
+      "format": "generic-mtime",
+      "fixtureFile": "generic-future-skew.json",
+      "selector": "skew",
+      "expected": {
+        "active": true,
+        "source": "session",
+        "detail": "Generic Skew Project · Active",
+        "id": "gemini:/tmp/seer-fixtures/agent-detection/generic-skew-project/session.json"
+      }
+    },
+    {
+      "id": "generic-mtime-extreme-future",
+      "family": "gemini",
+      "kind": "session",
+      "format": "generic-mtime",
+      "fixtureFile": "generic-future-skew.json",
+      "selector": "future",
+      "expected": {
+        "active": false,
+        "source": "session",
+        "detail": "Generic Future Project · Wrapping up",
+        "id": "gemini:/tmp/seer-fixtures/agent-detection/generic-future-project/session.json"
+      }
+    },
+    {
+      "id": "cursor-bounded-future-skew",
+      "family": "cursor",
+      "kind": "session",
+      "format": "cursor",
+      "fixtureFile": "cursor-skew.json",
+      "expected": {
+        "active": true,
+        "source": "session",
+        "detail": "Cursor Skew Project · Writing",
+        "id": "cursor:cursor-skew-composer"
+      }
+    },
+    {
+      "id": "cursor-extreme-future",
+      "family": "cursor",
+      "kind": "session",
+      "format": "cursor",
+      "fixtureFile": "cursor-future.json",
+      "expected": {
+        "active": false,
+        "source": "session",
+        "detail": "Cursor Future Project · Writing",
+        "id": "cursor:cursor-future-composer"
+      }
+    },
+    {
       "id": "gemini-recent",
       "family": "gemini",
       "kind": "session",
