@@ -246,17 +246,80 @@ final class HistoryStoreTests: XCTestCase {
         let fileSystem = InMemorySettingsFileSystem()
         let store = makeStore(fileSystem: fileSystem)
 
-        await store.record(activeState(agents: [("codex", "Codex"), ("claude", "Claude")], at: 1_000))
+        await store.record(activeState(agents: [("codex", "Codex"), ("claude-code", "Claude Code")], at: 1_000))
         clock.now = 4_000
-        await store.record(activeState(agents: [("codex", "Codex"), ("claude", "Claude")], at: 4_000)) // +3000 each
+        await store.record(activeState(agents: [("codex", "Codex"), ("claude-code", "Claude Code")], at: 4_000)) // +3000 each
         clock.now = 6_000
         await store.record(activeState(agents: [("codex", "Codex")], at: 6_000)) // +2000 codex only
 
         let stats = await store.stats()
-        XCTAssertEqual(stats.perAgent.map(\.id), ["codex", "claude"])
+        XCTAssertEqual(stats.perAgent.map(\.id), ["codex", "claude-code"])
         XCTAssertEqual(stats.perAgent.first?.durationMs, 5_000)
         XCTAssertEqual(stats.perAgent.last?.durationMs, 3_000)
-        XCTAssertEqual(stats.currentSession?.agents.map(\.id).sorted(), ["claude", "codex"])
+        XCTAssertEqual(stats.currentSession?.agents.map(\.id).sorted(), ["claude-code", "codex"])
+    }
+
+    func testAggregateTotalsUseStableFamiliesWhileCurrentSessionRetainsAgentIdentity() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let store = makeStore(fileSystem: fileSystem)
+        let agents = [
+            ("codex:transcript-a", "Codex"),
+            ("codex:transcript-b", "Codex"),
+            ("untrusted:session-a", "Unknown"),
+            ("another-unknown-session", "Unknown"),
+        ]
+
+        await store.record(activeState(agents: agents, at: 1_000))
+        clock.now = 3_000
+        await store.record(activeState(agents: agents, at: 3_000))
+
+        let stats = await store.stats()
+        let document = await store.persistedDocument()
+        XCTAssertEqual(Set(document.agentTotals.keys), Set(["codex", "other"]))
+        XCTAssertEqual(document.agentTotals["codex"]?.durationMs, 4_000)
+        XCTAssertEqual(document.agentTotals["other"]?.durationMs, 4_000)
+        XCTAssertEqual(
+            Set(stats.currentSession?.agents.map(\.id) ?? []),
+            Set(agents.map(\.0)),
+            "current/recent session details may retain per-session identity"
+        )
+    }
+
+    func testLoadMigratesThousandsOfAgentIDsIntoCompactAccurateFamilyTotals() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        var agentTotals: [String: Any] = [:]
+        for index in 0..<4_000 {
+            agentTotals["codex:transcript-\(index)"] = ["name": "Codex \(index)", "durationMs": 2]
+            agentTotals["malicious-family-\(index):transcript"] = ["name": "Unknown \(index)", "durationMs": 3]
+        }
+        let seeded = try JSONSerialization.data(withJSONObject: [
+            "version": HistoryDocument.currentVersion,
+            "totalAwakeMs": 20_000,
+            "sessionCount": 0,
+            "agentTotals": agentTotals,
+            "daily": [:],
+            "sessions": [],
+        ])
+        await fileSystem.seedFile(at: historyURL, contents: seeded)
+        let store = makeStore(fileSystem: fileSystem)
+
+        _ = await store.load()
+
+        var document = await store.persistedDocument()
+        XCTAssertEqual(Set(document.agentTotals.keys), Set(["codex", "other"]))
+        XCTAssertEqual(document.agentTotals["codex"]?.durationMs, 8_000)
+        XCTAssertEqual(document.agentTotals["other"]?.durationMs, 12_000)
+
+        _ = try await store.flush(at: clock.now)
+        let persistedBytes = await fileSystem.contents(at: historyURL)
+        let compactBytes = try XCTUnwrap(persistedBytes)
+        XCTAssertLessThan(compactBytes.count, 2_000)
+
+        let reloaded = makeStore(fileSystem: fileSystem)
+        _ = await reloaded.load()
+        document = await reloaded.persistedDocument()
+        XCTAssertEqual(document.agentTotals["codex"]?.durationMs, 8_000)
+        XCTAssertEqual(document.agentTotals["other"]?.durationMs, 12_000)
     }
 
     // MARK: 5. Keep-awake mode follows state changes
@@ -523,7 +586,7 @@ final class HistoryStoreTests: XCTestCase {
           "totalAwakeMs": -50,
           "sessionCount": -3,
           "agentTotals": {
-            "good": {"name": "Codex", "durationMs": 10},
+            "codex": {"name": "Codex", "durationMs": 10},
             "negative": {"name": "Bad", "durationMs": -5},
             "malformed": {"name": 123}
           },
@@ -544,7 +607,7 @@ final class HistoryStoreTests: XCTestCase {
         XCTAssertEqual(decoded.version, HistoryDocument.currentVersion)
         XCTAssertEqual(decoded.totalAwakeMs, 0, "negative totalAwakeMs must clamp to 0, never propagate as-is")
         XCTAssertEqual(decoded.sessionCount, 0, "negative sessionCount must clamp to 0")
-        XCTAssertEqual(decoded.agentTotals, ["good": HistoryAgentTotal(name: "Codex", durationMs: 10)])
+        XCTAssertEqual(decoded.agentTotals, ["codex": HistoryAgentTotal(name: "Codex", durationMs: 10)])
         XCTAssertEqual(decoded.daily, ["2024-01-01": 100])
         XCTAssertEqual(decoded.sessions.map(\.id), ["s1"])
     }

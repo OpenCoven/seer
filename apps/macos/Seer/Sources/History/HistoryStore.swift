@@ -21,6 +21,7 @@ public struct HistoryAgentTotal: Codable, Equatable, Sendable {
 /// recent session list never loses historical totals.
 public struct HistoryDocument: VersionedDocument {
     public static let currentVersion = 1
+    public static let unknownAgentFamilyID = "other"
 
     public static let defaultValue = HistoryDocument(
         version: HistoryDocument.currentVersion,
@@ -184,7 +185,35 @@ public struct HistoryDocument: VersionedDocument {
         _ container: KeyedDecodingContainer<CodingKeys>
     ) -> [String: HistoryAgentTotal] {
         let raw = lenientDecodeIfPresent(container, .agentTotals, as: [String: FailableAgentTotal].self) ?? [:]
-        return raw.compactMapValues { $0.total }
+        var normalized: [String: HistoryAgentTotal] = [:]
+        for sourceID in raw.keys.sorted() {
+            guard let sourceTotal = raw[sourceID]?.total else { continue }
+            let familyID = aggregateAgentID(sourceID)
+            var familyTotal = normalized[familyID] ?? HistoryAgentTotal(
+                name: aggregateAgentName(familyID: familyID, fallback: sourceTotal.name),
+                durationMs: 0
+            )
+            familyTotal.durationMs = addingClamped(familyTotal.durationMs, sourceTotal.durationMs)
+            normalized[familyID] = familyTotal
+        }
+        return normalized
+    }
+
+    static func aggregateAgentID(_ sourceID: String) -> String {
+        let prefix = String(sourceID.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false).first ?? "")
+        return AgentFamily(rawValue: prefix) == nil ? unknownAgentFamilyID : prefix
+    }
+
+    static func aggregateAgentName(familyID: String, fallback: String) -> String {
+        if familyID == unknownAgentFamilyID {
+            return "Other"
+        }
+        return AGENT_KINDS.first(where: { $0.id.rawValue == familyID })?.name ?? fallback
+    }
+
+    private static func addingClamped(_ left: Int64, _ right: Int64) -> Int64 {
+        let (sum, overflow) = left.addingReportingOverflow(right)
+        return overflow ? Int64.max : sum
     }
 
     private static func decodeDaily(_ container: KeyedDecodingContainer<CodingKeys>) -> [String: Int64] {
@@ -473,10 +502,13 @@ public actor HistoryStore {
 
         for agent in state.agents {
             addAgentTime(to: &session.agents, id: agent.id, name: agent.name, delta: delta)
-            var total = data.agentTotals[agent.id] ?? HistoryAgentTotal(name: agent.name, durationMs: 0)
+            let familyID = HistoryDocument.aggregateAgentID(agent.id)
+            var total = data.agentTotals[familyID] ?? HistoryAgentTotal(
+                name: HistoryDocument.aggregateAgentName(familyID: familyID, fallback: agent.name),
+                durationMs: 0
+            )
             total.durationMs += delta
-            total.name = agent.name
-            data.agentTotals[agent.id] = total
+            data.agentTotals[familyID] = total
         }
 
         current = session
