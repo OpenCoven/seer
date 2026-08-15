@@ -1,0 +1,126 @@
+name: Standalone macOS CI
+
+# This checks the standalone Seer.app surface (renderer + Swift app), not the
+# Glaze/Electron variant: this runner deliberately has no private Glaze SDK,
+# so every step below uses the ":standalone"/"-macos" package scripts, never
+# `npm run build|lint|type-check|test|dev` (those wrap `glaze.ts`, which
+# requires the private SDK — see glaze.ts) and never `tests/*.test.mjs` as a
+# glob (that would also pull in tests/glaze-runtime-resolution.test.mjs,
+# which exercises that same Glaze/Electron wrapper, and
+# tests/standalone-boundary.test.mjs, whose own "npm run build:macos
+# produces..." test would redundantly rebuild the whole app a second time —
+# this workflow already does that build and boundary check as explicit
+# steps below).
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  standalone:
+    name: standalone
+    runs-on: macos-14-xlarge
+    steps:
+      - name: Assert Apple Silicon runner
+        run: |
+          set -euo pipefail
+          host_arch="$(uname -m)"
+          if [ "${host_arch}" != "arm64" ]; then
+            echo "error: expected an Apple Silicon (arm64) runner, got '${host_arch}'" >&2
+            exit 1
+          fi
+          echo "runner arch: ${host_arch}"
+
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Select Xcode 16.2
+        uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
+        with:
+          xcode-version: "16.2"
+
+      - name: xcodebuild -version
+        run: xcodebuild -version
+
+      - name: Install xcodegen
+        run: |
+          set -euo pipefail
+          brew install xcodegen
+          xcodegen --version
+
+      - name: Setup Node 24
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: npm ci
+        run: npm ci
+
+      - name: Prepare diagnostics directory
+        run: mkdir -p ci-logs
+
+      # Explicit file list, not `tests/*.test.mjs`: this repo's `tests/`
+      # directory also holds tests/glaze-runtime-resolution.test.mjs (the
+      # Glaze/Electron SDK-resolution wrapper — out of scope for this
+      # standalone-only runner) and tests/standalone-boundary.test.mjs
+      # (whose own final test shells out to `npm run build:macos` itself,
+      # which would redundantly rebuild the whole app a second time — this
+      # workflow already runs that build and the boundary check as their
+      # own steps below). When Task 16 adds a release-manifest test file,
+      # append it to this explicit list rather than switching to a glob.
+      - name: Run standalone-safe unit tests (identity, standalone-renderer, publication safety, agent-detection, update)
+        run: |
+          node --test \
+            tests/identity.test.mjs \
+            tests/renderer-build-identity.test.mjs \
+            tests/standalone-renderer.test.mjs \
+            tests/standalone-renderer-lock.test.mjs \
+            tests/safe-app-publication.test.mjs \
+            tests/agent-detection-parity.test.mjs \
+            tests/tray-update-error-handling.test.mjs 2>&1 | tee ci-logs/unit-tests.log
+
+      - name: Run shared renderer unit tests
+        run: npm run test:renderer 2>&1 | tee ci-logs/test-renderer.log
+
+      - name: Type-check standalone surface
+        run: npm run type-check:standalone 2>&1 | tee ci-logs/type-check-standalone.log
+
+      - name: Lint standalone surface
+        run: npm run lint:standalone 2>&1 | tee ci-logs/lint-standalone.log
+
+      - name: Build standalone renderer
+        run: npm run build:standalone-renderer 2>&1 | tee ci-logs/build-standalone-renderer.log
+
+      # These three package scripts (not raw `xcodegen`/`xcodebuild`) each
+      # acquire the renderer build lock themselves via
+      # scripts/build-standalone-renderer.mjs before shelling out, so
+      # running them one after another in this single job never races a
+      # concurrent renderer generation (see
+      # tests/standalone-renderer-lock.test.mjs).
+      - name: Generate Xcode project
+        run: npm run generate:macos 2>&1 | tee ci-logs/generate-macos.log
+
+      - name: Run Swift tests
+        run: npm run test:macos 2>&1 | tee ci-logs/test-macos.log
+
+      - name: Build unsigned Seer.app
+        run: npm run build:macos 2>&1 | tee ci-logs/build-macos.log
+
+      - name: Repository and built-app boundary checks
+        run: npm run check:standalone-boundary 2>&1 | tee ci-logs/check-standalone-boundary.log
+
+      # Only the plain-text stdout/stderr logs captured above — never the
+      # built Seer.app, DerivedData, or an .xcresult bundle (which can embed
+      # source snippets) — so a failed run's diagnostics can never leak the
+      # app binary or source.
+      - name: Upload test diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: standalone-ci-logs
+          path: ci-logs/*.log
+          if-no-files-found: warn
+          retention-days: 7
