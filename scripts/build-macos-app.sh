@@ -1,8 +1,8 @@
 #!/bin/bash
 #
 # Builds an unsigned, arm64 Release Seer.app for local development/testing —
-# never signs, notarizes, packages, or publishes (see later plan tasks for
-# that). Every step is a fixed, hardcoded sequence:
+# never signs, notarizes, packages, or distributes it. Every step is a fixed,
+# hardcoded sequence:
 #
 #   1. Build the standalone renderer (npm run build:standalone-renderer).
 #   2. Generate the Xcode project from apps/macos/Seer/project.yml via
@@ -10,9 +10,8 @@
 #      never committed).
 #   3. Build the Seer scheme, Release configuration by default, with
 #      CODE_SIGNING_ALLOWED=NO (this script never signs anything).
-#   4. Copy the built Seer.app to build/macos/unsigned/Seer.app, a fixed
-#      destination cleaned before every copy so it never accumulates
-#      leftovers from a previous build.
+#   4. Stage the built Seer.app under build/macos/unsigned and publish it
+#      atomically with descriptor-relative, no-follow filesystem operations.
 #
 # Only CONFIGURATION and DERIVED_DATA_PATH may be overridden via the
 # environment, and each is validated/quoted as a single opaque argv token —
@@ -23,9 +22,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
-
-# shellcheck source=lib/safe-build-destination.sh
-source "${SCRIPT_DIR}/lib/safe-build-destination.sh"
 
 HOST_ARCH="$(uname -m)"
 if [ "${HOST_ARCH}" != "arm64" ]; then
@@ -53,13 +49,7 @@ esac
 PROJECT_SPEC="${REPO_ROOT}/apps/macos/Seer/project.yml"
 XCODEPROJ="${REPO_ROOT}/apps/macos/Seer/Seer.xcodeproj"
 
-# Resolves REPO_ROOT/build, REPO_ROOT/build/macos, and
-# REPO_ROOT/build/macos/unsigned one component at a time — never `mkdir
-# -p` — rejecting outright if any existing component along the way is a
-# symlink (which could otherwise silently redirect the cleanup/copy below
-# to an arbitrary directory outside this checkout). See
-# scripts/lib/safe-build-destination.sh for the full threat model.
-UNSIGNED_DIR="$(seer_prepare_unsigned_dir "${REPO_ROOT}")"
+UNSIGNED_DIR="${REPO_ROOT}/build/macos/unsigned"
 DEST_APP="${UNSIGNED_DIR}/Seer.app"
 
 cd "${REPO_ROOT}"
@@ -97,30 +87,16 @@ xcodebuild \
   CLANG_COVERAGE_MAPPING=NO \
   build
 
-BUILT_APP="${DERIVED_DATA_PATH}/Build/Products/${CONFIGURATION}/Seer.app"
+EFFECTIVE_DERIVED_DATA_PATH="$(cd "${DERIVED_DATA_PATH}" && pwd -P)"
+BUILT_APP="${EFFECTIVE_DERIVED_DATA_PATH}/Build/Products/${CONFIGURATION}/Seer.app"
 if [ ! -d "${BUILT_APP}" ]; then
   echo "error: expected xcodebuild output at ${BUILT_APP}, but it does not exist" >&2
   exit 1
 fi
 
-echo "==> Copying ${BUILT_APP} -> ${DEST_APP}"
-# UNSIGNED_DIR was already created (or verified to already exist as a real,
-# non-symlink directory) above, one component at a time, with its whole
-# ancestor chain re-verified against symlinks — so no further mkdir/mkdir -p
-# is needed or performed here.
-#
-# Remove exactly the destination app bundle — a fixed, known path, never a
-# caller-influenced fragment — so the copy below can never mix in files
-# left over from an earlier build (a stale resource, a previous binary,
-# etc.). Never removes UNSIGNED_DIR itself or any sibling it might contain.
-# Guarded by seer_assert_dest_app_not_symlink so a symlinked DEST_APP leaf
-# is rejected outright rather than rm -rf/cp -R ever touching it.
-seer_assert_dest_app_not_symlink "${DEST_APP}"
-rm -rf "${DEST_APP}"
-cp -R "${BUILT_APP}" "${DEST_APP}"
-
-if [ ! -x "${DEST_APP}/Contents/MacOS/Seer" ]; then
-  echo "error: expected executable at ${DEST_APP}/Contents/MacOS/Seer after copy" >&2
+BUILT_EXECUTABLE="${BUILT_APP}/Contents/MacOS/Seer"
+if [ ! -x "${BUILT_EXECUTABLE}" ]; then
+  echo "error: expected executable at ${BUILT_EXECUTABLE}" >&2
   exit 1
 fi
 
@@ -136,6 +112,25 @@ fi
 # dependency graph. `strip` re-signs the binary ad-hoc afterward on its
 # own (required on Apple Silicon for any tool that modifies a Mach-O
 # binary's bytes) — this script still never signs anything itself.
-strip -S "${DEST_APP}/Contents/MacOS/Seer"
+strip -S "${BUILT_EXECUTABLE}"
+
+ARCHITECTURES="$(/usr/bin/lipo -archs "${BUILT_EXECUTABLE}")"
+if [ "${ARCHITECTURES}" != "arm64" ]; then
+  echo "error: expected exactly one arm64 slice in ${BUILT_EXECUTABLE}; lipo -archs returned '${ARCHITECTURES}'" >&2
+  exit 1
+fi
+
+echo "==> Publishing ${BUILT_APP} -> ${DEST_APP}"
+# The helper creates a private random staging directory under unsigned/,
+# copies without following bundle symlinks, then reopens and identity-checks
+# the canonical repo/build/macos/unsigned chain immediately before using
+# renameat-style descriptor-relative operations. An existing Seer.app is
+# first moved to a private same-parent backup and removed without recursive
+# path traversal only after the staged app and private provenance metadata
+# have been published successfully.
+/usr/bin/python3 "${SCRIPT_DIR}/publish-macos-app.py" \
+  --repo-root "${REPO_ROOT}" \
+  --source-app "${BUILT_APP}" \
+  --derived-data-path "${EFFECTIVE_DERIVED_DATA_PATH}"
 
 echo "==> Built unsigned app: ${DEST_APP}"

@@ -231,26 +231,13 @@ test("the real npm run build:standalone-renderer build writes a build-manifest.j
   const outputDir = join(repoRoot, "build", "standalone-renderer", "Renderer");
   const manifestPath = join(outputDir, "build-manifest.json");
 
-  // The real build script (apps/macos/Seer/Scripts/build-standalone-renderer.sh)
-  // is what Xcode actually runs; it wraps this exact same shared module.
-  // Invoke that module the same way the build script does, twice in a row,
-  // to prove the resulting manifest is byte-for-byte stable across builds
-  // over the same (unchanged) source tree — never dependent on wall-clock
-  // time or git state.
+  // The package wrapper holds the renderer-build lock across both Vite's
+  // emptyOutDir build and manifest generation. Run it twice to prove the
+  // resulting manifest is stable over an unchanged source tree.
   execFileSync("npm", ["run", "build:standalone-renderer"], { cwd: repoRoot, encoding: "utf8", stdio: "pipe" });
-  execFileSync(
-    "node",
-    [join(repoRoot, "scripts", "renderer-build-identity.mjs"), repoRoot, manifestPath],
-    { cwd: repoRoot, encoding: "utf8", stdio: "pipe" },
-  );
   const firstManifestText = readFileSync(manifestPath, "utf8");
 
   execFileSync("npm", ["run", "build:standalone-renderer"], { cwd: repoRoot, encoding: "utf8", stdio: "pipe" });
-  execFileSync(
-    "node",
-    [join(repoRoot, "scripts", "renderer-build-identity.mjs"), repoRoot, manifestPath],
-    { cwd: repoRoot, encoding: "utf8", stdio: "pipe" },
-  );
   const secondManifestText = readFileSync(manifestPath, "utf8");
 
   assert.equal(

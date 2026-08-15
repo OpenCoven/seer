@@ -12,6 +12,7 @@ tmp/
 
 # Local visual brainstorming artifacts
 .superpowers/
+/.seer-standalone-renderer.lock/
 
 # Build caches and logs
 /build/

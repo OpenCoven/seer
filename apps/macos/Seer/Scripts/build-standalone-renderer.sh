@@ -8,9 +8,10 @@
 # `RendererIntegrationTests.swift`'s `BundledRenderer`, which now only ever
 # reads what this script already produced).
 #
-# Only ever invokes the already-installed local `npm`/Vite toolchain
-# (`npm run build:standalone-renderer`, itself `vite build --config
-# vite.standalone.config.ts` — see `package.json`) — never a network fetch.
+# Only ever invokes the already-installed local `npm`/Vite toolchain.
+# `npm run build:standalone-renderer` owns the cross-process build lock and
+# invokes Vite plus the renderer identity writer directly — never recursively
+# invokes npm and never performs a network fetch.
 # `basedOnDependencyAnalysis: false` on this script's `project.yml` entry
 # means Xcode always re-runs it, so it is deliberately not gated on any
 # input/output file list here.
@@ -58,22 +59,6 @@ if [ ! -f "${DOCUMENT_PATH}" ]; then
   exit 1
 fi
 
-# A deterministic source/build identity marker, copied into the bundle as
-# an ordinary resource (it lives inside the `Renderer` folder `project.yml`
-# already declares as a resources build phase input): a stable content
-# digest over every file this build actually reads (the whole `renderer/`
-# source tree plus the fixed top-level config/lockfile inputs — see
-# `scripts/renderer-build-identity.mjs`, the single shared implementation
-# this script and `RendererIntegrationTests.swift`'s independent Swift
-# recomputation both rely on). Deliberately never a timestamp or `git`
-# commit SHA: a timestamp only proves *when* a build ran, not *what* it was
-# built from, and a commit SHA can't tell a clean checkout apart from one
-# with uncommitted local edits (and is simply unavailable outside a git
-# checkout at all). Read back by
-# `RendererIntegrationTests.BundledRenderer.ensureAvailable()`, which fails
-# closed if the digest it recomputes over the current checkout doesn't
-# exactly match this manifest's `digest` — proving the bundled renderer was
-# actually built from what's on disk right now, not a stale artifact left
-# in `build/` (e.g. from an earlier checkout, or `build/` restored from a
-# cache), regardless of git availability or dirty/uncommitted state.
-node "${REPO_ROOT}/scripts/renderer-build-identity.mjs" "${REPO_ROOT}" "${MANIFEST_PATH}"
+# The lock-owning package wrapper writes build-manifest.json before releasing
+# the lock, so Vite's emptyOutDir and manifest publication are one serialized
+# critical section shared by package tests, this Xcode phase, and app builds.

@@ -16,12 +16,13 @@
 //   2. A built `.app` bundle (`scanBundle` + `checkInfoPlist` +
 //      `checkEntitlements`): walked with `fs` APIs that never follow
 //      symlinks, checked file-by-file for forbidden names/extensions and
-//      forbidden byte content (absolute `/Users/` paths, the current
-//      account's home directory, and the same Glaze references as above),
-//      and structurally verified via `/usr/bin/file` (exactly one Mach-O,
-//      at `Contents/MacOS/Seer`) and `/usr/bin/otool -L` (every dependency
-//      under `/System/Library` or `/usr/lib`, never an embedded `@rpath`
-//      framework). The Mach-O/otool checks are a *structural* allowlist —
+//      forbidden byte content (the recorded canonical repo/DerivedData
+//      paths, absolute `/Users/` paths, the current account's home directory,
+//      and the same Glaze references as above), and structurally verified via
+//      `/usr/bin/file` (exactly one Mach-O, at `Contents/MacOS/Seer`),
+//      `/usr/bin/lipo -archs` (exact output `arm64`), and `/usr/bin/otool -L`
+//      (every dependency under `/System/Library` or `/usr/lib`, never an
+//      embedded `@rpath` framework). These are structural allowlists —
 //      they catch an embedded runtime executable/framework regardless of
 //      what it happens to be named, not only files that still say "Glaze"
 //      or "node" in their name.
@@ -33,9 +34,17 @@
 // established for the renderer build-identity digest).
 import { execFileSync } from "node:child_process";
 import console from "node:console";
-import { lstatSync, readFileSync, readdirSync } from "node:fs";
+import {
+  closeSync,
+  constants as fsConstants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+} from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, relative } from "node:path";
+import { dirname, isAbsolute, join, relative } from "node:path";
 import { normalize as posixNormalize } from "node:path/posix";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -60,6 +69,9 @@ export const REPO_ROOT = dirname(here);
 
 /** The bundle path this script checks unless overridden — never committed, built fresh by `npm run build:macos`. */
 export const DEFAULT_APP_PATH = join(REPO_ROOT, "build", "macos", "unsigned", "Seer.app");
+
+/** Private local build metadata, deliberately adjacent to (not inside) the unsigned output directory. */
+export const DEFAULT_PROVENANCE_PATH = join(REPO_ROOT, "build", "macos", "standalone-build-provenance.json");
 
 /** The one file the built bundle's executable is expected at, relative to the `.app` root. */
 export const EXPECTED_EXECUTABLE_RELATIVE_PATH = "Contents/MacOS/Seer";
@@ -108,7 +120,8 @@ const SOURCE_SCAN_FILES = [
   "standalone-window.html",
   "tsconfig.standalone.json",
   "scripts/build-macos-app.sh",
-  "scripts/lib/safe-build-destination.sh",
+  "scripts/build-standalone-renderer.mjs",
+  "scripts/publish-macos-app.py",
 ];
 
 /**
@@ -328,9 +341,12 @@ export function findBundleSymlinkOffender(appPath, relativePath = "") {
  * a previous `readdirSync`) transparently follows `appPath` if it is
  * itself a symlink.
  */
-export function walkBundle(appPath) {
+export function walkBundle(appPath, { forbiddenAbsolutePaths = [] } = {}) {
   const offenders = [];
   const regularFiles = [];
+  const uniqueBuildPaths = [
+    ...new Set(forbiddenAbsolutePaths.filter((path) => typeof path === "string" && path.length > 1)),
+  ];
 
   function visit(directory) {
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
@@ -362,6 +378,11 @@ export function walkBundle(appPath) {
       if (home && home !== "/" && content.includes(home)) {
         offenders.push(`${relPath}: contains the current account's home directory path`);
       }
+      for (const buildPath of uniqueBuildPaths) {
+        if (content.includes(buildPath)) {
+          offenders.push(`${relPath}: contains absolute build provenance path ${JSON.stringify(buildPath)}`);
+        }
+      }
 
       regularFiles.push(relPath);
     }
@@ -373,16 +394,15 @@ export function walkBundle(appPath) {
 
 /**
  * Runs `/usr/bin/file` on every regular bundle file and returns every one
- * `file` reports as Mach-O, as `{ relPath, output }` pairs (the raw `file`
- * output is kept so callers can also assert the exact architecture/type
- * string without a second subprocess call per file).
+ * `file` reports as Mach-O, as `{ relPath, absolutePath, output }` records.
  */
 export function classifyMachOFiles(appPath, regularFiles) {
   const machOFiles = [];
   for (const relPath of regularFiles) {
-    const output = execFileSync("/usr/bin/file", ["-b", join(appPath, relPath)], { encoding: "utf8" });
+    const absolutePath = join(appPath, relPath);
+    const output = execFileSync("/usr/bin/file", ["-b", absolutePath], { encoding: "utf8" });
     if (/Mach-O/.test(output)) {
-      machOFiles.push({ relPath, output: output.trim() });
+      machOFiles.push({ relPath, absolutePath, output: output.trim() });
     }
   }
   return machOFiles;
@@ -415,8 +435,18 @@ export function checkExactlyOneMachO(machOFiles, expectedExecutableRelPath) {
   return { offenders: [], entry };
 }
 
-/** Asserts a `file`-reported Mach-O classification is a 64-bit arm64 executable. */
-export function checkArchitecture(machOEntry) {
+/** Requires both an arm64 executable classification and exact `lipo -archs` output `arm64`. */
+export function checkArchitecture(machOEntry, { lipoOutput } = {}) {
+  const architectures =
+    lipoOutput ??
+    execFileSync("/usr/bin/lipo", ["-archs", machOEntry.absolutePath], {
+      encoding: "utf8",
+    });
+  if (architectures.trim() !== "arm64") {
+    return [
+      `${machOEntry.relPath}: expected lipo -archs output to be exactly "arm64", got ${JSON.stringify(architectures.trim())}`,
+    ];
+  }
   if (!/Mach-O 64-bit executable arm64\b/.test(machOEntry.output)) {
     return [`${machOEntry.relPath}: expected "Mach-O 64-bit executable arm64", got "${machOEntry.output}"`];
   }
@@ -526,13 +556,19 @@ export function checkOtoolDependencies(executableAbsPath) {
  * (which would otherwise transparently follow it to wherever it points,
  * including outside the repository).
  */
-export function scanBundle(appPath, { expectedExecutableRelPath = EXPECTED_EXECUTABLE_RELATIVE_PATH } = {}) {
+export function scanBundle(
+  appPath,
+  {
+    expectedExecutableRelPath = EXPECTED_EXECUTABLE_RELATIVE_PATH,
+    forbiddenAbsolutePaths = [],
+  } = {},
+) {
   const rootOffender = findBundleSymlinkOffender(appPath);
   if (rootOffender) {
     return [rootOffender];
   }
 
-  const { offenders, regularFiles } = walkBundle(appPath);
+  const { offenders, regularFiles } = walkBundle(appPath, { forbiddenAbsolutePaths });
 
   const machOFiles = classifyMachOFiles(appPath, regularFiles);
   const { offenders: machOOffenders, entry } = checkExactlyOneMachO(machOFiles, expectedExecutableRelPath);
@@ -656,9 +692,47 @@ export function checkEntitlements(appPath, { sourceEntitlementsPath } = {}) {
   return offenders;
 }
 
+/**
+ * Loads the canonical repo and effective DerivedData paths recorded by the
+ * publisher. The file is outside Seer.app and is opened with O_NOFOLLOW;
+ * its lstat/open identities must match so a symlink or leaf swap cannot
+ * redirect the scanner.
+ */
+export function loadBuildProvenance(provenancePath = DEFAULT_PROVENANCE_PATH) {
+  const before = lstatSync(provenancePath);
+  if (before.isSymbolicLink() || !before.isFile()) {
+    throw new Error(`build provenance must be a regular non-symlink file: ${provenancePath}`);
+  }
+
+  const descriptor = openSync(provenancePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  let source;
+  try {
+    const after = fstatSync(descriptor);
+    if (!after.isFile() || before.dev !== after.dev || before.ino !== after.ino) {
+      throw new Error(`build provenance changed identity while being opened: ${provenancePath}`);
+    }
+    source = readFileSync(descriptor, "utf8");
+  } finally {
+    closeSync(descriptor);
+  }
+
+  const provenance = JSON.parse(source);
+  if (provenance.schemaVersion !== 1) {
+    throw new Error(`unsupported build provenance schemaVersion ${JSON.stringify(provenance.schemaVersion)}`);
+  }
+  const paths = [provenance.canonicalRepoRoot, provenance.effectiveDerivedDataPath];
+  for (const path of paths) {
+    if (typeof path !== "string" || !isAbsolute(path) || path === "/") {
+      throw new Error(`invalid absolute path in build provenance: ${JSON.stringify(path)}`);
+    }
+  }
+  return [...new Set(paths)];
+}
+
 function main() {
   const appPath = process.argv[2] ?? process.env.SEER_APP_PATH ?? DEFAULT_APP_PATH;
   const sourceEntitlementsPath = join(REPO_ROOT, "apps", "macos", "Seer", "Config", "Seer.entitlements");
+  const provenancePath = process.env.SEER_BUILD_PROVENANCE_PATH ?? DEFAULT_PROVENANCE_PATH;
 
   const offenders = [...scanSourceBoundary(REPO_ROOT)];
 
@@ -668,7 +742,14 @@ function main() {
     return;
   }
 
-  offenders.push(...scanBundle(appPath));
+  let forbiddenAbsolutePaths = [];
+  try {
+    forbiddenAbsolutePaths = loadBuildProvenance(provenancePath);
+  } catch (error) {
+    offenders.push(`unable to load private build provenance from ${provenancePath}: ${error.message}`);
+  }
+
+  offenders.push(...scanBundle(appPath, { forbiddenAbsolutePaths }));
   offenders.push(...checkInfoPlist(appPath));
   offenders.push(...checkEntitlements(appPath, { sourceEntitlementsPath }));
 

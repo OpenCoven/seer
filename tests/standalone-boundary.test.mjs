@@ -14,6 +14,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
+import * as boundaryChecks from "../scripts/check-standalone-boundary.mjs";
 import {
   BUNDLE_FORBIDDEN_NAME_PATTERNS,
   checkArchitecture,
@@ -58,6 +59,7 @@ test("generated Xcode project and native build output stay gitignored", () => {
     "apps/macos/Seer/DerivedData/some-file",
     "build/macos/unsigned/Seer.app",
     "build/macos/derived-data/some-file",
+    "build/macos/standalone-build-provenance.json",
     "build/standalone-renderer/Renderer/index.html",
     "release.xcarchive",
     "release.dmg",
@@ -305,6 +307,60 @@ test("the bundle walker rejects absolute /Users/ paths, the current home directo
   }
 });
 
+test("the bundle walker rejects every configured build provenance path, including non-home paths", () => {
+  mkdirSync(join(repoRoot, "build"), { recursive: true });
+  const tmpRoot = mkdtempSync(join(repoRoot, "build", "seer-bundle-provenance-"));
+  try {
+    const resources = join(tmpRoot, "Contents", "Resources");
+    mkdirSync(resources, { recursive: true });
+    const repoPath = "/Volumes/Build Farm/checkouts/seer";
+    const derivedDataPath = "/private/var/build/DerivedData/Seer";
+    const toolPath = "/opt/seer-build/toolchain";
+    writeFileSync(join(resources, "repo.txt"), `compiled from ${repoPath}/Sources/App.swift\n`);
+    writeFileSync(join(resources, "derived.bin"), `objects: ${derivedDataPath}/Build/Intermediates.noindex\0`);
+    writeFileSync(join(resources, "tool.txt"), `tool: ${toolPath}/bin/swiftc\n`);
+    writeFileSync(join(resources, "clean.txt"), "/System/Library/Frameworks/AppKit.framework\n");
+
+    const { offenders } = walkBundle(tmpRoot, {
+      forbiddenAbsolutePaths: [repoPath, derivedDataPath, toolPath],
+    });
+    const text = offenders.join("\n");
+    assert.match(text, /repo\.txt.*Volumes\/Build Farm/);
+    assert.match(text, /derived\.bin.*private\/var\/build/);
+    assert.match(text, /tool\.txt.*opt\/seer-build/);
+    assert.doesNotMatch(text, /clean\.txt/);
+  } finally {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test("build provenance is loaded from ignored metadata outside Seer.app", () => {
+  assert.equal(
+    typeof boundaryChecks.loadBuildProvenance,
+    "function",
+    "the boundary scanner must expose its provenance loader",
+  );
+  mkdirSync(join(repoRoot, "build"), { recursive: true });
+  const tmpRoot = mkdtempSync(join(repoRoot, "build", "seer-build-provenance-"));
+  try {
+    const metadataPath = join(tmpRoot, "standalone-build-provenance.json");
+    writeFileSync(
+      metadataPath,
+      `${JSON.stringify({
+        schemaVersion: 1,
+        canonicalRepoRoot: "/Volumes/build/seer",
+        effectiveDerivedDataPath: "/private/var/build/DerivedData",
+      })}\n`,
+    );
+    assert.deepEqual(boundaryChecks.loadBuildProvenance(metadataPath), [
+      "/Volumes/build/seer",
+      "/private/var/build/DerivedData",
+    ]);
+  } finally {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
 test("classifyMachOFiles + checkExactlyOneMachO require exactly one Mach-O file, at Contents/MacOS/Seer", () => {
   const tmpRoot = mkdtempSync(join(tmpdir(), "seer-macho-count-"));
   try {
@@ -381,6 +437,20 @@ test("checkArchitecture requires a 64-bit arm64 executable, not x86_64 or anothe
     assert.match(x86Offenders[0], /arm64/);
   } finally {
     rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test("checkArchitecture requires lipo -archs output to be exactly one arm64 slice", () => {
+  const arm64Entry = {
+    relPath: EXPECTED_EXECUTABLE_RELATIVE_PATH,
+    output: "Mach-O 64-bit executable arm64",
+  };
+
+  assert.deepEqual(checkArchitecture(arm64Entry, { lipoOutput: "arm64\n" }), []);
+  for (const lipoOutput of ["arm64 x86_64\n", "arm64e\n", "x86_64\n"]) {
+    const offenders = checkArchitecture(arm64Entry, { lipoOutput });
+    assert.equal(offenders.length, 1, `expected to reject lipo output ${JSON.stringify(lipoOutput)}`);
+    assert.match(offenders[0], /exactly "arm64"/);
   }
 });
 
@@ -675,6 +745,8 @@ test("npm run build:macos produces an unsigned arm64 Release Seer.app that passe
   const executablePath = join(DEFAULT_APP_PATH, EXPECTED_EXECUTABLE_RELATIVE_PATH);
   const fileOutput = execFileSync("/usr/bin/file", ["-b", executablePath], { encoding: "utf8" });
   assert.match(fileOutput, /Mach-O 64-bit executable arm64/);
+  const lipoOutput = execFileSync("/usr/bin/lipo", ["-archs", executablePath], { encoding: "utf8" }).trim();
+  assert.equal(lipoOutput, "arm64");
 
   const bundleOffenders = scanBundle(DEFAULT_APP_PATH);
   assert.deepEqual(bundleOffenders, [], `bundle boundary offenders: ${JSON.stringify(bundleOffenders, null, 2)}`);
