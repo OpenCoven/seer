@@ -179,7 +179,7 @@ public final class PanelController: NSObject {
     public let webView: WKWebView
 
     private let seerPanel: SeerPanel
-    private let navigationDelegate = SeerWebViewNavigationDelegate()
+    private let navigationDelegate: SeerWebViewNavigationDelegate
     private let clock: Clock
     private var lastBlurHideAtMilliseconds: Int64?
 
@@ -193,8 +193,26 @@ public final class PanelController: NSObject {
         webView.configuration.userContentController
     }
 
-    public init(rendererRoot: SeerRendererRoot, clock: Clock = SystemClock()) {
+    /// Constructs the panel's own `SeerWebViewNavigationDelegate`, wiring
+    /// `onNavigationDecision` straight through as its `onDecision` hook.
+    /// `onNavigationDecision` defaults to `nil` (matching
+    /// `SeerWebViewNavigationDelegate`'s own default), so every existing
+    /// caller — production's `AppDelegate` included — gets byte-for-byte
+    /// the same navigation delegate/behavior as before this parameter
+    /// existed; it exists purely so a test can *observe* the exact,
+    /// real production decision (URL + resulting `WKNavigationActionPolicy`)
+    /// `SeerWebViewNavigationDelegate.webView(_:decidePolicyFor:decisionHandler:)`
+    /// reaches for a real navigation attempt driven through a real,
+    /// fully-wired `PanelController` — never a synthetic stand-in for the
+    /// decision, and never a test having to poll `document.title`/sleep a
+    /// fixed duration and hope the (invisible) decision already happened.
+    public init(
+        rendererRoot: SeerRendererRoot,
+        clock: Clock = SystemClock(),
+        onNavigationDecision: (@MainActor (URL, WKNavigationActionPolicy) -> Void)? = nil
+    ) {
         self.clock = clock
+        self.navigationDelegate = SeerWebViewNavigationDelegate(onDecision: onNavigationDecision)
 
         let contentRect = CGRect(origin: .zero, size: PanelController.panelSize)
         let webView = SeerWebViewFactory.makeWebView(rendererRoot: rendererRoot, frame: contentRect)

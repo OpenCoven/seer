@@ -134,12 +134,49 @@ final class NavigationPolicyTests: XCTestCase {
             .write(to: root.appendingPathComponent("standalone-window.html"), atomically: true, encoding: .utf8)
     }
 
+    /// Records every `(URL, WKNavigationActionPolicy)` pair
+    /// `SeerWebViewNavigationDelegate.webView(_:decidePolicyFor:
+    /// decisionHandler:)` — real production code — reaches through
+    /// `PanelController`'s injectable `onNavigationDecision` hook (default
+    /// `nil`, no behavior change; see `PanelController.init`), and lets a
+    /// test `await` the exact decision for a specific URL instead of
+    /// sleeping a fixed duration and inferring denial indirectly from
+    /// `document.title` never having changed. `@MainActor`-isolated since
+    /// `onNavigationDecision` itself is `@MainActor`, and this suite's own
+    /// tests are `@MainActor`.
+    @MainActor
+    private final class NavigationDecisionRecorder {
+        private(set) var decisions: [URL: WKNavigationActionPolicy] = [:]
+
+        func record(_ url: URL, _ policy: WKNavigationActionPolicy) {
+            decisions[url] = policy
+        }
+
+        /// Awaits (bounded by `timeout`) the exact recorded decision for
+        /// `url`, returning `nil` if none arrived in time — the caller
+        /// asserts against this directly, so a missing/late decision
+        /// fails the assertion rather than the test silently passing on a
+        /// stale/absent read the way a sleep-then-check-title probe could.
+        func decision(for url: URL, timeout: TimeInterval = 5) async -> WKNavigationActionPolicy? {
+            let deadline = Date().addingTimeInterval(timeout)
+            while decisions[url] == nil, Date() < deadline {
+                try? await Task.sleep(nanoseconds: 5_000_000)
+            }
+            return decisions[url]
+        }
+    }
+
     /// Builds a real `PanelController` — real `SeerWebViewFactory`
     /// configuration, real `SeerSchemeHandler`, real
     /// `SeerWebViewNavigationDelegate` — serving a minimal fixture from a
     /// fresh temporary directory, loads the one allowed document, then
     /// attempts to navigate the same main frame directly to each denied
-    /// URL and asserts the document never actually changed. `javascript:`
+    /// URL and awaits the exact production `decidePolicyFor` decision for
+    /// that precise URL through `PanelController`'s injectable
+    /// `onNavigationDecision` hook — proof the real delegate actually
+    /// denied *that* navigation, not an inference from `document.title`
+    /// having stayed put after a fixed sleep (which cannot distinguish
+    /// "denied" from "the decision simply hasn't run yet"). `javascript:`
     /// is intentionally excluded from the real-navigation loop below and
     /// covered only by the pure-function matrix above instead: WKWebView
     /// does not reliably route a `javascript:` URL passed to
@@ -161,7 +198,11 @@ final class NavigationPolicyTests: XCTestCase {
         addTeardownBlock { try? FileManager.default.removeItem(at: tempRoot) }
         try writeMinimalFixture(into: tempRoot)
 
-        let panel = PanelController(rendererRoot: SeerRendererRoot(url: tempRoot))
+        let recorder = NavigationDecisionRecorder()
+        let panel = PanelController(
+            rendererRoot: SeerRendererRoot(url: tempRoot),
+            onNavigationDecision: { url, policy in recorder.record(url, policy) }
+        )
         addTeardownBlock { @MainActor in
             panel.webView.stopLoading()
             panel.panel.close()
@@ -177,12 +218,13 @@ final class NavigationPolicyTests: XCTestCase {
 
         for url in deniedURLs {
             panel.webView.load(URLRequest(url: url))
-            // `decidePolicyFor` cancels synchronously relative to the
-            // navigation attempt; a short bounded wait gives WebKit's own
-            // dispatch a chance to run without this test depending on any
-            // exact timing for correctness (the assertion below is what
-            // actually proves denial, not the wait itself).
-            try? await Task.sleep(nanoseconds: 150_000_000)
+            let decision = await recorder.decision(for: url)
+            XCTAssertEqual(
+                decision,
+                .cancel,
+                "the real SeerWebViewNavigationDelegate must have reached and recorded a .cancel " +
+                    "decision for \(url), but recorded \(String(describing: decision))"
+            )
             let title = await evaluateString(panel.webView, "document.title")
             XCTAssertEqual(title, "Seer", "navigation to \(url) must have been denied, but the document changed")
         }

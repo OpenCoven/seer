@@ -27,6 +27,25 @@ targets:
       - path: ../../../build/standalone-renderer/Renderer
         type: folder
         buildPhase: resources
+    # Builds the standalone renderer (npm run build:standalone-renderer)
+    # into build/standalone-renderer/Renderer before Xcode's own "Copy
+    # Resources" phase (registered above) ever runs, so the bundled
+    # Renderer folder always reflects the current checkout instead of a
+    # stale artifact or one built on demand at test runtime. See
+    # Scripts/build-standalone-renderer.sh and
+    # RendererIntegrationTests.swift's BundledRenderer.
+    preBuildScripts:
+      - name: Build standalone renderer
+        path: Scripts/build-standalone-renderer.sh
+        shell: /bin/bash
+        # Always re-run: the script's own inputs (the whole renderer/
+        # source tree) aren't practically expressible as a flat
+        # inputFiles list, and this keeps every build's bundled renderer
+        # correct by construction rather than by cache freshness.
+        basedOnDependencyAnalysis: false
+        outputFiles:
+          - $(SRCROOT)/../../../build/standalone-renderer/Renderer/standalone-window.html
+          - $(SRCROOT)/../../../build/standalone-renderer/Renderer/build-manifest.json
     settings:
       base:
         PRODUCT_NAME: Seer

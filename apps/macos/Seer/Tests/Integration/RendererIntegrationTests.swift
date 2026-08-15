@@ -9,8 +9,11 @@ import WebKit
 /// (`TEST_HOST` in `Seer.xcodeproj`), so `Bundle.main` here *is* the built
 /// `Seer.app` bundle, and its own `Resources` build phase already copies
 /// `build/standalone-renderer/Renderer` — built from `renderer/standalone/
-/// index.tsx` by `npm run build:standalone-renderer` — into it under the
-/// name `Renderer`. This is precisely the same expression
+/// index.tsx` by the `Seer` target's "Build standalone renderer"
+/// `preBuildScripts` phase (`Scripts/build-standalone-renderer.sh`, wired
+/// in `project.yml`; runs `npm run build:standalone-renderer`
+/// unconditionally, *before* the Resources phase, on every build) — into
+/// it under the name `Renderer`. This is precisely the same expression
 /// `AppDelegate.bootstrapServices(...)`'s own `rendererRoot` default
 /// parameter uses (see `Sources/App/AppDelegate.swift`), so every test in
 /// this file drives the real `SeerSchemeHandler` serving the real,
@@ -22,78 +25,131 @@ private enum BundledRenderer {
     )
 
     private static let documentFileName = "standalone-window.html"
+    private static let manifestFileName = "build-manifest.json"
 
-    /// Thrown whenever the bundled renderer document cannot be produced or
-    /// located, even after a genuine build attempt — surfaced as a real
-    /// XCTest setup failure (never `XCTSkip`), so a missing or failed
-    /// renderer build is always visible as a failing required-coverage
-    /// test, never silently allowed to "pass" with no renderer under test.
+    /// Thrown whenever the bundled renderer document is missing or stale
+    /// relative to the checked-out renderer source — surfaced as a real
+    /// XCTest setup failure (never `XCTSkip`), so a missing/misconfigured
+    /// prebuild is always visible as a failing required-coverage test,
+    /// never silently allowed to "pass" with no renderer under test.
     struct SetupFailure: Error, CustomStringConvertible {
         let description: String
     }
 
-    /// A deterministic precondition, run once before any test in this file:
-    /// fail fast with an actionable message rather than letting a missing
-    /// build artifact surface later as an opaque `WKWebView` load timeout.
-    /// If the bundled document is missing (a clean checkout that has never
-    /// run the renderer build), this builds it exactly once, entirely
-    /// offline — `npm run build:standalone-renderer` only ever invokes the
-    /// already-installed local Vite toolchain in `node_modules`, never a
-    /// network fetch — checking the real process' termination
-    /// status/reason and capturing its stdout/stderr, and, if the build
-    /// fails or the document is still absent afterward, throws
-    /// `SetupFailure` with the captured diagnostics — which XCTest reports
-    /// as a genuine setup failure of every test in this file, never a skip
-    /// that would let "no renderer" quietly count as "renderer coverage
-    /// passed".
+    /// A deterministic precondition, run once before every test in this
+    /// file. The bundled renderer is built entirely by the `Seer` target's
+    /// own build — the "Build standalone renderer" `preBuildScripts` phase
+    /// runs `npm run build:standalone-renderer` unconditionally
+    /// (`basedOnDependencyAnalysis: false`), *before* Xcode's "Copy
+    /// Resources" phase, on every single build — so by the time
+    /// `SeerTests` even links against `Seer.app` (its `TEST_HOST`), the
+    /// bundled `Renderer` folder this reads has already been produced from
+    /// the current checkout. This precondition therefore never launches
+    /// `npm`/any subprocess itself (that previously risked an
+    /// xcodebuild-invoked `Process` deadlocking or timing out draining a
+    /// long-running child's stdout/stderr pipes) — it only ever *verifies*
+    /// what the prebuild step already produced, and fails closed (throws
+    /// `SetupFailure`, never `XCTSkip`) both when the document is entirely
+    /// absent and when `build-manifest.json`'s identity marker shows the
+    /// bundle predates the checked-out renderer source (see
+    /// `verifyManifestIsFresh` below).
     static func ensureAvailable(file: StaticString = #filePath) throws {
         let documentURL = root.url.appendingPathComponent(documentFileName)
-        guard !FileManager.default.fileExists(atPath: documentURL.path) else { return }
-
-        let repoRoot = try repoRootURL(fromTestFile: file)
-
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        let process = Process()
-        process.currentDirectoryURL = repoRoot
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["npm", "run", "build:standalone-renderer"]
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-
-        do {
-            try process.run()
-        } catch {
-            throw SetupFailure(description: """
-                Failed to launch `npm run build:standalone-renderer` from \(repoRoot.path): \(error)
-                """)
-        }
-        process.waitUntilExit()
-
-        let stdoutText = String(data: stdoutPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        let stderrText = String(data: stderrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-
-        guard process.terminationReason == .exit, process.terminationStatus == 0 else {
-            throw SetupFailure(description: """
-                `npm run build:standalone-renderer` (run from \(repoRoot.path)) did not succeed \
-                (terminationReason: \(process.terminationReason), status: \(process.terminationStatus)).
-                --- stdout ---
-                \(stdoutText)
-                --- stderr ---
-                \(stderrText)
-                """)
-        }
-
         guard FileManager.default.fileExists(atPath: documentURL.path) else {
             throw SetupFailure(description: """
-                Bundled renderer document not found at \(documentURL.path) even though \
-                `npm run build:standalone-renderer` (run from \(repoRoot.path)) reported success.
-                --- stdout ---
-                \(stdoutText)
-                --- stderr ---
-                \(stderrText)
+                Bundled renderer document not found at \(documentURL.path). The Seer target's \
+                "Build standalone renderer" preBuildScripts phase (apps/macos/Seer/Scripts/\
+                build-standalone-renderer.sh, wired in apps/macos/Seer/project.yml) should have produced \
+                this before Xcode's Resources phase ever ran. Run `xcodegen generate` in \
+                apps/macos/Seer and rebuild the Seer target.
                 """)
         }
+        try verifyManifestIsFresh(file: file)
+    }
+
+    /// Reads the `builtAtEpochSeconds` identity marker
+    /// `Scripts/build-standalone-renderer.sh` writes into
+    /// `build-manifest.json` alongside the bundled document, and fails
+    /// closed if any file under the renderer source this build actually
+    /// depends on (`renderer/`, `standalone-window.html`,
+    /// `vite.standalone.config.ts`) was modified *after* that build
+    /// completed — proof the bundled renderer genuinely corresponds to the
+    /// current source tree, not a stale artifact left over in `build/`
+    /// from an earlier checkout (e.g. the prebuild phase having been
+    /// bypassed, or `build/` restored from a cache).
+    private static func verifyManifestIsFresh(file: StaticString) throws {
+        let manifestURL = root.url.appendingPathComponent(manifestFileName)
+        guard let data = FileManager.default.contents(atPath: manifestURL.path) else {
+            throw SetupFailure(description: """
+                Bundled renderer manifest not found at \(manifestURL.path); the "Build standalone \
+                renderer" preBuildScripts phase always writes it alongside \(documentFileName). Run \
+                `xcodegen generate` in apps/macos/Seer and rebuild the Seer target.
+                """)
+        }
+        guard
+            let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+            let builtAtEpochSeconds = json["builtAtEpochSeconds"] as? Double
+        else {
+            throw SetupFailure(description: """
+                Bundled renderer manifest at \(manifestURL.path) is malformed: \
+                \(String(data: data, encoding: .utf8) ?? "<non-UTF8 contents>")
+                """)
+        }
+        let builtAt = Date(timeIntervalSince1970: builtAtEpochSeconds)
+
+        let repoRoot = try repoRootURL(fromTestFile: file)
+        let trackedSourcePaths = [
+            repoRoot.appendingPathComponent("renderer", isDirectory: true),
+            repoRoot.appendingPathComponent("standalone-window.html"),
+            repoRoot.appendingPathComponent("vite.standalone.config.ts"),
+        ]
+
+        for path in trackedSourcePaths {
+            guard let newestModification = try latestModificationDate(under: path) else { continue }
+            guard newestModification <= builtAt else {
+                throw SetupFailure(description: """
+                    Bundled renderer at \(root.url.path) was built at \(builtAt) (per \
+                    \(manifestURL.path)), but \(path.path) has a file modified at \
+                    \(newestModification) — after that build completed. The bundled renderer is stale \
+                    relative to the current renderer source; rebuild the Seer target (its "Build \
+                    standalone renderer" preBuildScripts phase runs automatically) before running these \
+                    tests again.
+                    """)
+            }
+        }
+    }
+
+    /// The latest modification date of `path` itself (if it is a file) or
+    /// of any file it recursively contains (if it is a directory); `nil`
+    /// if `path` does not exist on disk at all (nothing to compare
+    /// against — e.g. a repository layout that no longer has this path).
+    private static func latestModificationDate(under path: URL) throws -> Date? {
+        let fileManager = FileManager.default
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: path.path, isDirectory: &isDirectory) else { return nil }
+
+        guard isDirectory.boolValue else {
+            let attributes = try fileManager.attributesOfItem(atPath: path.path)
+            return attributes[.modificationDate] as? Date
+        }
+
+        guard let enumerator = fileManager.enumerator(
+            at: path,
+            includingPropertiesForKeys: [.contentModificationDateKey, .isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return nil
+        }
+
+        var latest: Date?
+        for case let fileURL as URL in enumerator {
+            let values = try fileURL.resourceValues(forKeys: [.contentModificationDateKey, .isDirectoryKey])
+            guard values.isDirectory != true, let modified = values.contentModificationDate else { continue }
+            if latest == nil || modified > latest! {
+                latest = modified
+            }
+        }
+        return latest
     }
 
     /// Derives the repository root by walking upward from this very
