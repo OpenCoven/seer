@@ -19,6 +19,47 @@ private actor RecordingReleaseOpener: ReleaseURLOpening {
     }
 }
 
+/// A fake `WKURLSchemeTask` — `WKURLSchemeTask` is an Objective-C protocol
+/// (not a concrete, hard-to-instantiate class), so it can be conformed to
+/// directly here, letting this suite drive `SeerSchemeHandler.webView(_:
+/// start:)` directly and record its *exact* terminal callback
+/// (`didReceive(response:)` + `didReceive(data:)` + `didFinish()`, or
+/// `didFailWithError(_:)`) for an exact request URL — unambiguous proof of
+/// allow/deny that does not depend on `WKWebView`'s own image-decoding
+/// behavior the way an `<img>`-based real-navigation assertion would (a
+/// served-but-undecodable resource and a denied resource both fire an
+/// `<img>` `error` event, so that alone cannot distinguish "the scheme
+/// handler denied this" from "the scheme handler served bytes an `<img>`
+/// simply couldn't decode").
+private final class FakeSchemeTask: NSObject, WKURLSchemeTask {
+    let request: URLRequest
+
+    private(set) var receivedResponses: [URLResponse] = []
+    private(set) var receivedData: [Data] = []
+    private(set) var finishedCallCount = 0
+    private(set) var failedErrors: [Error] = []
+
+    init(url: URL) {
+        request = URLRequest(url: url)
+    }
+
+    func didReceive(_ response: URLResponse) {
+        receivedResponses.append(response)
+    }
+
+    func didReceive(_ data: Data) {
+        receivedData.append(data)
+    }
+
+    func didFinish() {
+        finishedCallCount += 1
+    }
+
+    func didFailWithError(_ error: Error) {
+        failedErrors.append(error)
+    }
+}
+
 /// Security-focused navigation/scheme/update-open tests for the standalone
 /// panel. Reuses the exact production decision points wherever possible
 /// (`SeerNavigationPolicy.decide`, `SeerSchemeHandler`/
@@ -106,8 +147,18 @@ final class NavigationPolicyTests: XCTestCase {
         let tempRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("NavigationPolicyTests-\(UUID().uuidString)", isDirectory: true)
         try writeMinimalFixture(into: tempRoot)
+        // Registered immediately after the resource this test owns is
+        // actually created — before anything below can throw — so
+        // `XCTestCase.addTeardownBlock`'s guarantee (runs after the test
+        // method returns whether it passed, failed an assertion, or threw)
+        // means this can never be skipped and leak the temp directory.
+        addTeardownBlock { try? FileManager.default.removeItem(at: tempRoot) }
 
         let panel = PanelController(rendererRoot: SeerRendererRoot(url: tempRoot))
+        addTeardownBlock { @MainActor in
+            panel.webView.stopLoading()
+            panel.panel.close()
+        }
         panel.loadInitialDocument()
         await waitUntil { await self.evaluateString(panel.webView, "document.title") == "Seer" }
 
@@ -128,47 +179,104 @@ final class NavigationPolicyTests: XCTestCase {
             let title = await evaluateString(panel.webView, "document.title")
             XCTAssertEqual(title, "Seer", "navigation to \(url) must have been denied, but the document changed")
         }
-
-        panel.webView.stopLoading()
-        try? FileManager.default.removeItem(at: tempRoot)
     }
 
     // MARK: - 3. Real SeerSchemeHandler: a percent-encoded ../ resource request is denied end to end
 
-    /// A minimal, valid 1×1 transparent PNG — needed so the "legitimate
-    /// sibling asset" `<img>` below actually fires `load` (not `error` from
-    /// a decode failure), making the contrast with the denied traversal
-    /// request unambiguous.
+    /// A minimal, valid 1×1 transparent PNG — needed so both the
+    /// legitimate in-root asset *and* the outside-root decoy below are
+    /// genuinely decodable images. If the decoy were plain text (as it
+    /// used to be), an `<img>` fetching it would fire `error` regardless
+    /// of whether the scheme handler actually denied the request or
+    /// mistakenly served it — a decode failure and a denial are
+    /// indistinguishable from the DOM's `error` event alone. Using a real
+    /// PNG for both makes `load` vs. `error` an unambiguous signal of
+    /// allow vs. deny.
     private static let onePixelPNG = Data(base64Encoded:
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
     )!
 
-    /// Drives a real percent-encoded (`%2e%2e`) path-traversal resource
-    /// request through the actual `WKURLSchemeHandler` pipeline — a real
-    /// `<img>` element's `src`, resolved and fetched by WebKit itself, not
-    /// a directly-constructed `URL(string:)` handed straight to
-    /// `SeerSchemeResourceLoader.load(requestURL:rendererRoot:)` (already
-    /// covered at that unit level by `SeerSchemeHandlerTests`). Percent-
-    /// encoded dot segments are used deliberately: unlike literal `..`,
-    /// they are not collapsed by the browser's own URL parser during
-    /// relative-reference resolution, so this is the one traversal shape
-    /// that can actually reach `SeerSchemeHandler.webView(_:start:)` with
-    /// its escaping intent intact from a real page load — exactly the
-    /// "exercise the actual scheme handler path" requirement.
+    /// A once-percent-encoded (`%2e%2e`) traversal path segment.
+    /// Empirically (verified against this project's real `WKWebView`),
+    /// WebKit's own WHATWG URL parser recognizes `%2e`/`%2E` as an alias
+    /// for a literal `.` *during its own URL normalization* — so any
+    /// request built from this shape, relative or absolute, is already
+    /// collapsed to a flat, non-traversing `seer://app/<name>` path before
+    /// `SeerSchemeHandler.webView(_:start:)` ever sees it: a real `<img
+    /// src="assets/%2e%2e/%2e%2e/secret.png">` never actually reaches the
+    /// scheme handler with `assets`/`%2e%2e` segments intact at all. This
+    /// shape therefore only reaches `SeerSchemeResourceLoader`'s own
+    /// character-level defense (`SeerResourceError.pathEscapesRoot`) when
+    /// something constructs the request directly — see
+    /// `testSeerSchemeHandlerDirectlyRecordsFinishForLegitimateResourceAndFailureForTraversal`
+    /// below, and `SeerSchemeHandlerTests
+    /// .testPercentEncodedDotDotTraversalIsRejected` at the pure-loader
+    /// level — never via genuine browser-driven navigation.
+    private static let directlyConstructedTraversalRequestSuffix = "assets/%2e%2e/%2e%2e"
+
+    /// A *twice*-percent-encoded (`%252e%252e`) traversal path segment —
+    /// after WebKit's own single decode-and-normalize pass, this becomes
+    /// the three literal characters `%2e`, which is *not* itself a
+    /// recognized dot-segment alias, so it survives WebKit's URL
+    /// normalization completely intact. Confirmed empirically: a real
+    /// `<img src="assets/%252e%252e/%252e%252e/secret.png">` reaches
+    /// `SeerSchemeHandler.webView(_:start:)` as exactly
+    /// `seer://app/assets/%252e%252e/%252e%252e/secret.png`, with every
+    /// segment untouched — this is the one traversal shape that is both
+    /// genuinely reachable through a real browser-driven request *and*
+    /// still depends on `SeerSchemeResourceLoader`'s own defense (a
+    /// literal `%` surviving one decode pass is rejected as
+    /// `SeerResourceError.invalidPathEncoding`, precisely so a future
+    /// change cannot "helpfully" decode it a second time into `..`) to be
+    /// denied — exactly the "exercise the actual scheme handler path via
+    /// real webview navigation" requirement.
+    private static let browserSurvivableTraversalRequestSuffix = "assets/%252e%252e/%252e%252e"
+
+    /// Both traversal shapes above resolve — per ordinary RFC 3986
+    /// relative-reference merging, and (for the twice-encoded shape) per
+    /// `SeerSchemeResourceLoader.resolve`'s own component-by-component
+    /// path join — to exactly `<root>`'s parent directory, were their two
+    /// `..`-equivalent segments ever actually honored: `assets` cancels
+    /// with the first, and the second walks one level above `<root>`
+    /// itself. Every traversal test below places its decoy at precisely
+    /// that location — one directory above the served root, never an
+    /// arbitrarily-deeper sibling — so a hypothetical regression that
+    /// weakened either defense would still be caught here, rather than
+    /// this test passing vacuously because the decoy never existed at the
+    /// path traversal would actually reach.
+    private static let traversalDecoyFileName = "secret.png"
+
+    /// Drives a real percent-encoded path-traversal resource request
+    /// through the actual `WKURLSchemeHandler` pipeline — a real `<img>`
+    /// element's `src`, resolved and fetched by WebKit itself, never a
+    /// directly-constructed `URL(string:)`. Uses
+    /// `browserSurvivableTraversalRequestSuffix` (see its own
+    /// documentation for why the more obvious single-encoded `%2e%2e`
+    /// shape cannot actually prove anything about the scheme handler here
+    /// — WebKit's own URL parser already neutralizes it before the
+    /// handler is ever invoked). Both the legitimate sibling asset and the
+    /// outside-root decoy are real, valid PNGs (see `onePixelPNG`'s
+    /// documentation for why), and the decoy sits at the exact location
+    /// the traversal's segments resolve to, so `load` vs. `error` here is
+    /// unambiguous proof of "the scheme handler actually denied this",
+    /// never an artifact of an undecodable file or a decoy planted
+    /// somewhere the traversal could never have reached anyway.
     func testRealSchemeHandlerDeniesPercentEncodedTraversalForARealResourceRequest() async throws {
-        let tempRoot = FileManager.default.temporaryDirectory
+        let stagingRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("NavigationPolicyTests-\(UUID().uuidString)", isDirectory: true)
+        let tempRoot = stagingRoot.appendingPathComponent("renderer-root", isDirectory: true)
         let assetsDir = tempRoot.appendingPathComponent("assets", isDirectory: true)
         try FileManager.default.createDirectory(at: assetsDir, withIntermediateDirectories: true)
         try Self.onePixelPNG.write(to: assetsDir.appendingPathComponent("pixel.png"))
 
-        // A decoy file genuinely outside the renderer root, in a sibling
-        // directory — if traversal were ever actually served, this exact
-        // byte sequence would end up observable, but it never does.
-        let outsideRoot = tempRoot.deletingLastPathComponent()
-            .appendingPathComponent("NavigationPolicyTests-outside-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: outsideRoot, withIntermediateDirectories: true)
-        try Data("top-secret".utf8).write(to: outsideRoot.appendingPathComponent("secret.txt"))
+        // The decoy: a real, decodable PNG exactly one directory above
+        // `tempRoot` — precisely where the traversal resolves to (see
+        // `traversalDecoyFileName`'s documentation). `stagingRoot` (not
+        // the shared system temp directory itself) stands in as
+        // `tempRoot`'s parent so this decoy, and its cleanup, both stay
+        // scoped to this test.
+        try Self.onePixelPNG.write(to: stagingRoot.appendingPathComponent(Self.traversalDecoyFileName))
+        addTeardownBlock { try? FileManager.default.removeItem(at: stagingRoot) }
 
         let html = """
         <!doctype html>
@@ -178,7 +286,7 @@ final class NavigationPolicyTests: XCTestCase {
             <img id="good" src="assets/pixel.png"
                  onload="window.__imgResults = window.__imgResults || {}; window.__imgResults.good = 'load';"
                  onerror="window.__imgResults = window.__imgResults || {}; window.__imgResults.good = 'error';">
-            <img id="evil" src="assets/%2e%2e/%2e%2e/secret.txt"
+            <img id="evil" src="\(Self.browserSurvivableTraversalRequestSuffix)/\(Self.traversalDecoyFileName)"
                  onload="window.__imgResults = window.__imgResults || {}; window.__imgResults.evil = 'load';"
                  onerror="window.__imgResults = window.__imgResults || {}; window.__imgResults.evil = 'error';">
           </body>
@@ -187,6 +295,10 @@ final class NavigationPolicyTests: XCTestCase {
         try html.write(to: tempRoot.appendingPathComponent("standalone-window.html"), atomically: true, encoding: .utf8)
 
         let panel = PanelController(rendererRoot: SeerRendererRoot(url: tempRoot))
+        addTeardownBlock { @MainActor in
+            panel.webView.stopLoading()
+            panel.panel.close()
+        }
         panel.loadInitialDocument()
 
         await waitUntil {
@@ -200,11 +312,85 @@ final class NavigationPolicyTests: XCTestCase {
         let evilResult = await evaluateString(panel.webView, "window.__imgResults && window.__imgResults.evil")
 
         XCTAssertEqual(goodResult, "load", "the legitimate sibling asset must load normally")
-        XCTAssertEqual(evilResult, "error", "a percent-encoded ../ traversal request must be denied, never served")
+        XCTAssertEqual(
+            evilResult, "error",
+            "a percent-encoded ../ traversal request must be denied, never served, even though the decoy at its " +
+            "resolved target is a genuinely valid, decodable image"
+        )
+    }
 
-        panel.webView.stopLoading()
-        try? FileManager.default.removeItem(at: tempRoot)
-        try? FileManager.default.removeItem(at: outsideRoot)
+    /// Exercises the production `SeerSchemeHandler` directly — bypassing
+    /// `WKWebView`/`<img>` entirely — via a real `FakeSchemeTask`,
+    /// recording its *exact* terminal callback for the legitimate in-root
+    /// resource and for both traversal shapes
+    /// (`directlyConstructedTraversalRequestSuffix`,
+    /// `browserSurvivableTraversalRequestSuffix`). This is the unambiguous
+    /// "scheme task response recorder" version of the real-navigation test
+    /// above: `didFinish()` with the exact PNG bytes for the legitimate
+    /// request, and `didFailWithError(_:)` — never any data, never
+    /// `didFinish()` — for each traversal, proven independent of any
+    /// `WKWebView`/image-decoding behavior at all. The
+    /// once-encoded shape is only reachable this way (see its own
+    /// documentation for why a real `WKWebView` never actually delivers it
+    /// intact), so this is its sole piece of coverage against a real
+    /// `SeerSchemeHandler` instance.
+    func testSeerSchemeHandlerDirectlyRecordsFinishForLegitimateResourceAndFailureForTraversal() throws {
+        let stagingRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("NavigationPolicyTests-\(UUID().uuidString)", isDirectory: true)
+        let tempRoot = stagingRoot.appendingPathComponent("renderer-root", isDirectory: true)
+        let assetsDir = tempRoot.appendingPathComponent("assets", isDirectory: true)
+        try FileManager.default.createDirectory(at: assetsDir, withIntermediateDirectories: true)
+        try Self.onePixelPNG.write(to: assetsDir.appendingPathComponent("pixel.png"))
+        try Self.onePixelPNG.write(to: stagingRoot.appendingPathComponent(Self.traversalDecoyFileName))
+        addTeardownBlock { try? FileManager.default.removeItem(at: stagingRoot) }
+
+        let handler = SeerSchemeHandler(rendererRoot: SeerRendererRoot(url: tempRoot))
+        // `SeerSchemeHandler.webView(_:start:)` never reads its `webView`
+        // parameter (see `SeerSchemeHandler.swift`) — a disposable,
+        // never-navigated `WKWebView` only satisfies the protocol's
+        // required argument type.
+        let unusedWebView = WKWebView(frame: .zero)
+
+        let legitimateTask = FakeSchemeTask(url: URL(string: "seer://app/assets/pixel.png")!)
+        handler.webView(unusedWebView, start: legitimateTask)
+
+        XCTAssertEqual(legitimateTask.finishedCallCount, 1, "the legitimate in-root resource must finish exactly once")
+        XCTAssertTrue(legitimateTask.failedErrors.isEmpty, "the legitimate in-root resource must never fail")
+        XCTAssertEqual(legitimateTask.receivedData, [Self.onePixelPNG], "the exact bytes on disk must be delivered")
+        XCTAssertEqual(legitimateTask.receivedResponses.first?.mimeType, "image/png")
+
+        let onceEncodedTask = FakeSchemeTask(
+            url: URL(string: "seer://app/\(Self.directlyConstructedTraversalRequestSuffix)/\(Self.traversalDecoyFileName)")!
+        )
+        handler.webView(unusedWebView, start: onceEncodedTask)
+
+        XCTAssertEqual(onceEncodedTask.finishedCallCount, 0, "a once-encoded ../ traversal request must never finish")
+        XCTAssertTrue(onceEncodedTask.receivedData.isEmpty, "a once-encoded ../ traversal request must never deliver data")
+        XCTAssertEqual(
+            onceEncodedTask.failedErrors.count, 1,
+            "a once-encoded ../ traversal request must fail exactly once, never finish"
+        )
+        XCTAssertEqual(
+            onceEncodedTask.failedErrors.first as? SeerSchemeHandlerError, SeerSchemeHandlerError(resourceError: .pathEscapesRoot),
+            "a once-encoded ../ traversal request must fail with exactly .pathEscapesRoot"
+        )
+
+        let twiceEncodedTask = FakeSchemeTask(
+            url: URL(string: "seer://app/\(Self.browserSurvivableTraversalRequestSuffix)/\(Self.traversalDecoyFileName)")!
+        )
+        handler.webView(unusedWebView, start: twiceEncodedTask)
+
+        XCTAssertEqual(twiceEncodedTask.finishedCallCount, 0, "a twice-encoded ../ traversal request must never finish")
+        XCTAssertTrue(twiceEncodedTask.receivedData.isEmpty, "a twice-encoded ../ traversal request must never deliver data")
+        XCTAssertEqual(
+            twiceEncodedTask.failedErrors.count, 1,
+            "a twice-encoded ../ traversal request must fail exactly once, never finish"
+        )
+        XCTAssertEqual(
+            twiceEncodedTask.failedErrors.first as? SeerSchemeHandlerError, SeerSchemeHandlerError(resourceError: .invalidPathEncoding),
+            "a twice-encoded ../ traversal request must fail with exactly .invalidPathEncoding — the exact defense " +
+            "the real-webview traversal test above depends on"
+        )
     }
 
     // MARK: - 4. updates.open can never carry (or open) a renderer-supplied URL

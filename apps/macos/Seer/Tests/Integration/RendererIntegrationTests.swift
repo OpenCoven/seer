@@ -2,62 +2,67 @@ import XCTest
 import WebKit
 @testable import Seer
 
-// MARK: - Fixture renderer document
+// MARK: - The real, bundled production renderer
 
-/// Writes a small, self-contained fixture document into `root` that fills
-/// exactly the same contract Seer's real bundled renderer
-/// (`renderer/standalone/index.tsx`) fills — a `<title>Seer</title>`
-/// document that freezes `window.seerNative` with the exact production
-/// `bridgeVersion`, renders a visible "Status" element driven by
-/// `snapshot.changed` events, and sends outbound bridge requests through
-/// the *exact* wire contract `renderer/bridge/dom-relay-port.ts` uses
-/// (`BridgeRelayUserScript.attributeName`/`.eventName`, interpolated here
-/// rather than duplicated as literals, so this fixture cannot silently
-/// drift from the native relay it is exercising). Deliberately never the
-/// real Vite-built bundle (`build/standalone-renderer/Renderer`, a
-/// gitignored build artifact `SeerSchemeHandlerTests` also never depends
-/// on) — every real production Swift component this test exercises
-/// (`SeerSchemeHandler`, `PanelController`, `BridgeRelayUserScript`,
-/// `BridgeMessageHandler`) is exercised for real; only the renderer's own
-/// TypeScript/React implementation is stood in for by this fixture.
-private enum RendererFixture {
-    static func write(into root: URL) throws {
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+/// Locates the exact production standalone renderer this suite loads —
+/// never a synthetic fixture. `SeerTests` runs hosted inside `Seer.app`
+/// (`TEST_HOST` in `Seer.xcodeproj`), so `Bundle.main` here *is* the built
+/// `Seer.app` bundle, and its own `Resources` build phase already copies
+/// `build/standalone-renderer/Renderer` — built from `renderer/standalone/
+/// index.tsx` by `npm run build:standalone-renderer` — into it under the
+/// name `Renderer`. This is precisely the same expression
+/// `AppDelegate.bootstrapServices(...)`'s own `rendererRoot` default
+/// parameter uses (see `Sources/App/AppDelegate.swift`), so every test in
+/// this file drives the real `SeerSchemeHandler` serving the real,
+/// Vite-built React app that ships in production, through the real
+/// `PanelController` wiring — nothing here is stood in for.
+private enum BundledRenderer {
+    static let root = SeerRendererRoot(
+        url: Bundle.main.resourceURL!.appendingPathComponent("Renderer", isDirectory: true)
+    )
 
-        let html = """
-        <!doctype html>
-        <html>
-          <head><title>Seer</title></head>
-          <body>
-            <div id="status">Idle</div>
-            <script src="./app.js"></script>
-          </body>
-        </html>
-        """
+    private static let documentFileName = "standalone-window.html"
 
-        let js = """
-        window.__seerTestReceived = [];
-        window.seerNative = Object.freeze({
-          version: "\(bridgeVersion)",
-          receive: function (message) {
-            window.__seerTestReceived.push(message);
-            if (message && message.kind === "event" && message.type === "snapshot.changed") {
-              var el = document.getElementById("status");
-              if (el) {
-                el.textContent = message.snapshot.monitor.active ? "Active" : "Idle";
-              }
-            }
-          }
-        });
-        window.__seerSendBridgeRequest = function (id, method, payload) {
-          var request = { id: id, version: "\(bridgeVersion)", method: method, payload: payload };
-          document.documentElement.setAttribute("\(BridgeRelayUserScript.attributeName)", JSON.stringify(request));
-          document.documentElement.dispatchEvent(new Event("\(BridgeRelayUserScript.eventName)", { bubbles: false }));
-        };
-        """
+    /// A deterministic precondition, run once before any test in this file:
+    /// fail fast with an actionable message rather than letting a missing
+    /// build artifact surface later as an opaque `WKWebView` load timeout.
+    /// If the bundled document is missing (a clean checkout that has never
+    /// run the renderer build), this builds it exactly once, entirely
+    /// offline — `npm run build:standalone-renderer` only ever invokes the
+    /// already-installed local Vite toolchain in `node_modules`, never a
+    /// network fetch — before re-checking and, only if it is still absent,
+    /// skipping with a message pointing at the exact command to run.
+    static func ensureAvailable(file: StaticString = #filePath) throws {
+        let documentURL = root.url.appendingPathComponent(documentFileName)
+        guard !FileManager.default.fileExists(atPath: documentURL.path) else { return }
 
-        try html.write(to: root.appendingPathComponent("standalone-window.html"), atomically: true, encoding: .utf8)
-        try js.write(to: root.appendingPathComponent("app.js"), atomically: true, encoding: .utf8)
+        let repoRoot = repoRootURL(fromTestFile: file)
+        let process = Process()
+        process.currentDirectoryURL = repoRoot
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["npm", "run", "build:standalone-renderer"]
+        try process.run()
+        process.waitUntilExit()
+
+        guard FileManager.default.fileExists(atPath: documentURL.path) else {
+            throw XCTSkip("""
+                Bundled renderer document not found at \(documentURL.path), even after \
+                attempting `npm run build:standalone-renderer` from \(repoRoot.path). Run \
+                that command yourself (offline — it only needs the already-installed \
+                node_modules) before re-running SeerTests/RendererIntegrationTests.
+                """)
+        }
+    }
+
+    /// Derives the repository root from this very source file's own
+    /// on-disk location (`apps/macos/Seer/Tests/Integration/
+    /// RendererIntegrationTests.swift`) rather than any assumption about
+    /// the current working directory `xcodebuild` happens to invoke tests
+    /// from — deterministic regardless of caller.
+    private static func repoRootURL(fromTestFile file: StaticString) -> URL {
+        var url = URL(fileURLWithPath: "\(file)")
+        for _ in 0..<5 { url.deleteLastPathComponent() }
+        return url
     }
 }
 
@@ -79,24 +84,30 @@ private final class FakeAgentDetecting: AgentDetecting, @unchecked Sendable {
     }
 }
 
-/// An always-succeeding `PowerAssertionBackend` double — this test never
-/// exercises power-assertion failure handling, only that a synthetic scan
-/// can flow all the way through `AppSnapshotCoordinator.applyScan(_:
-/// scannedAt:)` to a real, visible renderer update.
+/// An always-succeeding `PowerAssertionBackend` double, additionally
+/// tracking every assertion it ever created/released — this suite's
+/// lifecycle assertions use these counts to prove
+/// `AppSnapshotCoordinator.shutdown()` actually released whatever it had
+/// created, never leaving one retained past a test.
 private final class FakePowerAssertionBackend: PowerAssertionBackend, @unchecked Sendable {
     private var nextID: UInt32 = 1
+    private(set) var createdCount = 0
+    private(set) var releasedIDs: [UInt32] = []
 
     func createAssertion(mode: KeepAwakeMode, reason: String) throws -> UInt32 {
         defer { nextID += 1 }
+        createdCount += 1
         return nextID
     }
 
-    func releaseAssertion(id: UInt32) throws {}
+    func releaseAssertion(id: UInt32) throws {
+        releasedIDs.append(id)
+    }
 }
 
-/// The typed, closed `BridgeCommandHandling` fake this suite's bridge-path
-/// test routes `BridgeMessageHandler` through — recording the *exact*
-/// commands/arguments it receives, rather than standing up a real
+/// The typed, closed `BridgeCommandHandling` fake this suite's real-UI
+/// bridge-path test routes `BridgeMessageHandler` through — recording the
+/// *exact* commands/arguments it receives, rather than standing up a real
 /// `AppSnapshotCoordinator` (whose real side effects — power assertions,
 /// disk-backed history — are irrelevant to proving the wire path itself
 /// works end to end).
@@ -135,11 +146,16 @@ final class RendererIntegrationTests: XCTestCase {
     private let settingsURL = URL(fileURLWithPath: "/Renderer-Integration-Test/ai.opencoven.seer/settings.json")
     private let historyURL = URL(fileURLWithPath: "/Renderer-Integration-Test/ai.opencoven.seer/history.json")
 
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        try BundledRenderer.ensureAvailable()
+    }
+
     /// One full, real Swift-side stack: a real `PanelController` (and
     /// therefore real `SeerWebViewFactory`/`SeerSchemeHandler`/
-    /// `SeerWebViewNavigationDelegate` wiring) serving `RendererFixture`
-    /// from a fresh temporary directory, a real `RendererEventSink`, and a
-    /// real `BridgeMessageHandler` registered via the real
+    /// `SeerWebViewNavigationDelegate` wiring) serving the *real bundled*
+    /// `BundledRenderer.root`, a real `RendererEventSink`, and a real
+    /// `BridgeMessageHandler` registered via the real
     /// `BridgeMessageHandlerRegistration.register(_:on:)` — i.e. exactly
     /// production's own `AppDelegate.bootstrapServices(...)` wiring, minus
     /// the status item/agent-monitor-loop/update-scheduler pieces this
@@ -147,42 +163,50 @@ final class RendererIntegrationTests: XCTestCase {
     /// directly.
     @MainActor
     private struct Harness {
-        let tempRoot: URL
         let panel: PanelController
         let bridgeMessageHandler: BridgeMessageHandler
+        let coordinator: AppSnapshotCoordinator?
 
         var webView: WKWebView { panel.webView }
 
+        /// Fully, deterministically releases every real resource this
+        /// harness acquired: stops accepting/cancels in-flight bridge
+        /// work, runs the real `AppSnapshotCoordinator.shutdown()` path
+        /// (releasing its power assertion and stopping its update
+        /// scheduler) when a real coordinator backs this harness, removes
+        /// the exact registration `BridgeMessageHandlerRegistration
+        /// .register` installed (the isolated-world script message
+        /// handler and the relay user script), and finally stops loading
+        /// and closes the panel/web view. Idempotent — every step here is
+        /// safe to run more than once — so callers may invoke this both
+        /// explicitly at the end of a passing test *and* register it via
+        /// `XCTestCase.addTeardownBlock`, which XCTest guarantees runs
+        /// after the test method returns whether it passed, failed an
+        /// assertion, or threw partway through — so a thrown error can
+        /// never skip this and leak a webview/power assertion/update
+        /// scheduler.
         func tearDown() async {
-            // Stops accepting/cancels in-flight bridge work, then removes
-            // the exact registration `BridgeMessageHandlerRegistration
-            // .register` installed — the isolated-world script message
-            // handler and the relay user script — before releasing the
-            // temporary renderer root this test served resources from.
             bridgeMessageHandler.stopAccepting()
             bridgeMessageHandler.cancelAll()
+            try? await coordinator?.shutdown()
             panel.userContentController.removeScriptMessageHandler(
                 forName: BridgeMessageHandler.messageHandlerName,
                 contentWorld: BridgeContentWorld.bridge
             )
             panel.userContentController.removeAllUserScripts()
             panel.webView.stopLoading()
-            try? FileManager.default.removeItem(at: tempRoot)
+            panel.panel.close()
         }
     }
 
-    private func makeHarness(router: any BridgeCommandHandling) throws -> Harness {
-        let tempRoot = FileManager.default.temporaryDirectory
-            .appendingPathComponent("RendererIntegrationTests-\(UUID().uuidString)", isDirectory: true)
-        try RendererFixture.write(into: tempRoot)
-
-        let panel = PanelController(rendererRoot: SeerRendererRoot(url: tempRoot))
+    private func makeHarness(router: any BridgeCommandHandling) -> Harness {
+        let panel = PanelController(rendererRoot: BundledRenderer.root)
         let rendererSink = RendererEventSink(javaScriptCaller: panel.webView)
         let bridgeMessageHandler = BridgeMessageHandler(router: router, responder: rendererSink)
         BridgeMessageHandlerRegistration.register(bridgeMessageHandler, on: panel.userContentController)
         panel.loadInitialDocument()
 
-        return Harness(tempRoot: tempRoot, panel: panel, bridgeMessageHandler: bridgeMessageHandler)
+        return Harness(panel: panel, bridgeMessageHandler: bridgeMessageHandler, coordinator: nil)
     }
 
     /// Builds the same harness, but with a *real* `AppSnapshotCoordinator`
@@ -193,7 +217,15 @@ final class RendererIntegrationTests: XCTestCase {
     /// — exactly the router production wiring builds.
     private func makeRealCoordinatorHarness(
         clock: MutableClock = MutableClock(now: 1_700_000_000_000)
-    ) async throws -> (harness: Harness, coordinator: AppSnapshotCoordinator, detector: FakeAgentDetecting, agentMonitor: AgentMonitor) {
+    ) async throws -> (
+        harness: Harness,
+        coordinator: AppSnapshotCoordinator,
+        detector: FakeAgentDetecting,
+        agentMonitor: AgentMonitor,
+        power: PowerAssertionService,
+        powerBackend: FakePowerAssertionBackend,
+        updateScheduler: FakeUpdateSchedulerControlling
+    ) {
         let settingsStore = SettingsStore(
             store: AtomicJSONStore<SettingsDocument>(fileURL: settingsURL, fileSystem: InMemorySettingsFileSystem(), clock: clock)
         )
@@ -201,15 +233,14 @@ final class RendererIntegrationTests: XCTestCase {
             store: AtomicJSONStore<HistoryDocument>(fileURL: historyURL, fileSystem: InMemorySettingsFileSystem(), clock: clock),
             clock: clock
         )
-        let power = PowerAssertionService(backend: FakePowerAssertionBackend())
+        let powerBackend = FakePowerAssertionBackend()
+        let power = PowerAssertionService(backend: powerBackend)
         let updateService = FakeUpdateChecking()
+        let updateScheduler = FakeUpdateSchedulerControlling()
         let detector = FakeAgentDetecting()
         let agentMonitor = AgentMonitor(detector: detector, clock: clock)
 
-        let tempRoot = FileManager.default.temporaryDirectory
-            .appendingPathComponent("RendererIntegrationTests-\(UUID().uuidString)", isDirectory: true)
-        try RendererFixture.write(into: tempRoot)
-        let panel = PanelController(rendererRoot: SeerRendererRoot(url: tempRoot))
+        let panel = PanelController(rendererRoot: BundledRenderer.root)
         let rendererSink = RendererEventSink(javaScriptCaller: panel.webView)
 
         let coordinator = await AppSnapshotCoordinator.makeAtStartup(
@@ -220,7 +251,7 @@ final class RendererIntegrationTests: XCTestCase {
             clock: clock,
             appVersion: "1.0.0-integration-test",
             updateService: updateService,
-            updateScheduler: FakeUpdateSchedulerControlling()
+            updateScheduler: updateScheduler
         )
 
         let router = StandaloneBridgeCommandRouter.forCoordinator(coordinator)
@@ -228,13 +259,13 @@ final class RendererIntegrationTests: XCTestCase {
         BridgeMessageHandlerRegistration.register(bridgeMessageHandler, on: panel.userContentController)
         panel.loadInitialDocument()
 
-        let harness = Harness(tempRoot: tempRoot, panel: panel, bridgeMessageHandler: bridgeMessageHandler)
-        return (harness, coordinator, detector, agentMonitor)
+        let harness = Harness(panel: panel, bridgeMessageHandler: bridgeMessageHandler, coordinator: coordinator)
+        return (harness, coordinator, detector, agentMonitor, power, powerBackend, updateScheduler)
     }
 
     // MARK: - JS helpers
 
-    private func waitUntil(timeout: TimeInterval = 5, _ condition: @escaping () async -> Bool) async {
+    private func waitUntil(timeout: TimeInterval = 10, _ condition: @escaping () async -> Bool) async {
         let deadline = Date().addingTimeInterval(timeout)
         while await !condition(), Date() < deadline {
             try? await Task.sleep(nanoseconds: 10_000_000)
@@ -245,23 +276,77 @@ final class RendererIntegrationTests: XCTestCase {
         (try? await webView.evaluateJavaScript(expression)) as? String
     }
 
-    private func evaluateInt(_ webView: WKWebView, _ expression: String) async -> Int? {
-        if let number = (try? await webView.evaluateJavaScript(expression)) as? NSNumber {
-            return number.intValue
-        }
-        return nil
+    /// The real `HomeView`'s status title text node (`renderer/main/
+    /// home-view.tsx`'s `statusTitle`) — exactly "Idle" or "Keeping Mac
+    /// awake", nothing else in the bundled app renders either string.
+    /// Never a test-fixture stand-in element.
+    private func statusTitleText(_ webView: WKWebView) async -> String? {
+        let expression = """
+            (function () {
+              var nodes = Array.from(document.querySelectorAll('span'));
+              var match = nodes.find(function (node) {
+                return node.textContent === 'Idle' || node.textContent === 'Keeping Mac awake';
+              });
+              return match ? match.textContent : null;
+            })()
+            """
+        return await evaluateString(webView, expression)
+    }
+
+    /// Clicks the first real `<button>` whose exact, trimmed text content
+    /// matches `text` (e.g. the real `PanelTabs`/`SegmentedControlItem`
+    /// buttons) — driving the actual production React UI, never a
+    /// directly-injected wire-protocol event. Returns whether a match was
+    /// found and clicked.
+    private func clickButtonWithText(_ webView: WKWebView, _ text: String) async -> Bool {
+        let escaped = text.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "'", with: "\\'")
+        let expression = """
+            (function () {
+              var buttons = Array.from(document.querySelectorAll('button'));
+              var match = buttons.find(function (button) {
+                return button.textContent && button.textContent.trim() === '\(escaped)';
+              });
+              if (!match) { return false; }
+              match.click();
+              return true;
+            })()
+            """
+        return (try? await webView.evaluateJavaScript(expression)) as? Bool ?? false
+    }
+
+    /// Clicks the real, non-disabled `<button aria-label="…">` matching
+    /// `label` (e.g. `HistoryView`'s real "Clear history" button) — again
+    /// driving actual production UI, not a synthetic stand-in. Returns
+    /// `false` (and never clicks) while the button is still disabled, so
+    /// callers can `waitUntil` it becomes clickable.
+    private func clickButtonWithAriaLabel(_ webView: WKWebView, _ label: String) async -> Bool {
+        let escaped = label.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "'", with: "\\'")
+        let expression = """
+            (function () {
+              var match = document.querySelector('[aria-label=\\'\(escaped)\\']');
+              if (!match || match.disabled) { return false; }
+              match.click();
+              return true;
+            })()
+            """
+        return (try? await webView.evaluateJavaScript(expression)) as? Bool ?? false
     }
 
     // MARK: 1. Bundled document loads, exposes the exact bridge version
 
     /// Full, real stack (real `PanelController`, real `SeerSchemeHandler`
-    /// serving the fixture document from disk, real navigation policy)
-    /// with fake detector/storage/history/power/update services backing a
-    /// real `AppSnapshotCoordinator`. Waits for the bundled document to
+    /// serving the *actual bundled* `standalone-window.html` from
+    /// `build/standalone-renderer/Renderer`, real navigation policy) with
+    /// fake detector/storage/history/power/update services backing a real
+    /// `AppSnapshotCoordinator`. Waits for the bundled document to
     /// actually finish loading through `seer://app/standalone-window.html`
-    /// before asserting `document.title`/`window.seerNative.version`.
+    /// before asserting `document.title`/`window.seerNative.version`, and
+    /// confirms the real coordinator's shutdown lifecycle (power
+    /// assertion released, update scheduler stopped) leaves nothing
+    /// retained once this test's own harness tears down.
     func testBundledDocumentLoadsAndExposesBridgeVersion() async throws {
-        let (harness, _, _, _) = try await makeRealCoordinatorHarness()
+        let (harness, _, _, _, power, powerBackend, updateScheduler) = try await makeRealCoordinatorHarness()
+        addTeardownBlock { await harness.tearDown() }
 
         await waitUntil { await self.evaluateString(harness.webView, "document.title") == "Seer" }
 
@@ -272,24 +357,33 @@ final class RendererIntegrationTests: XCTestCase {
         XCTAssertEqual(version, bridgeVersion)
 
         await harness.tearDown()
+        XCTAssertFalse(power.isActive, "the coordinator's shutdown() must release the power assertion, leaving none retained")
+        XCTAssertEqual(
+            powerBackend.releasedIDs.count, powerBackend.createdCount,
+            "every power assertion this test's coordinator created must have been released"
+        )
+        XCTAssertEqual(updateScheduler.stopCallCount, 1, "the coordinator's shutdown() must stop the update scheduler exactly once")
     }
 
-    // MARK: 2. A synthetic AppSnapshot visibly updates Status
+    // MARK: 2. A synthetic AppSnapshot visibly updates the real Status UI
 
     /// Drives a real scan through a fake `AgentDetecting`/`AgentMonitor`
     /// pair, exactly mirroring `AppDelegate.performScanTick(agentMonitor:
     /// coordinator:)`'s own two-step handoff (`agentMonitor.scan()` then
     /// `coordinator.applyScan(state.agents, scannedAt:)`), then confirms
     /// the resulting `snapshot.changed` event — delivered through the
-    /// real `RendererEventSink` → `window.seerNative.receive` path — is
-    /// visibly reflected in the fixture's "Status" DOM element.
+    /// real `RendererEventSink` → `window.seerNative.receive` path, into
+    /// the real bundled React app's own `useAppSnapshot`/`HomeView` —
+    /// is visibly reflected in the real, rendered status title text.
     func testSyntheticSnapshotUpdatesVisibleStatusText() async throws {
-        let (harness, coordinator, detector, agentMonitor) = try await makeRealCoordinatorHarness()
+        let (harness, coordinator, detector, agentMonitor, power, powerBackend, updateScheduler) = try await makeRealCoordinatorHarness()
+        addTeardownBlock { await harness.tearDown() }
 
         await waitUntil { await self.evaluateString(harness.webView, "document.title") == "Seer" }
+        await waitUntil { await self.statusTitleText(harness.webView) != nil }
 
-        let initialStatus = await evaluateString(harness.webView, "document.getElementById('status').textContent")
-        XCTAssertEqual(initialStatus, "Idle")
+        let initialStatus = await statusTitleText(harness.webView)
+        XCTAssertEqual(initialStatus, "Idle", "the real HomeView status title must read Idle before any agent is detected")
 
         detector.nextAgents = [
             ActiveAgent(
@@ -305,48 +399,75 @@ final class RendererIntegrationTests: XCTestCase {
         XCTAssertTrue(state.active, "the fake detector's scripted agent must have made the monitor report active")
         await coordinator.applyScan(state.agents, scannedAt: state.lastScanAt)
 
-        await waitUntil {
-            await self.evaluateString(harness.webView, "document.getElementById('status').textContent") == "Active"
-        }
-        let updatedStatus = await evaluateString(harness.webView, "document.getElementById('status').textContent")
-        XCTAssertEqual(updatedStatus, "Active", "a real snapshot.changed event must visibly update the Status element")
+        await waitUntil { await self.statusTitleText(harness.webView) == "Keeping Mac awake" }
+        let updatedStatus = await statusTitleText(harness.webView)
+        XCTAssertEqual(
+            updatedStatus, "Keeping Mac awake",
+            "a real snapshot.changed event must visibly update the real HomeView's status title"
+        )
         XCTAssertTrue(coordinator.snapshot.monitor.active)
 
         await harness.tearDown()
+        XCTAssertFalse(power.isActive, "the coordinator's shutdown() must release the power assertion, leaving none retained")
+        XCTAssertEqual(
+            powerBackend.releasedIDs.count, powerBackend.createdCount,
+            "every power assertion this test's coordinator created must have been released"
+        )
+        XCTAssertEqual(updateScheduler.stopCallCount, 1, "the coordinator's shutdown() must stop the update scheduler exactly once")
     }
 
     // MARK: 3. keepAwakeMode.set / history.clear reach the typed fake coordinator
 
-    /// Sends both commands from real page-world script, through the
-    /// production DOM-relay contract (`BridgeRelayUserScript`'s isolated
-    /// content-world listener, never `BridgeMessageHandler.handle(body:)`
-    /// called directly), and asserts the typed `RecordingBridgeCommandRouter`
-    /// fake received the exact commands/arguments, plus that the real
-    /// response round-trip (through `RendererEventSink` back into
-    /// `window.seerNative.receive`) actually completed successfully.
+    /// Triggers both commands by clicking real, rendered buttons in the
+    /// actual bundled React app — the "System + Display" segmented-control
+    /// option (`HomeView`) and the "Clear history" toolbar button
+    /// (`HistoryView`) — never by injecting a hand-rolled wire-protocol
+    /// event. Each click flows through the real `RendererBridge` →
+    /// `createDomRelayPort` → `BridgeRelayUserScript`'s isolated
+    /// content-world listener → real `BridgeMessageHandler`, and is
+    /// asserted to have reached the typed `RecordingBridgeCommandRouter`
+    /// fake with the exact commands/arguments — never
+    /// `BridgeMessageHandler.handle(body:)` called directly, and no bridge
+    /// logic of any kind duplicated in this test file.
     func testKeepAwakeModeSetAndHistoryClearReachTypedFakeCoordinatorThroughRealBridgePath() async throws {
-        let router = RecordingBridgeCommandRouter(snapshot: .empty(version: "1.0.0-integration-test"))
-        let harness = try makeHarness(router: router)
+        // Seeded with non-empty history so `HistoryView`'s real
+        // "Clear history" button (disabled while there is nothing to
+        // clear) is actually clickable from the moment the page loads.
+        let seededSnapshot = AppSnapshot(
+            monitor: AgentMonitorState(active: false, keepingAwake: false, keepAwakeMode: .system, agents: [], lastScanAt: 0),
+            history: HistoryStats(
+                totalAwakeMs: 3_600_000,
+                todayAwakeMs: 1_800_000,
+                sessionCount: 1,
+                perAgent: [],
+                currentSession: nil,
+                recentSessions: [
+                    AwakeSession(
+                        id: "session-1",
+                        startedAt: 1_699_999_000_000,
+                        endedAt: 1_700_000_000_000,
+                        durationMs: 1_000_000,
+                        mode: .system,
+                        agents: []
+                    ),
+                ]
+            ),
+            update: UpdateState(checking: false, availableVersion: nil, releaseURL: nil, lastCheckedAt: nil),
+            diagnostics: [],
+            appVersion: "1.0.0-integration-test"
+        )
+        let router = RecordingBridgeCommandRouter(snapshot: seededSnapshot)
+        let harness = makeHarness(router: router)
+        addTeardownBlock { await harness.tearDown() }
 
         await waitUntil { await self.evaluateString(harness.webView, "document.title") == "Seer" }
 
-        _ = try? await harness.webView.evaluateJavaScript(
-            "window.__seerSendBridgeRequest('kam-1', 'keepAwakeMode.set', {mode: 'display'})"
-        )
-        _ = try? await harness.webView.evaluateJavaScript(
-            "window.__seerSendBridgeRequest('hc-1', 'history.clear', {})"
-        )
+        await waitUntil { await self.clickButtonWithText(harness.webView, "System + Display") }
+        await waitUntil { router.keepAwakeModeSetCalls.count == 1 }
 
-        await waitUntil { await self.evaluateInt(harness.webView, "window.__seerTestReceived.length") == 2 }
-
-        let received = try await harness.webView.evaluateJavaScript("window.__seerTestReceived") as? [[String: Any]]
-        let responsesByID = Dictionary(uniqueKeysWithValues: (received ?? []).compactMap { entry -> (String, [String: Any])? in
-            guard let id = entry["id"] as? String else { return nil }
-            return (id, entry)
-        })
-
-        XCTAssertEqual(responsesByID["kam-1"]?["ok"] as? Bool, true)
-        XCTAssertEqual(responsesByID["hc-1"]?["ok"] as? Bool, true)
+        await waitUntil { await self.clickButtonWithText(harness.webView, "History") }
+        await waitUntil { await self.clickButtonWithAriaLabel(harness.webView, "Clear history") }
+        await waitUntil { router.historyClearCallCount == 1 }
 
         XCTAssertEqual(router.keepAwakeModeSetCalls, [.display], "the exact requested mode must reach the typed fake coordinator")
         XCTAssertEqual(router.historyClearCallCount, 1, "history.clear must reach the typed fake coordinator exactly once")
