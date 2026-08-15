@@ -138,9 +138,10 @@ account, or in-progress work.
   Instead, record only the specific fields the row is actually testing
   (e.g. `keepAwakeMode`'s value, and whether the sentinel entry's `id` is
   present/absent — never the entry's real working-directory-derived
-  fields), plus a `sha256sum` digest of the *entire* raw file so a future
-  re-run can prove byte-for-byte identity/difference without ever
-  re-exposing the bytes themselves.
+  fields), plus a `/usr/bin/shasum -a 256` digest (stock macOS; output is the
+  same `<hash>  <filename>` format as GNU `sha256sum`) of the *entire* raw
+  file so a future re-run can prove byte-for-byte identity/difference
+  without ever re-exposing the bytes themselves.
 - **Screenshots/logs: redact personal paths and session metadata.** Crop
   or blur any visible absolute path, real username, machine name, menu-bar
   clock, or any other session metadata before committing a screenshot;
@@ -296,7 +297,8 @@ contents.
    — never a real project path, real agent session ID, or a freshly
    generated timestamp/UUID). Quit Glaze.
 3. Capture `docs/parity-evidence/isolated-storage-glaze.log`: for each of
-   `settings.json` and `history.json`, record (a) a `sha256sum` digest of
+   `settings.json` and `history.json`, record (a) a `/usr/bin/shasum -a 256`
+   digest of
    the full raw file, and (b) only the specific fields this row tests —
    `keepAwakeMode`'s value, and whether an entry containing
    `SEER-PARITY-SENTINEL-GLAZE-0001` is present — never the raw file
@@ -311,13 +313,13 @@ contents.
    the fixed synthetic sentinel identifier
    `SEER-PARITY-SENTINEL-STANDALONE-0001`. Quit the standalone app.
 5. Capture `docs/parity-evidence/isolated-storage-standalone.log`: the same
-   two things as step 3 (per-file sha256 digest plus the
+   two things as step 3 (per-file `/usr/bin/shasum -a 256` digest plus the
    `keepAwakeMode`/sentinel-presence extract) for
    `$HOME/Library/Application Support/ai.opencoven.seer/settings.json` and
    `history.json`, plus confirmation that Glaze's directory/files from step
    3 are byte-for-byte unchanged — proven by comparing the step-3
-   `sha256sum` digests against a freshly recomputed one, not by re-pasting
-   file contents.
+   `/usr/bin/shasum -a 256` digests against a freshly recomputed one, not by
+   re-pasting file contents.
 
 ### 3. Relaunch both and verify neither observes the other's state
 
@@ -334,7 +336,7 @@ contents.
    **Display** mode must be **absent**. Screenshot as
    `docs/parity-evidence/isolated-storage-standalone.png`, redacted the
    same way.
-8. Append the post-relaunch `sha256sum` digests and `keepAwakeMode`/
+8. Append the post-relaunch `/usr/bin/shasum -a 256` digests and `keepAwakeMode`/
    sentinel-presence extracts (the same normalized form as steps 3/5 — never
    a raw file dump) for both applications' `settings.json`/`history.json`
    to their respective `.log` files, so the evidence directly shows each
@@ -363,12 +365,13 @@ isolation, but must not be conflated with a `PASS`).
 
 The scenarios below are exercised deterministically by
 `apps/macos/Seer/Tests/Integration/RendererIntegrationTests.swift` and
-`apps/macos/Seer/Tests/Integration/NavigationPolicyTests.swift` (run via
-`xcodebuild test -project apps/macos/Seer/Seer.xcodeproj -scheme Seer
--destination 'platform=macOS,arch=arm64' CODE_SIGNING_ALLOWED=NO
--only-testing:SeerTests/RendererIntegrationTests
--only-testing:SeerTests/NavigationPolicyTests`) and by the broader
-`SeerTests`/`npm run test:renderer` suites, so this manual matrix does not
+`apps/macos/Seer/Tests/Integration/NavigationPolicyTests.swift` (run via the
+official, lock-safe `npm run test:macos`, which generates the Xcode project
+with `xcodegen` and runs `xcodebuild test` for the full `SeerTests` suite,
+including `RendererIntegrationTests` and `NavigationPolicyTests`; do not invoke
+`xcodebuild` directly, since that bypasses the renderer/generated-project lock
+and assumes outputs that are gitignored on a clean checkout) and by the
+broader `SeerTests`/`npm run test:renderer` suites, so this manual matrix does not
 need to re-prove them — only the genuinely manual, cross-application
 scenarios above still require human execution:
 
