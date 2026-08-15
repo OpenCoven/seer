@@ -14,6 +14,10 @@ fail() {
   exit 1
 }
 
+if ! [[ "${PREPARE_RUNNER_ID:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]]; then
+  fail "PREPARE_RUNNER_ID must be a nonempty stable runner identity"
+fi
+
 run_unsigned_build() {
   if [[ "$#" -ne 8 ]]; then
     fail "internal unsigned build received invalid arguments"
@@ -174,7 +178,8 @@ node "${SCRIPT_DIR}/build-standalone-renderer.mjs" -- \
   --version "${VERSION}" \
   --build-number "${BUILD_NUMBER}" \
   --bundle-identifier ai.opencoven.seer \
-  --architecture arm64
+  --architecture arm64 \
+  --prepare-runner-id "${PREPARE_RUNNER_ID}"
 
 chmod 0644 \
   "${STAGE_DIR}/Seer-unsigned-arm64.tar" \
@@ -182,3 +187,6 @@ chmod 0644 \
 mv "${STAGE_DIR}" "${OUTPUT_DIR}"
 
 echo "unsigned release input staged at build/macos/release-input"
+echo "PREPARE_RUNNER_ID=${PREPARE_RUNNER_ID}"
+echo "UNSIGNED_APP_SHA256=$(/usr/bin/shasum -a 256 "${OUTPUT_DIR}/Seer-unsigned-arm64.tar" | { read -r digest _; printf '%s' "${digest}"; })"
+echo "UNSIGNED_APP_ATTESTATION_SHA256=$(/usr/bin/shasum -a 256 "${OUTPUT_DIR}/unsigned-app-attestation.json" | { read -r digest _; printf '%s' "${digest}"; })"

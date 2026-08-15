@@ -34,6 +34,8 @@ const signingIdentity = "Developer ID Application: OpenCoven (ABCDEFGHIJ)";
 const apiIssuer = "00000000-0000-0000-0000-000000000000";
 const apiKeyId = "TESTKEY123";
 const appleId = "developer@example.com";
+const prepareRunnerId = "prepare-hosted-runner-123";
+const signingRunnerId = "signing-hosted-runner-456";
 const credentialValues = [
   Buffer.from("test certificate").toString("base64"),
   "certificate-password",
@@ -48,6 +50,64 @@ const credentialValues = [
   "test certificate",
   "test api key",
 ];
+
+function prepareBindingSha256({
+  prepareRunner = prepareRunnerId,
+  sourceCommit = "a".repeat(40),
+  archiveSha256,
+  appDigest,
+  entryListSha256,
+}) {
+  return createHash("sha256")
+    .update(
+      `prepareRunnerId:${prepareRunner}\n` +
+        `sourceCommit:${sourceCommit}\n` +
+        `archiveSha256:${archiveSha256}\n` +
+        `appDigest:${appDigest}\n` +
+        `entryListSha256:${entryListSha256}\n`,
+    )
+    .digest("hex");
+}
+
+function canonicalReleaseInputAttestation({
+  archiveSha256,
+  archiveSize,
+  entries,
+  appDigest = "0".repeat(64),
+  sourceCommit = "a".repeat(40),
+  prepareRunner = prepareRunnerId,
+}) {
+  const entryListSha256 = createHash("sha256").update(`${entries.join("\n")}\n`).digest("hex");
+  return {
+    appDigest,
+    appDigestAlgorithm: "sha256-files-v1",
+    architecture: "arm64",
+    archive: {
+      entryCount: entries.length,
+      entryListSha256,
+      name: "Seer-unsigned-arm64.tar",
+      sha256: archiveSha256,
+      size: archiveSize,
+    },
+    archiveFormat: "ustar",
+    boundary: "task14-release-v1",
+    boundaryValidation: "passed",
+    buildNumber: "42",
+    bundleIdentifier: "ai.opencoven.seer",
+    prepareBindingAlgorithm: "sha256-lines-v1",
+    prepareBindingSha256: prepareBindingSha256({
+      prepareRunner,
+      sourceCommit,
+      archiveSha256,
+      appDigest,
+      entryListSha256,
+    }),
+    prepareRunnerId: prepareRunner,
+    schemaVersion: 2,
+    sourceCommit,
+    version: "1.2.3",
+  };
+}
 
 function withScratch(prefix, callback) {
   mkdirSync(join(repoRoot, "build"), { recursive: true });
@@ -86,6 +146,8 @@ function completeSigningEnvironment(overrides = {}) {
     APPLE_UNRELATED_SECRET: "unrelated-apple-secret",
     SOURCE_COMMIT: "a".repeat(40),
     WORKFLOW_RUN: "123",
+    PREPARE_RUNNER_ID: prepareRunnerId,
+    SIGNING_RUNNER_ID: signingRunnerId,
     ...overrides,
   };
 }
@@ -162,6 +224,10 @@ function makeStubTools(
   const defaultKeychainState = join(scratch, "default-keychain");
   const mountPointer = join(scratch, "mounted-dmg-path");
   const pauseReady = join(scratch, "pause-ready");
+  const precredentialAttackMarker = join(scratch, "precredential-helper-daemonized");
+  const credentialsDestroyedMarker = join(scratch, "credentials-destroyed");
+  const precredentialCommandLog = join(scratch, "precredential-commands.log");
+  const signedState = join(scratch, "codesign-signed");
   mkdirSync(bin);
   mkdirSync(captureDir);
   writeFileSync(defaultKeychainState, `${join(scratch, "login.keychain-db")}\n`);
@@ -237,6 +303,7 @@ case "\${operation}" in
     last=""
     for argument in "$@"; do last="\${argument}"; done
     rm -f "\${last}"
+    printf "destroyed\\n" > ${JSON.stringify(credentialsDestroyedMarker)}
     ;;
   find-identity)
     printf '  1) AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA "Developer ID Application: OpenCoven (ABCDEFGHIJ)"\\n'
@@ -397,6 +464,9 @@ exec "\${SEER_REAL_NODE}" "$@"
       SEER_STUB_MOUNT_POINTER: mountPointer,
       SEER_STUB_NOTARY_MODE: notarizationMode,
       SEER_STUB_NOTARY_STATUS: notaryStatus,
+      SEER_TEST_MODE: "1",
+      SEER_TEST_SYSTEM_TOOLS_DIR: bin,
+      SEER_TEST_COMMAND_LOG: precredentialCommandLog,
       SEER_STUB_PAUSE_AT: pauseAt,
       SEER_STUB_PAUSE_READY: pauseReady,
     },
@@ -458,7 +528,8 @@ test("package script statically contains the complete secure release gate", () =
   assert.match(source, /trap ['"]?handle_signal 2['"]? INT/);
   assert.match(source, /trap ['"]?handle_signal 15['"]? TERM/);
   assert.ok(
-    source.indexOf("trap cleanup EXIT") < source.indexOf('mkdir -p "${BUILD_ROOT}"'),
+    source.indexOf("trap cleanup EXIT") <
+      source.indexOf('run_system_tool "${SYSTEM_MKDIR}" -p "${BUILD_ROOT}"'),
     "signal and EXIT traps must be installed before packaging side effects",
   );
   assert.match(source, /unset "\$\{apple_variable\}"/);
@@ -470,29 +541,48 @@ test("package script statically contains the complete secure release gate", () =
     firstCredentialUnset < source.indexOf("SCRIPT_DIR="),
     "signing variables must be unexported before the first command substitution",
   );
-  assert.match(source, /security create-keychain/);
-  assert.match(source, /security default-keychain -s/);
-  assert.match(source, /security delete-keychain/);
+  assert.match(source, /SYSTEM_SECURITY=\/usr\/bin\/security/);
+  assert.match(source, /SYSTEM_SECURITY}" create-keychain/);
+  assert.match(source, /SYSTEM_SECURITY}" default-keychain -s/);
+  assert.match(source, /SYSTEM_SECURITY}" delete-keychain/);
   assert.match(source, /API_KEY_PATH="\$\{CREDENTIAL_ROOT\}\/notary-api-key\.p8"/);
   assert.doesNotMatch(source, /API_KEY_PATH=.*APPLE_API_KEY/);
-  assert.match(source, /validate_release_input "\$\{VALIDATION_ROOT\}"/);
-  assert.match(source, /validate_release_input "\$\{UNSIGNED_ROOT\}"/);
+  assert.match(source, /archive exact entry allowlist/);
+  assert.match(source, /extracted app digest does not match/);
   assert.doesNotMatch(source, /\b(?:npm|npx|vite|xcodegen|xcodebuild)\b/);
   assert.match(source, /--options runtime/);
   assert.match(source, /--timestamp/);
-  assert.match(source, /--entitlements/);
-  assert.match(source, /codesign --verify --deep --strict/);
-  assert.match(source, /codesign -d --verbose=4 "\$\{WORK_DMG\}"/);
+  assert.doesNotMatch(source, /--entitlements/);
+  assert.match(source, /SYSTEM_CODESIGN}" --verify --deep --strict/);
+  assert.match(source, /SYSTEM_CODESIGN}" -d --verbose=4 "\$\{WORK_DMG\}"/);
   assert.match(source, /notarytool submit[\s\S]*--wait[\s\S]*--output-format json/);
-  assert.match(source, /ditto -c -k --keepParent/);
+  assert.match(source, /SYSTEM_DITTO}" -c -k --keepParent/);
   assert.match(source, /stapler staple/);
   assert.match(source, /stapler validate/);
-  assert.match(source, /hdiutil create[\s\S]*-format UDZO/);
-  assert.match(source, /spctl --assess[\s\S]*SIGNED_APP/);
-  assert.match(source, /spctl --assess[\s\S]*WORK_DMG/);
+  assert.match(source, /SYSTEM_HDIUTIL}" create[\s\S]*-format UDZO/);
+  assert.match(source, /SYSTEM_SPCTL}" --assess[\s\S]*SIGNED_APP/);
+  assert.match(source, /SYSTEM_SPCTL}" --assess[\s\S]*WORK_DMG/);
   assert.match(source, /check-release-boundary\.mjs/);
   assert.match(source, /write-release-manifest\.mjs/);
   assert.doesNotMatch(source, /\bgh\b|curl|git push|gh release/);
+});
+
+test("precredential signing verification uses only fixed system tools and shell built-ins", () => {
+  const source = readFileSync(packageScript, "utf8");
+  const credentialBoundary = source.indexOf("# CREDENTIAL PHASE");
+  assert.notEqual(credentialBoundary, -1, "signing script must mark the credential phase boundary");
+  const precredential = source.slice(0, credentialBoundary);
+
+  assert.doesNotMatch(
+    precredential,
+    /scripts\/.*\.(?:mjs|py)|\/usr\/bin\/python3|\b(?:node|npm|npx|git|xcodegen|xcodebuild)\b/,
+  );
+  for (const tool of ["codesign", "lipo", "plutil", "shasum", "stat", "tar", "uname"]) {
+    assert.match(precredential, new RegExp(`/usr/bin/${tool}\\b`), tool);
+  }
+  assert.match(precredential, /UNSIGNED_APP_ATTESTATION_SHA256/);
+  assert.match(precredential, /PREPARE_RUNNER_ID/);
+  assert.match(precredential, /SIGNING_RUNNER_ID/);
 });
 
 test("credential-free invocation names APPLE_CERTIFICATE first and creates no packaging state", () => {
@@ -619,6 +709,32 @@ test("unsigned preparation rejects every APPLE variable before running build too
   });
 });
 
+test("unsigned preparation requires a runner identity before invoking repository tooling", () => {
+  withScratch("release-prepare-runner-id-", (scratch) => {
+    const marker = join(scratch, "tool-ran");
+    const bin = join(scratch, "bin");
+    mkdirSync(bin);
+    for (const tool of ["git", "node", "uname", "xcodegen", "xcodebuild"]) {
+      writeExecutable(join(bin, tool), `printf "%s\\n" "${tool}" >> ${JSON.stringify(marker)}\n`);
+    }
+
+    const result = spawnSync("/bin/bash", [prepareScript], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      env: {
+        PATH: `${bin}:${process.env.PATH}`,
+        VERSION: "1.2.3",
+        BUILD_NUMBER: "42",
+        SOURCE_COMMIT: "a".repeat(40),
+      },
+    });
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /PREPARE_RUNNER_ID/);
+    assert.ok(!existsSync(marker), "runner identity must be checked before repository tooling");
+  });
+});
+
 test("unsigned preparation builds and attests the fixed release input without signing state", () => {
   withScratch("release-prepare-success-", (scratch) => {
     rmSync(releaseInputRoot, { recursive: true, force: true });
@@ -694,6 +810,7 @@ esac
         VERSION: "1.2.3",
         BUILD_NUMBER: "42",
         SOURCE_COMMIT: sourceCommit,
+        PREPARE_RUNNER_ID: prepareRunnerId,
       },
     });
 
@@ -706,9 +823,23 @@ esac
       readFileSync(join(releaseInputRoot, "unsigned-app-attestation.json"), "utf8"),
     );
     assert.equal(metadata.sourceCommit, sourceCommit);
+    assert.equal(metadata.prepareRunnerId, prepareRunnerId);
+    assert.equal(metadata.boundaryValidation, "passed");
+    assert.equal(
+      metadata.prepareBindingSha256,
+      prepareBindingSha256({
+        archiveSha256: metadata.archive.sha256,
+        appDigest: metadata.appDigest,
+        entryListSha256: metadata.archive.entryListSha256,
+        sourceCommit,
+      }),
+    );
     assert.equal(metadata.archive.sha256, createHash("sha256")
       .update(readFileSync(join(releaseInputRoot, "Seer-unsigned-arm64.tar")))
       .digest("hex"));
+    assert.match(result.stdout, new RegExp(`PREPARE_RUNNER_ID=${prepareRunnerId}`));
+    assert.match(result.stdout, new RegExp(`UNSIGNED_APP_SHA256=${metadata.archive.sha256}`));
+    assert.match(result.stdout, /UNSIGNED_APP_ATTESTATION_SHA256=[0-9a-f]{64}/);
     const toolEnvironment = readFileSync(capturedEnvironment, "utf8");
     assert.doesNotMatch(toolEnvironment, /^APPLE_/m);
     assert.match(readFileSync(log, "utf8"), /renderer\nxcodegen\nxcodebuild:[^\n]+\nstrip\nboundary\n/);
@@ -769,6 +900,8 @@ test("release-input tool creates deterministic no-link archives and source-bound
           "ai.opencoven.seer",
           "--architecture",
           "arm64",
+          "--prepare-runner-id",
+          prepareRunnerId,
         ],
         { cwd: repoRoot, encoding: "utf8" },
       );
@@ -786,8 +919,12 @@ test("release-input tool creates deterministic no-link archives and source-bound
       "archive",
       "archiveFormat",
       "boundary",
+      "boundaryValidation",
       "buildNumber",
       "bundleIdentifier",
+      "prepareBindingAlgorithm",
+      "prepareBindingSha256",
+      "prepareRunnerId",
       "schemaVersion",
       "sourceCommit",
       "version",
@@ -795,6 +932,7 @@ test("release-input tool creates deterministic no-link archives and source-bound
     assert.equal(metadata.archive.sha256, createHash("sha256").update(archiveBytes).digest("hex"));
     assert.equal(metadata.archive.size, archiveBytes.length);
     assert.equal(metadata.sourceCommit, "a".repeat(40));
+    assert.equal(metadata.prepareRunnerId, prepareRunnerId);
     assert.equal(metadata.architecture, "arm64");
     assert.equal(metadata.bundleIdentifier, "ai.opencoven.seer");
     assert.equal(metadata.appDigest, computeAppDigest(app));
@@ -826,6 +964,8 @@ test("release-input creation rejects non-fixed artifact names", () => {
         "ai.opencoven.seer",
         "--architecture",
         "arm64",
+        "--prepare-runner-id",
+        prepareRunnerId,
       ],
       { cwd: repoRoot, encoding: "utf8" },
     );
@@ -863,6 +1003,8 @@ test("release-input creation never follows a symlinked app ancestor", () => {
         "ai.opencoven.seer",
         "--architecture",
         "arm64",
+        "--prepare-runner-id",
+        prepareRunnerId,
       ],
       { cwd: repoRoot, encoding: "utf8" },
     );
@@ -904,6 +1046,8 @@ test("release-input validation safely extracts only an attested Seer.app", () =>
         "ai.opencoven.seer",
         "--architecture",
         "arm64",
+        "--prepare-runner-id",
+        prepareRunnerId,
       ],
       { cwd: repoRoot, encoding: "utf8" },
     );
@@ -929,6 +1073,8 @@ test("release-input validation safely extracts only an attested Seer.app", () =>
         "1.2.3",
         "--expected-build-number",
         "42",
+        "--expected-prepare-runner-id",
+        prepareRunnerId,
         "--destination",
         destination,
       ],
@@ -966,23 +1112,11 @@ with tarfile.open(${JSON.stringify(archive)}, "w", format=tarfile.USTAR_FORMAT) 
       writeFileSync(
         attestation,
         `${JSON.stringify(
-          {
-            appDigest: "0".repeat(64),
-            appDigestAlgorithm: "sha256-files-v1",
-            architecture: "arm64",
-            archive: {
-              name: "Seer-unsigned-arm64.tar",
-              sha256: archiveSha256,
-              size: bytes.length,
-            },
-            archiveFormat: "ustar",
-            boundary: "task14-release-v1",
-            buildNumber: "42",
-            bundleIdentifier: "ai.opencoven.seer",
-            schemaVersion: 1,
-            sourceCommit: "a".repeat(40),
-            version: "1.2.3",
-          },
+          canonicalReleaseInputAttestation({
+            archiveSha256,
+            archiveSize: bytes.length,
+            entries: ["Seer.app/", maliciousName],
+          }),
           null,
           2,
         )}\n`,
@@ -1007,6 +1141,8 @@ with tarfile.open(${JSON.stringify(archive)}, "w", format=tarfile.USTAR_FORMAT) 
           "1.2.3",
           "--expected-build-number",
           "42",
+          "--expected-prepare-runner-id",
+          prepareRunnerId,
           "--destination",
           destination,
         ],
@@ -1053,6 +1189,8 @@ function createAttestedInput(scratch, sourceCommit = "a".repeat(40)) {
       "ai.opencoven.seer",
       "--architecture",
       "arm64",
+      "--prepare-runner-id",
+      prepareRunnerId,
     ],
     { cwd: repoRoot, encoding: "utf8" },
   );
@@ -1071,6 +1209,7 @@ function makeSigningOnlyStubs(
     notaryStatus = "Accepted",
     notarizationMode = "api-key",
     backgroundAttack = false,
+    credentialCleanupFailure = false,
     pauseAt = "",
     signingSourceCommit = "a".repeat(40),
   } = {},
@@ -1084,6 +1223,10 @@ function makeSigningOnlyStubs(
   const dmgImage = join(scratch, "dmg-image");
   const mountPointer = join(scratch, "mount-path");
   const pauseReady = join(scratch, "pause-ready");
+  const precredentialAttackMarker = join(scratch, "precredential-helper-daemonized");
+  const credentialsDestroyedMarker = join(scratch, "credentials-destroyed");
+  const precredentialCommandLog = join(scratch, "precredential-commands.log");
+  const signedState = join(scratch, "codesign-signed");
   const sourceCommit = signingSourceCommit;
   mkdirSync(bin);
   writeFileSync(defaultKeychainState, `${join(scratch, "login.keychain-db")}\n`);
@@ -1110,6 +1253,9 @@ printf '%s\\n' "--- node $* ---" >> ${JSON.stringify(nodeEnvironment)}
 "/usr/bin/env" >> ${JSON.stringify(nodeEnvironment)}
 if [[ "\${1:-}" == *"/scripts/check-release-boundary.mjs" ]]; then
   printf "node:boundary\\n" >> ${JSON.stringify(logPath)}
+  if [[ ! -e ${JSON.stringify(credentialsDestroyedMarker)} ]]; then
+    ("/bin/sleep" 1; printf "repository helper daemon ran\\n" > ${JSON.stringify(precredentialAttackMarker)}) &
+  fi
   ${backgroundAttack ? `("/bin/sleep" 1; "/usr/bin/env" > ${JSON.stringify(backgroundEnvironment)}) &` : ""}
   exit 0
 fi
@@ -1155,6 +1301,8 @@ case "\${operation}" in
     last=""
     for argument in "$@"; do last="\${argument}"; done
     rm -f "\${last}"
+    printf "destroyed\\n" > ${JSON.stringify(credentialsDestroyedMarker)}
+    ${credentialCleanupFailure ? "exit 98" : ""}
     ;;
 esac
 `,
@@ -1169,15 +1317,23 @@ for argument in "$@"; do
   [[ "\${argument}" == "--verify" ]] && verify=1
 done
 if [[ "\${display}" == 1 ]]; then
-  {
-    printf "Authority=Developer ID Application: OpenCoven (ABCDEFGHIJ)\\n"
-    printf "TeamIdentifier=ABCDEFGHIJ\\n"
-    printf "Timestamp=Aug 15, 2026 at 9:30:00 AM\\n"
-    printf "flags=0x10000(runtime)\\n"
-  } >&2
+  if [[ ! -e ${JSON.stringify(signedState)} ]]; then
+    {
+      printf "Signature=adhoc\\n"
+      printf "TeamIdentifier=not set\\n"
+    } >&2
+  else
+    {
+      printf "Authority=Developer ID Application: OpenCoven (ABCDEFGHIJ)\\n"
+      printf "TeamIdentifier=ABCDEFGHIJ\\n"
+      printf "Timestamp=Aug 15, 2026 at 9:30:00 AM\\n"
+      printf "flags=0x10000(runtime)\\n"
+    } >&2
+  fi
 elif [[ "\${verify}" == 1 ]]; then
   printf "codesign:verify\\n" >> ${JSON.stringify(logPath)}
 else
+  printf "signed\\n" > ${JSON.stringify(signedState)}
   printf "codesign:sign\\n" >> ${JSON.stringify(logPath)}
 fi
 `,
@@ -1189,6 +1345,7 @@ case "\${2:-}" in
   CFBundleShortVersionString) printf "1.2.3\\n" ;;
   CFBundleVersion) printf "42\\n" ;;
   CFBundleIdentifier) printf "ai.opencoven.seer\\n" ;;
+  status) cat >/dev/null; printf "${notaryStatus}\\n" ;;
   *) exit 2 ;;
 esac
 `,
@@ -1278,6 +1435,9 @@ esac
         UNSIGNED_APP_ARCHIVE: input.archive,
         UNSIGNED_APP_ATTESTATION: input.attestation,
         UNSIGNED_APP_SHA256: input.sha256,
+        UNSIGNED_APP_ATTESTATION_SHA256: createHash("sha256")
+          .update(readFileSync(input.attestation))
+          .digest("hex"),
       }),
       ...(notarizationMode === "api-key"
         ? {
@@ -1289,6 +1449,9 @@ esac
             APPLE_ID: appleId,
             APPLE_PASSWORD: "app-password",
           }),
+      SEER_TEST_MODE: "1",
+      SEER_TEST_SYSTEM_TOOLS_DIR: bin,
+      SEER_TEST_COMMAND_LOG: precredentialCommandLog,
     },
     backgroundEnvironment,
     defaultKeychainState,
@@ -1297,8 +1460,52 @@ esac
     mountPointer,
     nodeEnvironment,
     pauseReady,
+    precredentialAttackMarker,
+    precredentialCommandLog,
   };
 }
+
+test("same runner identity is rejected before keychain creation", () => {
+  withScratch("release-sign-same-runner-", (scratch) => {
+    const input = createAttestedInput(scratch);
+    const { env, logPath } = makeSigningOnlyStubs(scratch, input);
+    const result = runPackage({
+      ...env,
+      PREPARE_RUNNER_ID: signingRunnerId,
+      SIGNING_RUNNER_ID: signingRunnerId,
+    });
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /runner identit(?:y|ies).*distinct|same runner/i);
+    const log = existsSync(logPath) ? readFileSync(logPath, "utf8") : "";
+    assert.doesNotMatch(log, /security:create-keychain|codesign:sign|notarytool/);
+  });
+});
+
+test("signing rejects an explicit preparation identity that differs from attestation", () => {
+  withScratch("release-sign-prepare-id-mismatch-", (scratch) => {
+    const input = createAttestedInput(scratch);
+    const { env, logPath } = makeSigningOnlyStubs(scratch, input);
+    const result = runPackage({ ...env, PREPARE_RUNNER_ID: "different-prepare-runner" });
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /attestation PREPARE_RUNNER_ID mismatch/i);
+    const log = existsSync(logPath) ? readFileSync(logPath, "utf8") : "";
+    assert.doesNotMatch(log, /security:create-keychain|codesign:sign|notarytool/);
+  });
+});
+
+test("GITHUB_ACTIONS cannot enable test-only system-tool overrides", () => {
+  withScratch("release-sign-ci-stub-rejection-", (scratch) => {
+    const input = createAttestedInput(scratch);
+    const { env, logPath } = makeSigningOnlyStubs(scratch, input);
+    const result = runPackage({ ...env, GITHUB_ACTIONS: "true" });
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /test mode.*GitHub Actions|GITHUB_ACTIONS/i);
+    assert.ok(!existsSync(logPath), "CI test-mode rejection must precede tool execution");
+  });
+});
 
 test("signing rejects tampered archive bytes before credential materialization", () => {
   withScratch("release-sign-tampered-", (scratch) => {
@@ -1324,6 +1531,11 @@ test("signing rejects app-digest and source-attestation mismatches before creden
       if (mismatch === "app digest") {
         const metadata = JSON.parse(readFileSync(input.attestation, "utf8"));
         metadata.appDigest = "0".repeat(64);
+        metadata.prepareBindingSha256 = prepareBindingSha256({
+          archiveSha256: metadata.archive.sha256,
+          appDigest: metadata.appDigest,
+          entryListSha256: metadata.archive.entryListSha256,
+        });
         writeFileSync(input.attestation, `${JSON.stringify(metadata, null, 2)}\n`);
       } else {
         options = { signingSourceCommit: "b".repeat(40) };
@@ -1382,19 +1594,14 @@ with tarfile.open(${JSON.stringify(archive)}, "w", format=tarfile.USTAR_FORMAT) 
       writeFileSync(
         attestation,
         `${JSON.stringify(
-          {
-            appDigest: "0".repeat(64),
-            appDigestAlgorithm: "sha256-files-v1",
-            architecture: "arm64",
-            archive: { name: "Seer-unsigned-arm64.tar", sha256, size: bytes.length },
-            archiveFormat: "ustar",
-            boundary: "task14-release-v1",
-            buildNumber: "42",
-            bundleIdentifier: "ai.opencoven.seer",
-            schemaVersion: 1,
-            sourceCommit: "a".repeat(40),
-            version: "1.2.3",
-          },
+          canonicalReleaseInputAttestation({
+            archiveSha256: sha256,
+            archiveSize: bytes.length,
+            entries: [
+              "Seer.app/",
+              kind === "traversal" ? "Seer.app/../../escaped" : "Seer.app/redirect",
+            ],
+          }),
           null,
           2,
         )}\n`,
@@ -1424,6 +1631,8 @@ test("signing-only flow cleans credentials before repository code and never runs
       keychainPointer,
       logPath,
       nodeEnvironment,
+      precredentialAttackMarker,
+      precredentialCommandLog,
     } = makeSigningOnlyStubs(scratch, input, { backgroundAttack: true });
 
     const result = runPackage(env);
@@ -1450,9 +1659,9 @@ test("signing-only flow cleans credentials before repository code and never runs
     });
     const log = readFileSync(logPath, "utf8");
     assert.doesNotMatch(log, /FORBIDDEN-BUILD-TOOL/);
-    assert.equal((log.match(/^node:boundary$/gm) ?? []).length, 3);
     assert.equal((log.match(/^notarytool:api-key$/gm) ?? []).length, 2);
     assert.equal((log.match(/^spctl$/gm) ?? []).length, 2);
+    assert.equal((log.match(/^node:boundary$/gm) ?? []).length, 2);
     assert.ok(
       log.indexOf("security:delete-keychain") < log.indexOf("node:manifest"),
       `credential cleanup must precede manifest code:\n${log}`,
@@ -1479,6 +1688,50 @@ test("signing-only flow cleans credentials before repository code and never runs
     for (const value of credentialValues) {
       assert.ok(!capturedBackgroundEnvironment.includes(value), `background process received ${value}`);
     }
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    assert.ok(
+      !existsSync(precredentialAttackMarker),
+      "a repository helper must never execute early enough to daemonize before credential teardown",
+    );
+    const allowedPrecredentialTools = new Set([
+      "/bin/mkdir",
+      "/bin/rm",
+      "/bin/rmdir",
+      "/usr/bin/codesign",
+      "/usr/bin/lipo",
+      "/usr/bin/mktemp",
+      "/usr/bin/plutil",
+      "/usr/bin/shasum",
+      "/usr/bin/stat",
+      "/usr/bin/tar",
+      "/usr/bin/uname",
+    ]);
+    const commandLog = readFileSync(precredentialCommandLog, "utf8").trim().split("\n");
+    const credentialMarker = commandLog.indexOf("# CREDENTIAL PHASE");
+    assert.notEqual(credentialMarker, -1);
+    for (const command of commandLog.slice(0, credentialMarker)) {
+      assert.ok(allowedPrecredentialTools.has(command), `unexpected precredential command: ${command}`);
+    }
+    assertNoPackagingLeaves();
+  });
+});
+
+test("repository code stays blocked if credential teardown fails", () => {
+  withScratch("release-sign-cleanup-failure-", (scratch) => {
+    rmSync(releaseRoot, { recursive: true, force: true });
+    const input = createAttestedInput(scratch);
+    const { env, logPath, nodeEnvironment } = makeSigningOnlyStubs(scratch, input, {
+      credentialCleanupFailure: true,
+    });
+
+    const result = runPackage(env);
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /credential teardown/i);
+    const log = readFileSync(logPath, "utf8");
+    assert.doesNotMatch(log, /^node:/m);
+    assert.ok(!existsSync(nodeEnvironment));
+    assert.ok(!existsSync(releaseRoot));
     assertNoPackagingLeaves();
   });
 });

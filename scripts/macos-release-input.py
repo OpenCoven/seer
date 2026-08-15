@@ -12,10 +12,12 @@ import stat
 import tarfile
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 APP_DIGEST_ALGORITHM = "sha256-files-v1"
 ARCHIVE_FORMAT = "ustar"
 BOUNDARY_VERSION = "task14-release-v1"
+BOUNDARY_VALIDATION = "passed"
+PREPARE_BINDING_ALGORITHM = "sha256-lines-v1"
 EXPECTED_ARCHIVE_NAME = "Seer-unsigned-arm64.tar"
 EXPECTED_ATTESTATION_NAME = "unsigned-app-attestation.json"
 MAX_ARCHIVE_SIZE = 1024 * 1024 * 1024
@@ -218,10 +220,18 @@ def create_release_input(args):
         raise ReleaseInputError("build number must be a positive integer")
     if args.bundle_identifier != "ai.opencoven.seer" or args.architecture != "arm64":
         raise ReleaseInputError("release identity must be ai.opencoven.seer arm64")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", args.prepare_runner_id):
+        raise ReleaseInputError("prepare runner ID is malformed")
     require_new_regular_output(args.archive)
     require_new_regular_output(args.attestation)
     root_info, entries = collect_app(args.app)
     app_digest = compute_app_digest(entries)
+    archive_entry_names = ["Seer.app/"]
+    for entry_type, relative_path, _absolute_path, _info, _contents in entries:
+        suffix = "/" if entry_type == "directory" else ""
+        archive_entry_names.append("Seer.app/{}{}".format(relative_path, suffix))
+    archive_entry_list = "".join("{}\n".format(name) for name in archive_entry_names)
+    archive_entry_list_sha256 = sha256_bytes(archive_entry_list.encode("utf-8"))
 
     archive_descriptor = open_new_output(args.archive)
     with os.fdopen(archive_descriptor, "w+b") as archive_file:
@@ -242,6 +252,15 @@ def create_release_input(args):
         archive_info = os.fstat(archive_descriptor)
         archive_file.seek(0)
         archive_sha256 = hashlib.sha256(archive_file.read()).hexdigest()
+    prepare_binding = "".join(
+        (
+            "prepareRunnerId:{}\n".format(args.prepare_runner_id),
+            "sourceCommit:{}\n".format(args.source_commit),
+            "archiveSha256:{}\n".format(archive_sha256),
+            "appDigest:{}\n".format(app_digest),
+            "entryListSha256:{}\n".format(archive_entry_list_sha256),
+        )
+    )
     metadata = {
         "schemaVersion": SCHEMA_VERSION,
         "sourceCommit": args.source_commit,
@@ -253,11 +272,17 @@ def create_release_input(args):
         "appDigest": app_digest,
         "archiveFormat": ARCHIVE_FORMAT,
         "archive": {
+            "entryCount": len(archive_entry_names),
+            "entryListSha256": archive_entry_list_sha256,
             "name": os.path.basename(args.archive),
             "sha256": archive_sha256,
             "size": archive_info.st_size,
         },
         "boundary": BOUNDARY_VERSION,
+        "boundaryValidation": BOUNDARY_VALIDATION,
+        "prepareRunnerId": args.prepare_runner_id,
+        "prepareBindingAlgorithm": PREPARE_BINDING_ALGORITHM,
+        "prepareBindingSha256": sha256_bytes(prepare_binding.encode("utf-8")),
     }
     attestation_descriptor = open_new_output(args.attestation)
     with os.fdopen(attestation_descriptor, "w", encoding="utf-8", newline="\n") as attestation_file:
@@ -309,8 +334,12 @@ def validate_attestation(metadata, args, archive_size):
         "archive",
         "archiveFormat",
         "boundary",
+        "boundaryValidation",
         "buildNumber",
         "bundleIdentifier",
+        "prepareBindingAlgorithm",
+        "prepareBindingSha256",
+        "prepareRunnerId",
         "schemaVersion",
         "sourceCommit",
         "version",
@@ -318,7 +347,13 @@ def validate_attestation(metadata, args, archive_size):
     if not isinstance(metadata, dict) or set(metadata) != expected_keys:
         raise ReleaseInputError("unsigned-app attestation has missing or unexpected fields")
     archive = metadata["archive"]
-    if not isinstance(archive, dict) or set(archive) != {"name", "sha256", "size"}:
+    if not isinstance(archive, dict) or set(archive) != {
+        "entryCount",
+        "entryListSha256",
+        "name",
+        "sha256",
+        "size",
+    }:
         raise ReleaseInputError("unsigned-app archive attestation has missing or unexpected fields")
     string_fields = (
         "sourceCommit",
@@ -330,6 +365,10 @@ def validate_attestation(metadata, args, archive_size):
         "appDigest",
         "archiveFormat",
         "boundary",
+        "boundaryValidation",
+        "prepareBindingAlgorithm",
+        "prepareBindingSha256",
+        "prepareRunnerId",
     )
     if type(metadata["schemaVersion"]) is not int or any(
         not isinstance(metadata[field], str) for field in string_fields
@@ -338,6 +377,8 @@ def validate_attestation(metadata, args, archive_size):
     if (
         not isinstance(archive["name"], str)
         or not isinstance(archive["sha256"], str)
+        or not isinstance(archive["entryListSha256"], str)
+        or type(archive["entryCount"]) is not int
         or type(archive["size"]) is not int
     ):
         raise ReleaseInputError("unsigned-app archive attestation field types are invalid")
@@ -351,6 +392,9 @@ def validate_attestation(metadata, args, archive_size):
         "appDigestAlgorithm": APP_DIGEST_ALGORITHM,
         "archiveFormat": ARCHIVE_FORMAT,
         "boundary": BOUNDARY_VERSION,
+        "boundaryValidation": BOUNDARY_VALIDATION,
+        "prepareBindingAlgorithm": PREPARE_BINDING_ALGORITHM,
+        "prepareRunnerId": args.expected_prepare_runner_id,
     }
     for field, expected in expected_values.items():
         if metadata[field] != expected:
@@ -359,12 +403,29 @@ def validate_attestation(metadata, args, archive_size):
             )
     if not re.fullmatch(r"[0-9a-f]{64}", metadata["appDigest"]):
         raise ReleaseInputError("unsigned-app attestation appDigest is malformed")
+    if not re.fullmatch(r"[0-9a-f]{64}", metadata["prepareBindingSha256"]):
+        raise ReleaseInputError("unsigned-app attestation prepare binding is malformed")
+    if not re.fullmatch(r"[0-9a-f]{64}", archive["entryListSha256"]):
+        raise ReleaseInputError("unsigned-app attestation entry-list digest is malformed")
+    if archive["entryCount"] < 1 or archive["entryCount"] > MAX_MEMBER_COUNT:
+        raise ReleaseInputError("unsigned-app attestation entry count is invalid")
     if archive["name"] != EXPECTED_ARCHIVE_NAME:
         raise ReleaseInputError("unsigned-app attestation archive name is not fixed")
     if archive["sha256"] != args.expected_archive_sha256:
         raise ReleaseInputError("unsigned-app attestation archive SHA-256 mismatch")
     if archive["size"] != archive_size:
         raise ReleaseInputError("unsigned-app attestation archive size mismatch")
+    prepare_binding = "".join(
+        (
+            "prepareRunnerId:{}\n".format(metadata["prepareRunnerId"]),
+            "sourceCommit:{}\n".format(metadata["sourceCommit"]),
+            "archiveSha256:{}\n".format(archive["sha256"]),
+            "appDigest:{}\n".format(metadata["appDigest"]),
+            "entryListSha256:{}\n".format(archive["entryListSha256"]),
+        )
+    )
+    if sha256_bytes(prepare_binding.encode("utf-8")) != metadata["prepareBindingSha256"]:
+        raise ReleaseInputError("unsigned-app attestation prepare binding mismatch")
 
 
 def validate_archive_name(name):
@@ -525,6 +586,10 @@ def validate_release_input(args):
         raise ReleaseInputError("expected version is malformed")
     if not re.fullmatch(r"[1-9][0-9]*", args.expected_build_number):
         raise ReleaseInputError("expected build number is malformed")
+    if not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", args.expected_prepare_runner_id
+    ):
+        raise ReleaseInputError("expected prepare runner ID is malformed")
     if (
         os.path.basename(args.archive) != EXPECTED_ARCHIVE_NAME
         or os.path.basename(args.attestation) != EXPECTED_ATTESTATION_NAME
@@ -549,6 +614,13 @@ def validate_release_input(args):
     archive_stream = io.BytesIO(archive_bytes)
     with tarfile.open(fileobj=archive_stream, mode="r:", format=tarfile.USTAR_FORMAT) as archive:
         members = validate_archive_members(archive, archive_info.st_size)
+        entry_list = "".join(
+            "{}{}\n".format(member.name, "/" if member.isdir() else "") for member in members
+        )
+        if len(members) != metadata["archive"]["entryCount"]:
+            raise ReleaseInputError("archive entry count does not match unsigned-app attestation")
+        if sha256_bytes(entry_list.encode("utf-8")) != metadata["archive"]["entryListSha256"]:
+            raise ReleaseInputError("archive entry list does not match unsigned-app attestation")
         extract_members(archive, members, args.destination)
 
     _root_info, extracted_entries = collect_app(os.path.join(args.destination, "Seer.app"))
@@ -569,6 +641,7 @@ def parser():
     create.add_argument("--build-number", required=True)
     create.add_argument("--bundle-identifier", required=True)
     create.add_argument("--architecture", required=True)
+    create.add_argument("--prepare-runner-id", required=True)
     validate = subparsers.add_parser("validate")
     validate.add_argument("--archive", required=True)
     validate.add_argument("--attestation", required=True)
@@ -576,6 +649,7 @@ def parser():
     validate.add_argument("--expected-source-commit", required=True)
     validate.add_argument("--expected-version", required=True)
     validate.add_argument("--expected-build-number", required=True)
+    validate.add_argument("--expected-prepare-runner-id", required=True)
     validate.add_argument("--destination", required=True)
     return argument_parser
 
