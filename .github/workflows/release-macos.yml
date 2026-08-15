@@ -97,8 +97,27 @@ jobs:
         with:
           xcode-version: "16.2"
 
-      - name: Install xcodegen
-        run: brew install xcodegen
+      - name: Install pinned XcodeGen 2.46.0
+        run: |
+          set -euo pipefail
+          xcodegen_root="${RUNNER_TEMP}/xcodegen-2.46.0"
+          archive="${xcodegen_root}/xcodegen.zip"
+          xcodegen_bin="${xcodegen_root}/xcodegen/bin"
+          [[ ! -e "${xcodegen_root}" && ! -L "${xcodegen_root}" ]]
+          mkdir "${xcodegen_root}"
+          /usr/bin/curl --fail --location --retry 3 --retry-all-errors --retry-delay 2 \
+            --output "${archive}" \
+            "https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip"
+          printf '%s  %s\n' \
+            '4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806' \
+            "${archive}" | /usr/bin/shasum -a 256 -c -
+          /usr/bin/unzip -q "${archive}" -d "${xcodegen_root}"
+          [[ -x "${xcodegen_bin}/xcodegen" && ! -L "${xcodegen_bin}/xcodegen" ]]
+          [[ "$("${xcodegen_bin}/xcodegen" --version)" == "Version: 2.46.0" ]] || {
+            echo "error: pinned XcodeGen did not report Version: 2.46.0" >&2
+            exit 1
+          }
+          printf '%s\n' "${xcodegen_bin}" >> "${GITHUB_PATH}"
 
       - name: Setup Node 24
         # v4.4.0, resolved from refs/tags/v4
@@ -133,6 +152,7 @@ jobs:
             tests/safe-app-publication.test.mjs \
             tests/release-manifest.test.mjs \
             tests/package-macos-release.test.mjs \
+            tests/release-macos-draft-policy.test.mjs \
             tests/release-macos-workflow.test.mjs \
             tests/agent-detection-parity.test.mjs \
             tests/tray-update-error-handling.test.mjs
@@ -210,7 +230,7 @@ jobs:
             build/macos/release-input/Seer-unsigned-arm64.tar
             build/macos/release-input/unsigned-app-attestation.json
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 90
           compression-level: 0
           overwrite: false
           include-hidden-files: false
@@ -270,38 +290,6 @@ jobs:
           [[ "${EXPECTED_ARCHIVE_SHA256}" =~ ^[0-9a-f]{64}$ ]]
           [[ "${EXPECTED_ATTESTATION_SHA256}" =~ ^[0-9a-f]{64}$ ]]
 
-      - name: Reject public-release collisions
-        env:
-          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
-          GH_REPO: OpenCoven/seer-releases
-        run: |
-          set -euo pipefail
-          visibility="$(gh api "repos/${GH_REPO}" --jq '.visibility')"
-          [[ "${visibility}" == "public" ]] || {
-            echo "error: release destination must be public" >&2
-            exit 1
-          }
-          require_missing() {
-            local endpoint="$1"
-            local label="$2"
-            local response
-            local status
-            set +e
-            response="$(gh api --include "${endpoint}" 2>&1)"
-            status=$?
-            set -e
-            if [[ "${status}" -eq 0 ]]; then
-              echo "error: ${label} already exists; refusing to overwrite it" >&2
-              exit 1
-            fi
-            if ! grep -Eq '^HTTP/[0-9.]+ 404 ' <<< "${response}"; then
-              echo "error: unable to prove ${label} is absent" >&2
-              exit 1
-            fi
-          }
-          require_missing "repos/${GH_REPO}/releases/tags/${GITHUB_REF_NAME}" "release ${GITHUB_REF_NAME}"
-          require_missing "repos/${GH_REPO}/git/ref/tags/${GITHUB_REF_NAME}" "tag ${GITHUB_REF_NAME}"
-
       - name: Assert fresh Apple Silicon signing runner
         run: |
           set -euo pipefail
@@ -352,6 +340,18 @@ jobs:
             echo "error: signing checkout must be clean before release input download" >&2
             exit 1
           }
+
+      - name: Reject unsafe release collisions
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          GH_REPO: OpenCoven/seer-releases
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          SOURCE_TAG: ${{ github.ref_name }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_RUN: ${{ github.run_id }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: bash scripts/release-macos-draft.sh preflight
 
       - name: Create empty release-input destination
         run: |
@@ -459,31 +459,35 @@ jobs:
         id: release-notes
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          SOURCE_TAG: ${{ github.ref_name }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_RUN: ${{ github.run_id }}
         run: |
           set -euo pipefail
           notes_path="${RUNNER_TEMP}/release-notes.md"
           [[ ! -e "${notes_path}" && ! -L "${notes_path}" ]]
           umask 077
-          printf 'Seer %s for Apple Silicon Macs running macOS 14 or later.\n' "${VERSION}" > "${notes_path}"
+          marker="$(bash scripts/release-macos-draft.sh marker)"
+          printf '%s\n\nSeer %s for Apple Silicon Macs running macOS 14 or later.\n' \
+            "${marker}" "${VERSION}" > "${notes_path}"
           chmod 0644 "${notes_path}"
           printf 'path=%s\n' "${notes_path}" >> "${GITHUB_OUTPUT}"
 
-      - name: Create draft and upload only public assets
+      - name: Create or resume draft and upload only public assets
         env:
           GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
           GH_REPO: OpenCoven/seer-releases
           VERSION: ${{ needs.prepare.outputs.version }}
-          RELEASE_NOTES: ${{ steps.release-notes.outputs.path }}
-        run: |
-          set -euo pipefail
-          RELEASE_DIR="build/macos/release"
-          gh release create "${GITHUB_REF_NAME}" --draft \
-            --title "Seer ${VERSION}" \
-            --notes-file "${RELEASE_NOTES}"
-          gh release upload "${GITHUB_REF_NAME}" \
-            "${RELEASE_DIR}/Seer-v${VERSION}-arm64.dmg" \
-            "${RELEASE_DIR}/SHA256SUMS" \
-            "${RELEASE_DIR}/release-manifest.json"
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          SOURCE_TAG: ${{ github.ref_name }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_RUN: ${{ github.run_id }}
+          RELEASE_BODY: ${{ steps.release-notes.outputs.path }}
+          RELEASE_DIR: build/macos/release
+        run: bash scripts/release-macos-draft.sh upload
 
       - name: Create fresh public-asset verification directory
         id: public-assets
@@ -579,16 +583,9 @@ jobs:
           GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
           GH_REPO: OpenCoven/seer-releases
           VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          set -euo pipefail
-          [[ "$(gh release view "${GITHUB_REF_NAME}" --json isDraft --jq '.isDraft')" == "true" ]] || {
-            echo "error: refusing to modify a non-draft release" >&2
-            exit 1
-          }
-          actual_assets="$(gh release view "${GITHUB_REF_NAME}" --json assets --jq '.assets[].name' | LC_ALL=C sort)"
-          expected_assets="$(printf '%s\n' "SHA256SUMS" "Seer-v${VERSION}-arm64.dmg" "release-manifest.json")"
-          [[ "${actual_assets}" == "${expected_assets}" ]] || {
-            echo "error: draft release asset allowlist changed before publish" >&2
-            exit 1
-          }
-          gh release edit "${GITHUB_REF_NAME}" --draft=false
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          SOURCE_TAG: ${{ github.ref_name }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_RUN: ${{ github.run_id }}
+        run: bash scripts/release-macos-draft.sh publish

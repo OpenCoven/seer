@@ -7,6 +7,8 @@ import { fileURLToPath } from "node:url";
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const workflowPath = join(repoRoot, ".github", "workflows", "release-macos.yml");
 const source = existsSync(workflowPath) ? readFileSync(workflowPath, "utf8") : "";
+const draftPolicyPath = join(repoRoot, "scripts", "release-macos-draft.sh");
+const draftPolicySource = existsSync(draftPolicyPath) ? readFileSync(draftPolicyPath, "utf8") : "";
 
 function jobBlock(name, nextName) {
   const start = source.indexOf(`  ${name}:\n`);
@@ -50,7 +52,7 @@ test("every external action is pinned to the resolved immutable SHA", () => {
   }
 });
 
-test("prepare is credential-free, runs the complete standalone gate, and uploads only attested input", () => {
+test("prepare pins XcodeGen and runs the complete standalone gate without credentials", () => {
   const prepare = jobBlock("prepare", "sign-and-release");
 
   assert.match(prepare, /runs-on: macos-14-xlarge/);
@@ -64,14 +66,22 @@ test("prepare is credential-free, runs the complete standalone gate, and uploads
   assert.match(prepare, /persist-credentials: false/);
   assert.match(prepare, /xcode-version: "16\.2"/);
   assert.match(prepare, /node-version: "24"/);
+  assert.doesNotMatch(prepare, /\bbrew install xcodegen\b/);
+  assert.match(prepare, /https:\/\/github\.com\/yonaskolb\/XcodeGen\/releases\/download\/2\.46\.0\/xcodegen\.zip/);
+  assert.match(prepare, /4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806/);
+  assert.match(prepare, /\/usr\/bin\/curl --fail --location --retry 3 --retry-all-errors --retry-delay 2/);
+  assert.match(prepare, /\/usr\/bin\/shasum -a 256 -c -/);
+  assert.match(prepare, /xcodegen_root="\$\{RUNNER_TEMP\}\/xcodegen-2\.46\.0"/);
+  assert.match(prepare, /printf '%s\\n' "\$\{xcodegen_bin\}" >> "\$\{GITHUB_PATH\}"/);
+  assert.match(prepare, /\[\[ "\$\("\$\{xcodegen_bin\}\/xcodegen" --version\)" == "Version: 2\.46\.0" \]\]/);
   for (const command of [
-    "brew install xcodegen",
     "xcodebuild -version",
     "xcodegen --version",
     "node --version",
     "npm --version",
     "npm ci",
     "tests/package-macos-release.test.mjs",
+    "tests/release-macos-draft-policy.test.mjs",
     "tests/release-macos-workflow.test.mjs",
     "npm run test:renderer",
     "npm run type-check:standalone",
@@ -107,6 +117,8 @@ test("prepare is credential-free, runs the complete standalone gate, and uploads
   assert.equal((prepare.match(/actions\/upload-artifact@/g) ?? []).length, 1);
   assert.doesNotMatch(prepare, /build\/macos\/release-input\/\*|gh release|\bAPPLE_/);
   assert.doesNotMatch(prepare, /artifact-id/);
+  assert.match(prepare, /retention-days: 90/);
+  assert.doesNotMatch(prepare, /retention-days: 1(?:\D|$)/);
 });
 
 test("prepared release input is downloaded by exact name into a flat root and checked for exactly two files before signing", () => {
@@ -171,7 +183,7 @@ test("signing uses a protected fresh job and rejects gates and identity mismatch
   assert.match(signing, /xcodebuild -version/);
 });
 
-test("signing passes only the Task 16 interface and scopes the releases token to release commands", () => {
+test("signing keeps build tools out and scopes the releases token to release policy commands", () => {
   const prepare = jobBlock("prepare", "sign-and-release");
   const signing = jobBlock("sign-and-release");
   const signingSecrets = new Set(
@@ -198,32 +210,46 @@ test("signing passes only the Task 16 interface and scopes the releases token to
   for (const step of steps) {
     const hasToken = step.includes("secrets.RELEASES_REPO_TOKEN");
     const hasGhCommand = /\bgh (?:api|release)\b/.test(step);
-    assert.equal(hasToken, hasGhCommand, "RELEASES_REPO_TOKEN and release-repository gh commands must share a step");
+    const hasReleasePolicy = /scripts\/release-macos-draft\.sh (?:preflight|upload|publish)/.test(step);
+    assert.equal(
+      hasToken,
+      hasGhCommand || hasReleasePolicy,
+      "RELEASES_REPO_TOKEN and release-repository commands must share a step",
+    );
     if (hasToken) {
       assert.match(step, /GH_REPO: OpenCoven\/seer-releases/);
       assert.doesNotMatch(step, /secrets\.APPLE_/);
     }
   }
-  assert.doesNotMatch(signing, /\bgh release delete\b|\bgh api\b[^\n]*-X DELETE/);
+  assert.doesNotMatch(`${signing}\n${draftPolicySource}`, /\bgh release delete\b|\bgh api\b[^\n]*-X DELETE/);
 });
 
-test("draft release contains only public outputs and is published only after downloaded-DMG verification", () => {
+test("draft policy resumes only bound allowlisted drafts and publishes after fresh verification", () => {
   const signing = jobBlock("sign-and-release");
-  const create = signing.indexOf("gh release create");
-  const upload = signing.indexOf("gh release upload");
+  const preflight = signing.indexOf("scripts/release-macos-draft.sh preflight");
+  const upload = signing.indexOf("scripts/release-macos-draft.sh upload");
   const download = signing.indexOf("gh release download");
   const scanner = signing.indexOf("node scripts/check-release-boundary.mjs", download);
-  const publish = signing.indexOf("gh release edit");
+  const publish = signing.indexOf("scripts/release-macos-draft.sh publish");
 
   assert.match(signing, /expected=\("Seer-v\$\{VERSION\}-arm64\.dmg" "SHA256SUMS" "release-manifest\.json"\)/);
   assert.match(signing, /release-notes\.md/);
-  assert.match(signing, /repos\/\$\{GH_REPO\}\/releases\/tags\/\$\{GITHUB_REF_NAME\}/);
-  assert.match(signing, /repos\/\$\{GH_REPO\}\/git\/ref\/tags\/\$\{GITHUB_REF_NAME\}/);
-  assert.match(signing, /gh release create "\$\{GITHUB_REF_NAME\}" --draft/);
-  assert.match(
-    signing,
-    /gh release upload "\$\{GITHUB_REF_NAME\}" \\\n\s+"\$\{RELEASE_DIR\}\/Seer-v\$\{VERSION\}-arm64\.dmg" \\\n\s+"\$\{RELEASE_DIR\}\/SHA256SUMS" \\\n\s+"\$\{RELEASE_DIR\}\/release-manifest\.json"/,
-  );
+  assert.match(signing, /SOURCE_REPOSITORY: \$\{\{ github\.repository \}\}/);
+  assert.match(signing, /SOURCE_COMMIT: \$\{\{ github\.sha \}\}/);
+  assert.match(signing, /SOURCE_TAG: \$\{\{ github\.ref_name \}\}/);
+  assert.match(signing, /WORKFLOW_REF: \$\{\{ github\.workflow_ref \}\}/);
+  assert.match(signing, /WORKFLOW_RUN: \$\{\{ github\.run_id \}\}/);
+  assert.match(draftPolicySource, /seer-release-provenance:/);
+  assert.match(draftPolicySource, /sourceRepository/);
+  assert.match(draftPolicySource, /sourceCommit/);
+  assert.match(draftPolicySource, /sourceTag/);
+  assert.match(draftPolicySource, /workflowRef/);
+  assert.match(draftPolicySource, /workflowRun/);
+  assert.match(draftPolicySource, /gh release create "\$\{SOURCE_TAG\}" --draft/);
+  assert.match(draftPolicySource, /gh release upload "\$\{SOURCE_TAG\}"[\s\S]*--clobber/);
+  assert.match(draftPolicySource, /existing published release/);
+  assert.match(draftPolicySource, /provenance marker does not match/);
+  assert.match(draftPolicySource, /foreign release asset/);
   assert.match(signing, /gh release download[\s\S]*--pattern "Seer-v\$\{VERSION\}-arm64\.dmg"[\s\S]*--pattern "SHA256SUMS"[\s\S]*--pattern "release-manifest\.json"/);
   assert.match(signing, /shasum -a 256 -c SHA256SUMS/);
   assert.match(signing, /trap cleanup EXIT/);
@@ -232,7 +258,12 @@ test("draft release contains only public outputs and is published only after dow
   assert.match(signing, /codesign --verify --deep --strict/);
   assert.match(signing, /spctl --assess --type execute/);
   assert.match(signing, /node scripts\/check-release-boundary\.mjs[\s\S]*--dmg-root/);
-  assert.match(signing, /gh release edit "\$\{GITHUB_REF_NAME\}" --draft=false/);
-  assert.doesNotMatch(signing, /--clobber/);
-  assert.ok(create !== -1 && create < upload && upload < download && download < scanner && scanner < publish);
+  assert.match(draftPolicySource, /gh release edit "\$\{SOURCE_TAG\}" --draft=false/);
+  assert.ok(
+    preflight !== -1 &&
+      preflight < upload &&
+      upload < download &&
+      download < scanner &&
+      scanner < publish,
+  );
 });
