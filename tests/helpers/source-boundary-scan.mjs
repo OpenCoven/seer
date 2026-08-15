@@ -1,6 +1,8 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { join, relative } from "node:path";
 
+import { CANONICAL_FORBIDDEN_MARKERS } from "../../scripts/check-standalone-boundary.mjs";
+
 /**
  * Pure source-boundary scanning helpers shared by production checks (the
  * real "no Glaze references in the standalone-safe renderer sources" scan)
@@ -11,7 +13,9 @@ import { join, relative } from "node:path";
  */
 
 /** Closed set of forbidden Glaze references the standalone build must never contain. */
-export const FORBIDDEN_PATTERNS = [/@glaze\/core/, /glaze-core:/, /window\.glazeAPI/];
+export const FORBIDDEN_PATTERNS = CANONICAL_FORBIDDEN_MARKERS.map(
+  ({ marker }) => new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+);
 
 /** Source extensions the scan covers — CSS is included alongside TS/TSX. */
 export const SOURCE_FILE_PATTERN = /\.(ts|tsx|css)$/;

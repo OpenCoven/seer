@@ -80,18 +80,36 @@ export const DEFAULT_PROVENANCE_PATH = join(REPO_ROOT, "build", "macos", "standa
 export const EXPECTED_EXECUTABLE_RELATIVE_PATH = "Contents/MacOS/Seer";
 
 /**
- * Forbidden Glaze references in *source*: an import/global a standalone
- * file could plausibly contain if Glaze-specific code (or a copy-pasted
- * fragment of it) leaked into the standalone-safe surface.
+ * The canonical forbidden marker list for every content scan. Source and
+ * bundle checks derive from this exact list so renamed or binary-looking
+ * bundle files cannot evade a marker that the source scan knows about.
  */
-export const SOURCE_FORBIDDEN_PATTERNS = [
-  { pattern: /@glaze\/core/, description: "@glaze/core import" },
-  { pattern: /\.glaze-core\b/, description: ".glaze-core local SDK symlink/path (see glaze.ts)" },
-  { pattern: /glaze-core:/, description: "glaze-core: custom resource scheme" },
-  { pattern: /window\.glazeAPI/, description: "window.glazeAPI bridge global" },
-  { pattern: /app\.glaze\.macos/, description: "Glaze app's Application Support bundle identifier path" },
-  { pattern: /cli\/glaze\.js/, description: "Glaze SDK CLI binary path" },
-];
+export const CANONICAL_FORBIDDEN_MARKERS = Object.freeze([
+  Object.freeze({ marker: "@glaze/core", description: "@glaze/core SDK reference" }),
+  Object.freeze({ marker: ".glaze-core", description: ".glaze-core local SDK path" }),
+  Object.freeze({ marker: "glaze-core:", description: "glaze-core: custom resource scheme" }),
+  Object.freeze({ marker: "window.glazeAPI", description: "window.glazeAPI bridge global" }),
+  Object.freeze({ marker: "app.glaze.macos", description: "Glaze Application Support path" }),
+  Object.freeze({ marker: "cli/glaze.js", description: "Glaze SDK CLI binary path" }),
+  Object.freeze({ marker: "sdk/current/@glaze/core", description: "Glaze current-SDK path" }),
+  Object.freeze({
+    marker: "Glaze.app/Contents/MacOS/Glaze",
+    description: "Glaze application binary path",
+  }),
+]);
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Backward-compatible regex view, generated only from the canonical markers above. */
+export const SOURCE_FORBIDDEN_PATTERNS = CANONICAL_FORBIDDEN_MARKERS.map(
+  ({ marker, description }) => ({
+    marker,
+    description,
+    pattern: new RegExp(escapeRegExp(marker)),
+  }),
+);
 
 /**
  * Standalone-safe directories walked recursively for the source scan.
@@ -244,9 +262,11 @@ export function scanFilesForForbiddenPatterns(files, root, patterns = SOURCE_FOR
   const offenders = [];
   for (const relPath of files) {
     const source = readFileSync(join(root, relPath), "utf8");
-    for (const { pattern, description } of patterns) {
+    for (const { marker, pattern, description } of patterns) {
       if (pattern.test(source)) {
-        offenders.push(`${relPath}: contains ${description} (matches ${pattern})`);
+        offenders.push(
+          `${relPath}: contains ${description} (marker ${JSON.stringify(marker)}, matches ${pattern})`,
+        );
       }
     }
   }
@@ -286,8 +306,6 @@ export const BUNDLE_FORBIDDEN_NAME_PATTERNS = [
 /** Byte-level content patterns forbidden anywhere in the built bundle. */
 const BUNDLE_FORBIDDEN_CONTENT_PATTERNS = [
   { pattern: /\/Users\//, description: "absolute /Users/ path" },
-  { pattern: /@glaze\/core/, description: "@glaze/core reference" },
-  { pattern: /glaze-core:/, description: "glaze-core: reference" },
 ];
 
 /**
@@ -381,6 +399,13 @@ export function walkBundle(appPath, { forbiddenAbsolutePaths = [] } = {}) {
       for (const { pattern, description } of BUNDLE_FORBIDDEN_CONTENT_PATTERNS) {
         if (pattern.test(content)) {
           offenders.push(`${relPath}: contains ${description}`);
+        }
+      }
+      for (const { marker, description } of CANONICAL_FORBIDDEN_MARKERS) {
+        if (content.includes(marker)) {
+          offenders.push(
+            `${relPath}: contains ${description} (forbidden boundary marker ${JSON.stringify(marker)})`,
+          );
         }
       }
       const home = homedir();

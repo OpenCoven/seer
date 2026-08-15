@@ -17,6 +17,7 @@ import test from "node:test";
 import * as boundaryChecks from "../scripts/check-standalone-boundary.mjs";
 import {
   BUNDLE_FORBIDDEN_NAME_PATTERNS,
+  CANONICAL_FORBIDDEN_MARKERS,
   checkArchitecture,
   checkEntitlements,
   checkExactlyOneMachO,
@@ -98,6 +99,69 @@ test("the source pattern scan flags each forbidden Glaze reference when present"
     assert.match(offenders[0], /@glaze\/core/);
   } finally {
     rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test("source and bundle content scans reject every canonical marker in renamed files", () => {
+  mkdirSync(join(repoRoot, "build"), { recursive: true });
+  const scratch = mkdtempSync(join(repoRoot, "build", "seer-canonical-boundary-markers-"));
+  try {
+    const sourceRoot = join(scratch, "source");
+    const bundleRoot = join(scratch, "Seer.app");
+    const sourceFiles = [];
+    const bundleFiles = [];
+    mkdirSync(join(sourceRoot, "renderer"), { recursive: true });
+    mkdirSync(join(bundleRoot, "Contents", "Resources"), { recursive: true });
+
+    for (const [index, { marker }] of CANONICAL_FORBIDDEN_MARKERS.entries()) {
+      const extension = index % 2 === 0 ? "js" : "bin";
+      const sourceFile = `renderer/renamed-${index}.${extension}`;
+      const bundleFile = `Contents/Resources/renamed-${index}.${extension}`;
+      writeFileSync(join(sourceRoot, sourceFile), `payload=${marker}\n`);
+      writeFileSync(join(bundleRoot, bundleFile), Buffer.from(`\0payload=${marker}\0`, "utf8"));
+      sourceFiles.push(sourceFile);
+      bundleFiles.push(bundleFile);
+    }
+
+    const sourceOffenders = scanFilesForForbiddenPatterns(sourceFiles, sourceRoot);
+    const { offenders: bundleOffenders, regularFiles } = walkBundle(bundleRoot);
+    assert.deepEqual(regularFiles.sort(), bundleFiles.sort());
+    for (const [index, { marker }] of CANONICAL_FORBIDDEN_MARKERS.entries()) {
+      const extension = index % 2 === 0 ? "js" : "bin";
+      const fileName = `renamed-${index}.${extension}`;
+      assert.ok(
+        sourceOffenders.some(
+          (offender) => offender.includes(fileName) && offender.includes(JSON.stringify(marker)),
+        ),
+        `source scan missed ${JSON.stringify(marker)} in ${fileName}`,
+      );
+      assert.ok(
+        bundleOffenders.some(
+          (offender) => offender.includes(fileName) && offender.includes(JSON.stringify(marker)),
+        ),
+        `bundle scan missed ${JSON.stringify(marker)} in ${fileName}`,
+      );
+    }
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test("canonical marker metadata outside the app bundle is not scanned as bundle content", () => {
+  mkdirSync(join(repoRoot, "build"), { recursive: true });
+  const scratch = mkdtempSync(join(repoRoot, "build", "seer-boundary-metadata-location-"));
+  try {
+    const appRoot = join(scratch, "Seer.app");
+    mkdirSync(join(appRoot, "Contents", "Resources"), { recursive: true });
+    writeFileSync(join(appRoot, "Contents", "Resources", "clean.bin"), "standalone");
+    writeFileSync(
+      join(scratch, "standalone-build-provenance.json"),
+      JSON.stringify({ forbiddenMarkers: CANONICAL_FORBIDDEN_MARKERS }),
+    );
+
+    assert.deepEqual(walkBundle(appRoot).offenders, []);
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
   }
 });
 
