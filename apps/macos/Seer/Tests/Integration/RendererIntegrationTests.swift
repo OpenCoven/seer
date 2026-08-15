@@ -42,16 +42,41 @@ private enum BundledRenderer {
     /// Same fixed, repo-root-relative files (outside `renderer/`) as
     /// `scripts/renderer-build-identity.mjs`'s own `TOP_LEVEL_INPUT_FILES`
     /// — kept in this exact spelling/order deliberately, so the two lists
-    /// are trivially diffable against each other.
+    /// are trivially diffable against each other. `tsconfig.json` is
+    /// included because `tsconfig.standalone.json`'s own
+    /// `"extends": "./tsconfig.json"` means the root config's
+    /// `compilerOptions` genuinely feed into how the standalone renderer
+    /// is type-checked/compiled.
     fileprivate static let topLevelInputFiles = [
         "standalone-window.html",
         "vite.standalone.config.ts",
         "package.json",
         "package-lock.json",
         "tsconfig.standalone.json",
+        "tsconfig.json",
     ]
 
     fileprivate static let rendererSourceDirName = "renderer"
+
+    /// The *only* filename excluded from `renderer/`'s otherwise-exhaustive
+    /// recursive walk — mirrors `scripts/renderer-build-identity.mjs`'s own
+    /// `EXCLUDED_METADATA_FILENAMES` exactly. `.DS_Store` is Finder-generated
+    /// metadata macOS silently writes into any directory a Finder window has
+    /// ever browsed; its bytes never reflect anything the build actually
+    /// reads, so letting it participate would let purely-local Finder
+    /// browsing "poison" (change) a checkout's build-identity digest with no
+    /// corresponding change to the built output.
+    ///
+    /// Deliberately narrow: this excludes *only* a file named exactly
+    /// `.DS_Store`, never dotfiles/dot-directories in general (previously
+    /// this used `FileManager.DirectoryEnumerationOptions.skipsHiddenFiles`,
+    /// which — unlike the Node implementation, which excluded nothing at
+    /// all — silently dropped *every* hidden file/directory, including any
+    /// that might be genuine, intentionally-hidden build input; the two
+    /// implementations must agree exactly on which files count as build
+    /// input, so both now apply this exact same narrow, named-file
+    /// exclusion instead).
+    fileprivate static let excludedMetadataFilenames: Set<String> = [".DS_Store"]
 
     /// Thrown whenever the bundled renderer document is missing or stale
     /// relative to the checked-out renderer source — surfaced as a real
@@ -171,7 +196,8 @@ private enum BundledRenderer {
     }
 
     /// Every path (relative to `repoRoot`, POSIX-style, sorted) this
-    /// digest depends on: `renderer/` walked recursively, plus whichever of
+    /// digest depends on: `renderer/` walked recursively (excluding only
+    /// `excludedMetadataFilenames`, e.g. `.DS_Store`), plus whichever of
     /// `topLevelInputFiles` actually exist on disk. Mirrors
     /// `rendererBuildInputFiles` in `scripts/renderer-build-identity.mjs`
     /// exactly — never returns an absolute path.
@@ -180,12 +206,16 @@ private enum BundledRenderer {
         var absoluteFiles: [URL] = []
 
         let rendererDir = repoRoot.appendingPathComponent(rendererSourceDirName, isDirectory: true)
+        // Deliberately no `.skipsHiddenFiles`: that would drop *every*
+        // hidden file/directory, not just `.DS_Store`, and diverge from
+        // the Node implementation's own narrow exclusion (see
+        // `excludedMetadataFilenames`'s doc comment above).
         if let enumerator = fileManager.enumerator(
             at: rendererDir,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
+            includingPropertiesForKeys: [.isDirectoryKey]
         ) {
             for case let fileURL as URL in enumerator {
+                if excludedMetadataFilenames.contains(fileURL.lastPathComponent) { continue }
                 let values = try fileURL.resourceValues(forKeys: [.isDirectoryKey])
                 if values.isDirectory != true {
                     absoluteFiles.append(fileURL)
@@ -404,6 +434,109 @@ final class RendererIntegrationTests: XCTestCase {
             expectedDigest,
             "the Swift digest must match the fixture oracle Node's independent recomputation also reads"
         )
+    }
+
+    /// A disposable copy of the shared `tests/fixtures/renderer-build-identity/repo`
+    /// fixture, mutable per-test without ever touching the real
+    /// repository's own `renderer/` tree or the committed fixture itself.
+    /// Mirrors `tests/renderer-build-identity.test.mjs`'s own
+    /// `withFixtureCopy` helper.
+    private func withScratchFixtureCopy<T>(_ run: (URL) throws -> T) throws -> T {
+        let repoRoot = try BundledRenderer.repoRootURL(fromTestFile: #filePath)
+        let fixtureRepo = repoRoot
+            .appendingPathComponent("tests", isDirectory: true)
+            .appendingPathComponent("fixtures", isDirectory: true)
+            .appendingPathComponent("renderer-build-identity", isDirectory: true)
+            .appendingPathComponent("repo", isDirectory: true)
+
+        let fileManager = FileManager.default
+        let scratchRoot = fileManager.temporaryDirectory
+            .appendingPathComponent("seer-renderer-build-identity-scratch-\(UUID().uuidString)", isDirectory: true)
+        let scratchRepo = scratchRoot.appendingPathComponent("repo", isDirectory: true)
+        try fileManager.createDirectory(at: scratchRoot, withIntermediateDirectories: true)
+        try fileManager.copyItem(at: fixtureRepo, to: scratchRepo)
+        defer { try? fileManager.removeItem(at: scratchRoot) }
+
+        return try run(scratchRepo)
+    }
+
+    /// Proves the root `tsconfig.json` is a genuine build input on the
+    /// Swift side too: `tsconfig.standalone.json`'s own
+    /// `"extends": "./tsconfig.json"` means the root config's
+    /// `compilerOptions` feed into how the standalone renderer compiles,
+    /// so changing its bytes must change the digest — mirrors
+    /// `tests/renderer-build-identity.test.mjs`'s identically-named Node
+    /// test exactly.
+    func testModifyingRootTsconfigJsonChangesTheDigest() throws {
+        try withScratchFixtureCopy { fixtureRepo in
+            let before = try BundledRenderer.computeRendererSourceDigest(repoRoot: fixtureRepo)
+
+            let rootTsconfigURL = fixtureRepo.appendingPathComponent("tsconfig.json")
+            let originalContents = try String(contentsOf: rootTsconfigURL, encoding: .utf8)
+            try (originalContents + "\n// modified\n").write(to: rootTsconfigURL, atomically: true, encoding: .utf8)
+
+            let after = try BundledRenderer.computeRendererSourceDigest(repoRoot: fixtureRepo)
+            XCTAssertNotEqual(
+                after,
+                before,
+                "the root tsconfig.json is extended by tsconfig.standalone.json, so changing its bytes must change the digest"
+            )
+        }
+    }
+
+    /// A `.DS_Store` file anywhere under `renderer/` (top-level or nested)
+    /// must never affect the digest — mirrors
+    /// `tests/renderer-build-identity.test.mjs`'s identically-named Node
+    /// test exactly, proving both implementations apply the exact same
+    /// narrow exclusion.
+    func testDSStoreFilesUnderRendererNeverAffectTheDigest() throws {
+        try withScratchFixtureCopy { fixtureRepo in
+            let before = try BundledRenderer.computeRendererSourceDigest(repoRoot: fixtureRepo)
+
+            let metadata = "finder metadata, never real source\n"
+            try metadata.write(
+                to: fixtureRepo.appendingPathComponent("renderer/.DS_Store"),
+                atomically: true,
+                encoding: .utf8
+            )
+            try metadata.write(
+                to: fixtureRepo.appendingPathComponent("renderer/nested/.DS_Store"),
+                atomically: true,
+                encoding: .utf8
+            )
+
+            let after = try BundledRenderer.computeRendererSourceDigest(repoRoot: fixtureRepo)
+            XCTAssertEqual(
+                after,
+                before,
+                ".DS_Store is Finder-generated metadata with no bearing on the build and must never poison the digest"
+            )
+        }
+    }
+
+    /// A hidden dotfile under `renderer/` that is *not* `.DS_Store` must
+    /// still be treated as real build input — proving the exclusion is
+    /// narrowly scoped to `.DS_Store` alone, never a blanket "skip all
+    /// hidden files" rule. Mirrors
+    /// `tests/renderer-build-identity.test.mjs`'s identically-named Node
+    /// test exactly.
+    func testHiddenDotfileUnderRendererThatIsNotDSStoreStillAffectsTheDigest() throws {
+        try withScratchFixtureCopy { fixtureRepo in
+            let before = try BundledRenderer.computeRendererSourceDigest(repoRoot: fixtureRepo)
+
+            try "export const z = 5;\n".write(
+                to: fixtureRepo.appendingPathComponent("renderer/.hidden-but-intentional.ts"),
+                atomically: true,
+                encoding: .utf8
+            )
+
+            let after = try BundledRenderer.computeRendererSourceDigest(repoRoot: fixtureRepo)
+            XCTAssertNotEqual(
+                after,
+                before,
+                "a dotfile that isn't .DS_Store may be genuine, intentionally-hidden source and must still affect the digest"
+            )
+        }
     }
 
     /// Proves `BundledRenderer.verifyManifestIsFresh` — the exact function

@@ -101,6 +101,7 @@ test("modifying any fixed top-level input file changes the digest", () => {
     "package.json",
     "package-lock.json",
     "tsconfig.standalone.json",
+    "tsconfig.json",
   ]) {
     withFixtureCopy((fixtureRepo) => {
       const before = computeRendererBuildDigest(fixtureRepo);
@@ -110,6 +111,73 @@ test("modifying any fixed top-level input file changes the digest", () => {
       assert.notEqual(after, before, `modifying ${relativePath} must change the digest`);
     });
   }
+});
+
+test("modifying the root tsconfig.json changes the digest (tsconfig.standalone.json `extends` it, so it genuinely affects how the renderer compiles)", () => {
+  withFixtureCopy((fixtureRepo) => {
+    const before = computeRendererBuildDigest(fixtureRepo);
+
+    const rootTsconfigPath = join(fixtureRepo, "tsconfig.json");
+    writeFileSync(rootTsconfigPath, `${readFileSync(rootTsconfigPath, "utf8")}\n// modified\n`);
+
+    const after = computeRendererBuildDigest(fixtureRepo);
+    assert.notEqual(
+      after,
+      before,
+      "the root tsconfig.json is extended by tsconfig.standalone.json, so changing its bytes must change the digest",
+    );
+  });
+});
+
+test("a .DS_Store file anywhere under renderer/ (top-level or nested) never affects the digest", () => {
+  withFixtureCopy((fixtureRepo) => {
+    const before = computeRendererBuildDigest(fixtureRepo);
+
+    writeFileSync(join(fixtureRepo, "renderer", ".DS_Store"), "finder metadata, never real source\n");
+    writeFileSync(
+      join(fixtureRepo, "renderer", "nested", ".DS_Store"),
+      "finder metadata, never real source\n",
+    );
+
+    const after = computeRendererBuildDigest(fixtureRepo);
+    assert.equal(
+      after,
+      before,
+      ".DS_Store is Finder-generated metadata with no bearing on the build and must never poison the digest",
+    );
+  });
+});
+
+test("a hidden dotfile under renderer/ that is not .DS_Store is still treated as real build input", () => {
+  withFixtureCopy((fixtureRepo) => {
+    const before = computeRendererBuildDigest(fixtureRepo);
+
+    writeFileSync(join(fixtureRepo, "renderer", ".hidden-but-intentional.ts"), "export const z = 5;\n");
+
+    const after = computeRendererBuildDigest(fixtureRepo);
+    assert.notEqual(
+      after,
+      before,
+      "a dotfile that isn't .DS_Store may be genuine, intentionally-hidden source and must still affect the digest",
+    );
+  });
+});
+
+test("rendererBuildInputFiles excludes exactly-named .DS_Store files but includes other hidden files under renderer/", () => {
+  withFixtureCopy((fixtureRepo) => {
+    writeFileSync(join(fixtureRepo, "renderer", ".DS_Store"), "finder metadata\n");
+    writeFileSync(join(fixtureRepo, "renderer", ".hidden-but-intentional.ts"), "export const z = 5;\n");
+
+    const files = rendererBuildInputFiles(fixtureRepo);
+    assert.ok(
+      !files.includes("renderer/.DS_Store"),
+      ".DS_Store must never be listed as a build input",
+    );
+    assert.ok(
+      files.includes("renderer/.hidden-but-intentional.ts"),
+      "a hidden dotfile that isn't .DS_Store must still be listed as a build input",
+    );
+  });
 });
 
 test("files outside the declared input set (not under renderer/, not one of the fixed top-level files) never affect the digest", () => {

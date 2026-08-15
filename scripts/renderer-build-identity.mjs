@@ -33,8 +33,13 @@ export const RENDERER_BUILD_MANIFEST_ALGORITHM = "sha256";
  * build actually reads: `vite.standalone.config.ts`'s own entry point and
  * plugin config, and the npm/TypeScript toolchain configuration/lockfile
  * that determine exactly what gets installed and how it's compiled.
- * Tailwind v4 is configured entirely in CSS (`@import "tailwindcss"`/
- * `@theme`, see `renderer/styles.css`) — there is no separate
+ * `tsconfig.json` is included alongside `tsconfig.standalone.json` because
+ * the latter's `"extends": "./tsconfig.json"` means the root config's
+ * `compilerOptions` genuinely feed into how the standalone renderer is
+ * type-checked/compiled — a change to it can change build output just as
+ * much as a change to `tsconfig.standalone.json` itself. Tailwind v4 is
+ * configured entirely in CSS (`@import "tailwindcss"`/`@theme`, see
+ * `renderer/styles.css`) — there is no separate
  * `tailwind.config.*`/`postcss.config.*` file in this repo to also list;
  * every stylesheet that does exist already lives under `renderer/` below.
  */
@@ -44,10 +49,31 @@ const TOP_LEVEL_INPUT_FILES = [
   "package.json",
   "package-lock.json",
   "tsconfig.standalone.json",
+  "tsconfig.json",
 ];
 
 /** The renderer source tree, walked recursively. */
 const RENDERER_SOURCE_DIR = "renderer";
+
+/**
+ * The *only* filename excluded from `renderer/`'s otherwise-exhaustive
+ * recursive walk. `.DS_Store` is Finder-generated metadata macOS silently
+ * writes into any directory a Finder window has ever browsed — its bytes
+ * (icon-position/view-state caches) never reflect anything the build
+ * actually reads, so letting it participate would let purely-local Finder
+ * browsing "poison" (change) a checkout's build-identity digest with no
+ * corresponding change to the built output.
+ *
+ * Deliberately narrow: this excludes *only* a file named exactly
+ * `.DS_Store`, never dotfiles/dot-directories in general. A hidden file
+ * under `renderer/` could legitimately be intentional build input the
+ * project relies on, and Swift's `rendererBuildInputFiles` (see
+ * `apps/macos/Seer/Tests/Integration/RendererIntegrationTests.swift`)
+ * mirrors this exact same narrow exclusion — never a blanket
+ * "skip all hidden files" rule — so the two implementations can never
+ * silently diverge on which hidden files count as build input.
+ */
+const EXCLUDED_METADATA_FILENAMES = new Set([".DS_Store"]);
 
 function toPosixRelativePath(repoRoot, absolutePath) {
   return relative(repoRoot, absolutePath).split(sep).join("/");
@@ -67,6 +93,7 @@ function collectFilesRecursively(absoluteDir, out) {
   // independent of the OS/filesystem's own directory-entry ordering).
   const sortedEntries = [...entries].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   for (const entry of sortedEntries) {
+    if (EXCLUDED_METADATA_FILENAMES.has(entry.name)) continue;
     const absoluteChild = join(absoluteDir, entry.name);
     if (entry.isDirectory()) {
       collectFilesRecursively(absoluteChild, out);
