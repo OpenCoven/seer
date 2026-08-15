@@ -346,7 +346,7 @@ def sha256_file_at(parent_fd, name, expected):
 
 
 def collect_app_digest_lines(directory_fd, prefix, lines):
-    for name in sorted(os.listdir(directory_fd)):
+    for name in sorted(os.listdir(directory_fd), key=lambda value: value.encode("utf-8")):
         info = lstat_at(directory_fd, name)
         if info is None:
             raise PublicationError("app digest entry {!r} disappeared".format(name))

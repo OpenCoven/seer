@@ -226,6 +226,37 @@ test("publication atomically replaces the old app and writes private provenance 
   }
 });
 
+test("Python publication and Node verification use identical UTF-8 byte ordering for app filenames", () => {
+  mkdirSync(join(repoRoot, "build"), { recursive: true });
+  const scratch = mkdtempSync(join(repoRoot, "build", "safe-publication-unicode-digest-"));
+
+  try {
+    const fixtureRepo = join(scratch, "repo");
+    const sourceApp = join(scratch, "source", "Seer.app");
+    const derivedData = join(scratch, "derived-data");
+    const contents = join(sourceApp, "Contents");
+    const unsignedApp = join(fixtureRepo, "build", "macos", "unsigned", "Seer.app");
+    makeFixtureApp(sourceApp, "unicode ordering\n");
+    mkdirSync(fixtureRepo, { recursive: true });
+    for (const name of ["Z.txt", "a.txt", "é.txt", "Ω.txt"]) {
+      writeFileSync(join(contents, name), `${name}\n`);
+    }
+    mkdirSync(derivedData, { recursive: true });
+
+    const result = publish({ fixtureRepo, sourceApp, derivedData });
+    assert.equal(result.status, 0, `publication failed:\n${result.stdout}\n${result.stderr}`);
+    const provenance = JSON.parse(
+      readFileSync(
+        join(fixtureRepo, "build", "macos", "standalone-build-provenance.json"),
+        "utf8",
+      ),
+    );
+    assert.equal(provenance.appDigest, computeAppDigest(unsignedApp));
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
 test("publication rejects a symlinked Seer.app leaf without touching its external target", () => {
   mkdirSync(join(repoRoot, "build"), { recursive: true });
   const scratch = mkdtempSync(join(repoRoot, "build", "safe-publication-leaf-"));

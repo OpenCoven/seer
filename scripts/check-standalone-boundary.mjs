@@ -32,6 +32,7 @@
 // the checks the test suite asserts against can never silently drift apart
 // (the same pattern `scripts/renderer-build-identity.mjs` already
 // established for the renderer build-identity digest).
+import { Buffer } from "node:buffer";
 import { execFileSync } from "node:child_process";
 import console from "node:console";
 import { createHash } from "node:crypto";
@@ -707,7 +708,9 @@ function sha256Hex(bytes) {
 
 function collectAppDigestLines(directory, prefix, lines) {
   const entries = readdirSync(directory, { withFileTypes: true })
-    .sort((left, right) => left.name.localeCompare(right.name));
+    .sort((left, right) =>
+      Buffer.compare(Buffer.from(left.name, "utf8"), Buffer.from(right.name, "utf8")),
+    );
   for (const entry of entries) {
     const fullPath = join(directory, entry.name);
     const relativePath = prefix ? `${prefix}/${entry.name}` : entry.name;

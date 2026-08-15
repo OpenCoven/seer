@@ -23,7 +23,11 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import {
+  RENDERER_BUILD_MANIFEST_ALGORITHM,
+  RENDERER_BUILD_MANIFEST_SCHEMA_VERSION,
   buildRendererBuildManifest,
+  computeRendererAssetDigest,
+  computeRendererBuildDigest,
   serializeRendererBuildManifest,
 } from "./renderer-build-identity.mjs";
 
@@ -57,6 +61,10 @@ const waitMs = positiveIntegerFromEnv("SEER_RENDERER_LOCK_WAIT_MS", 10 * 60 * 10
 const staleMs = positiveIntegerFromEnv("SEER_RENDERER_LOCK_STALE_MS", 2 * 60 * 1000);
 const pollMs = positiveIntegerFromEnv("SEER_RENDERER_LOCK_POLL_MS", 100);
 const eexistDelayMs = positiveIntegerFromEnv("SEER_RENDERER_LOCK_TEST_EEXIST_DELAY_MS", 0);
+const sourceChangeMaxRetries = positiveIntegerFromEnv(
+  "SEER_RENDERER_SOURCE_CHANGE_MAX_RETRIES",
+  2,
+);
 
 function sameIdentity(left, right) {
   return left.dev === right.dev && left.ino === right.ino;
@@ -200,6 +208,63 @@ function isProcessGroupAlive(processGroupId) {
   }
 }
 
+function recordedChildGroupState(childRecord, owner) {
+  if (!childRecord) return { state: "stale", diagnostic: null };
+  const child = childRecord.value;
+  if (
+    !child ||
+    typeof child !== "object" ||
+    typeof child.token !== "string" ||
+    !Number.isSafeInteger(child.pid) ||
+    child.pid <= 0 ||
+    typeof child.bootIdentity !== "string" ||
+    typeof child.processStartIdentity !== "string" ||
+    !owner ||
+    typeof owner.token !== "string" ||
+    child.token !== owner.token
+  ) {
+    return {
+      state: "unknown",
+      diagnostic: "recorded child process-group identity cannot be proven stale",
+    };
+  }
+  if (child.bootIdentity !== bootIdentity) {
+    return { state: "stale", diagnostic: null };
+  }
+
+  const currentStartIdentity = readProcessStartIdentity(child.pid);
+  if (currentStartIdentity) {
+    if (currentStartIdentity === child.processStartIdentity) {
+      return {
+        state: "live",
+        diagnostic: `recorded renderer child ${child.pid} is still alive`,
+      };
+    }
+    return { state: "stale", diagnostic: null };
+  }
+
+  if (child.processGroupId === null && process.platform === "win32") {
+    return { state: "stale", diagnostic: null };
+  }
+  if (
+    !Number.isSafeInteger(child.processGroupId) ||
+    child.processGroupId <= 0 ||
+    child.processGroupId !== child.pid
+  ) {
+    return {
+      state: "unknown",
+      diagnostic: "recorded child process-group identity cannot be proven stale",
+    };
+  }
+  if (isProcessGroupAlive(child.processGroupId)) {
+    return {
+      state: "live",
+      diagnostic: `recorded renderer child process group ${child.processGroupId} is still alive`,
+    };
+  }
+  return { state: "stale", diagnostic: null };
+}
+
 function removeVerifiedLock(expectedDirectory, knownEntries) {
   const currentDirectory = lstatSync(lockDir);
   assertOwnedDirectory(currentDirectory, "renderer lock");
@@ -225,7 +290,7 @@ function removeVerifiedLock(expectedDirectory, knownEntries) {
 
 function inspectAndMaybeRemoveStaleLock() {
   const directoryInfo = lstatOrNull(lockDir);
-  if (!directoryInfo) return true;
+  if (!directoryInfo) return { removed: true, diagnostic: null };
   assertOwnedDirectory(directoryInfo, "renderer lock");
 
   let ownerRecord = null;
@@ -233,7 +298,9 @@ function inspectAndMaybeRemoveStaleLock() {
   try {
     ownerRecord = readJsonFileNoFollow(ownerPath, "renderer lock owner metadata");
   } catch (error) {
-    if (error.code !== "ENOENT" && Date.now() - directoryInfo.mtimeMs < staleMs) return false;
+    if (error.code !== "ENOENT" && Date.now() - directoryInfo.mtimeMs < staleMs) {
+      return { removed: false, diagnostic: "renderer lock owner metadata is not yet stale" };
+    }
     if (error.code !== "ENOENT") {
       if (!error.verifiedFileInfo) throw error;
       ownerRecord = { info: error.verifiedFileInfo, value: null };
@@ -242,22 +309,33 @@ function inspectAndMaybeRemoveStaleLock() {
   try {
     childRecord = readJsonFileNoFollow(childPath, "renderer lock child metadata");
   } catch (error) {
-    if (error.code !== "ENOENT" && Date.now() - directoryInfo.mtimeMs < staleMs) return false;
+    if (error.code !== "ENOENT" && Date.now() - directoryInfo.mtimeMs < staleMs) {
+      return { removed: false, diagnostic: "renderer lock child metadata is not yet stale" };
+    }
     if (error.code !== "ENOENT") {
       if (!error.verifiedFileInfo) throw error;
       childRecord = { info: error.verifiedFileInfo, value: null };
     }
   }
 
-  const child = childRecord?.value;
-  if (recordedProcessIsLive(child)) return false;
   const owner = ownerRecord?.value;
-  if (recordedProcessIsLive(owner)) return false;
+  if (recordedProcessIsLive(owner)) {
+    return {
+      removed: false,
+      diagnostic: `recorded renderer lock owner ${owner.pid} is still alive`,
+    };
+  }
+  const childGroup = recordedChildGroupState(childRecord, owner);
+  if (childGroup.state !== "stale") {
+    return { removed: false, diagnostic: childGroup.diagnostic };
+  }
 
   const createdAtMs = Number.isSafeInteger(owner?.createdAtMs)
     ? owner.createdAtMs
     : directoryInfo.mtimeMs;
-  if (Date.now() - createdAtMs < staleMs) return false;
+  if (Date.now() - createdAtMs < staleMs) {
+    return { removed: false, diagnostic: "renderer lock has not reached its stale age" };
+  }
 
   const knownEntries = new Map();
   if (ownerRecord) knownEntries.set("owner.json", ownerRecord.info);
@@ -265,10 +343,10 @@ function inspectAndMaybeRemoveStaleLock() {
   try {
     removeVerifiedLock(directoryInfo, knownEntries);
   } catch (error) {
-    if (error.code === "ENOENT") return true;
+    if (error.code === "ENOENT") return { removed: true, diagnostic: null };
     throw error;
   }
-  return true;
+  return { removed: true, diagnostic: null };
 }
 
 function sleep(durationMs) {
@@ -280,6 +358,7 @@ async function acquireLock() {
   const token = randomUUID();
   const deadline = Date.now() + waitMs;
   const processStartIdentity = readProcessStartIdentity(process.pid);
+  let lockDiagnostic = null;
   if (!processStartIdentity) {
     throw new Error("unable to identify the renderer lock owner process start");
   }
@@ -341,6 +420,7 @@ async function acquireLock() {
             { encoding: "utf8", flag: "wx", mode: 0o600 },
           );
           activeChildInfo = lstatSync(childPath);
+          return childProcessStartIdentity;
         },
         clearChild() {
           if (!activeChildInfo) return;
@@ -376,10 +456,17 @@ async function acquireLock() {
     } catch (error) {
       if (error.code !== "EEXIST") throw error;
       if (eexistDelayMs > 0) await sleep(eexistDelayMs);
-      if (inspectAndMaybeRemoveStaleLock()) continue;
+      const inspection = inspectAndMaybeRemoveStaleLock();
+      if (inspection.removed) continue;
+      lockDiagnostic = inspection.diagnostic;
       if (Date.now() >= deadline) {
+        const detail = lockDiagnostic ? `; ${lockDiagnostic}` : "";
+        const manualRecovery =
+          lockDiagnostic?.includes("cannot be proven stale")
+            ? `; after verifying the recorded process group is gone, remove ${lockDir} manually`
+            : "";
         throw new Error(
-          `timed out after ${waitMs}ms waiting for the standalone renderer build lock`,
+          `timed out after ${waitMs}ms waiting for the standalone renderer build lock${detail}${manualRecovery}`,
         );
       }
       await sleep(pollMs);
@@ -393,32 +480,56 @@ function trace(event, token) {
   appendFileSync(tracePath, `${JSON.stringify({ event, token, pid: process.pid })}\n`, "utf8");
 }
 
-function signalChild(child, processGroupId, signal) {
+function signalChild(child, processGroupId, processStartIdentity, signal, leaderExited = false) {
   if (Number.isSafeInteger(processGroupId) && processGroupId > 0) {
+    const currentStartIdentity = readProcessStartIdentity(child.pid);
+    if (
+      currentStartIdentity &&
+      (leaderExited || currentStartIdentity !== processStartIdentity)
+    ) {
+      return;
+    }
+    if (
+      !currentStartIdentity &&
+      (processGroupId !== child.pid || !isProcessGroupAlive(processGroupId))
+    ) {
+      return;
+    }
     try {
       process.kill(-processGroupId, signal);
       return;
     } catch (error) {
       if (error.code !== "ESRCH") throw error;
     }
+    return;
   }
   child.kill(signal);
 }
 
-async function terminateRemainingProcessGroup(child, processGroupId) {
-  if (!isProcessGroupAlive(processGroupId)) return;
-  signalChild(child, processGroupId, "SIGTERM");
+function remainingSpawnedProcessGroupIsAlive(child, processGroupId) {
+  if (!Number.isSafeInteger(processGroupId) || processGroupId <= 0) {
+    return false;
+  }
+  // This runs only from ChildProcess's close event, after the recorded leader
+  // has exited. Any process now visible at that PID is recycled and unrelated.
+  if (readProcessStartIdentity(child.pid)) return false;
+  return isProcessGroupAlive(processGroupId);
+}
+
+async function terminateRemainingProcessGroup(child, processGroupId, processStartIdentity) {
+  if (!remainingSpawnedProcessGroupIsAlive(child, processGroupId)) return;
+  signalChild(child, processGroupId, processStartIdentity, "SIGTERM", true);
   const termDeadline = Date.now() + 2_000;
-  while (Date.now() < termDeadline && isProcessGroupAlive(processGroupId)) {
+  while (Date.now() < termDeadline && remainingSpawnedProcessGroupIsAlive(child, processGroupId)) {
     await sleep(20);
   }
-  if (!isProcessGroupAlive(processGroupId)) return;
-  signalChild(child, processGroupId, "SIGKILL");
+  if (!remainingSpawnedProcessGroupIsAlive(child, processGroupId)) return;
+  signalChild(child, processGroupId, processStartIdentity, "SIGKILL", true);
   const killDeadline = Date.now() + 2_000;
-  while (Date.now() < killDeadline && isProcessGroupAlive(processGroupId)) {
+  while (Date.now() < killDeadline && remainingSpawnedProcessGroupIsAlive(child, processGroupId)) {
     await sleep(20);
   }
-  if (isProcessGroupAlive(processGroupId)) {
+  if (remainingSpawnedProcessGroupIsAlive(child, processGroupId)) {
     throw new Error(`spawned process group ${processGroupId} remained alive after termination`);
   }
 }
@@ -433,10 +544,10 @@ async function run(lock, command, args, { env = process.env } = {}) {
       detached,
     });
     const processGroupId = detached ? child.pid : null;
+    let childProcessStartIdentity;
     try {
-      lock.recordChild(child.pid, processGroupId);
+      childProcessStartIdentity = lock.recordChild(child.pid, processGroupId);
     } catch (error) {
-      signalChild(child, processGroupId, "SIGTERM");
       child.once("close", () => reject(error));
       return;
     }
@@ -444,7 +555,8 @@ async function run(lock, command, args, { env = process.env } = {}) {
     let spawnError = null;
     const handlers = new Map();
     for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
-      const handler = () => signalChild(child, processGroupId, signal);
+      const handler = () =>
+        signalChild(child, processGroupId, childProcessStartIdentity, signal);
       handlers.set(signal, handler);
       process.once(signal, handler);
     }
@@ -454,7 +566,7 @@ async function run(lock, command, args, { env = process.env } = {}) {
     child.once("error", (error) => {
       spawnError = error;
       try {
-        signalChild(child, processGroupId, "SIGTERM");
+        signalChild(child, processGroupId, childProcessStartIdentity, "SIGTERM");
       } catch {
         // The original spawn error is authoritative.
       }
@@ -462,7 +574,7 @@ async function run(lock, command, args, { env = process.env } = {}) {
     child.once("close", (code, signal) => {
       cleanupHandlers();
       void (async () => {
-        await terminateRemainingProcessGroup(child, processGroupId);
+        await terminateRemainingProcessGroup(child, processGroupId, childProcessStartIdentity);
         lock.clearChild();
         if (spawnError) {
           reject(spawnError);
@@ -719,17 +831,19 @@ function validateRendererGeneration(path, expectedIdentity, label) {
     throw new Error(`${label} build manifest is not owned by the current uid`);
   }
   const actual = manifestRecord.value;
-  const expected = buildRendererBuildManifest(repoRoot, path);
   const expectedKeys = ["algorithm", "assetDigest", "schemaVersion", "sourceDigest"];
   if (
     !actual ||
     typeof actual !== "object" ||
     Array.isArray(actual) ||
     JSON.stringify(Object.keys(actual).sort()) !== JSON.stringify(expectedKeys) ||
-    actual.schemaVersion !== expected.schemaVersion ||
-    actual.algorithm !== expected.algorithm ||
-    actual.sourceDigest !== expected.sourceDigest ||
-    actual.assetDigest !== expected.assetDigest
+    actual.schemaVersion !== RENDERER_BUILD_MANIFEST_SCHEMA_VERSION ||
+    actual.algorithm !== RENDERER_BUILD_MANIFEST_ALGORITHM ||
+    typeof actual.sourceDigest !== "string" ||
+    !/^[0-9a-f]{64}$/.test(actual.sourceDigest) ||
+    typeof actual.assetDigest !== "string" ||
+    !/^[0-9a-f]{64}$/.test(actual.assetDigest) ||
+    actual.assetDigest !== computeRendererAssetDigest(path)
   ) {
     throw new Error(`${label} build manifest does not validate the complete generation`);
   }
@@ -945,45 +1059,64 @@ async function buildAndPublish(lock) {
   prepareBuildRoot();
   recoverRendererPublication();
   cleanupAbandonedStages();
-  const token = randomUUID().replaceAll("-", "");
-  const stagePath = join(rendererBuildRoot, `.renderer-stage-${token}`);
-  mkdirSync(stagePath, { mode: 0o700 });
-  let transactionStarted = false;
-  try {
-    const testBuilder = process.env.SEER_RENDERER_BUILD_TEST_BUILDER;
-    if (testBuilder) {
-      await run(lock, process.execPath, [testBuilder, stagePath]);
-    } else {
-      await run(
-        lock,
-        join(repoRoot, "node_modules", ".bin", "vite"),
-        ["build", "--config", "vite.standalone.config.ts", "--outDir", stagePath],
-        { env: { ...process.env, SEER_RENDERER_PRIVATE_OUT_DIR: stagePath } },
-      );
-    }
-    const stageInfo = assertExpectedDirectory(stagePath, null, "private renderer stage");
-    const manifestPath = join(stagePath, "build-manifest.json");
-    const manifest = buildRendererBuildManifest(repoRoot, stagePath);
-    const descriptor = openSync(
-      manifestPath,
-      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
-      0o600,
-    );
+  for (let attempt = 0; attempt <= sourceChangeMaxRetries; attempt += 1) {
+    const token = randomUUID().replaceAll("-", "");
+    const stagePath = join(rendererBuildRoot, `.renderer-stage-${token}`);
+    mkdirSync(stagePath, { mode: 0o700 });
+    let transactionStarted = false;
     try {
-      writeFileSync(descriptor, serializeRendererBuildManifest(manifest), "utf8");
-      fsyncSync(descriptor);
-    } finally {
-      closeSync(descriptor);
+      const testBuilder = process.env.SEER_RENDERER_BUILD_TEST_BUILDER;
+      const sourceDigestBeforeBuild = computeRendererBuildDigest(repoRoot);
+      if (testBuilder) {
+        await run(lock, process.execPath, [testBuilder, stagePath]);
+      } else {
+        await run(
+          lock,
+          join(repoRoot, "node_modules", ".bin", "vite"),
+          ["build", "--config", "vite.standalone.config.ts", "--outDir", stagePath],
+          { env: { ...process.env, SEER_RENDERER_PRIVATE_OUT_DIR: stagePath } },
+        );
+      }
+      const sourceDigestAfterBuild = computeRendererBuildDigest(repoRoot);
+      if (sourceDigestAfterBuild !== sourceDigestBeforeBuild) {
+        removeExpectedDirectory(stagePath, null, "source-raced private renderer stage");
+        fsyncDirectory(rendererBuildRoot);
+        if (attempt === sourceChangeMaxRetries) {
+          throw new Error(
+            `renderer sources changed during ${attempt + 1} consecutive build attempts; retry after edits settle`,
+          );
+        }
+        continue;
+      }
+      const stageInfo = assertExpectedDirectory(stagePath, null, "private renderer stage");
+      const manifestPath = join(stagePath, "build-manifest.json");
+      const manifest = buildRendererBuildManifest(
+        repoRoot,
+        stagePath,
+        sourceDigestBeforeBuild,
+      );
+      const descriptor = openSync(
+        manifestPath,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+        0o600,
+      );
+      try {
+        writeFileSync(descriptor, serializeRendererBuildManifest(manifest), "utf8");
+        fsyncSync(descriptor);
+      } finally {
+        closeSync(descriptor);
+      }
+      fsyncDirectory(stagePath);
+      transactionStarted = true;
+      publishRendererStage(stagePath, stageInfo);
+      return;
+    } catch (error) {
+      if (!transactionStarted && lstatOrNull(stagePath)) {
+        removeExpectedDirectory(stagePath, null, "failed private renderer stage");
+        fsyncDirectory(rendererBuildRoot);
+      }
+      throw error;
     }
-    fsyncDirectory(stagePath);
-    transactionStarted = true;
-    publishRendererStage(stagePath, stageInfo);
-  } catch (error) {
-    if (!transactionStarted && lstatOrNull(stagePath)) {
-      removeExpectedDirectory(stagePath, null, "failed private renderer stage");
-      fsyncDirectory(rendererBuildRoot);
-    }
-    throw error;
   }
 }
 
@@ -999,6 +1132,7 @@ function consumerArguments() {
 async function main() {
   const consumer = consumerArguments();
   const lock = await acquireLock();
+  let operationError = null;
   trace("start", lock.token);
   try {
     await buildAndPublish(lock);
@@ -1009,9 +1143,17 @@ async function main() {
       });
       trace("consumer-end", lock.token);
     }
+  } catch (error) {
+    operationError = error;
+    throw error;
   } finally {
     trace("end", lock.token);
-    lock.release();
+    try {
+      lock.release();
+    } catch (releaseError) {
+      if (!operationError) throw releaseError;
+      operationError.message += `; renderer lock cleanup also failed: ${releaseError.message}`;
+    }
   }
 }
 

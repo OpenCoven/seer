@@ -194,11 +194,15 @@ export function computeRendererAssetDigest(rendererRoot) {
 }
 
 /** The full build-manifest object, before serialization. */
-export function buildRendererBuildManifest(repoRoot, rendererRoot) {
+export function buildRendererBuildManifest(
+  repoRoot,
+  rendererRoot,
+  sourceDigest = computeRendererBuildDigest(repoRoot),
+) {
   return {
     schemaVersion: RENDERER_BUILD_MANIFEST_SCHEMA_VERSION,
     algorithm: RENDERER_BUILD_MANIFEST_ALGORITHM,
-    sourceDigest: computeRendererBuildDigest(repoRoot),
+    sourceDigest,
     assetDigest: computeRendererAssetDigest(rendererRoot),
   };
 }
