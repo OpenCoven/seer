@@ -20,7 +20,8 @@ and never edit a row's `Result` without also filling in `Date`, `Tester`,
 ## Task 18 automated evidence (not manual parity)
 
 This evidence records the local automated gate without changing any manual
-matrix result. Date: **2026-08-14** · Tester: **Cody** · Implementation HEAD:
+matrix result. Date: **2026-08-14 (UTC-05:00; logs/commit tooling may display
+2026-08-15 UTC)** · Tester: **Cody** · Implementation HEAD:
 **`b259509fbffc63db17db00da6df50812d5bd906b`**. Logs are ignored,
 worktree-relative files under `build/test-results/task18/`; paths in the logs
 are redacted to `$REPO`/`$HOME`, and no log is a release artifact.
