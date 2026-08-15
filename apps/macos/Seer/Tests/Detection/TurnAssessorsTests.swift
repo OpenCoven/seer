@@ -269,6 +269,76 @@ final class TurnAssessorsTests: XCTestCase {
         XCTAssertFalse(pastBoundary.active, "age == 20s + 1ms must be stale")
     }
 
+    func testRecencyHelperEnforcesGraceFutureSkewAndOverflowBoundaries() {
+        let now: Int64 = 1_786_449_620_000
+        let cases: [(name: String, timestamp: Int64, grace: Int64, expected: Bool)] = [
+            ("grace start", now - turnActiveGraceMs, turnActiveGraceMs, true),
+            ("past grace", now - turnActiveGraceMs - 1, turnActiveGraceMs, false),
+            ("future skew boundary", now + timestampFutureSkewMs, turnActiveGraceMs, true),
+            ("past future skew", now + timestampFutureSkewMs + 1, turnActiveGraceMs, false),
+            ("extreme future", Int64.max, turnActiveGraceMs, false),
+            ("extreme past", Int64.min, turnActiveGraceMs, false),
+            ("overflow future", Int64.max, Int64.min, false),
+            ("overflow past", Int64.min, Int64.max, false),
+        ]
+
+        for testCase in cases {
+            XCTAssertEqual(
+                isRecentTimestamp(testCase.timestamp, now: now, within: testCase.grace),
+                testCase.expected,
+                testCase.name
+            )
+        }
+    }
+
+    func testEveryAssessorFamilyRejectsExtremeFutureButAcceptsBoundedClockSkew() {
+        let now: Int64 = 1_786_449_620_000
+        let assessors: [(String, (Int64) -> TurnAssessment)] = [
+            ("claude", { timestamp in
+                assessClaudeTurn(
+                    [["type": "assistant", "timestamp": timestamp, "message": ["stop_reason": "tool_use"]]],
+                    mtimeMs: now,
+                    now: now
+                )
+            }),
+            ("codex", { timestamp in
+                assessCodexTurn(
+                    [["timestamp": timestamp, "type": "event_msg", "payload": ["type": "task_started"]]],
+                    mtimeMs: now,
+                    now: now
+                )
+            }),
+            ("grok", { timestamp in
+                assessGrokTurn([["ts": timestamp, "type": "turn_started"]], mtimeMs: now, now: now)
+            }),
+            ("generic mtime", { timestamp in
+                assessGenericMtime(mtimeMs: timestamp, now: now)
+            }),
+            ("cursor", { timestamp in
+                assessCursorComposerRecord(
+                    ["status": "generating", "lastUpdatedAt": timestamp, "fullConversationHeadersOnly": []],
+                    now: now
+                )
+            }),
+        ]
+
+        for (name, assess) in assessors {
+            XCTAssertTrue(assess(now + timestampFutureSkewMs).active, "\(name) must tolerate the documented skew")
+            XCTAssertFalse(assess(Int64.max).active, "\(name) must reject extreme future evidence")
+        }
+    }
+
+    func testCodexAndGrokQuietTailFallbacksRejectExtremeFutureMtimeButAllowBoundedSkew() {
+        let now: Int64 = 1_786_449_620_000
+        for (name, assess) in [
+            ("codex", { (mtime: Int64) in assessCodexTurn([], mtimeMs: mtime, now: now) }),
+            ("grok", { (mtime: Int64) in assessGrokTurn([], mtimeMs: mtime, now: now) }),
+        ] {
+            XCTAssertTrue(assess(now + timestampFutureSkewMs).active, "\(name) fallback must tolerate bounded skew")
+            XCTAssertFalse(assess(Int64.max).active, "\(name) fallback must reject extreme future mtime")
+        }
+    }
+
     // MARK: - Timestamp overflow hardening (Finding 1)
 
     /// A finite JSON number far above `Int64` range (`1e300`) must saturate
@@ -316,9 +386,7 @@ final class TurnAssessorsTests: XCTestCase {
     /// End-to-end: syntactically valid JSON containing `1e300` must parse via
     /// `JSONSerialization`, flow through `assessClaudeTurn` without trapping,
     /// and produce a bounded `lastActivityAt`. A future-huge timestamp must
-    /// saturate to `Int64.max`; since `now` is realistic, `now - Int64.max`
-    /// must saturate to a very negative age, keeping the turn observably
-    /// "fresh" (active) rather than becoming stale or crashing.
+    /// saturate to `Int64.max` and be rejected as implausibly future-dated.
     func testAssessClaudeTurnSurvivesHugeFutureTimestampJSON() throws {
         let json = #"""
         [{"type":"assistant","timestamp":1e300,"message":{"stop_reason":"tool_use"}}]
@@ -329,7 +397,7 @@ final class TurnAssessorsTests: XCTestCase {
         let now: Int64 = 1_786_449_620_000
         let assessment = assessClaudeTurn(events, mtimeMs: now, now: now)
         XCTAssertEqual(assessment.lastActivityAt, Int64.max)
-        XCTAssertTrue(assessment.active, "a huge future timestamp must saturate to fresh, not stale or trapped")
+        XCTAssertFalse(assessment.active, "a huge future timestamp must be rejected, not active forever")
     }
 
     /// The past-huge mirror: `-1e300` must saturate to `Int64.min`, and the
@@ -350,7 +418,7 @@ final class TurnAssessorsTests: XCTestCase {
 
     /// Same JSON-callable trap coverage for the Codex assessor: a huge future
     /// `timestamp` in an `event_msg`/`task_started` record must not trap, and
-    /// must classify as an in-progress (fresh) open turn.
+    /// must be rejected as implausibly future-dated.
     func testAssessCodexTurnSurvivesHugeFutureTimestampJSON() throws {
         let json = #"""
         [{"timestamp":1e300,"type":"event_msg","payload":{"type":"task_started","cwd":"/tmp/x"}}]
@@ -361,7 +429,7 @@ final class TurnAssessorsTests: XCTestCase {
         let now: Int64 = 1_786_449_620_000
         let assessment = assessCodexTurn(events, mtimeMs: now, now: now)
         XCTAssertEqual(assessment.lastActivityAt, Int64.max)
-        XCTAssertTrue(assessment.active)
+        XCTAssertFalse(assessment.active)
     }
 
     /// Same JSON-callable trap coverage for the Grok assessor. Grok tracks
@@ -396,7 +464,7 @@ final class TurnAssessorsTests: XCTestCase {
     func testAssessGenericMtimeSurvivesSaturatedExtremeTimestamps() {
         let now: Int64 = 1_786_449_620_000
         let future = assessGenericMtime(mtimeMs: Int64.max, now: now)
-        XCTAssertTrue(future.active)
+        XCTAssertFalse(future.active)
         let ancient = assessGenericMtime(mtimeMs: Int64.min, now: now)
         XCTAssertFalse(ancient.active)
     }
@@ -414,6 +482,7 @@ final class TurnAssessorsTests: XCTestCase {
         let now: Int64 = 1_786_449_620_000
         let assessment = assessCursorComposerRecord(record, now: now)
         XCTAssertEqual(assessment.lastActivityAt, Int64.max)
+        XCTAssertFalse(assessment.active)
     }
 
     /// Direct boundary tests for the saturating subtraction helper backing

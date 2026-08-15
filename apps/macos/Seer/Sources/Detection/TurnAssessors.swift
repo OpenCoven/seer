@@ -29,6 +29,9 @@ public let openTurnQuietTailMs: Int64 = 15_000
 public let processOnlyCPUThreshold: Double = 25.0
 /// Generic logs only get a short window — better false negatives than caffeinating idle CLIs.
 public let genericMtimeWindowMs: Int64 = 20_000
+/// Tolerates small wall-clock/filesystem skew without allowing corrupt
+/// far-future timestamps to remain active indefinitely.
+public let timestampFutureSkewMs: Int64 = 5_000
 
 // MARK: - Numeric/timestamp helpers
 
@@ -83,6 +86,16 @@ func saturatingSubtract(_ a: Int64, _ b: Int64) -> Int64 {
     // was a future/very-positive timestamp — saturate to the "very fresh"
     // bound). This holds regardless of `a`'s own range.
     return b <= 0 ? Int64.max : Int64.min
+}
+
+/// Overflow-safe recency predicate shared by every transcript and mtime
+/// family. The timestamp must be no older than `graceMs` and no farther than
+/// five seconds in the future.
+public func isRecentTimestamp(_ timestampMs: Int64, now: Int64, within graceMs: Int64) -> Bool {
+    guard graceMs >= 0 else { return false }
+    let (age, overflow) = now.subtractingReportingOverflow(timestampMs)
+    guard !overflow else { return false }
+    return age >= -timestampFutureSkewMs && age <= graceMs
 }
 
 /// Parses an ISO 8601 timestamp (with or without fractional seconds) to Unix
@@ -335,8 +348,6 @@ public func assessClaudeTurn(_ events: [JSONObject], mtimeMs: Int64, now: Int64)
         if claudeMetadataTypes.contains(type) { continue }
 
         let timestamp = parseTimestamp(record["timestamp"], fallbackMs: mtimeMs)
-        let age = saturatingSubtract(now, timestamp)
-
         if type == "system" {
             let subtype = record["subtype"] as? String ?? ""
             if subtype == "turn_duration" || subtype == "away_summary" {
@@ -354,7 +365,7 @@ public func assessClaudeTurn(_ events: [JSONObject], mtimeMs: Int64, now: Int64)
             }
 
             if stopReason == "tool_use" {
-                let active = age <= toolTurnGraceMs
+                let active = isRecentTimestamp(timestamp, now: now, within: toolTurnGraceMs)
                 return TurnAssessment(
                     active: active,
                     lastActivityAt: timestamp,
@@ -363,7 +374,7 @@ public func assessClaudeTurn(_ events: [JSONObject], mtimeMs: Int64, now: Int64)
             }
 
             // Streaming / incomplete assistant chunk without an end marker.
-            let active = age <= turnActiveGraceMs
+            let active = isRecentTimestamp(timestamp, now: now, within: turnActiveGraceMs)
             return TurnAssessment(
                 active: active,
                 lastActivityAt: timestamp,
@@ -374,7 +385,7 @@ public func assessClaudeTurn(_ events: [JSONObject], mtimeMs: Int64, now: Int64)
         if type == "user" {
             let hasToolResult = record["toolUseResult"] != nil
             if hasToolResult {
-                let active = age <= toolTurnGraceMs
+                let active = isRecentTimestamp(timestamp, now: now, within: toolTurnGraceMs)
                 return TurnAssessment(
                     active: active,
                     lastActivityAt: timestamp,
@@ -383,7 +394,7 @@ public func assessClaudeTurn(_ events: [JSONObject], mtimeMs: Int64, now: Int64)
             }
 
             // Fresh human prompt starts a turn.
-            let active = age <= turnActiveGraceMs
+            let active = isRecentTimestamp(timestamp, now: now, within: turnActiveGraceMs)
             return TurnAssessment(
                 active: active,
                 lastActivityAt: timestamp,
@@ -537,8 +548,7 @@ public func assessCodexTurn(_ events: [JSONObject], mtimeMs: Int64, now: Int64) 
 
     if lastActivityAt < 0 {
         // Tail held nothing recognizable (huge single records) — trust fresh writes only.
-        let age = saturatingSubtract(now, mtimeMs)
-        let active = age <= openTurnQuietTailMs
+        let active = isRecentTimestamp(mtimeMs, now: now, within: openTurnQuietTailMs)
         return TurnAssessment(
             active: active,
             lastActivityAt: mtimeMs,
@@ -547,14 +557,12 @@ public func assessCodexTurn(_ events: [JSONObject], mtimeMs: Int64, now: Int64) 
         )
     }
 
-    let age = saturatingSubtract(now, lastActivityAt)
-
     if latest?.role == .awaitUser {
         return TurnAssessment(active: false, lastActivityAt: lastActivityAt, reason: "waiting for approval", label: label)
     }
 
     if startedAt > endedAt {
-        let active = age <= openTurnGraceMs
+        let active = isRecentTimestamp(lastActivityAt, now: now, within: openTurnGraceMs)
         let reason = codexSignalReason(latest)
         return TurnAssessment(
             active: active,
@@ -568,7 +576,12 @@ public func assessCodexTurn(_ events: [JSONObject], mtimeMs: Int64, now: Int64) 
     if let latest, latest.at > endedAt, latest.role == .stream || latest.role == .tool {
         let grace = latest.role == .tool ? toolTurnGraceMs : turnActiveGraceMs
         let reason = codexSignalReason(latest)
-        return TurnAssessment(active: age <= grace, lastActivityAt: lastActivityAt, reason: reason, label: label)
+        return TurnAssessment(
+            active: isRecentTimestamp(lastActivityAt, now: now, within: grace),
+            lastActivityAt: lastActivityAt,
+            reason: reason,
+            label: label
+        )
     }
 
     return TurnAssessment(
@@ -646,8 +659,7 @@ public func assessGrokTurn(_ events: [JSONObject], mtimeMs: Int64, now: Int64) -
     }
 
     if lastActivityAt < 0 {
-        let age = saturatingSubtract(now, mtimeMs)
-        let active = age <= openTurnQuietTailMs
+        let active = isRecentTimestamp(mtimeMs, now: now, within: openTurnQuietTailMs)
         return TurnAssessment(
             active: active,
             lastActivityAt: mtimeMs,
@@ -655,7 +667,6 @@ public func assessGrokTurn(_ events: [JSONObject], mtimeMs: Int64, now: Int64) -
         )
     }
 
-    let age = saturatingSubtract(now, lastActivityAt)
     let reason = latest?.kind ?? "turn in progress"
 
     if latest?.role == .awaitUser {
@@ -663,7 +674,7 @@ public func assessGrokTurn(_ events: [JSONObject], mtimeMs: Int64, now: Int64) -
     }
 
     if startedAt > endedAt {
-        let active = age <= openTurnGraceMs
+        let active = isRecentTimestamp(lastActivityAt, now: now, within: openTurnGraceMs)
         return TurnAssessment(
             active: active,
             lastActivityAt: lastActivityAt,
@@ -678,7 +689,11 @@ public func assessGrokTurn(_ events: [JSONObject], mtimeMs: Int64, now: Int64) -
 
     if (noBoundaryInTail || outputAfterEnd), let latest, latest.role == .stream || latest.role == .tool {
         let grace = latest.role == .tool ? toolTurnGraceMs : turnActiveGraceMs
-        return TurnAssessment(active: age <= grace, lastActivityAt: lastActivityAt, reason: reason)
+        return TurnAssessment(
+            active: isRecentTimestamp(lastActivityAt, now: now, within: grace),
+            lastActivityAt: lastActivityAt,
+            reason: reason
+        )
     }
 
     return TurnAssessment(active: false, lastActivityAt: lastActivityAt, reason: endedAt >= 0 ? "turn complete" : "idle")
@@ -687,8 +702,7 @@ public func assessGrokTurn(_ events: [JSONObject], mtimeMs: Int64, now: Int64) -
 // MARK: - Generic mtime
 
 public func assessGenericMtime(mtimeMs: Int64, now: Int64) -> TurnAssessment {
-    let age = saturatingSubtract(now, mtimeMs)
-    let active = age <= genericMtimeWindowMs
+    let active = isRecentTimestamp(mtimeMs, now: now, within: genericMtimeWindowMs)
     return TurnAssessment(
         active: active,
         lastActivityAt: mtimeMs,
@@ -767,7 +781,12 @@ public func assessCursorComposerRecord(_ record: JSONObject, now: Int64) -> Turn
         } else if (record["unifiedMode"] as? String) == "agent" {
             reason = "agent generating"
         }
-        return TurnAssessment(active: true, lastActivityAt: lastActivityAt, reason: reason, label: label)
+        return TurnAssessment(
+            active: isRecentTimestamp(lastActivityAt, now: now, within: sessionCandidateWindowMs),
+            lastActivityAt: lastActivityAt,
+            reason: reason,
+            label: label
+        )
     }
 
     let headers = record["fullConversationHeadersOnly"] as? [JSONObject] ?? []
@@ -831,14 +850,18 @@ public func assessCursorComposerRecord(_ record: JSONObject, now: Int64) -> Turn
     }
 
     if runningTool {
-        return TurnAssessment(active: true, lastActivityAt: lastActivityAt, reason: "tool_call in progress", label: label)
+        return TurnAssessment(
+            active: isRecentTimestamp(lastActivityAt, now: now, within: toolTurnGraceMs),
+            lastActivityAt: lastActivityAt,
+            reason: "tool_call in progress",
+            label: label
+        )
     }
 
     if let openUserTurnAt, !sawCompletedTurnAfterUser {
         _ = openUserTurnAt // boundary already folded into lastActivityAt, matching the TS reference.
-        let age = saturatingSubtract(now, lastActivityAt)
         let grace = openTurnTouchesTools ? toolTurnGraceMs : turnActiveGraceMs
-        if age <= grace {
+        if isRecentTimestamp(lastActivityAt, now: now, within: grace) {
             return TurnAssessment(
                 active: true,
                 lastActivityAt: lastActivityAt,

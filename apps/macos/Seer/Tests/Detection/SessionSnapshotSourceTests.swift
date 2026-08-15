@@ -25,6 +25,7 @@ final class SessionSnapshotSourceTests: XCTestCase {
     private func write(_ text: String, to url: URL) {
         try! FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try! text.data(using: .utf8)!.write(to: url)
+        setModificationDate(Date(timeIntervalSince1970: Double(fixedNow) / 1000), at: url)
     }
 
     private func setModificationDate(_ date: Date, at url: URL) {
@@ -146,6 +147,26 @@ final class SessionSnapshotSourceTests: XCTestCase {
 
         XCTAssertEqual(hits.count, sessionMaximumFilesPerRoot)
         XCTAssertEqual(sessionMaximumFilesPerRoot, 400)
+    }
+
+    func testCollectCandidatesAllowsOnlyBoundedFutureMtimeSkew() throws {
+        let base = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let tolerated = base.appendingPathComponent("tolerated.jsonl")
+        let rejected = base.appendingPathComponent("rejected.jsonl")
+        write("{}", to: tolerated)
+        write("{}", to: rejected)
+        setModificationDate(Date(timeIntervalSince1970: Double(fixedNow + timestampFutureSkewMs) / 1000), at: tolerated)
+        setModificationDate(Date(timeIntervalSince1970: Double(fixedNow + timestampFutureSkewMs + 1_000) / 1000), at: rejected)
+
+        let hits = SessionSnapshotSource.collectCandidates(
+            root: base.path,
+            extensions: [".jsonl"],
+            fileNames: nil,
+            now: fixedNow
+        )
+
+        XCTAssertEqual(hits.map(\.path), [tolerated.path])
     }
 
     // MARK: - collectCandidates: skipped directory names + symlinked dirs
@@ -389,6 +410,21 @@ final class SessionSnapshotSourceTests: XCTestCase {
             return XCTFail("expected the transcript to canonicalize")
         }
         XCTAssertEqual(evidence.first?.identity, canonicalPath)
+    }
+
+    func testNativeSourceProducesNoDetectorEvidenceFromExtremeFutureTranscriptTimestamp() async throws {
+        let home = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let transcript = home.appendingPathComponent(".claude/projects/my-project/session.jsonl")
+        write(activeClaudeLine(timestampMs: Int64.max), to: transcript)
+
+        let source = NativeSessionSnapshotSource(homeDirectory: home)
+        let evidence = try await source.snapshot(now: fixedNow)
+
+        XCTAssertTrue(
+            evidence.isEmpty,
+            "rejected future transcript evidence must never reach AgentDetector or activate its downstream power state"
+        )
     }
 
     func testNativeSourceProducesZeroEvidenceForASymlinkedTranscriptOutsideRoot() async throws {

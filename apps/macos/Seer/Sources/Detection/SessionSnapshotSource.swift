@@ -205,8 +205,7 @@ enum SessionSnapshotSource {
             guard isPath(fullPath, containedIn: root) else { continue }
 
             let mtimeMs = mtimeMilliseconds(from: entryStat)
-            let age = now - mtimeMs
-            guard age <= sessionCandidateWindowMs else { continue }
+            guard isRecentTimestamp(mtimeMs, now: now, within: sessionCandidateWindowMs) else { continue }
 
             hits.append(SessionCandidate(path: fullPath, mtimeMs: mtimeMs, label: friendlySessionLabel(fullPath)))
         }
