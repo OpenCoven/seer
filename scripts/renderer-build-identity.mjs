@@ -17,7 +17,16 @@
 import { Buffer } from "node:buffer";
 import console from "node:console";
 import { createHash } from "node:crypto";
-import { readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join, relative, sep } from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -80,6 +89,10 @@ function toPosixRelativePath(repoRoot, absolutePath) {
 }
 
 function collectFilesRecursively(absoluteDir, out) {
+  const directoryInfo = lstatSync(absoluteDir);
+  if (directoryInfo.isSymbolicLink() || !directoryInfo.isDirectory()) {
+    throw new Error(`renderer build input directory must be a real directory: ${absoluteDir}`);
+  }
   let entries;
   try {
     entries = readdirSync(absoluteDir, { withFileTypes: true });
@@ -91,14 +104,21 @@ function collectFilesRecursively(absoluteDir, out) {
   // deterministic too (not load-bearing for the digest — the final file
   // list is sorted again below — but keeps this function's behavior
   // independent of the OS/filesystem's own directory-entry ordering).
-  const sortedEntries = [...entries].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  const sortedEntries = [...entries].sort((a, b) =>
+    a.name < b.name ? -1 : a.name > b.name ? 1 : 0,
+  );
   for (const entry of sortedEntries) {
     if (EXCLUDED_METADATA_FILENAMES.has(entry.name)) continue;
     const absoluteChild = join(absoluteDir, entry.name);
+    if (entry.isSymbolicLink()) {
+      throw new Error(`renderer build input must not be a symlink: ${absoluteChild}`);
+    }
     if (entry.isDirectory()) {
       collectFilesRecursively(absoluteChild, out);
     } else if (entry.isFile()) {
       out.push(absoluteChild);
+    } else {
+      throw new Error(`renderer build input must be a regular file or directory: ${absoluteChild}`);
     }
   }
 }
@@ -118,22 +138,43 @@ export function rendererBuildInputFiles(repoRoot) {
   for (const relativePath of TOP_LEVEL_INPUT_FILES) {
     const absolutePath = join(repoRoot, relativePath);
     try {
-      if (statSync(absolutePath).isFile()) {
-        absoluteFiles.push(absolutePath);
+      const info = lstatSync(absolutePath);
+      if (info.isSymbolicLink() || !info.isFile()) {
+        throw new Error(`renderer build input must be a regular non-symlink file: ${absolutePath}`);
       }
+      absoluteFiles.push(absolutePath);
     } catch (error) {
       if (error && error.code === "ENOENT") continue;
       throw error;
     }
   }
 
-  const relativePaths = absoluteFiles.map((absolutePath) => toPosixRelativePath(repoRoot, absolutePath));
+  const relativePaths = absoluteFiles.map((absolutePath) =>
+    toPosixRelativePath(repoRoot, absolutePath),
+  );
   relativePaths.sort();
   return relativePaths;
 }
 
 function sha256Hex(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
+}
+
+function readRegularFileNoFollow(path, label) {
+  const before = lstatSync(path);
+  if (before.isSymbolicLink() || !before.isFile()) {
+    throw new Error(`${label} must be a regular non-symlink file`);
+  }
+  const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const opened = fstatSync(descriptor);
+    if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino) {
+      throw new Error(`${label} changed identity while being opened`);
+    }
+    return readFileSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
 }
 
 /**
@@ -150,15 +191,16 @@ export function computeRendererBuildDigest(repoRoot) {
   let manifestLines = "";
   for (const relativePath of relativePaths) {
     const absolutePath = join(repoRoot, ...relativePath.split("/"));
-    const contents = readFileSync(absolutePath);
+    const contents = readRegularFileNoFollow(absolutePath, `renderer build input ${relativePath}`);
     manifestLines += `${relativePath}:${sha256Hex(contents)}\n`;
   }
   return sha256Hex(Buffer.from(manifestLines, "utf8"));
 }
 
 function collectRendererAssetFiles(rendererRoot, directory, out) {
-  const entries = readdirSync(directory, { withFileTypes: true })
-    .sort((left, right) => left.name.localeCompare(right.name));
+  const entries = readdirSync(directory, { withFileTypes: true }).sort((left, right) =>
+    left.name.localeCompare(right.name),
+  );
   for (const entry of entries) {
     const absolutePath = join(directory, entry.name);
     const relativePath = toPosixRelativePath(rendererRoot, absolutePath);
@@ -228,7 +270,9 @@ export function serializeRendererBuildManifest(manifest) {
 function main() {
   const [, , repoRootArg, rendererRootArg, outputPathArg] = process.argv;
   if (!repoRootArg || !rendererRootArg || !outputPathArg) {
-    console.error("usage: node renderer-build-identity.mjs <repoRoot> <rendererRoot> <outputManifestPath>");
+    console.error(
+      "usage: node renderer-build-identity.mjs <repoRoot> <rendererRoot> <outputManifestPath>",
+    );
     process.exitCode = 1;
     return;
   }

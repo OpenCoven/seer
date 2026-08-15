@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import {
+  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -15,7 +16,10 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { computeRendererBuildDigest } from "../scripts/renderer-build-identity.mjs";
+import {
+  computeRendererBuildDigest,
+  rendererBuildInputFiles,
+} from "../scripts/renderer-build-identity.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = dirname(here);
@@ -26,11 +30,11 @@ const failingProcessGroupPath = join(here, "helpers", "renderer-failing-process-
 const exitedLeaderGroupPath = join(here, "helpers", "renderer-exited-leader-group.mjs");
 const publicationKillHookPath = join(here, "helpers", "renderer-publication-kill-hook.mjs");
 
-function runWrapper({ env = {}, consumerArgs = [] } = {}) {
-  const args = [wrapperPath];
+function runWrapper({ env = {}, consumerArgs = [], root = repoRoot, script = wrapperPath } = {}) {
+  const args = [script];
   if (consumerArgs.length > 0) args.push("--", ...consumerArgs);
   const child = spawn(process.execPath, args, {
-    cwd: repoRoot,
+    cwd: root,
     env: { ...process.env, ...env },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -114,6 +118,70 @@ function isProcessGroupAlive(processGroupId) {
   }
 }
 
+function privateRendererArtifacts(root = repoRoot) {
+  const buildRoot = join(root, "build", "standalone-renderer");
+  if (!existsSync(buildRoot)) return [];
+  return readdirSync(buildRoot)
+    .filter((name) => name.startsWith(".renderer-"))
+    .sort();
+}
+
+function createRendererFixture(scratch) {
+  const fixtureRepo = join(scratch, "repo");
+  mkdirSync(join(fixtureRepo, "scripts"), { recursive: true });
+  cpSync(join(repoRoot, "renderer"), join(fixtureRepo, "renderer"), { recursive: true });
+  for (const relativePath of [
+    "standalone-window.html",
+    "vite.standalone.config.ts",
+    "package.json",
+    "package-lock.json",
+    "tsconfig.standalone.json",
+    "tsconfig.json",
+    "scripts/build-standalone-renderer.mjs",
+    "scripts/renderer-build-identity.mjs",
+  ]) {
+    cpSync(join(repoRoot, relativePath), join(fixtureRepo, relativePath));
+  }
+  return {
+    repo: fixtureRepo,
+    vite: join(repoRoot, "node_modules", ".bin", "vite"),
+    wrapper: join(fixtureRepo, "scripts", "build-standalone-renderer.mjs"),
+  };
+}
+
+function blockingViteConfig(source) {
+  const withImports = source.replace(
+    'import process from "node:process";',
+    `import process from "node:process";
+import { existsSync, writeFileSync } from "node:fs";`,
+  );
+  return withImports.replace(
+    "plugins: [react(), tailwindcss()],",
+    `plugins: [react(), tailwindcss(), {
+    name: "renderer-snapshot-race-test",
+    async buildStart() {
+      const ready = process.env.SEER_RENDERER_VITE_TEST_BUILD_READY;
+      const release = process.env.SEER_RENDERER_VITE_TEST_BUILD_RELEASE;
+      if (!ready || !release) return;
+      writeFileSync(ready, "ready\\n");
+      while (!existsSync(release)) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    },
+    async transformIndexHtml(html) {
+      const ready = process.env.SEER_RENDERER_VITE_TEST_HTML_READY;
+      const release = process.env.SEER_RENDERER_VITE_TEST_HTML_RELEASE;
+      if (!ready || !release) return html;
+      writeFileSync(ready, "ready\\n");
+      while (!existsSync(release)) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      return html;
+    },
+  }],`,
+  );
+}
+
 async function waitForProcessGroupExit(processGroupId, timeoutMs = 10_000) {
   const deadline = Date.now() + timeoutMs;
   while (isProcessGroupAlive(processGroupId)) {
@@ -194,9 +262,172 @@ test("a renderer source edit during the build discards stale assets and retries 
       JSON.parse(readFileSync(join(renderer, "build-manifest.json"), "utf8")).sourceDigest,
       computeRendererBuildDigest(repoRoot),
     );
+    assert.deepEqual(privateRendererArtifacts(), []);
   } finally {
     writeFileSync(releasePath, "release\n");
     writeFileSync(sourcePath, originalSource);
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test("A-B-A live source edits cannot change assets built from the immutable Vite snapshot", async () => {
+  mkdirSync(join(repoRoot, "build"), { recursive: true });
+  const scratch = mkdtempSync(join(repoRoot, "build", "renderer-snapshot-race-test-"));
+  const fixture = createRendererFixture(scratch);
+  const configPath = join(fixture.repo, "vite.standalone.config.ts");
+  const htmlPath = join(fixture.repo, "standalone-window.html");
+  const originalConfig = readFileSync(configPath, "utf8");
+  const originalHtml = readFileSync(htmlPath, "utf8");
+  const sourceA = originalHtml.replace("<title>Seer</title>", "<title>snapshot-source-a</title>");
+  const sourceB = originalHtml.replace(
+    "<title>Seer</title>",
+    "<title>transient-live-source-b</title>",
+  );
+  const buildReady = join(scratch, "build-ready");
+  const buildRelease = join(scratch, "build-release");
+  const htmlReady = join(scratch, "html-ready");
+  const htmlRelease = join(scratch, "html-release");
+  let run = null;
+  try {
+    writeFileSync(configPath, blockingViteConfig(originalConfig));
+    writeFileSync(htmlPath, sourceA);
+    run = runWrapper({
+      env: {
+        SEER_RENDERER_BUILD_TEST_VITE_EXECUTABLE: fixture.vite,
+        SEER_RENDERER_VITE_TEST_BUILD_READY: buildReady,
+        SEER_RENDERER_VITE_TEST_BUILD_RELEASE: buildRelease,
+        SEER_RENDERER_VITE_TEST_HTML_READY: htmlReady,
+        SEER_RENDERER_VITE_TEST_HTML_RELEASE: htmlRelease,
+      },
+      root: fixture.repo,
+      script: fixture.wrapper,
+    });
+    await waitForFile(buildReady, 120_000);
+    writeFileSync(htmlPath, sourceB);
+    writeFileSync(buildRelease, "release\n");
+    await waitForFile(htmlReady, 120_000);
+    writeFileSync(htmlPath, sourceA);
+    writeFileSync(htmlRelease, "release\n");
+
+    const result = await run.completed;
+    assert.equal(result.code, 0, `snapshot build failed:\n${result.stdout}\n${result.stderr}`);
+    const emittedHtml = readFileSync(
+      join(fixture.repo, "build", "standalone-renderer", "Renderer", "standalone-window.html"),
+      "utf8",
+    );
+    assert.match(emittedHtml, /snapshot-source-a/);
+    assert.doesNotMatch(emittedHtml, /transient-live-source-b/);
+    assert.deepEqual(privateRendererArtifacts(fixture.repo), []);
+  } finally {
+    writeFileSync(buildRelease, "release\n");
+    writeFileSync(htmlRelease, "release\n");
+    writeFileSync(htmlPath, originalHtml);
+    writeFileSync(configPath, originalConfig);
+    if (run && run.child.exitCode === null && run.child.signalCode === null) {
+      await run.completed;
+    }
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test("renderer build rejects symlinks and special files in the declared input tree", () => {
+  mkdirSync(join(repoRoot, "build"), { recursive: true });
+  const scratch = mkdtempSync(join(repoRoot, "build", "renderer-snapshot-symlink-test-"));
+  const fixtureRepo = join(scratch, "repo");
+  const target = join(scratch, "target.ts");
+  const input = join(fixtureRepo, "renderer", "input.ts");
+  try {
+    mkdirSync(join(fixtureRepo, "renderer"), { recursive: true });
+    writeFileSync(target, 'export const outside = "must-not-be-read";\n');
+    symlinkSync(target, input);
+    assert.throws(
+      () => rendererBuildInputFiles(fixtureRepo),
+      /renderer.*input.*symlink|symlink.*renderer.*input/i,
+    );
+
+    rmSync(input);
+    execFileSync("/usr/bin/mkfifo", [input]);
+    assert.throws(
+      () => rendererBuildInputFiles(fixtureRepo),
+      /renderer.*input.*regular file or directory/i,
+    );
+  } finally {
+    rmSync(input, { force: true });
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test("the next lock owner removes an immutable snapshot abandoned by a crashed build", async () => {
+  mkdirSync(join(repoRoot, "build"), { recursive: true });
+  const scratch = mkdtempSync(join(repoRoot, "build", "renderer-snapshot-crash-test-"));
+  const fixture = createRendererFixture(scratch);
+  const configPath = join(fixture.repo, "vite.standalone.config.ts");
+  const originalConfig = readFileSync(configPath, "utf8");
+  const buildReady = join(scratch, "build-ready");
+  const buildRelease = join(scratch, "build-release");
+  let crashed = null;
+  let vitePid = null;
+  try {
+    writeFileSync(configPath, blockingViteConfig(originalConfig));
+    crashed = runWrapper({
+      env: {
+        SEER_RENDERER_BUILD_TEST_VITE_EXECUTABLE: fixture.vite,
+        SEER_RENDERER_VITE_TEST_BUILD_READY: buildReady,
+        SEER_RENDERER_VITE_TEST_BUILD_RELEASE: buildRelease,
+      },
+      root: fixture.repo,
+      script: fixture.wrapper,
+    });
+    await waitForFile(buildReady, 120_000);
+    vitePid = JSON.parse(
+      readFileSync(join(fixture.repo, ".seer-standalone-renderer.lock", "child.json"), "utf8"),
+    ).pid;
+    const snapshotNames = privateRendererArtifacts(fixture.repo).filter((name) =>
+      name.startsWith(".renderer-snapshot-"),
+    );
+    assert.equal(snapshotNames.length, 1);
+    const snapshotPath = join(fixture.repo, "build", "standalone-renderer", snapshotNames[0]);
+    assert.deepEqual(
+      rendererBuildInputFiles(snapshotPath),
+      rendererBuildInputFiles(fixture.repo),
+      "the private snapshot must contain exactly the declared inputs at stable relative paths",
+    );
+    assert.equal(statSync(snapshotPath).mode & 0o222, 0);
+    assert.equal(statSync(join(snapshotPath, "vite.standalone.config.ts")).mode & 0o222, 0);
+    crashed.child.kill("SIGKILL");
+    writeFileSync(buildRelease, "release\n");
+    await waitForProcessGroupExit(vitePid, 120_000);
+    const crashedResult = await crashed.completed;
+    assert.equal(crashedResult.signal, "SIGKILL");
+
+    const recovered = await runWrapper({
+      env: {
+        SEER_RENDERER_BUILD_TEST_BUILDER: testBuilderPath,
+        SEER_RENDERER_BUILD_TEST_MARKER: "snapshot-crash-recovered",
+        SEER_RENDERER_LOCK_STALE_MS: "0",
+        SEER_RENDERER_LOCK_POLL_MS: "5",
+        SEER_RENDERER_LOCK_WAIT_MS: "5000",
+      },
+      root: fixture.repo,
+      script: fixture.wrapper,
+    }).completed;
+    assert.equal(recovered.code, 0, `snapshot recovery failed:\n${recovered.stderr}`);
+    assert.deepEqual(privateRendererArtifacts(fixture.repo), []);
+  } finally {
+    writeFileSync(buildRelease, "release\n");
+    writeFileSync(configPath, originalConfig);
+    if (crashed && crashed.child.exitCode === null && crashed.child.signalCode === null) {
+      crashed.child.kill("SIGKILL");
+      await crashed.completed;
+    }
+    if (vitePid && isProcessGroupAlive(vitePid)) {
+      process.kill(-vitePid, "SIGKILL");
+      await waitForProcessGroupExit(vitePid);
+    }
+    rmSync(join(fixture.repo, ".seer-standalone-renderer.lock"), {
+      recursive: true,
+      force: true,
+    });
     rmSync(scratch, { recursive: true, force: true });
   }
 });
@@ -208,10 +439,12 @@ test("EEXIST followed by a disappearing lock retries across repeated handoffs", 
     SEER_RENDERER_LOCK_POLL_MS: "1",
     SEER_RENDERER_LOCK_WAIT_MS: "120000",
   };
-  const runs = Array.from({ length: 10 }, (_, index) =>
-    runWrapper({
-      env: { ...env, SEER_RENDERER_BUILD_TEST_MARKER: `handoff-${index}` },
-    }).completed,
+  const runs = Array.from(
+    { length: 10 },
+    (_, index) =>
+      runWrapper({
+        env: { ...env, SEER_RENDERER_BUILD_TEST_MARKER: `handoff-${index}` },
+      }).completed,
   );
   const results = await Promise.all(runs);
   for (const result of results) {
@@ -254,7 +487,11 @@ test("a dead wrapper's known live child group prevents lock stealing and writes 
       join(repoRoot, "build", "standalone-renderer", "Renderer", "generation-marker.txt"),
       "utf8",
     );
-    assert.equal(publicMarker, "winner\n", "the abandoned child must never write into the public Renderer");
+    assert.equal(
+      publicMarker,
+      "winner\n",
+      "the abandoned child must never write into the public Renderer",
+    );
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }
@@ -344,10 +581,7 @@ test("a recorded child process group retains the stale lock after its leader exi
   } finally {
     writeFileSync(leaderReleasePath, "release\n");
     writeFileSync(descendantReleasePath, "release\n");
-    await Promise.race([
-      leaderCompleted,
-      new Promise((resolve) => setTimeout(resolve, 2_000)),
-    ]);
+    await Promise.race([leaderCompleted, new Promise((resolve) => setTimeout(resolve, 2_000))]);
     if (leader.exitCode === null && leader.signalCode === null) {
       leader.kill("SIGKILL");
       await leaderCompleted;
@@ -452,6 +686,36 @@ test("wrapper failure terminates and waits for the recorded child process group 
   }
 });
 
+test("a nonexistent consumer command fails cleanly without leaking child metadata or private generations", async () => {
+  const missingCommand = join(repoRoot, "build", "definitely-not-a-consumer-command");
+  const result = await runWrapper({
+    env: {
+      SEER_RENDERER_BUILD_TEST_BUILDER: testBuilderPath,
+      SEER_RENDERER_BUILD_TEST_MARKER: "missing-consumer",
+    },
+    consumerArgs: [missingCommand],
+  }).completed;
+  assert.notEqual(result.code, 0);
+  assert.match(result.stderr, /ENOENT|not.*found|spawn/i);
+  assert.doesNotMatch(result.stderr, /Unhandled 'error' event/i);
+  assert.equal(existsSync(join(repoRoot, ".seer-standalone-renderer.lock")), false);
+  assert.deepEqual(privateRendererArtifacts(), []);
+});
+
+test("a nonexistent Vite executable fails cleanly without leaking a lock or private generation", async () => {
+  const missingVite = join(repoRoot, "build", "definitely-not-a-vite-executable");
+  const result = await runWrapper({
+    env: {
+      SEER_RENDERER_BUILD_TEST_VITE_EXECUTABLE: missingVite,
+    },
+  }).completed;
+  assert.notEqual(result.code, 0);
+  assert.match(result.stderr, /ENOENT|not.*found|spawn/i);
+  assert.doesNotMatch(result.stderr, /Unhandled 'error' event/i);
+  assert.equal(existsSync(join(repoRoot, ".seer-standalone-renderer.lock")), false);
+  assert.deepEqual(privateRendererArtifacts(), []);
+});
+
 test("the next wrapper recovers every SIGKILL publication phase under the lock", async () => {
   mkdirSync(join(repoRoot, "build"), { recursive: true });
   const scratch = mkdtempSync(join(repoRoot, "build", "renderer-publication-kill-test-"));
@@ -549,7 +813,11 @@ test("backup-cleaned recovery validates the committed assets independently of ed
         SEER_RENDERER_LOCK_WAIT_MS: "5000",
       },
     }).completed;
-    assert.equal(recovery.code, 0, `recovery/rebuild failed:\n${recovery.stdout}\n${recovery.stderr}`);
+    assert.equal(
+      recovery.code,
+      0,
+      `recovery/rebuild failed:\n${recovery.stdout}\n${recovery.stderr}`,
+    );
     assert.equal(
       readFileSync(join(buildRoot, "Renderer", "generation-marker.txt"), "utf8"),
       "rebuilt-current-source\n",

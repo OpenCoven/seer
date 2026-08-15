@@ -5,6 +5,7 @@ import {
   appendFileSync,
   closeSync,
   constants,
+  fchmodSync,
   fstatSync,
   fsyncSync,
   lstatSync,
@@ -18,7 +19,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
@@ -28,6 +29,7 @@ import {
   buildRendererBuildManifest,
   computeRendererAssetDigest,
   computeRendererBuildDigest,
+  rendererBuildInputFiles,
   serializeRendererBuildManifest,
 } from "./renderer-build-identity.mjs";
 
@@ -43,6 +45,7 @@ const publicationJournalTempPath = join(rendererBuildRoot, ".renderer-publicatio
 const publicationJournalSchemaVersion = 1;
 const publicationJournalMaxBytes = 64 * 1024;
 const rendererStageNamePattern = /^\.renderer-stage-[0-9a-f]{32}$/;
+const rendererSnapshotNamePattern = /^\.renderer-snapshot-[0-9a-f]{32}$/;
 const rendererBackupNamePattern = /^\.renderer-backup-[0-9a-f]{32}$/;
 const legacyGenerationNamePattern = /^\.renderer-generation-[0-9a-f-]{36}$/;
 const publicationPhases = new Set(["prepared", "old-backed-up", "new-published", "cleanup"]);
@@ -61,10 +64,7 @@ const waitMs = positiveIntegerFromEnv("SEER_RENDERER_LOCK_WAIT_MS", 10 * 60 * 10
 const staleMs = positiveIntegerFromEnv("SEER_RENDERER_LOCK_STALE_MS", 2 * 60 * 1000);
 const pollMs = positiveIntegerFromEnv("SEER_RENDERER_LOCK_POLL_MS", 100);
 const eexistDelayMs = positiveIntegerFromEnv("SEER_RENDERER_LOCK_TEST_EEXIST_DELAY_MS", 0);
-const sourceChangeMaxRetries = positiveIntegerFromEnv(
-  "SEER_RENDERER_SOURCE_CHANGE_MAX_RETRIES",
-  2,
-);
+const sourceChangeMaxRetries = positiveIntegerFromEnv("SEER_RENDERER_SOURCE_CHANGE_MAX_RETRIES", 2);
 
 function sameIdentity(left, right) {
   return left.dev === right.dev && left.ino === right.ino;
@@ -407,19 +407,43 @@ async function acquireLock() {
           if (!childProcessStartIdentity) {
             throw new Error("unable to identify spawned renderer process start");
           }
-          writeFileSync(
-            childPath,
-            `${JSON.stringify({
-              token,
-              pid,
-              processGroupId,
-              createdAtMs: Date.now(),
-              bootIdentity,
-              processStartIdentity: childProcessStartIdentity,
-            })}\n`,
-            { encoding: "utf8", flag: "wx", mode: 0o600 },
-          );
-          activeChildInfo = lstatSync(childPath);
+          const encoded = `${JSON.stringify({
+            token,
+            pid,
+            processGroupId,
+            createdAtMs: Date.now(),
+            bootIdentity,
+            processStartIdentity: childProcessStartIdentity,
+          })}\n`;
+          let descriptor = null;
+          let createdInfo = null;
+          try {
+            descriptor = openSync(
+              childPath,
+              constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+              0o600,
+            );
+            createdInfo = fstatSync(descriptor);
+            if (!createdInfo.isFile()) {
+              throw new Error("renderer child metadata was not created as a regular file");
+            }
+            writeFileSync(descriptor, encoded, "utf8");
+            fsyncSync(descriptor);
+            activeChildInfo = createdInfo;
+          } catch (error) {
+            if (descriptor !== null) {
+              closeSync(descriptor);
+              descriptor = null;
+              if (createdInfo) {
+                const current = lstatOrNull(childPath);
+                if (current && sameIdentity(createdInfo, current)) unlinkSync(childPath);
+              }
+            }
+            activeChildInfo = null;
+            throw error;
+          } finally {
+            if (descriptor !== null) closeSync(descriptor);
+          }
           return childProcessStartIdentity;
         },
         clearChild() {
@@ -461,10 +485,9 @@ async function acquireLock() {
       lockDiagnostic = inspection.diagnostic;
       if (Date.now() >= deadline) {
         const detail = lockDiagnostic ? `; ${lockDiagnostic}` : "";
-        const manualRecovery =
-          lockDiagnostic?.includes("cannot be proven stale")
-            ? `; after verifying the recorded process group is gone, remove ${lockDir} manually`
-            : "";
+        const manualRecovery = lockDiagnostic?.includes("cannot be proven stale")
+          ? `; after verifying the recorded process group is gone, remove ${lockDir} manually`
+          : "";
         throw new Error(
           `timed out after ${waitMs}ms waiting for the standalone renderer build lock${detail}${manualRecovery}`,
         );
@@ -483,10 +506,7 @@ function trace(event, token) {
 function signalChild(child, processGroupId, processStartIdentity, signal, leaderExited = false) {
   if (Number.isSafeInteger(processGroupId) && processGroupId > 0) {
     const currentStartIdentity = readProcessStartIdentity(child.pid);
-    if (
-      currentStartIdentity &&
-      (leaderExited || currentStartIdentity !== processStartIdentity)
-    ) {
+    if (currentStartIdentity && (leaderExited || currentStartIdentity !== processStartIdentity)) {
       return;
     }
     if (
@@ -534,57 +554,87 @@ async function terminateRemainingProcessGroup(child, processGroupId, processStar
   }
 }
 
-async function run(lock, command, args, { env = process.env } = {}) {
+async function run(lock, command, args, { cwd = repoRoot, env = process.env } = {}) {
   await new Promise((resolve, reject) => {
     const detached = process.platform !== "win32";
-    const child = spawn(command, args, {
-      cwd: repoRoot,
-      env,
-      stdio: "inherit",
-      detached,
-    });
-    const processGroupId = detached ? child.pid : null;
-    let childProcessStartIdentity;
+    let child;
     try {
-      childProcessStartIdentity = lock.recordChild(child.pid, processGroupId);
+      child = spawn(command, args, {
+        cwd,
+        env,
+        stdio: "inherit",
+        detached,
+      });
     } catch (error) {
-      child.once("close", () => reject(error));
+      reject(error);
       return;
     }
 
     let spawnError = null;
+    let setupError = null;
+    let exitResult = null;
+    let childRecorded = false;
+    let childProcessStartIdentity = null;
+    let processGroupId = null;
     const handlers = new Map();
-    for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
-      const handler = () =>
-        signalChild(child, processGroupId, childProcessStartIdentity, signal);
-      handlers.set(signal, handler);
-      process.once(signal, handler);
-    }
     const cleanupHandlers = () => {
       for (const [signal, handler] of handlers) process.off(signal, handler);
     };
     child.once("error", (error) => {
       spawnError = error;
-      try {
-        signalChild(child, processGroupId, childProcessStartIdentity, "SIGTERM");
-      } catch {
-        // The original spawn error is authoritative.
-      }
+    });
+    child.once("exit", (code, signal) => {
+      exitResult = { code, signal };
     });
     child.once("close", (code, signal) => {
       cleanupHandlers();
       void (async () => {
-        await terminateRemainingProcessGroup(child, processGroupId, childProcessStartIdentity);
-        lock.clearChild();
+        if (childRecorded) {
+          await terminateRemainingProcessGroup(child, processGroupId, childProcessStartIdentity);
+          lock.clearChild();
+          childRecorded = false;
+        }
         if (spawnError) {
           reject(spawnError);
+        } else if (setupError) {
+          reject(setupError);
         } else if (code === 0) {
           resolve();
         } else {
-          reject(new Error(`${command} exited ${signal ? `on ${signal}` : `with status ${code}`}`));
+          const result = exitResult ?? { code, signal };
+          reject(
+            new Error(
+              `${command} exited ${
+                result.signal ? `on ${result.signal}` : `with status ${result.code}`
+              }`,
+            ),
+          );
         }
       })().catch(reject);
     });
+
+    if (!Number.isSafeInteger(child.pid) || child.pid <= 0) {
+      setupError = new Error(`${command} spawned without a process id`);
+      return;
+    }
+    processGroupId = detached ? child.pid : null;
+    try {
+      childProcessStartIdentity = lock.recordChild(child.pid, processGroupId);
+      childRecorded = true;
+    } catch (error) {
+      setupError = error;
+      try {
+        child.kill("SIGTERM");
+      } catch {
+        // The metadata setup error is authoritative.
+      }
+      return;
+    }
+    for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+      const handler = () => signalChild(child, processGroupId, childProcessStartIdentity, signal);
+      handlers.set(signal, handler);
+      process.once(signal, handler);
+    }
   });
 }
 
@@ -596,6 +646,19 @@ function removeTreeNoFollow(path) {
     (typeof process.getuid === "function" && info.uid !== process.getuid())
   ) {
     throw new Error(`refusing to recursively remove unsafe or unowned directory: ${path}`);
+  }
+  const descriptor = openSync(
+    path,
+    constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+  );
+  try {
+    const opened = fstatSync(descriptor);
+    if (!sameIdentity(info, opened)) {
+      throw new Error(`directory changed identity before recursive removal: ${path}`);
+    }
+    fchmodSync(descriptor, opened.mode | 0o700);
+  } finally {
+    closeSync(descriptor);
   }
   for (const entry of readdirSync(path, { withFileTypes: true })) {
     const child = join(path, entry.name);
@@ -666,6 +729,18 @@ function prepareBuildRoot() {
   ensureOwnedDirectory(rendererBuildRoot, "standalone renderer build directory");
 }
 
+function cleanupAbandonedSnapshots() {
+  for (const entry of readdirSync(rendererBuildRoot, { withFileTypes: true })) {
+    if (!rendererSnapshotNamePattern.test(entry.name)) continue;
+    const path = join(rendererBuildRoot, entry.name);
+    if (!entry.isDirectory() || entry.isSymbolicLink()) {
+      throw new Error(`abandoned renderer snapshot must be a real directory: ${path}`);
+    }
+    removeExpectedDirectory(path, null, "abandoned renderer input snapshot");
+  }
+  fsyncDirectory(rendererBuildRoot);
+}
+
 function cleanupAbandonedStages() {
   for (const entry of readdirSync(rendererBuildRoot, { withFileTypes: true })) {
     if (
@@ -678,9 +753,153 @@ function cleanupAbandonedStages() {
     if (!entry.isDirectory() || entry.isSymbolicLink()) {
       throw new Error(`abandoned renderer stage must be a real directory: ${path}`);
     }
-    removeExpectedDirectory(path, null, "abandoned renderer stage");
+    removeExpectedDirectory(path, null, "abandoned renderer private directory");
   }
   fsyncDirectory(rendererBuildRoot);
+}
+
+function snapshotRelativePath(absolutePath) {
+  return relative(repoRoot, absolutePath).split(sep).join("/");
+}
+
+function assertSnapshotSourceFile(path, label) {
+  const info = lstatSync(path);
+  if (info.isSymbolicLink() || !info.isFile()) {
+    throw new Error(`${label} must be a regular non-symlink file`);
+  }
+  const canonicalParent = realpathSync(dirname(path));
+  if (
+    canonicalParent !== dirname(path) ||
+    (!canonicalParent.startsWith(`${repoRoot}${sep}`) && canonicalParent !== repoRoot)
+  ) {
+    throw new Error(`${label} parent must be a canonical repository directory`);
+  }
+  return info;
+}
+
+function copySnapshotInput(sourcePath, destinationPath, relativePath) {
+  const before = assertSnapshotSourceFile(sourcePath, `renderer build input ${relativePath}`);
+  const sourceDescriptor = openSync(sourcePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  let contents;
+  let opened;
+  try {
+    opened = fstatSync(sourceDescriptor);
+    if (!opened.isFile() || !sameIdentity(before, opened)) {
+      throw new Error(`renderer build input ${relativePath} changed identity while opening`);
+    }
+    contents = readFileSync(sourceDescriptor);
+    const afterRead = fstatSync(sourceDescriptor);
+    if (
+      !sameIdentity(opened, afterRead) ||
+      opened.size !== afterRead.size ||
+      opened.mtimeMs !== afterRead.mtimeMs ||
+      opened.ctimeMs !== afterRead.ctimeMs
+    ) {
+      throw new Error(`renderer build input ${relativePath} changed while snapshotting`);
+    }
+  } finally {
+    closeSync(sourceDescriptor);
+  }
+
+  const destinationDescriptor = openSync(
+    destinationPath,
+    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+    0o600,
+  );
+  try {
+    writeFileSync(destinationDescriptor, contents);
+    fchmodSync(destinationDescriptor, opened.mode & 0o777);
+    fsyncSync(destinationDescriptor);
+  } finally {
+    closeSync(destinationDescriptor);
+  }
+  const current = assertSnapshotSourceFile(sourcePath, `renderer build input ${relativePath}`);
+  if (
+    !sameIdentity(opened, current) ||
+    opened.size !== current.size ||
+    opened.mtimeMs !== current.mtimeMs ||
+    opened.ctimeMs !== current.ctimeMs
+  ) {
+    throw new Error(`renderer build input ${relativePath} changed while snapshotting`);
+  }
+}
+
+function freezeSnapshotTree(path) {
+  const info = lstatSync(path);
+  if (info.isSymbolicLink()) {
+    throw new Error(`renderer input snapshot must not contain symlinks: ${path}`);
+  }
+  if (info.isDirectory()) {
+    const descriptor = openSync(
+      path,
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    );
+    try {
+      for (const entry of readdirSync(path, { withFileTypes: true })) {
+        freezeSnapshotTree(join(path, entry.name));
+      }
+      const opened = fstatSync(descriptor);
+      if (!opened.isDirectory() || !sameIdentity(info, opened)) {
+        throw new Error(`renderer input snapshot directory changed identity: ${path}`);
+      }
+      fchmodSync(descriptor, (opened.mode & 0o555) | 0o500);
+    } finally {
+      closeSync(descriptor);
+    }
+    return;
+  }
+  if (!info.isFile()) {
+    throw new Error(`renderer input snapshot must contain only regular files: ${path}`);
+  }
+  const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const opened = fstatSync(descriptor);
+    if (!opened.isFile() || !sameIdentity(info, opened)) {
+      throw new Error(`renderer input snapshot file changed identity: ${path}`);
+    }
+    fchmodSync(descriptor, (opened.mode & 0o555) | 0o400);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function createRendererInputSnapshot() {
+  const snapshotPath = join(
+    rendererBuildRoot,
+    `.renderer-snapshot-${randomUUID().replaceAll("-", "")}`,
+  );
+  mkdirSync(snapshotPath, { mode: 0o700 });
+  try {
+    for (const relativePath of rendererBuildInputFiles(repoRoot)) {
+      const sourcePath = join(repoRoot, ...relativePath.split("/"));
+      const destinationPath = join(snapshotPath, ...relativePath.split("/"));
+      const destinationParent = dirname(destinationPath);
+      mkdirSync(destinationParent, { recursive: true, mode: 0o700 });
+      if (
+        snapshotRelativePath(sourcePath) !== relativePath ||
+        !destinationPath.startsWith(`${snapshotPath}${sep}`)
+      ) {
+        throw new Error(`renderer build input path is unsafe: ${relativePath}`);
+      }
+      copySnapshotInput(sourcePath, destinationPath, relativePath);
+    }
+    freezeSnapshotTree(snapshotPath);
+    const snapshotInfo = assertExpectedDirectory(
+      snapshotPath,
+      null,
+      "private renderer input snapshot",
+    );
+    return {
+      digest: computeRendererBuildDigest(snapshotPath),
+      info: snapshotInfo,
+      path: snapshotPath,
+    };
+  } catch (error) {
+    if (lstatOrNull(snapshotPath)) {
+      removeExpectedDirectory(snapshotPath, null, "failed renderer input snapshot");
+    }
+    throw error;
+  }
 }
 
 function validatePublicationPath(path, expectedNamePattern, label) {
@@ -1057,6 +1276,7 @@ function publishRendererStage(stagePath, stageInfo) {
 
 async function buildAndPublish(lock) {
   prepareBuildRoot();
+  cleanupAbandonedSnapshots();
   recoverRendererPublication();
   cleanupAbandonedStages();
   for (let attempt = 0; attempt <= sourceChangeMaxRetries; attempt += 1) {
@@ -1064,21 +1284,32 @@ async function buildAndPublish(lock) {
     const stagePath = join(rendererBuildRoot, `.renderer-stage-${token}`);
     mkdirSync(stagePath, { mode: 0o700 });
     let transactionStarted = false;
+    let snapshot = null;
     try {
       const testBuilder = process.env.SEER_RENDERER_BUILD_TEST_BUILDER;
-      const sourceDigestBeforeBuild = computeRendererBuildDigest(repoRoot);
+      snapshot = createRendererInputSnapshot();
       if (testBuilder) {
         await run(lock, process.execPath, [testBuilder, stagePath]);
       } else {
         await run(
           lock,
-          join(repoRoot, "node_modules", ".bin", "vite"),
-          ["build", "--config", "vite.standalone.config.ts", "--outDir", stagePath],
-          { env: { ...process.env, SEER_RENDERER_PRIVATE_OUT_DIR: stagePath } },
+          process.env.SEER_RENDERER_BUILD_TEST_VITE_EXECUTABLE ??
+            join(repoRoot, "node_modules", ".bin", "vite"),
+          [
+            "build",
+            "--config",
+            join(snapshot.path, "vite.standalone.config.ts"),
+            "--outDir",
+            stagePath,
+          ],
+          {
+            cwd: snapshot.path,
+            env: { ...process.env, SEER_RENDERER_PRIVATE_OUT_DIR: stagePath },
+          },
         );
       }
       const sourceDigestAfterBuild = computeRendererBuildDigest(repoRoot);
-      if (sourceDigestAfterBuild !== sourceDigestBeforeBuild) {
+      if (sourceDigestAfterBuild !== snapshot.digest) {
         removeExpectedDirectory(stagePath, null, "source-raced private renderer stage");
         fsyncDirectory(rendererBuildRoot);
         if (attempt === sourceChangeMaxRetries) {
@@ -1090,11 +1321,7 @@ async function buildAndPublish(lock) {
       }
       const stageInfo = assertExpectedDirectory(stagePath, null, "private renderer stage");
       const manifestPath = join(stagePath, "build-manifest.json");
-      const manifest = buildRendererBuildManifest(
-        repoRoot,
-        stagePath,
-        sourceDigestBeforeBuild,
-      );
+      const manifest = buildRendererBuildManifest(snapshot.path, stagePath, snapshot.digest);
       const descriptor = openSync(
         manifestPath,
         constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
@@ -1116,6 +1343,11 @@ async function buildAndPublish(lock) {
         fsyncDirectory(rendererBuildRoot);
       }
       throw error;
+    } finally {
+      if (snapshot && lstatOrNull(snapshot.path)) {
+        removeExpectedDirectory(snapshot.path, snapshot.info, "private renderer input snapshot");
+        fsyncDirectory(rendererBuildRoot);
+      }
     }
   }
 }
