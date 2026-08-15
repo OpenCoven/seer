@@ -25,9 +25,9 @@ function stepBlocks(job) {
   return starts.map((start, index) => job.slice(start, starts[index + 1] ?? job.length));
 }
 
-test("release workflow exists and has only the protected tag trigger and minimal permissions", () => {
+test("release workflow exists and has only the protected tag trigger and scoped source-run read permission", () => {
   assert.ok(existsSync(workflowPath), ".github/workflows/release-macos.yml must exist");
-  assert.match(source, /^on:\n {2}push:\n {4}tags:\n {6}- "v\*\.\*\.\*"\n\npermissions:\n {2}contents: read\n {2}id-token: write$/m);
+  assert.match(source, /^on:\n {2}push:\n {4}tags:\n {6}- "v\*\.\*\.\*"\n\npermissions:\n {2}actions: read\n {2}contents: read\n {2}id-token: write$/m);
   assert.doesNotMatch(source, /\b(?:pull_request|workflow_dispatch|schedule):/);
   assert.match(
     source,
@@ -307,7 +307,13 @@ test("release lock is always relinquished and governance identity is protected-e
   assert.ok(acquire, "atomic release-lock acquisition step must exist");
   assert.ok(release, "release-lock cleanup step must exist");
   assert.match(release, /^\s+if: always\(\)$/m);
-  assert.match(release, /RELEASE_LOCK_ACQUIRED: \$\{\{ steps\.release-lock\.outputs\.acquired \}\}/);
+  assert.doesNotMatch(release, /RELEASE_LOCK_ACQUIRED/);
+  assert.match(acquire, /SOURCE_GITHUB_TOKEN: \$\{\{ github\.token \}\}/);
+  assert.match(draftPolicySource, /SOURCE_GITHUB_TOKEN/);
+  assert.match(
+    draftPolicySource,
+    /GH_TOKEN="\$\{SOURCE_GITHUB_TOKEN\}" gh api[\s\S]*actions\/runs\/\$\{run_id\}\/attempts\/\$\{run_attempt\}/,
+  );
   assert.match(signing, /RELEASE_WRITER_LOGIN: \$\{\{ vars\.RELEASE_WRITER_LOGIN \}\}/);
   assert.match(signing, /RELEASE_WRITER_ID: \$\{\{ vars\.RELEASE_WRITER_ID \}\}/);
   assert.match(signing, /WORKFLOW_ATTEMPT: \$\{\{ github\.run_attempt \}\}/);

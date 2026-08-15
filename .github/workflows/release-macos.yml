@@ -15,6 +15,7 @@ on:
       - "v*.*.*"
 
 permissions:
+  actions: read
   contents: read
   id-token: write
 
@@ -368,6 +369,7 @@ jobs:
         id: release-lock
         env:
           GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          SOURCE_GITHUB_TOKEN: ${{ github.token }}
           GH_REPO: OpenCoven/seer-releases
           RELEASE_WRITER_LOGIN: ${{ vars.RELEASE_WRITER_LOGIN }}
           RELEASE_WRITER_ID: ${{ vars.RELEASE_WRITER_ID }}
@@ -673,7 +675,6 @@ jobs:
           GH_REPO: OpenCoven/seer-releases
           RELEASE_WRITER_LOGIN: ${{ vars.RELEASE_WRITER_LOGIN }}
           RELEASE_WRITER_ID: ${{ vars.RELEASE_WRITER_ID }}
-          RELEASE_LOCK_ACQUIRED: ${{ steps.release-lock.outputs.acquired }}
           SOURCE_REPOSITORY: ${{ github.repository }}
           SOURCE_COMMIT: ${{ github.sha }}
           SOURCE_TAG: ${{ github.ref_name }}

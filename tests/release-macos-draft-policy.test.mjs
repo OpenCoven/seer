@@ -20,18 +20,36 @@ const releaseWriter = { id: 7, login: "release-writer" };
 const releaseRepoCommit = "c".repeat(40);
 const lockTagObjectSHA = "d".repeat(40);
 const lockRef = `refs/tags/seer-release-lock-${sourceTag}`;
-const lockTagName =
-  `seer-release-lock-${sourceTag}-${sourceCommit}-run-${workflowRun}-attempt-${workflowAttempt}`;
-const lockMessage =
-  `${JSON.stringify({
-    schema: 1,
+function lockOwnership(overrides = {}) {
+  const metadata = {
+    lockSchema: 1,
     sourceRepository,
     sourceCommit,
     sourceTag,
     workflowRef,
     workflowRun,
     workflowAttempt,
-  })}\n`;
+    ...overrides,
+  };
+  return {
+    tag: `seer-release-lock-${metadata.sourceTag}-${metadata.sourceCommit}-run-${metadata.workflowRun}-attempt-${metadata.workflowAttempt}`,
+    message: `${JSON.stringify(metadata)}\n`,
+  };
+}
+const { tag: lockTagName, message: lockMessage } = lockOwnership();
+function lockFixture(overrides = {}, sha = "e".repeat(40)) {
+  const ownership = lockOwnership(overrides);
+  return {
+    ref: lockRef,
+    sha,
+    tagObject: {
+      sha,
+      tag: ownership.tag,
+      message: ownership.message,
+      object: { type: "commit", sha: releaseRepoCommit },
+    },
+  };
+}
 const expectedAssets = [`Seer-v${version}-arm64.dmg`, "SHA256SUMS", "release-manifest.json"];
 const marker =
   `<!-- seer-release-provenance:{"schema":1,"sourceRepository":"${sourceRepository}",` +
@@ -59,6 +77,7 @@ function matchingRelease(overrides = {}) {
   return {
     id: 42,
     draft: true,
+    prerelease: false,
     tag: sourceTag,
     title: canonicalTitle,
     body: canonicalBody,
@@ -94,6 +113,7 @@ const endpoint = args.find((arg) => arg.startsWith("repos/"));
 const releaseJSON = () => ({
   id: state.release.id,
   draft: state.release.draft,
+  prerelease: state.release.prerelease,
   tag_name: state.release.tag,
   name: state.release.title,
   body: state.release.body,
@@ -148,6 +168,12 @@ if (args[0] === "api" && args.includes("user")) {
   }
   const fields = Object.fromEntries(args.filter((arg) => arg.includes("=")).map((arg) => arg.split(/=(.*)/s).slice(0, 2)));
   state.lock = { ref: fields.ref, sha: fields.sha, tagObject: state.pendingLockTag };
+  if (state.createRefLostResponse) {
+    state.createRefLostResponse = false;
+    save();
+    console.error("gh: response lost after create");
+    process.exit(1);
+  }
   save();
   console.log(JSON.stringify({ ref: state.lock.ref, object: { type: "tag", sha: state.lock.sha } }));
 } else if (args[0] === "api" && endpoint === "repos/OpenCoven/seer-releases/git/ref/tags/seer-release-lock-v1.2.3") {
@@ -166,6 +192,25 @@ if (args[0] === "api" && args.includes("user")) {
   if (!state.lock) fail404();
   state.lock = null;
   save();
+} else if (args[0] === "api" && endpoint?.startsWith("repos/OpenCoven/seer/actions/runs/")) {
+  state.sourceRunQueries.push(endpoint);
+  if (process.env.GH_TOKEN !== process.env.FAKE_SOURCE_TOKEN || state.sourceRunResponse === "api-error") {
+    save();
+    console.error("gh: source Actions run unavailable");
+    process.exit(1);
+  }
+  const parts = endpoint.split("/");
+  const runID = Number(parts[parts.indexOf("runs") + 1]);
+  const attempt = Number(parts[parts.indexOf("attempts") + 1]);
+  save();
+  console.log(JSON.stringify(
+    state.sourceRunResponse ?? {
+      id: runID,
+      run_attempt: attempt,
+      status: state.sourceRunStatus,
+      conclusion: state.sourceRunConclusion,
+    },
+  ));
 } else if (args[0] === "api" && endpoint?.includes("/releases/tags/")) {
   if (!state.release) fail404();
   save();
@@ -202,6 +247,7 @@ if (args[0] === "api" && args.includes("user")) {
   state.release = {
     id: 42,
     draft: true,
+    prerelease: false,
     tag: args[2],
     title: args[titleIndex + 1],
     body: readFileSync(args[notesIndex + 1], "utf8"),
@@ -283,6 +329,7 @@ const writeResponse = (status, body, etag = state.etag) => {
 const releaseJSON = () => JSON.stringify({
   id: state.release.id,
   draft: state.release.draft,
+  prerelease: state.release.prerelease,
   tag_name: state.release.tag,
   name: state.release.title,
   body: state.release.body,
@@ -311,10 +358,12 @@ if (method === "GET" && url?.includes("/releases/tags/")) {
   save();
 } else if (method === "PATCH" && url?.includes("/releases/")) {
   state.release.draft = false;
+  state.release.prerelease = false;
   state.release.immutable = state.immutableReleases;
   state.release.updatedAt = "2026-08-15T18:02:00Z";
   if (state.postPublishMutation === "title") state.release.title += " foreign";
   if (state.postPublishMutation === "asset-id") state.release.assets[0].id += 1000;
+  if (state.postPublishMutation === "prerelease") state.release.prerelease = true;
   writeResponse(200, JSON.stringify({ ...JSON.parse(releaseJSON()), draft: false }));
   save();
 } else {
@@ -363,6 +412,11 @@ function withHarness(callback, options = {}) {
                 },
               }
             : options.lock,
+        createRefLostResponse: options.createRefLostResponse ?? false,
+        sourceRunStatus: options.sourceRunStatus ?? "completed",
+        sourceRunConclusion: options.sourceRunConclusion ?? "success",
+        sourceRunResponse: options.sourceRunResponse ?? null,
+        sourceRunQueries: [],
         release: options.release === undefined ? matchingRelease() : options.release,
         tagExists: options.tagExists ?? true,
         etag: options.etag ?? '"draft-etag"',
@@ -386,9 +440,11 @@ function withHarness(callback, options = {}) {
           FAKE_GH_SCRIPT: ghScript,
           FAKE_CURL_SCRIPT: curlScript,
           FAKE_EXPECTED_TOKEN: "test-token",
+          FAKE_SOURCE_TOKEN: "source-token",
           FAKE_RELEASE_STATE: statePath,
           GITHUB_API_URL: "https://api.github.test",
           GH_TOKEN: "test-token",
+          SOURCE_GITHUB_TOKEN: "source-token",
           GH_REPO: destinationRepository,
           SOURCE_REPOSITORY: sourceRepository,
           SOURCE_COMMIT: sourceCommit,
@@ -407,7 +463,7 @@ function withHarness(callback, options = {}) {
         },
       });
 
-    return callback({ run, readState, writeState, releaseDir, releaseBody, verifiedState });
+    return callback({ run, readState, writeState, releaseDir, releaseBody, verifiedState, scratch });
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }
@@ -461,6 +517,19 @@ test("upload resumes only a canonical draft and clobbers the allowlisted assets"
   });
 });
 
+test("prerelease drafts are rejected before any upload", () => {
+  withHarness(({ run, readState }) => {
+    const result = run("upload");
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /prerelease|stable release/i);
+    assert.ok(
+      !readState().calls.some(
+        (call) => call[0] === "gh" && call[1] === "release" && call[2] === "upload",
+      ),
+    );
+  }, { release: matchingRelease({ prerelease: true }) });
+});
+
 test("upload rejects local notes with trailing or foreign bytes", () => {
   withHarness(({ run, releaseBody, readState }) => {
     writeFileSync(releaseBody, `${canonicalBody}\n`);
@@ -477,6 +546,7 @@ test("capture emits exact release, metadata, asset, byte, and notes bindings", (
     assert.equal(result.status, 0, result.stderr);
     const captured = JSON.parse(readFileSync(verifiedState, "utf8"));
     assert.equal(captured.releaseId, 42);
+    assert.equal(captured.prerelease, false);
     assert.equal(captured.updatedAt, "2026-08-15T18:00:00Z");
     assert.equal(captured.tagName, sourceTag);
     assert.equal(captured.title, canonicalTitle);
@@ -552,6 +622,7 @@ test("publish fails closed when canonical release or asset identity state change
     ["title", (state) => { state.release.title += " changed"; }],
     ["body", (state) => { state.release.body += "foreign\n"; }],
     ["author", (state) => { state.release.author = { id: 99, login: "foreign-writer" }; }],
+    ["prerelease", (state) => { state.release.prerelease = true; }],
     ["asset id", (state) => { state.release.assets[0].id = 999; }],
     ["asset size", (state) => { state.release.assets[0].size += 1; }],
     ["asset digest", (state) => { state.release.assets[0].digest = `sha256:${"f".repeat(64)}`; }],
@@ -621,7 +692,7 @@ test("publish rejects changed remote bytes when API digests are unavailable", ()
   });
 });
 
-test("atomic tag-scoped lock acquisition collides and only its exact owner releases it", () => {
+test("atomic tag-scoped lock acquisition adopts its exact owner and releases it", () => {
   withHarness(({ run, readState }) => {
     const acquired = run("acquire-lock");
     assert.equal(acquired.status, 0, acquired.stderr);
@@ -632,14 +703,104 @@ test("atomic tag-scoped lock acquisition collides and only its exact owner relea
     assert.deepEqual(held.tagObject.object, { type: "commit", sha: releaseRepoCommit });
 
     const collision = run("acquire-lock");
-    assert.notEqual(collision.status, 0);
-    assert.match(collision.stderr, /already exists|lock/i);
+    assert.equal(collision.status, 0, collision.stderr);
     assert.deepEqual(readState().lock, held);
 
-    const released = run("release-lock", { RELEASE_LOCK_ACQUIRED: "true" });
+    const released = run("release-lock");
     assert.equal(released.status, 0, released.stderr);
     assert.equal(readState().lock, null);
   }, { lock: null });
+});
+
+test("lost create-ref response is adopted after exact ownership refetch", () => {
+  withHarness(({ run, readState, scratch }) => {
+    const output = join(scratch, "github-output");
+    const result = run("acquire-lock", { GITHUB_OUTPUT: output });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(readFileSync(output, "utf8"), "acquired=true\n");
+    assert.equal(readState().lock.tagObject.message, lockMessage);
+  }, { lock: null, createRefLostResponse: true });
+});
+
+test("cleanup reconciles and removes an exact current lock even before acquired output was set", () => {
+  withHarness(({ run, readState }) => {
+    const result = run("release-lock", { RELEASE_LOCK_ACQUIRED: "" });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(readState().lock, null);
+  });
+});
+
+test("a definitively completed previous attempt is reclaimed with the source Actions token", () => {
+  const previous = lockFixture({ workflowAttempt: "1" });
+  withHarness(({ run, readState }) => {
+    const result = run("acquire-lock", { WORKFLOW_ATTEMPT: "2" });
+
+    assert.equal(result.status, 0, result.stderr);
+    const state = readState();
+    assert.equal(state.lock.tagObject.message, lockOwnership({ workflowAttempt: "2" }).message);
+    assert.deepEqual(
+      state.sourceRunQueries,
+      [`repos/${sourceRepository}/actions/runs/${workflowRun}/attempts/1`],
+    );
+  }, {
+    lock: previous,
+    sourceRunStatus: "completed",
+    sourceRunConclusion: "success",
+  });
+});
+
+test("active or unknown previous attempts are preserved and fail closed", () => {
+  const cases = [
+    { name: "active", options: { sourceRunStatus: "in_progress", sourceRunConclusion: null } },
+    {
+      name: "unknown",
+      options: {
+        sourceRunResponse: {
+          id: Number(workflowRun),
+          run_attempt: 1,
+          status: "mystery",
+          conclusion: null,
+        },
+      },
+    },
+  ];
+  for (const { name, options } of cases) {
+    const previous = lockFixture({ workflowAttempt: "1" });
+    withHarness(({ run, readState }) => {
+      const result = run("acquire-lock", { WORKFLOW_ATTEMPT: "2" });
+
+      assert.notEqual(result.status, 0, `${name} lock must not be reclaimed`);
+      assert.deepEqual(readState().lock, previous);
+      assert.ok(!readState().calls.some((call) => call.includes("DELETE")));
+    }, { lock: previous, ...options });
+  }
+});
+
+test("foreign cleanup and malicious ownership metadata never delete the lock", () => {
+  const cases = [
+    {
+      name: "foreign previous attempt",
+      lock: lockFixture({ workflowAttempt: "1" }),
+      mode: "release-lock",
+    },
+    {
+      name: "malicious repository",
+      lock: lockFixture({ sourceRepository: "attacker/repository" }),
+      mode: "acquire-lock",
+    },
+  ];
+  for (const entry of cases) {
+    withHarness(({ run, readState }) => {
+      const result = run(entry.mode, { WORKFLOW_ATTEMPT: "2" });
+
+      assert.notEqual(result.status, 0, `${entry.name} must fail closed`);
+      assert.deepEqual(readState().lock, entry.lock);
+      assert.equal(readState().sourceRunQueries.length, 0);
+      assert.ok(!readState().calls.some((call) => call.includes("DELETE")));
+    }, { lock: entry.lock });
+  }
 });
 
 test("foreign lock ownership, release author, and asset uploader fail closed", () => {
@@ -695,7 +856,7 @@ test("immutable release repository protection is mandatory and verifiable", () =
 });
 
 test("post-publish mismatch fails loudly without deleting the release", () => {
-  for (const mutation of ["title", "asset-id"]) {
+  for (const mutation of ["title", "asset-id", "prerelease"]) {
     withHarness(({ run, readState, writeState }) => {
       assert.equal(run("capture").status, 0);
       const state = readState();

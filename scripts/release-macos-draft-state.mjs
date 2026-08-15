@@ -32,19 +32,15 @@ const expectedMarker =
 const expectedBody =
   `${expectedMarker}\n\nSeer ${version} for Apple Silicon Macs running macOS 14 or later.\n`;
 const expectedNames = [`Seer-v${version}-arm64.dmg`, "SHA256SUMS", "release-manifest.json"];
-const expectedLockTag =
-  `seer-release-lock-${sourceTag}-${sourceCommit}-run-${workflowRun}-attempt-${workflowAttempt}`;
-const expectedLockMessage =
-  `${JSON.stringify({
-    schema: 1,
-    sourceRepository,
-    sourceCommit,
-    sourceTag,
-    workflowRef,
-    workflowRun,
-    workflowAttempt,
-  })}\n`;
-
+const expectedLockMetadata = {
+  lockSchema: 1,
+  sourceRepository,
+  sourceCommit,
+  sourceTag,
+  workflowRef,
+  workflowRun,
+  workflowAttempt,
+};
 function fail(message) {
   throw new Error(message);
 }
@@ -93,6 +89,7 @@ function parseMetadata(value, { requireComplete, expectedDraft }) {
   const {
     id,
     draft,
+    prerelease,
     immutable,
     tag_name: tagName,
     name: title,
@@ -105,6 +102,7 @@ function parseMetadata(value, { requireComplete, expectedDraft }) {
     !Number.isSafeInteger(id) ||
     id <= 0 ||
     typeof draft !== "boolean" ||
+    typeof prerelease !== "boolean" ||
     typeof immutable !== "boolean" ||
     typeof tagName !== "string" ||
     typeof title !== "string" ||
@@ -118,6 +116,7 @@ function parseMetadata(value, { requireComplete, expectedDraft }) {
   if (expectedDraft !== undefined && draft !== expectedDraft) {
     fail(expectedDraft ? "verified release is no longer a draft" : "post-publish release is still a draft");
   }
+  if (prerelease !== false) fail("stable release workflow refuses prerelease metadata");
   if (!draft && !immutable) fail("published release is not protected by immutable releases");
   if (tagName !== sourceTag) fail(`draft release tag does not match ${sourceTag}`);
   if (title !== expectedTitle) fail("release canonical title does not match");
@@ -170,6 +169,7 @@ function parseMetadata(value, { requireComplete, expectedDraft }) {
   return {
     id,
     draft,
+    prerelease,
     immutable,
     tagName,
     title,
@@ -231,7 +231,7 @@ function validateLocal(metadata, localDir, localNotes, freshDownloads) {
 function validateStateShape(state) {
   if (
     !state ||
-    state.schema !== 2 ||
+    state.schema !== 3 ||
     state.repository !== destinationRepository ||
     !Number.isSafeInteger(state.releaseId) ||
     state.releaseId <= 0 ||
@@ -239,6 +239,7 @@ function validateStateShape(state) {
     state.tagName !== sourceTag ||
     state.title !== expectedTitle ||
     state.body !== expectedBody ||
+    state.prerelease !== false ||
     !state.notes ||
     !Number.isSafeInteger(state.notes.size) ||
     !/^[0-9a-f]{64}$/.test(state.notes.sha256) ||
@@ -271,6 +272,7 @@ function compareCanonical(metadata, local, state, { compareUpdatedAt, context })
     metadata.tagName !== state.tagName ||
     metadata.title !== state.title ||
     metadata.body !== state.body ||
+    metadata.prerelease !== state.prerelease ||
     JSON.stringify(metadata.author) !== JSON.stringify(state.author)
   ) {
     fail(`${context} canonical metadata changed after verification`);
@@ -294,6 +296,7 @@ async function runInspect() {
     [
       `id=${metadata.id}`,
       `draft=${metadata.draft}`,
+      `prerelease=${metadata.prerelease}`,
       `assetCount=${metadata.assets.length}`,
       `assetsComplete=${metadata.complete}`,
     ].join("\n") + "\n",
@@ -316,13 +319,14 @@ function runCapture() {
   const metadata = readMetadata(metadataPath, { requireComplete: true, expectedDraft: true });
   const local = validateLocal(metadata, releaseDir, notesPath, downloadsDir);
   const state = {
-    schema: 2,
+    schema: 3,
     repository: destinationRepository,
     releaseId: metadata.id,
     updatedAt: metadata.updatedAt,
     tagName: metadata.tagName,
     title: metadata.title,
     body: metadata.body,
+    prerelease: metadata.prerelease,
     author: metadata.author,
     notes: local.notes,
     assets: local.assets,
@@ -385,18 +389,112 @@ async function runRef() {
 
 async function runLockTag() {
   const tag = await readStdinJSON("release lock tag");
+  const parsed = parseLockTag(tag);
+  if (!parsed.current) {
+    fail("release lock ownership metadata does not match this tag and source run");
+  }
+  process.stdout.write(`${parsed.tagSHA}\n${parsed.commitSHA}\n`);
+}
+
+function parseLockTag(tag) {
   if (
     !tag ||
     !/^[0-9a-f]{40}$/.test(tag.sha) ||
-    tag.tag !== expectedLockTag ||
-    tag.message !== expectedLockMessage ||
+    typeof tag.tag !== "string" ||
+    typeof tag.message !== "string" ||
     !tag.object ||
     tag.object.type !== "commit" ||
     !/^[0-9a-f]{40}$/.test(tag.object.sha)
   ) {
-    fail("release lock ownership metadata does not match this tag and source run");
+    fail("release lock ownership metadata has an invalid shape");
   }
-  process.stdout.write(`${tag.sha}\n${tag.object.sha}\n`);
+  const message = tag.message.endsWith("\n") ? tag.message.slice(0, -1) : fail("release lock message is not canonical");
+  const metadata = parseJSON(message, "release lock ownership metadata");
+  const keys = [
+    "lockSchema",
+    "sourceRepository",
+    "sourceCommit",
+    "sourceTag",
+    "workflowRef",
+    "workflowRun",
+    "workflowAttempt",
+  ];
+  if (
+    !metadata ||
+    typeof metadata !== "object" ||
+    Array.isArray(metadata) ||
+    JSON.stringify(Object.keys(metadata)) !== JSON.stringify(keys) ||
+    metadata.lockSchema !== 1 ||
+    metadata.sourceRepository !== sourceRepository ||
+    metadata.sourceCommit !== sourceCommit ||
+    metadata.sourceTag !== sourceTag ||
+    metadata.workflowRef !== workflowRef ||
+    typeof metadata.workflowRun !== "string" ||
+    !/^[1-9][0-9]*$/.test(metadata.workflowRun) ||
+    typeof metadata.workflowAttempt !== "string" ||
+    !/^[1-9][0-9]*$/.test(metadata.workflowAttempt)
+  ) {
+    fail("release lock ownership metadata is untrusted or malformed");
+  }
+  const canonicalTag =
+    `seer-release-lock-${metadata.sourceTag}-${metadata.sourceCommit}` +
+    `-run-${metadata.workflowRun}-attempt-${metadata.workflowAttempt}`;
+  if (tag.tag !== canonicalTag || tag.message !== `${JSON.stringify(metadata)}\n`) {
+    fail("release lock tag and ownership metadata do not match");
+  }
+  return {
+    tagSHA: tag.sha,
+    commitSHA: tag.object.sha,
+    workflowRun: metadata.workflowRun,
+    workflowAttempt: metadata.workflowAttempt,
+    current:
+      metadata.workflowRun === expectedLockMetadata.workflowRun &&
+      metadata.workflowAttempt === expectedLockMetadata.workflowAttempt,
+  };
+}
+
+async function runLockOwner() {
+  const parsed = parseLockTag(await readStdinJSON("release lock tag"));
+  process.stdout.write(
+    [
+      `tagSha=${parsed.tagSHA}`,
+      `commitSha=${parsed.commitSHA}`,
+      `workflowRun=${parsed.workflowRun}`,
+      `workflowAttempt=${parsed.workflowAttempt}`,
+      `current=${parsed.current}`,
+    ].join("\n") + "\n",
+  );
+}
+
+async function runStatus() {
+  const runID = metadataPath;
+  const runAttempt = _headersPath;
+  if (!/^[1-9][0-9]*$/.test(runID ?? "") || !/^[1-9][0-9]*$/.test(runAttempt ?? "")) {
+    fail("recorded source workflow identity is invalid");
+  }
+  const status = await readStdinJSON("source workflow run status");
+  const definitiveConclusions = new Set([
+    "action_required",
+    "cancelled",
+    "failure",
+    "neutral",
+    "skipped",
+    "stale",
+    "startup_failure",
+    "success",
+    "timed_out",
+  ]);
+  if (
+    !status ||
+    !Number.isSafeInteger(status.id) ||
+    String(status.id) !== runID ||
+    !Number.isSafeInteger(status.run_attempt) ||
+    String(status.run_attempt) !== runAttempt ||
+    status.status !== "completed" ||
+    !definitiveConclusions.has(status.conclusion)
+  ) {
+    fail("recorded source workflow run is active, unknown, or not definitively completed");
+  }
 }
 
 async function runCommit() {
@@ -441,13 +539,19 @@ try {
     case "lock-tag":
       await runLockTag();
       break;
+    case "lock-owner":
+      await runLockOwner();
+      break;
+    case "run-status":
+      await runStatus();
+      break;
     case "commit":
       await runCommit();
       break;
     default:
       fail(
         "usage: release-macos-draft-state.mjs inspect|downloads|validate-notes|capture|compare|" +
-          "compare-published|identity|repository|immutable|ref|lock-tag|commit",
+          "compare-published|identity|repository|immutable|ref|lock-tag|lock-owner|run-status|commit",
       );
   }
 } catch (error) {

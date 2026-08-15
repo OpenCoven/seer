@@ -78,7 +78,7 @@ LOCK_REF_NAME="seer-release-lock-${SOURCE_TAG}"
 LOCK_REF="refs/tags/${LOCK_REF_NAME}"
 LOCK_TAG_NAME="${LOCK_REF_NAME}-${SOURCE_COMMIT}-run-${WORKFLOW_RUN}-attempt-${WORKFLOW_ATTEMPT}"
 LOCK_MESSAGE="$(
-  printf '{"schema":1,"sourceRepository":"%s","sourceCommit":"%s","sourceTag":"%s","workflowRef":"%s","workflowRun":"%s","workflowAttempt":"%s"}\n' \
+  printf '{"lockSchema":1,"sourceRepository":"%s","sourceCommit":"%s","sourceTag":"%s","workflowRef":"%s","workflowRun":"%s","workflowAttempt":"%s"}\n' \
     "${SOURCE_REPOSITORY}" "${SOURCE_COMMIT}" "${SOURCE_TAG}" "${WORKFLOW_REF}" \
     "${WORKFLOW_RUN}" "${WORKFLOW_ATTEMPT}"
 )"
@@ -86,12 +86,24 @@ LOCK_MESSAGE+=$'\n'
 RELEASE_EXISTS=0
 RELEASE_ID=""
 RELEASE_DRAFT=""
+RELEASE_PRERELEASE=""
 RELEASE_ASSET_COUNT=0
 RELEASE_ASSETS_COMPLETE=""
 DEFAULT_BRANCH=""
 
 api() {
   gh api --header "X-GitHub-Api-Version: ${GH_API_VERSION}" "$@"
+}
+
+source_api() {
+  local run_id="$1"
+  local run_attempt="$2"
+  SOURCE_GITHUB_TOKEN="${SOURCE_GITHUB_TOKEN:-}"
+  [[ -n "${SOURCE_GITHUB_TOKEN}" ]] ||
+    fail "SOURCE_GITHUB_TOKEN with actions:read is required to reconcile a previous release lock"
+  GH_TOKEN="${SOURCE_GITHUB_TOKEN}" gh api \
+    --header "X-GitHub-Api-Version: ${GH_API_VERSION}" \
+    "repos/${SOURCE_REPOSITORY}/actions/runs/${run_id}/attempts/${run_attempt}"
 }
 
 require_repository_governance() {
@@ -114,18 +126,14 @@ verify_commit_exists() {
   printf '%s' "${response}" | node "${STATE_HELPER}" commit "${commit_sha}"
 }
 
-verify_remote_lock() {
+remote_lock_summary() {
   local ref_response
   local ref_summary
   local ref_type
   local ref_sha
   local tag_response
-  local tag_summary
-  local tag_sha
-  local commit_sha
 
-  ref_response="$(api "repos/${GH_REPO}/git/ref/tags/${LOCK_REF_NAME}")" ||
-    fail "release lock is missing"
+  ref_response="$(api "repos/${GH_REPO}/git/ref/tags/${LOCK_REF_NAME}")" || return $?
   ref_summary="$(printf '%s' "${ref_response}" | node "${STATE_HELPER}" ref)"
   ref_type="$(printf '%s\n' "${ref_summary}" | /usr/bin/sed -n '1p')"
   ref_sha="$(printf '%s\n' "${ref_summary}" | /usr/bin/sed -n '2p')"
@@ -133,11 +141,24 @@ verify_remote_lock() {
     fail "release lock ref does not target an annotated ownership tag"
 
   tag_response="$(api "repos/${GH_REPO}/git/tags/${ref_sha}")"
-  tag_summary="$(printf '%s' "${tag_response}" | node "${STATE_HELPER}" lock-tag)"
-  tag_sha="$(printf '%s\n' "${tag_summary}" | /usr/bin/sed -n '1p')"
-  commit_sha="$(printf '%s\n' "${tag_summary}" | /usr/bin/sed -n '2p')"
+  local owner_summary
+  owner_summary="$(printf '%s' "${tag_response}" | node "${STATE_HELPER}" lock-owner)"
+  local tag_sha
+  tag_sha="$(printf '%s\n' "${owner_summary}" | /usr/bin/sed -n '1s/^tagSha=//p')"
   [[ "${tag_sha}" == "${ref_sha}" ]] ||
     fail "release lock tag identity changed"
+  printf '%s' "${owner_summary}"
+}
+
+verify_remote_lock() {
+  local summary
+  summary="$(remote_lock_summary)" || fail "release lock is missing or unreadable"
+  local current
+  local commit_sha
+  current="$(printf '%s\n' "${summary}" | /usr/bin/sed -n '5s/^current=//p')"
+  commit_sha="$(printf '%s\n' "${summary}" | /usr/bin/sed -n '2s/^commitSha=//p')"
+  [[ "${current}" == "true" && "${commit_sha}" =~ ^[0-9a-f]{40}$ ]] ||
+    fail "release lock is not owned by this exact workflow attempt"
   verify_commit_exists "${commit_sha}"
 }
 
@@ -150,7 +171,13 @@ acquire_remote_lock() {
   local tag_summary
   local tag_sha
   local ref_response
-  local status
+  local create_status
+  local owner_summary
+  local owner_status
+  local owner_current
+  local owner_run
+  local owner_attempt
+  local owner_commit
 
   branch_response="$(api "repos/${GH_REPO}/git/ref/heads/${DEFAULT_BRANCH}")"
   branch_summary="$(printf '%s' "${branch_response}" | node "${STATE_HELPER}" ref)"
@@ -177,21 +204,92 @@ acquire_remote_lock() {
       --raw-field "ref=${LOCK_REF}" \
       --raw-field "sha=${tag_sha}" 2>&1
   )"
-  status=$?
+  create_status=$?
   set -e
-  [[ "${status}" -eq 0 ]] ||
-    fail "atomic release lock already exists or could not be acquired"
+  set +e
+  owner_summary="$(remote_lock_summary 2>&1)"
+  owner_status=$?
+  set -e
+  [[ "${owner_status}" -eq 0 ]] ||
+    fail "atomic release lock create result could not be reconciled: ${owner_summary}"
+
+  owner_current="$(printf '%s\n' "${owner_summary}" | /usr/bin/sed -n '5s/^current=//p')"
+  if [[ "${owner_current}" != "true" ]]; then
+    [[ "${create_status}" -ne 0 ]] ||
+      fail "release lock ref unexpectedly changed after successful acquisition"
+    owner_run="$(printf '%s\n' "${owner_summary}" | /usr/bin/sed -n '3s/^workflowRun=//p')"
+    owner_attempt="$(printf '%s\n' "${owner_summary}" | /usr/bin/sed -n '4s/^workflowAttempt=//p')"
+    owner_commit="$(printf '%s\n' "${owner_summary}" | /usr/bin/sed -n '2s/^commitSha=//p')"
+    [[ "${owner_run}" =~ ^[1-9][0-9]*$ &&
+      "${owner_attempt}" =~ ^[1-9][0-9]*$ &&
+      "${owner_commit}" =~ ^[0-9a-f]{40}$ ]] ||
+      fail "previous release lock ownership is invalid"
+    verify_commit_exists "${owner_commit}"
+
+    local run_response
+    run_response="$(source_api "${owner_run}" "${owner_attempt}")" ||
+      fail "unable to prove the exact previous source workflow attempt terminated"
+    printf '%s' "${run_response}" |
+      node "${STATE_HELPER}" run-status "${owner_run}" "${owner_attempt}" ||
+      fail "previous source workflow attempt is active or unknown; preserving its lock"
+
+    local latest_summary
+    latest_summary="$(remote_lock_summary)" ||
+      fail "previous release lock disappeared during stale-lock reconciliation"
+    [[ "${latest_summary}" == "${owner_summary}" ]] ||
+      fail "release lock ownership changed during stale-lock reconciliation"
+    api --method DELETE "repos/${GH_REPO}/git/refs/tags/${LOCK_REF_NAME}" >/dev/null
+
+    set +e
+    ref_response="$(
+      api --method POST "repos/${GH_REPO}/git/refs" \
+        --raw-field "ref=${LOCK_REF}" \
+        --raw-field "sha=${tag_sha}" 2>&1
+    )"
+    create_status=$?
+    set -e
+    set +e
+    owner_summary="$(remote_lock_summary 2>&1)"
+    owner_status=$?
+    set -e
+    [[ "${owner_status}" -eq 0 ]] ||
+      fail "reclaimed release lock create result could not be reconciled: ${owner_summary}"
+    owner_current="$(printf '%s\n' "${owner_summary}" | /usr/bin/sed -n '5s/^current=//p')"
+    [[ "${owner_current}" == "true" ]] ||
+      fail "reclaimed release lock belongs to a foreign workflow attempt"
+  fi
 
   if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
     printf 'acquired=true\n' >> "${GITHUB_OUTPUT}"
   fi
-  printf '%s' "${ref_response}" | node "${STATE_HELPER}" ref >/dev/null
   verify_remote_lock
 }
 
 release_remote_lock() {
-  [[ "${RELEASE_LOCK_ACQUIRED:-}" == "true" ]] || return 0
-  verify_remote_lock
+  local summary
+  local status
+  set +e
+  summary="$(remote_lock_summary 2>&1)"
+  status=$?
+  set -e
+  if [[ "${status}" -ne 0 ]]; then
+    if /usr/bin/grep -Eq '\(HTTP 404\)|^HTTP/[0-9.]+ 404 ' <<< "${summary}"; then
+      return 0
+    fi
+    fail "release lock could not be reconciled during cleanup: ${summary}"
+  fi
+  local current
+  local commit_sha
+  current="$(printf '%s\n' "${summary}" | /usr/bin/sed -n '5s/^current=//p')"
+  commit_sha="$(printf '%s\n' "${summary}" | /usr/bin/sed -n '2s/^commitSha=//p')"
+  [[ "${current}" == "true" ]] ||
+    fail "refusing to remove a release lock owned by another workflow attempt"
+  verify_commit_exists "${commit_sha}"
+  local latest_summary
+  latest_summary="$(remote_lock_summary)" ||
+    fail "release lock disappeared during cleanup reconciliation"
+  [[ "${latest_summary}" == "${summary}" ]] ||
+    fail "release lock ownership changed during cleanup reconciliation"
   api --method DELETE "repos/${GH_REPO}/git/refs/tags/${LOCK_REF_NAME}" >/dev/null
 }
 
@@ -210,6 +308,7 @@ query_release() {
       RELEASE_EXISTS=0
       RELEASE_ID=""
       RELEASE_DRAFT=""
+      RELEASE_PRERELEASE=""
       RELEASE_ASSET_COUNT=0
       RELEASE_ASSETS_COMPLETE=""
       return
@@ -225,13 +324,15 @@ query_release() {
 
   RELEASE_EXISTS=1
   field_count="$(printf '%s\n' "${summary}" | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
-  [[ "${field_count}" -eq 4 ]] || fail "release metadata has an invalid shape"
+  [[ "${field_count}" -eq 5 ]] || fail "release metadata has an invalid shape"
   RELEASE_ID="$(printf '%s\n' "${summary}" | /usr/bin/sed -n '1s/^id=//p')"
   RELEASE_DRAFT="$(printf '%s\n' "${summary}" | /usr/bin/sed -n '2s/^draft=//p')"
-  RELEASE_ASSET_COUNT="$(printf '%s\n' "${summary}" | /usr/bin/sed -n '3s/^assetCount=//p')"
-  RELEASE_ASSETS_COMPLETE="$(printf '%s\n' "${summary}" | /usr/bin/sed -n '4s/^assetsComplete=//p')"
+  RELEASE_PRERELEASE="$(printf '%s\n' "${summary}" | /usr/bin/sed -n '3s/^prerelease=//p')"
+  RELEASE_ASSET_COUNT="$(printf '%s\n' "${summary}" | /usr/bin/sed -n '4s/^assetCount=//p')"
+  RELEASE_ASSETS_COMPLETE="$(printf '%s\n' "${summary}" | /usr/bin/sed -n '5s/^assetsComplete=//p')"
   [[ "${RELEASE_ID}" =~ ^[1-9][0-9]*$ &&
     "${RELEASE_DRAFT}" =~ ^(true|false)$ &&
+    "${RELEASE_PRERELEASE}" == "false" &&
     "${RELEASE_ASSET_COUNT}" =~ ^[0-9]+$ &&
     "${RELEASE_ASSETS_COMPLETE}" =~ ^(true|false)$ ]] ||
     fail "release metadata has an invalid shape"
@@ -421,7 +522,7 @@ case "${MODE}" in
       --header "Accept: application/vnd.github+json" \
       --header "Authorization: Bearer ${GH_TOKEN}" \
       --header "X-GitHub-Api-Version: ${GH_API_VERSION}" \
-      --data '{"draft":false}' \
+      --data '{"draft":false,"prerelease":false}' \
       --output "${patch_response}" \
       "${GITHUB_API_URL:-https://api.github.com}/repos/${GH_REPO}/releases/${release_id}" ||
       fail "supported release publish request failed"
