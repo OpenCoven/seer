@@ -9,38 +9,46 @@ the standalone native app for scenarios that automated tests either cannot
 fully observe (visual tray/menu state, real relaunch across process
 restarts) or that this task's automated suite only partially exercises.
 
-**No row in this document has been executed.** Every `Result` cell below is
-`TODO` and every evidence cell is a placeholder. Do not mark any row `PASS`
-until a tester has actually performed that exact scenario against both
-applications and attached real evidence (a screenshot path or a log path)
-— never leave a row `PASS` on the strength of the automated suite alone,
-and never edit a row's `Result` without also filling in `Date`, `Tester`,
-`Build commit`, and the evidence paths for both applications.
+**No manual parity row in the Matrix section has been executed.** Every manual
+`Result` cell is `TODO` and every manual evidence cell is a placeholder. Do not
+mark any manual row `PASS` until a tester has actually performed that exact
+scenario against both applications and attached real evidence (a screenshot
+path or a log path) — never leave a row `PASS` on the strength of the automated
+suite alone, and never edit a row's `Result` without also filling in `Date`,
+`Tester`, `Build commit`, and the evidence paths for both applications.
 
 ## Task 18 automated evidence (not manual parity)
 
-This evidence records the local automated gate without changing any manual
-matrix result. Date: **2026-08-14 (UTC-05:00; logs/commit tooling may display
-2026-08-15 UTC)** · Tester: **Cody** · Implementation HEAD:
-**`b259509fbffc63db17db00da6df50812d5bd906b`**. Logs are ignored,
+This section records local automated checks without changing any manual matrix
+result. `VERIFIED (local)` means only that the named command exited zero on
+this host. `OBSERVED` records a narrower fact and is not a UI pass. `BLOCKED`
+means that no UI assertion was possible. None of these classifications is
+clean-machine or release evidence.
+
+Session-supplied evidence date: 2026-08-14 UTC-05:00; host Git clock stamped implementation commit b259509 on 2026-08-15 -05:00, so commit timestamp is recorded separately and not used as the session date.
+Tester: **Cody** · Implementation commit:
+**`b259509fbffc63db17db00da6df50812d5bd906b`** · Pinned-tool rerun checkout:
+**`669a3fb558559451eea4b4a8801805cb5a4ce662`**. Logs are ignored,
 worktree-relative files under `build/test-results/task18/`; paths in the logs
 are redacted to `$REPO`/`$HOME`, and no log is a release artifact.
 
 | Surface | Command | Result | Local log |
 | --- | --- | --- | --- |
-| Locked dependency install | `npm ci` | PASS (local) | `build/test-results/task18/npm-ci.log` |
-| Node suite, including release-manifest, package, draft-policy, and workflow static tests | `npm test` | PASS (local) | `build/test-results/task18/npm-test.log` |
-| Shared renderer tests | `npm run test:renderer` | PASS (local) | `build/test-results/task18/test-renderer.log` |
-| Glaze reference type-check | `npm run type-check` | PASS (local) | `build/test-results/task18/type-check.log` |
-| Glaze reference lint | `npm run lint` | PASS with 8 warnings (local; 0 errors) | `build/test-results/task18/lint.log` |
-| Glaze reference build | `npm run build` | PASS (local) | `build/test-results/task18/build.log` |
-| Standalone renderer build | `npm run build:standalone-renderer` | PASS (local) | `build/test-results/task18/build-standalone-renderer.log` |
-| Native Swift tests | `npm run test:macos` | PASS, 590 tests (local) | `build/test-results/task18/test-macos.log` |
-| Unsigned native app build | `npm run build:macos` | PASS (local) | `build/test-results/task18/build-macos.log` |
-| Repository/bundle boundary scan | `npm run check:standalone-boundary` | PASS (local) | `build/test-results/task18/check-standalone-boundary.log` |
-| Standalone boundary suite | `node --test tests/standalone-boundary.test.mjs` | PASS, 32 tests (local) | `build/test-results/task18/standalone-boundary-test.log` |
-| Patch whitespace validation | `git diff --check` | PASS (local) | `build/test-results/task18/git-diff-check.log` |
-| Unsigned launch/accessory smoke | `open build/macos/unsigned/Seer.app` | PASS (local process/identity check only) | `build/test-results/task18/smoke.log` |
+| Locked dependency install | `npm ci` | VERIFIED (local) | `build/test-results/task18/npm-ci.log` |
+| Node suite, including release-manifest, package, draft-policy, and workflow static tests | `npm test` | VERIFIED (local) | `build/test-results/task18/npm-test.log` |
+| Shared renderer tests | `npm run test:renderer` | VERIFIED (local) | `build/test-results/task18/test-renderer.log` |
+| Glaze reference type-check | `npm run type-check` | VERIFIED (local) | `build/test-results/task18/type-check.log` |
+| Glaze reference lint | `npm run lint` | VERIFIED with 8 warnings (local; 0 errors) | `build/test-results/task18/lint.log` |
+| Glaze reference build | `npm run build` | VERIFIED (local) | `build/test-results/task18/build.log` |
+| Standalone renderer build | `npm run build:standalone-renderer` | VERIFIED (local) | `build/test-results/task18/build-standalone-renderer.log` |
+| Native project generation | `npm run generate:macos` | VERIFIED (local; XcodeGen 2.46.0, noncanonical Xcode 26.6) | `build/test-results/task18/generate-macos-pinned.log` |
+| Native Swift tests | `npm run test:macos` | VERIFIED, 590 tests (local; XcodeGen 2.46.0, noncanonical Xcode 26.6) | `build/test-results/task18/test-macos-pinned.log` |
+| Unsigned native app build | `npm run build:macos` | VERIFIED (local; XcodeGen 2.46.0, noncanonical Xcode 26.6) | `build/test-results/task18/build-macos-pinned.log` |
+| Repository/bundle boundary scan | `npm run check:standalone-boundary` | VERIFIED (local; resulting pinned-XcodeGen bundle, noncanonical Xcode 26.6) | `build/test-results/task18/check-standalone-boundary-pinned.log` |
+| Standalone boundary suite | `node --test tests/standalone-boundary.test.mjs` | VERIFIED, 32 tests (local) | `build/test-results/task18/standalone-boundary-test.log` |
+| Patch whitespace validation | `git diff --check` | VERIFIED (local) | `build/test-results/task18/git-diff-check.log` |
+| Unsigned launch/accessory smoke | `open build/macos/unsigned/Seer.app` | OBSERVED (exact-bundle process/identity only; not a UI pass) | `build/test-results/task18/smoke.log` |
+| GUI smoke attempt | `open build/macos/unsigned/Seer.app`, then `osascript`/System Events accessibility query | BLOCKED (`osascript` denied assistive access, error `-25211`; no UI assertions) | `build/test-results/task18/ui-smoke-attempt.log` |
 
 The smoke check observed a live exact-bundle process with bundle identifier
 `ai.opencoven.seer`, `LSUIElement=true`, and Launch Services
@@ -49,12 +57,33 @@ exact-path process or Seer power assertion remained afterward. This does
 **not** claim that a human observed the tray, panel, routes, modes, Escape, or
 blur behavior.
 
-The local host was Apple Silicon, but reported macOS 26.6.1, Xcode 26.6, and
-XcodeGen 2.45.4 rather than the prescribed clean release toolchain (macOS 14+,
-Xcode 16.2, pinned XcodeGen 2.46.0). These local PASS results therefore do not
-set `CLEAN_MACHINE_VERIFIED_COMMIT` or approve a release. A real
-signing/notarization run was not attempted without credentials; `npm test`
-uses only stubbed packaging tools.
+The pinned-tool rerun downloaded Task 17's XcodeGen 2.46.0 archive, verified
+both expected and actual SHA-256 as
+`4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806`,
+prepended its `bin` directory to `PATH`, and removed the temporary local tool
+directory afterward. `generate:macos`, `test:macos`, and `build:macos`
+therefore used XcodeGen 2.46.0; the boundary command checked the resulting
+bundle. The installed system XcodeGen remains 2.45.4.
+
+The Apple Silicon host reported macOS 26.6.1. Inspection found only
+`/Applications/Xcode.app`, reporting Xcode 26.6 (build 17F113); Xcode 16.2 was
+not installed and was not downloaded. Therefore canonical Xcode 16.2
+clean-machine validation remains incomplete even though the pinned XcodeGen
+checks above are locally verified on Xcode 26.6.
+
+The GUI attempt stopped as soon as System Events returned
+`osascript is not allowed assistive access` (`-25211`) while querying the Seer
+process's menu bars and windows. Because the status item could not be
+identified reliably, no menu-bar click, panel visibility/title, Status or
+History route, mode menu, Escape, blur, or Quit assertion was made, and no
+machine-readable UI evidence was created. The blocker log records the command
+and denial only. Cleanup by exact PID left no Seer process or Seer power
+assertion. Every human UI matrix row remains incomplete and `TODO`, as do all
+other manual parity rows; every clean-machine check remains incomplete.
+
+These local results do not set `CLEAN_MACHINE_VERIFIED_COMMIT` or approve a
+release. A real signing/notarization run was not attempted without credentials;
+`npm test` uses only stubbed packaging tools.
 
 ## How to execute a row
 
