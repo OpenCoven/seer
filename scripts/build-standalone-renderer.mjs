@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   appendFileSync,
@@ -18,7 +18,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
@@ -34,6 +34,14 @@ const ownerPath = join(lockDir, "owner.json");
 const childPath = join(lockDir, "child.json");
 const rendererBuildRoot = join(repoRoot, "build", "standalone-renderer");
 const publishedRenderer = join(rendererBuildRoot, "Renderer");
+const publicationJournalPath = join(rendererBuildRoot, ".renderer-publication-transaction.json");
+const publicationJournalTempPath = join(rendererBuildRoot, ".renderer-publication-transaction.new");
+const publicationJournalSchemaVersion = 1;
+const publicationJournalMaxBytes = 64 * 1024;
+const rendererStageNamePattern = /^\.renderer-stage-[0-9a-f]{32}$/;
+const rendererBackupNamePattern = /^\.renderer-backup-[0-9a-f]{32}$/;
+const legacyGenerationNamePattern = /^\.renderer-generation-[0-9a-f-]{36}$/;
+const publicationPhases = new Set(["prepared", "old-backed-up", "new-published", "cleanup"]);
 
 function positiveIntegerFromEnv(name, fallback) {
   const raw = process.env[name];
@@ -133,6 +141,53 @@ function isPidAlive(pid) {
   }
 }
 
+function readBootIdentity() {
+  if (process.platform === "darwin") {
+    const result = spawnSync("/usr/sbin/sysctl", ["-n", "kern.boottime"], {
+      encoding: "utf8",
+    });
+    if (result.error) throw result.error;
+    if (result.status !== 0) {
+      throw new Error(`unable to read Darwin boot identity: ${result.stderr.trim()}`);
+    }
+    const match = result.stdout.match(/sec\s*=\s*(\d+),\s*usec\s*=\s*(\d+)/);
+    if (!match) throw new Error("Darwin kern.boottime had an unexpected format");
+    return `${match[1]}:${match[2]}`;
+  }
+  try {
+    return readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+  } catch (error) {
+    throw new Error(`unable to read operating-system boot identity: ${error.message}`);
+  }
+}
+
+const bootIdentity = readBootIdentity();
+
+function readProcessStartIdentity(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+  const result = spawnSync("/bin/ps", ["-p", String(pid), "-o", "lstart="], {
+    encoding: "utf8",
+    env: { ...process.env, LC_ALL: "C" },
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) return null;
+  const identity = result.stdout.trim().replaceAll(/\s+/g, " ");
+  return identity || null;
+}
+
+function recordedProcessIsLive(record) {
+  if (
+    !record ||
+    typeof record.bootIdentity !== "string" ||
+    typeof record.processStartIdentity !== "string" ||
+    record.bootIdentity !== bootIdentity ||
+    !isPidAlive(record.pid)
+  ) {
+    return false;
+  }
+  return readProcessStartIdentity(record.pid) === record.processStartIdentity;
+}
+
 function isProcessGroupAlive(processGroupId) {
   if (!Number.isSafeInteger(processGroupId) || processGroupId <= 0) return false;
   try {
@@ -195,14 +250,9 @@ function inspectAndMaybeRemoveStaleLock() {
   }
 
   const child = childRecord?.value;
-  if (
-    child &&
-    (isPidAlive(child.pid) || isProcessGroupAlive(child.processGroupId))
-  ) {
-    return false;
-  }
+  if (recordedProcessIsLive(child)) return false;
   const owner = ownerRecord?.value;
-  if (owner && isPidAlive(owner.pid)) return false;
+  if (recordedProcessIsLive(owner)) return false;
 
   const createdAtMs = Number.isSafeInteger(owner?.createdAtMs)
     ? owner.createdAtMs
@@ -229,13 +279,23 @@ async function acquireLock() {
   verifyRepoRoot();
   const token = randomUUID();
   const deadline = Date.now() + waitMs;
+  const processStartIdentity = readProcessStartIdentity(process.pid);
+  if (!processStartIdentity) {
+    throw new Error("unable to identify the renderer lock owner process start");
+  }
 
   while (true) {
     try {
       mkdirSync(lockDir, { mode: 0o700 });
       const directoryInfo = lstatSync(lockDir);
       assertOwnedDirectory(directoryInfo, "renderer lock");
-      const owner = { token, pid: process.pid, createdAtMs: Date.now() };
+      const owner = {
+        token,
+        pid: process.pid,
+        createdAtMs: Date.now(),
+        bootIdentity,
+        processStartIdentity,
+      };
       try {
         writeFileSync(ownerPath, `${JSON.stringify(owner)}\n`, {
           encoding: "utf8",
@@ -251,7 +311,12 @@ async function acquireLock() {
         throw error;
       }
       const ownerRecord = readJsonFileNoFollow(ownerPath, "renderer lock owner metadata");
-      if (ownerRecord.value.token !== token || ownerRecord.value.pid !== process.pid) {
+      if (
+        ownerRecord.value.token !== token ||
+        ownerRecord.value.pid !== process.pid ||
+        ownerRecord.value.bootIdentity !== bootIdentity ||
+        ownerRecord.value.processStartIdentity !== processStartIdentity
+      ) {
         throw new Error("renderer lock ownership could not be verified after acquisition");
       }
 
@@ -259,9 +324,20 @@ async function acquireLock() {
       return {
         token,
         recordChild(pid, processGroupId) {
+          const childProcessStartIdentity = readProcessStartIdentity(pid);
+          if (!childProcessStartIdentity) {
+            throw new Error("unable to identify spawned renderer process start");
+          }
           writeFileSync(
             childPath,
-            `${JSON.stringify({ token, pid, processGroupId, createdAtMs: Date.now() })}\n`,
+            `${JSON.stringify({
+              token,
+              pid,
+              processGroupId,
+              createdAtMs: Date.now(),
+              bootIdentity,
+              processStartIdentity: childProcessStartIdentity,
+            })}\n`,
             { encoding: "utf8", flag: "wx", mode: 0o600 },
           );
           activeChildInfo = lstatSync(childPath);
@@ -269,7 +345,11 @@ async function acquireLock() {
         clearChild() {
           if (!activeChildInfo) return;
           const current = lstatSync(childPath);
-          if (current.isSymbolicLink() || !current.isFile() || !sameIdentity(activeChildInfo, current)) {
+          if (
+            current.isSymbolicLink() ||
+            !current.isFile() ||
+            !sameIdentity(activeChildInfo, current)
+          ) {
             throw new Error("renderer lock child metadata changed identity before cleanup");
           }
           unlinkSync(childPath);
@@ -277,10 +357,17 @@ async function acquireLock() {
         },
         release() {
           if (activeChildInfo) {
-            throw new Error("refusing to release renderer lock while a recorded child may still be alive");
+            throw new Error(
+              "refusing to release renderer lock while a recorded child may still be alive",
+            );
           }
           const current = readJsonFileNoFollow(ownerPath, "renderer lock owner metadata");
-          if (current.value.token !== token || current.value.pid !== process.pid) {
+          if (
+            current.value.token !== token ||
+            current.value.pid !== process.pid ||
+            current.value.bootIdentity !== bootIdentity ||
+            current.value.processStartIdentity !== processStartIdentity
+          ) {
             throw new Error("refusing to release a renderer lock owned by another process");
           }
           removeVerifiedLock(directoryInfo, new Map([["owner.json", current.info]]));
@@ -291,7 +378,9 @@ async function acquireLock() {
       if (eexistDelayMs > 0) await sleep(eexistDelayMs);
       if (inspectAndMaybeRemoveStaleLock()) continue;
       if (Date.now() >= deadline) {
-        throw new Error(`timed out after ${waitMs}ms waiting for the standalone renderer build lock`);
+        throw new Error(
+          `timed out after ${waitMs}ms waiting for the standalone renderer build lock`,
+        );
       }
       await sleep(pollMs);
     }
@@ -407,8 +496,52 @@ function removeTreeNoFollow(path) {
   rmdirSync(path);
 }
 
+function encodedIdentity(info) {
+  return { dev: info.dev, ino: info.ino };
+}
+
+function validEncodedIdentity(value) {
+  return (
+    value &&
+    typeof value === "object" &&
+    Number.isSafeInteger(value.dev) &&
+    value.dev >= 0 &&
+    Number.isSafeInteger(value.ino) &&
+    value.ino >= 0
+  );
+}
+
+function identityMatches(info, expected) {
+  return Boolean(
+    info &&
+    validEncodedIdentity(expected) &&
+    info.dev === expected.dev &&
+    info.ino === expected.ino,
+  );
+}
+
+function assertExpectedDirectory(path, expectedIdentity, label) {
+  const info = lstatSync(path);
+  assertOwnedDirectory(info, label);
+  if (expectedIdentity && !identityMatches(info, expectedIdentity)) {
+    throw new Error(`${label} changed identity`);
+  }
+  if (dirname(path) !== rendererBuildRoot || realpathSync(path) !== path) {
+    throw new Error(`${label} must be a canonical child of the renderer publication directory`);
+  }
+  return info;
+}
+
+function removeExpectedDirectory(path, expectedIdentity, label) {
+  assertExpectedDirectory(path, expectedIdentity, label);
+  removeTreeNoFollow(path);
+}
+
 function fsyncDirectory(path) {
-  const descriptor = openSync(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  const descriptor = openSync(
+    path,
+    constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+  );
   try {
     fsyncSync(descriptor);
   } finally {
@@ -421,67 +554,416 @@ function prepareBuildRoot() {
   ensureOwnedDirectory(rendererBuildRoot, "standalone renderer build directory");
 }
 
-function cleanupAbandonedGenerations() {
+function cleanupAbandonedStages() {
   for (const entry of readdirSync(rendererBuildRoot, { withFileTypes: true })) {
-    if (!entry.name.startsWith(".renderer-generation-")) continue;
-    const path = join(rendererBuildRoot, entry.name);
-    if (entry.isDirectory() && !entry.isSymbolicLink()) {
-      removeTreeNoFollow(path);
-    } else {
-      unlinkSync(path);
+    if (
+      !rendererStageNamePattern.test(entry.name) &&
+      !legacyGenerationNamePattern.test(entry.name)
+    ) {
+      continue;
     }
+    const path = join(rendererBuildRoot, entry.name);
+    if (!entry.isDirectory() || entry.isSymbolicLink()) {
+      throw new Error(`abandoned renderer stage must be a real directory: ${path}`);
+    }
+    removeExpectedDirectory(path, null, "abandoned renderer stage");
+  }
+  fsyncDirectory(rendererBuildRoot);
+}
+
+function validatePublicationPath(path, expectedNamePattern, label) {
+  if (
+    typeof path !== "string" ||
+    !isAbsolute(path) ||
+    path !== resolve(path) ||
+    dirname(path) !== rendererBuildRoot ||
+    !expectedNamePattern.test(basename(path))
+  ) {
+    throw new Error(`renderer publication journal ${label} path is invalid`);
   }
 }
 
-function publishRendererGeneration(generationDir, rendererDir) {
-  const existing = lstatOrNull(publishedRenderer);
-  let backupPath = null;
-  if (existing) {
-    assertOwnedDirectory(existing, "published Renderer");
-    backupPath = join(rendererBuildRoot, `.renderer-backup-${randomUUID()}`);
-    renameSync(publishedRenderer, backupPath);
+function validatePublicationJournal(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new Error("renderer publication transaction journal root must be an object");
   }
-  let newRendererPublished = false;
+  if (payload.schemaVersion !== publicationJournalSchemaVersion) {
+    throw new Error("unsupported renderer publication transaction journal schema");
+  }
+  if (!publicationPhases.has(payload.phase)) {
+    throw new Error("renderer publication transaction journal phase is invalid");
+  }
+  const paths = payload.paths;
+  if (!paths || typeof paths !== "object" || Array.isArray(paths)) {
+    throw new Error("renderer publication transaction journal paths must be an object");
+  }
+  if (paths.publicationParent !== rendererBuildRoot || paths.renderer !== publishedRenderer) {
+    throw new Error("renderer publication transaction journal fixed path is invalid");
+  }
+  validatePublicationPath(paths.stage, rendererStageNamePattern, "stage");
+  validatePublicationPath(paths.backup, rendererBackupNamePattern, "backup");
+
+  const oldRenderer = payload.oldRenderer;
+  if (
+    !oldRenderer ||
+    typeof oldRenderer !== "object" ||
+    typeof oldRenderer.present !== "boolean" ||
+    (oldRenderer.present
+      ? !validEncodedIdentity(oldRenderer.identity)
+      : oldRenderer.identity !== null)
+  ) {
+    throw new Error("renderer publication transaction journal old Renderer record is invalid");
+  }
+  if (!validEncodedIdentity(payload.newRendererIdentity)) {
+    throw new Error("renderer publication transaction journal new Renderer identity is invalid");
+  }
+  return payload;
+}
+
+function readPublicationJournal() {
+  const info = lstatOrNull(publicationJournalPath);
+  if (!info) return { info: null, payload: null };
+  if (info.size > publicationJournalMaxBytes) {
+    throw new Error("renderer publication transaction journal exceeds the size limit");
+  }
+  const record = readJsonFileNoFollow(
+    publicationJournalPath,
+    "renderer publication transaction journal",
+  );
+  if (typeof process.getuid === "function" && record.info.uid !== process.getuid()) {
+    throw new Error("renderer publication transaction journal is not owned by the current uid");
+  }
+  return { info: record.info, payload: validatePublicationJournal(record.value) };
+}
+
+function validateUncommittedPublicationJournalTemp() {
+  const before = lstatOrNull(publicationJournalTempPath);
+  if (!before) return null;
+  if (
+    before.isSymbolicLink() ||
+    !before.isFile() ||
+    (typeof process.getuid === "function" && before.uid !== process.getuid())
+  ) {
+    throw new Error(
+      "renderer publication transaction journal temp must be a regular non-symlink file owned by the current uid",
+    );
+  }
+  const descriptor = openSync(
+    publicationJournalTempPath,
+    constants.O_RDONLY | constants.O_NOFOLLOW,
+  );
   try {
-    renameSync(rendererDir, publishedRenderer);
-    newRendererPublished = true;
-    fsyncDirectory(rendererBuildRoot);
-  } catch (error) {
-    if (newRendererPublished) {
-      renameSync(publishedRenderer, rendererDir);
+    const opened = fstatSync(descriptor);
+    if (!sameIdentity(before, opened)) {
+      throw new Error("renderer publication transaction journal temp changed identity");
     }
-    if (backupPath) renameSync(backupPath, publishedRenderer);
+  } finally {
+    closeSync(descriptor);
+  }
+  return before;
+}
+
+function discardUncommittedPublicationJournalTemp() {
+  const tempInfo = validateUncommittedPublicationJournalTemp();
+  if (!tempInfo) return;
+  const current = lstatSync(publicationJournalTempPath);
+  if (!sameIdentity(tempInfo, current)) {
+    throw new Error("renderer publication transaction journal temp changed before cleanup");
+  }
+  unlinkSync(publicationJournalTempPath);
+  fsyncDirectory(rendererBuildRoot);
+}
+
+function persistPublicationJournal(payload) {
+  validatePublicationJournal(payload);
+  const encoded = `${JSON.stringify(payload)}\n`;
+  if (Buffer.byteLength(encoded) > publicationJournalMaxBytes) {
+    throw new Error("renderer publication transaction journal exceeds the size limit");
+  }
+  if (lstatOrNull(publicationJournalTempPath)) {
+    throw new Error("renderer publication transaction journal temp already exists");
+  }
+  const descriptor = openSync(
+    publicationJournalTempPath,
+    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+    0o600,
+  );
+  try {
+    writeFileSync(descriptor, encoded, "utf8");
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+  renameSync(publicationJournalTempPath, publicationJournalPath);
+  fsyncDirectory(rendererBuildRoot);
+}
+
+function removePublicationJournal() {
+  const record = readJsonFileNoFollow(
+    publicationJournalPath,
+    "renderer publication transaction journal",
+  );
+  const current = lstatSync(publicationJournalPath);
+  if (!sameIdentity(record.info, current)) {
+    throw new Error("renderer publication transaction journal changed before cleanup");
+  }
+  unlinkSync(publicationJournalPath);
+  fsyncDirectory(rendererBuildRoot);
+}
+
+function validateRendererGeneration(path, expectedIdentity, label) {
+  assertExpectedDirectory(path, expectedIdentity, label);
+  const manifestPath = join(path, "build-manifest.json");
+  const manifestRecord = readJsonFileNoFollow(manifestPath, `${label} build manifest`);
+  if (typeof process.getuid === "function" && manifestRecord.info.uid !== process.getuid()) {
+    throw new Error(`${label} build manifest is not owned by the current uid`);
+  }
+  const actual = manifestRecord.value;
+  const expected = buildRendererBuildManifest(repoRoot, path);
+  const expectedKeys = ["algorithm", "assetDigest", "schemaVersion", "sourceDigest"];
+  if (
+    !actual ||
+    typeof actual !== "object" ||
+    Array.isArray(actual) ||
+    JSON.stringify(Object.keys(actual).sort()) !== JSON.stringify(expectedKeys) ||
+    actual.schemaVersion !== expected.schemaVersion ||
+    actual.algorithm !== expected.algorithm ||
+    actual.sourceDigest !== expected.sourceDigest ||
+    actual.assetDigest !== expected.assetDigest
+  ) {
+    throw new Error(`${label} build manifest does not validate the complete generation`);
+  }
+}
+
+function inspectRecoveryDirectory(path, expectedIdentity, label) {
+  const info = lstatOrNull(path);
+  if (!info) return null;
+  assertExpectedDirectory(path, expectedIdentity, label);
+  return info;
+}
+
+function rollbackRendererPublication(payload) {
+  const { stage, backup } = payload.paths;
+  let rendererInfo = inspectRecoveryDirectory(
+    publishedRenderer,
+    null,
+    "published Renderer during rollback",
+  );
+  let stageInfo = inspectRecoveryDirectory(
+    stage,
+    payload.newRendererIdentity,
+    "private renderer stage during rollback",
+  );
+  let backupInfo = inspectRecoveryDirectory(
+    backup,
+    payload.oldRenderer.identity,
+    "private Renderer backup during rollback",
+  );
+
+  if (
+    rendererInfo &&
+    identityMatches(rendererInfo, payload.newRendererIdentity) &&
+    payload.oldRenderer.present &&
+    !backupInfo
+  ) {
+    throw new Error(
+      "cannot roll back the new Renderer because the committed old backup is no longer available",
+    );
+  }
+  if (rendererInfo && identityMatches(rendererInfo, payload.newRendererIdentity)) {
+    removeExpectedDirectory(
+      publishedRenderer,
+      payload.newRendererIdentity,
+      "new published Renderer during rollback",
+    );
+    rendererInfo = null;
+  }
+  if (rendererInfo && !identityMatches(rendererInfo, payload.oldRenderer.identity)) {
+    throw new Error("published Renderer has an unknown identity during rollback");
+  }
+
+  if (payload.oldRenderer.present) {
+    if (rendererInfo) {
+      if (backupInfo) {
+        throw new Error("duplicate old Renderer found during rollback");
+      }
+    } else {
+      if (!backupInfo) {
+        throw new Error("old Renderer backup is missing during rollback");
+      }
+      renameSync(backup, publishedRenderer);
+      backupInfo = null;
+    }
+  } else if (rendererInfo || backupInfo) {
+    throw new Error("unexpected old Renderer artifact during rollback");
+  }
+
+  if (stageInfo) {
+    removeExpectedDirectory(
+      stage,
+      payload.newRendererIdentity,
+      "private renderer stage during rollback",
+    );
+    stageInfo = null;
+  }
+  fsyncDirectory(rendererBuildRoot);
+  removePublicationJournal();
+}
+
+function runPublicationTestHook(phase) {
+  const hookPath = process.env.SEER_RENDERER_PUBLICATION_TEST_HOOK;
+  if (!hookPath || process.env.SEER_RENDERER_PUBLICATION_TEST_PHASE !== phase) return;
+  const result = spawnSync(process.execPath, [hookPath, phase], {
+    cwd: repoRoot,
+    env: process.env,
+    stdio: "inherit",
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(`renderer publication test hook exited with status ${result.status}`);
+  }
+}
+
+function finishCommittedRendererPublication(payload) {
+  const { stage, backup } = payload.paths;
+  validateRendererGeneration(
+    publishedRenderer,
+    payload.newRendererIdentity,
+    "new published Renderer",
+  );
+  if (lstatOrNull(stage)) {
+    throw new Error("private renderer stage still exists beside the published generation");
+  }
+
+  if (payload.phase !== "cleanup") {
+    payload.phase = "cleanup";
+    persistPublicationJournal(payload);
+  }
+  runPublicationTestHook("cleanup");
+
+  const backupInfo = lstatOrNull(backup);
+  if (backupInfo) {
+    if (!payload.oldRenderer.present) {
+      throw new Error("unexpected private Renderer backup during cleanup");
+    }
+    removeExpectedDirectory(
+      backup,
+      payload.oldRenderer.identity,
+      "private Renderer backup during cleanup",
+    );
     fsyncDirectory(rendererBuildRoot);
+  }
+  runPublicationTestHook("backup-cleaned");
+  removePublicationJournal();
+}
+
+function recoverRendererPublication() {
+  const { payload } = readPublicationJournal();
+  discardUncommittedPublicationJournalTemp();
+  if (!payload) return;
+
+  const { stage, backup } = payload.paths;
+  const rendererInfo = inspectRecoveryDirectory(
+    publishedRenderer,
+    null,
+    "published Renderer during recovery",
+  );
+  const stageInfo = inspectRecoveryDirectory(
+    stage,
+    payload.newRendererIdentity,
+    "private renderer stage during recovery",
+  );
+  inspectRecoveryDirectory(
+    backup,
+    payload.oldRenderer.identity,
+    "private Renderer backup during recovery",
+  );
+  if (rendererInfo && identityMatches(rendererInfo, payload.newRendererIdentity) && !stageInfo) {
+    try {
+      validateRendererGeneration(
+        publishedRenderer,
+        payload.newRendererIdentity,
+        "new published Renderer during recovery",
+      );
+    } catch (error) {
+      rollbackRendererPublication(payload);
+      return;
+    }
+    finishCommittedRendererPublication(payload);
+    return;
+  }
+  rollbackRendererPublication(payload);
+}
+
+function publishRendererStage(stagePath, stageInfo) {
+  const existing = lstatOrNull(publishedRenderer);
+  if (existing) assertOwnedDirectory(existing, "published Renderer");
+  const backupPath = join(
+    rendererBuildRoot,
+    `.renderer-backup-${randomUUID().replaceAll("-", "")}`,
+  );
+  const journal = {
+    schemaVersion: publicationJournalSchemaVersion,
+    phase: "prepared",
+    paths: {
+      publicationParent: rendererBuildRoot,
+      renderer: publishedRenderer,
+      stage: stagePath,
+      backup: backupPath,
+    },
+    oldRenderer: {
+      present: Boolean(existing),
+      identity: existing ? encodedIdentity(existing) : null,
+    },
+    newRendererIdentity: encodedIdentity(stageInfo),
+  };
+  persistPublicationJournal(journal);
+  runPublicationTestHook("prepared");
+
+  try {
+    if (existing) {
+      renameSync(publishedRenderer, backupPath);
+      fsyncDirectory(rendererBuildRoot);
+    }
+    journal.phase = "old-backed-up";
+    persistPublicationJournal(journal);
+    runPublicationTestHook("old-backed-up");
+
+    renameSync(stagePath, publishedRenderer);
+    fsyncDirectory(rendererBuildRoot);
+    journal.phase = "new-published";
+    persistPublicationJournal(journal);
+    runPublicationTestHook("new-published");
+    finishCommittedRendererPublication(journal);
+  } catch (error) {
+    recoverRendererPublication();
     throw error;
   }
-  if (backupPath) removeTreeNoFollow(backupPath);
-  rmdirSync(generationDir);
-  fsyncDirectory(rendererBuildRoot);
 }
 
 async function buildAndPublish(lock) {
   prepareBuildRoot();
-  cleanupAbandonedGenerations();
-  const token = randomUUID();
-  const generationDir = join(rendererBuildRoot, `.renderer-generation-${token}`);
-  const rendererDir = join(generationDir, "Renderer");
-  mkdirSync(generationDir, { mode: 0o700 });
+  recoverRendererPublication();
+  cleanupAbandonedStages();
+  const token = randomUUID().replaceAll("-", "");
+  const stagePath = join(rendererBuildRoot, `.renderer-stage-${token}`);
+  mkdirSync(stagePath, { mode: 0o700 });
+  let transactionStarted = false;
   try {
     const testBuilder = process.env.SEER_RENDERER_BUILD_TEST_BUILDER;
     if (testBuilder) {
-      await run(lock, process.execPath, [testBuilder, rendererDir]);
+      await run(lock, process.execPath, [testBuilder, stagePath]);
     } else {
       await run(
         lock,
         join(repoRoot, "node_modules", ".bin", "vite"),
-        ["build", "--config", "vite.standalone.config.ts", "--outDir", rendererDir],
-        { env: { ...process.env, SEER_RENDERER_PRIVATE_OUT_DIR: rendererDir } },
+        ["build", "--config", "vite.standalone.config.ts", "--outDir", stagePath],
+        { env: { ...process.env, SEER_RENDERER_PRIVATE_OUT_DIR: stagePath } },
       );
     }
-    const rendererInfo = lstatSync(rendererDir);
-    assertOwnedDirectory(rendererInfo, "private renderer generation");
-    const manifestPath = join(rendererDir, "build-manifest.json");
-    const manifest = buildRendererBuildManifest(repoRoot, rendererDir);
+    const stageInfo = assertExpectedDirectory(stagePath, null, "private renderer stage");
+    const manifestPath = join(stagePath, "build-manifest.json");
+    const manifest = buildRendererBuildManifest(repoRoot, stagePath);
     const descriptor = openSync(
       manifestPath,
       constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
@@ -493,10 +975,14 @@ async function buildAndPublish(lock) {
     } finally {
       closeSync(descriptor);
     }
-    fsyncDirectory(rendererDir);
-    publishRendererGeneration(generationDir, rendererDir);
+    fsyncDirectory(stagePath);
+    transactionStarted = true;
+    publishRendererStage(stagePath, stageInfo);
   } catch (error) {
-    if (lstatOrNull(generationDir)) removeTreeNoFollow(generationDir);
+    if (!transactionStarted && lstatOrNull(stagePath)) {
+      removeExpectedDirectory(stagePath, null, "failed private renderer stage");
+      fsyncDirectory(rendererBuildRoot);
+    }
     throw error;
   }
 }

@@ -1,6 +1,15 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  cpSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,6 +23,25 @@ import {
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = dirname(here);
+
+function buildFixtureCss(fixtureRepo, outputName) {
+  const outDir = join(fixtureRepo, outputName);
+  execFileSync(
+    join(repoRoot, "node_modules", ".bin", "vite"),
+    ["build", "--config", "vite.standalone.config.ts", "--outDir", outDir],
+    {
+      cwd: fixtureRepo,
+      encoding: "utf8",
+      env: { ...process.env, SEER_RENDERER_PRIVATE_OUT_DIR: outDir },
+      stdio: "pipe",
+    },
+  );
+  return readdirSync(join(outDir, "assets"))
+    .filter((name) => name.endsWith(".css"))
+    .sort()
+    .map((name) => readFileSync(join(outDir, "assets", name), "utf8"))
+    .join("\n");
+}
 
 /** Absolute paths (relative to repo root) excluded from the "no Glaze" source scan. */
 const EXCLUDED_SOURCE_FILES = new Set([
@@ -195,5 +223,46 @@ test("the standalone renderer builds a production bundle with no Glaze reference
       "expected a production Content-Security-Policy meta tag",
     );
     assert.doesNotMatch(html, /<script(?![^>]*\bsrc=)[^>]*>[^<]+<\/script>/, "no inline scripts");
+  }
+});
+
+test("Tailwind ignores class content outside declared renderer inputs but responds to renderer source", () => {
+  mkdirSync(join(repoRoot, "build"), { recursive: true });
+  const scratch = mkdtempSync(join(repoRoot, "build", "tailwind-source-scope-test-"));
+  const fixtureRepo = join(scratch, "repo");
+  try {
+    mkdirSync(fixtureRepo);
+    cpSync(join(repoRoot, "renderer"), join(fixtureRepo, "renderer"), { recursive: true });
+    cpSync(join(repoRoot, "standalone-window.html"), join(fixtureRepo, "standalone-window.html"));
+    cpSync(
+      join(repoRoot, "vite.standalone.config.ts"),
+      join(fixtureRepo, "vite.standalone.config.ts"),
+    );
+
+    const baseline = buildFixtureCss(fixtureRepo, "out-baseline");
+    writeFileSync(
+      join(fixtureRepo, "outside-only.tsx"),
+      'export const outside = <div className="bg-[#123456]" />;\n',
+    );
+    const outsideOnly = buildFixtureCss(fixtureRepo, "out-outside");
+    assert.equal(
+      outsideOnly,
+      baseline,
+      "a repository file outside the declared Tailwind/digest input scope must not alter emitted CSS",
+    );
+
+    writeFileSync(
+      join(fixtureRepo, "renderer", "tailwind-source-probe.tsx"),
+      'export const inside = <div className="text-[#abcdef]" />;\n',
+    );
+    const rendererChanged = buildFixtureCss(fixtureRepo, "out-renderer");
+    assert.notEqual(
+      rendererChanged,
+      baseline,
+      "a declared renderer TSX source must alter emitted CSS when it adds a class",
+    );
+    assert.match(rendererChanged, /#abcdef/i);
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
   }
 });

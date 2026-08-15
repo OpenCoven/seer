@@ -544,6 +544,32 @@ def read_small_json_at(parent_fd, name, label):
     return payload, before
 
 
+def validate_uncommitted_journal_temp(macos_fd):
+    before = lstat_at(macos_fd, TRANSACTION_JOURNAL_TEMP_FILE)
+    if before is None:
+        return None
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise PublicationError("transaction journal temporary file must be a regular non-symlink file")
+    if before.st_uid != os.geteuid():
+        raise PublicationError(
+            "transaction journal temporary file must be owned by uid {}".format(os.geteuid())
+        )
+    descriptor = os.open(
+        TRANSACTION_JOURNAL_TEMP_FILE,
+        os.O_RDONLY | O_NOFOLLOW,
+        dir_fd=macos_fd,
+    )
+    try:
+        verify_identity(
+            os.fstat(descriptor),
+            before,
+            "transaction journal temporary file",
+        )
+    finally:
+        os.close(descriptor)
+    return before
+
+
 def require_canonical_recorded_path(path, publication_parent, label):
     if not isinstance(path, str) or not os.path.isabs(path) or os.path.normpath(path) != path:
         raise PublicationError("transaction journal {} path is not canonical".format(label))
@@ -671,14 +697,6 @@ def persist_transaction_journal(macos_fd, payload):
 
 
 def load_transaction_journal(macos_fd, unsigned_fd, macos_path, unsigned_path):
-    temp_payload, temp_info = read_small_json_at(
-        macos_fd,
-        TRANSACTION_JOURNAL_TEMP_FILE,
-        "transaction journal temporary file",
-    )
-    if temp_payload is not None:
-        validate_transaction_journal(temp_payload, macos_path, unsigned_path)
-
     payload, journal_info = read_small_json_at(
         macos_fd,
         TRANSACTION_JOURNAL_FILE,
@@ -688,6 +706,7 @@ def load_transaction_journal(macos_fd, unsigned_fd, macos_path, unsigned_path):
         validate_transaction_journal(payload, macos_path, unsigned_path)
         validate_recovery_artifacts(payload, macos_fd, unsigned_fd)
 
+    temp_info = validate_uncommitted_journal_temp(macos_fd)
     if temp_info is not None:
         unlink_verified(macos_fd, TRANSACTION_JOURNAL_TEMP_FILE, temp_info)
         os.fsync(macos_fd)

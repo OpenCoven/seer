@@ -5,7 +5,7 @@
  * rather than depending on the Glaze host's build pipeline to auto-inject
  * anything (no styles from the Glaze package are imported here).
  */
-@import "tailwindcss";
+@import "tailwindcss" source(none);
 @import "@radix-ui/colors/gray.css";
 @import "@radix-ui/colors/gray-dark.css";
 @import "@radix-ui/colors/gray-alpha.css";
@@ -13,10 +13,9 @@
 @import "@radix-ui/colors/green.css";
 @import "@radix-ui/colors/green-dark.css";
 
-/* Tell Tailwind to scan all local renderer window files for class names */
-@source "./**/*.{ts,tsx}";
-@source not "./preload.ts";
-@source not "./dev/**/*";
+/* Keep Tailwind's scanner inside the renderer build-identity input scope. */
+@source "./**/*.{ts,tsx,html}";
+@source "../standalone-window.html";
 
 /*
  * Seer's small semantic token set, mapped into Tailwind's `--color-*`

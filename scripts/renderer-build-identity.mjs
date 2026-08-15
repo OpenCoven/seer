@@ -36,10 +36,12 @@ export const RENDERER_BUILD_MANIFEST_ALGORITHM = "sha256";
  * `compilerOptions` genuinely feed into how the standalone renderer is
  * type-checked/compiled — a change to it can change build output just as
  * much as a change to `tsconfig.standalone.json` itself. Tailwind v4 is
- * configured entirely in CSS (`@import "tailwindcss"`/`@theme`, see
- * `renderer/styles.css`) — there is no separate
- * `tailwind.config.*`/`postcss.config.*` file in this repo to also list;
- * every stylesheet that does exist already lives under `renderer/` below.
+ * configured entirely in CSS (`@import "tailwindcss" source(none)`,
+ * explicit `@source`, and `@theme`; see `renderer/styles.css`) — there is no
+ * separate `tailwind.config.*`/`postcss.config.*` file in this repo to also
+ * list. Every explicit Tailwind scan source is either under `renderer/` or
+ * the `standalone-window.html` entry listed below, so the scanner cannot read
+ * class content outside this digest's input scope.
  */
 const TOP_LEVEL_INPUT_FILES = [
   "standalone-window.html",

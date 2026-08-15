@@ -10,6 +10,9 @@ if (startedPath) writeFileSync(startedPath, `${process.pid}\n`);
 
 const delayMs = Number(process.env.SEER_RENDERER_BUILD_TEST_CHILD_DELAY_MS ?? "0");
 if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
+if (process.env.SEER_RENDERER_BUILD_TEST_FAIL === "1") {
+  throw new Error("injected renderer build failure");
+}
 
 mkdirSync(join(outputDir, "assets"), { recursive: true });
 writeFileSync(join(outputDir, "standalone-window.html"), '<script src="./assets/app.js"></script>\n');

@@ -156,6 +156,29 @@ function transactionArtifacts(fixtureRepo) {
   ];
 }
 
+function unpreparedJournal(fixtureRepo) {
+  const macosDir = join(fixtureRepo, "build", "macos");
+  const unsignedDir = join(macosDir, "unsigned");
+  return {
+    schemaVersion: 1,
+    phase: "staging",
+    paths: {
+      publicationParent: macosDir,
+      unsignedParent: unsignedDir,
+      app: join(unsignedDir, "Seer.app"),
+      provenance: join(macosDir, "standalone-build-provenance.json"),
+      stage: join(unsignedDir, `.seer-stage-${"1".repeat(32)}`),
+      appBackup: join(unsignedDir, `.seer-backup-${"2".repeat(32)}`),
+      provenanceTemp: join(macosDir, `.seer-provenance-${"3".repeat(32)}.json`),
+      provenanceBackup: join(macosDir, `.seer-provenance-backup-${"4".repeat(32)}.json`),
+    },
+    oldApp: { present: null, identity: null },
+    oldProvenance: { present: null, identity: null },
+    newAppIdentity: null,
+    newProvenanceIdentity: null,
+  };
+}
+
 test("publication atomically replaces the old app and writes private provenance outside unsigned/", () => {
   mkdirSync(join(repoRoot, "build"), { recursive: true });
   const scratch = mkdtempSync(join(repoRoot, "build", "safe-publication-success-"));
@@ -641,6 +664,140 @@ test("a malicious abandoned journal path is rejected without touching its canary
     assert.equal(readFileSync(canary, "utf8"), "do-not-touch\n");
     assert.equal(readFileSync(join(unsignedDir, "Seer.app", "Contents", "marker.txt"), "utf8"), "old\n");
     assert.equal(readFileSync(provenancePath, "utf8"), oldProvenance);
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test("every torn journal temp prefix is discarded as uncommitted, with or without an authoritative primary", () => {
+  mkdirSync(join(repoRoot, "build"), { recursive: true });
+  const scratch = mkdtempSync(join(repoRoot, "build", "safe-publication-torn-journal-"));
+  try {
+    for (const primaryPresent of [false, true]) {
+      const fixtureRepo = join(scratch, primaryPresent ? "with-primary" : "without-primary");
+      const sourceApp = join(scratch, "source", "Seer.app");
+      const derivedData = join(scratch, "derived-data");
+      makeFixtureApp(sourceApp, "new\n");
+      mkdirSync(derivedData, { recursive: true });
+
+      const lengthFor = [
+        () => 0,
+        () => 1,
+        (length) => Math.floor(length / 2),
+        (length) => length - 1,
+        (length) => length,
+      ];
+      for (const [index, journalLength] of lengthFor.entries()) {
+        const caseRepo = `${fixtureRepo}-${index}`;
+        const macosDir = join(caseRepo, "build", "macos");
+        const unsignedDir = join(macosDir, "unsigned");
+        const journal = `${JSON.stringify(unpreparedJournal(caseRepo))}\n`;
+        mkdirSync(unsignedDir, { recursive: true });
+        if (primaryPresent) {
+          writeFileSync(join(macosDir, ".seer-publication-transaction.json"), journal);
+        }
+        writeFileSync(
+          join(macosDir, ".seer-publication-transaction.new"),
+          journal.slice(0, journalLength(journal.length)),
+        );
+
+        const result = publish({ fixtureRepo: caseRepo, sourceApp, derivedData });
+        assert.equal(
+          result.status,
+          0,
+          `${primaryPresent ? "primary" : "no primary"}, prefix ${index} failed:\n${result.stderr}`,
+        );
+        assert.equal(
+          readFileSync(join(unsignedDir, "Seer.app", "Contents", "marker.txt"), "utf8"),
+          "new\n",
+        );
+        assert.deepEqual(transactionArtifacts(caseRepo), []);
+      }
+    }
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test("an uncommitted temp payload is never parsed as an authoritative path record", () => {
+  mkdirSync(join(repoRoot, "build"), { recursive: true });
+  const scratch = mkdtempSync(join(repoRoot, "build", "safe-publication-untrusted-temp-"));
+  try {
+    const fixtureRepo = join(scratch, "repo");
+    const sourceApp = join(scratch, "source", "Seer.app");
+    const derivedData = join(scratch, "derived-data");
+    const macosDir = join(fixtureRepo, "build", "macos");
+    const unsignedDir = join(macosDir, "unsigned");
+    const canary = join(scratch, "canary.txt");
+    const malicious = unpreparedJournal(fixtureRepo);
+    malicious.paths.stage = canary;
+    makeFixtureApp(sourceApp, "new\n");
+    mkdirSync(unsignedDir, { recursive: true });
+    mkdirSync(derivedData, { recursive: true });
+    writeFileSync(canary, "do-not-touch\n");
+    writeFileSync(
+      join(macosDir, ".seer-publication-transaction.new"),
+      `${JSON.stringify(malicious)}\n`,
+    );
+
+    const result = publish({ fixtureRepo, sourceApp, derivedData });
+    assert.equal(result.status, 0, `publication failed:\n${result.stderr}`);
+    assert.equal(readFileSync(canary, "utf8"), "do-not-touch\n");
+    assert.equal(readFileSync(join(unsignedDir, "Seer.app", "Contents", "marker.txt"), "utf8"), "new\n");
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test("a symlinked journal temp is rejected without touching its target", () => {
+  mkdirSync(join(repoRoot, "build"), { recursive: true });
+  const scratch = mkdtempSync(join(repoRoot, "build", "safe-publication-temp-symlink-"));
+  try {
+    const fixtureRepo = join(scratch, "repo");
+    const sourceApp = join(scratch, "source", "Seer.app");
+    const derivedData = join(scratch, "derived-data");
+    const macosDir = join(fixtureRepo, "build", "macos");
+    const canary = join(scratch, "canary.txt");
+    makeFixtureApp(sourceApp, "new\n");
+    mkdirSync(join(macosDir, "unsigned"), { recursive: true });
+    mkdirSync(derivedData, { recursive: true });
+    writeFileSync(canary, "do-not-touch\n");
+    symlinkSync(canary, join(macosDir, ".seer-publication-transaction.new"));
+
+    const result = publish({ fixtureRepo, sourceApp, derivedData });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /temporary|journal|symlink/i);
+    assert.equal(readFileSync(canary, "utf8"), "do-not-touch\n");
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test("an invalid primary journal fails closed instead of falling back to a valid temp", () => {
+  mkdirSync(join(repoRoot, "build"), { recursive: true });
+  const scratch = mkdtempSync(join(repoRoot, "build", "safe-publication-invalid-primary-"));
+  try {
+    const fixtureRepo = join(scratch, "repo");
+    const oldSource = join(scratch, "old-source", "Seer.app");
+    const newSource = join(scratch, "new-source", "Seer.app");
+    const derivedData = join(scratch, "derived-data");
+    const macosDir = join(fixtureRepo, "build", "macos");
+    const unsignedDir = join(macosDir, "unsigned");
+    makeFixtureApp(oldSource, "old\n");
+    makeFixtureApp(newSource, "new\n");
+    mkdirSync(fixtureRepo, { recursive: true });
+    mkdirSync(derivedData, { recursive: true });
+    assert.equal(publish({ fixtureRepo, sourceApp: oldSource, derivedData }).status, 0);
+    writeFileSync(join(macosDir, ".seer-publication-transaction.json"), '{"phase":');
+    writeFileSync(
+      join(macosDir, ".seer-publication-transaction.new"),
+      `${JSON.stringify(unpreparedJournal(fixtureRepo))}\n`,
+    );
+
+    const result = publish({ fixtureRepo, sourceApp: newSource, derivedData });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /journal|JSON/i);
+    assert.equal(readFileSync(join(unsignedDir, "Seer.app", "Contents", "marker.txt"), "utf8"), "old\n");
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }

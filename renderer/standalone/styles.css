@@ -10,7 +10,6 @@
  * only `ScrollPanel`'s own content region (`overflow-y-auto`, see
  * `renderer/ui/primitives.tsx`) owns scrolling.
  */
-@import "tailwindcss";
 @import "../styles.css";
 
 @layer base {
