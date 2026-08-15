@@ -2129,6 +2129,8 @@ git commit -m "ci: verify standalone macOS app"
 ## Task 16: Add signed packaging and deterministic release metadata
 
 **Files:**
+- Create `scripts/prepare-macos-release-input.sh`
+- Create `scripts/macos-release-input.py`
 - Create `scripts/package-macos-release.sh`
 - Create `scripts/write-release-manifest.mjs`
 - Create `tests/release-manifest.test.mjs`
@@ -2165,7 +2167,7 @@ Expected: FAIL because the manifest script does not exist.
 
 - [ ] **Step 3: Implement manifest and checksum generation**
 
-The script accepts explicit CLI arguments, reads artifact bytes, and writes
+The manifest script accepts explicit CLI arguments, reads artifact bytes, and writes
 stable two-space JSON. `SHA256SUMS` uses:
 
 ```text
@@ -2175,7 +2177,26 @@ stable two-space JSON. `SHA256SUMS` uses:
 Reject non-semantic versions, non-40-character source SHAs, unexpected
 artifact names, and notarization states other than `accepted`.
 
-- [ ] **Step 4: Implement signing and notarization script**
+- [ ] **Step 4: Implement the isolated preparation and signing contract**
+
+The credential-free preparation job runs
+`scripts/prepare-macos-release-input.sh`. It fails if any `APPLE_*` variable is
+set, builds from a clean exact `SOURCE_COMMIT`, runs the Task 14 boundary gate,
+and emits exactly:
+
+```text
+build/macos/release-input/Seer-unsigned-arm64.tar
+build/macos/release-input/unsigned-app-attestation.json
+```
+
+The signing job must execute on a distinct runner machine and receive those
+files only through workflow artifact transfer. It passes
+`UNSIGNED_APP_ARCHIVE`, `UNSIGNED_APP_ATTESTATION`, and the preparation job's
+`UNSIGNED_APP_SHA256` to `scripts/package-macos-release.sh`. That script never
+runs dependency installation, renderer/build tooling, project generation, or
+compilation. It validates archive bytes, traversal/link allowlists,
+attestation, source commit, recursive app digest, bundle identity, and exact
+arm64 before materializing any credential.
 
 Require:
 
@@ -2186,6 +2207,9 @@ APPLE_CERTIFICATE
 APPLE_CERTIFICATE_PASSWORD
 APPLE_SIGNING_IDENTITY
 APPLE_TEAM_ID
+UNSIGNED_APP_ARCHIVE
+UNSIGNED_APP_ATTESTATION
+UNSIGNED_APP_SHA256
 ```
 
 Select exactly one complete notarization set:
@@ -2200,15 +2224,17 @@ or:
 APPLE_ID + APPLE_PASSWORD + APPLE_TEAM_ID
 ```
 
-The script creates a temporary keychain, imports the certificate, builds the
-arm64 archive, signs with Hardened Runtime and timestamp, verifies with
+After input validation, the script creates a temporary keychain, imports the
+certificate, signs with Hardened Runtime and timestamp, verifies with
 `codesign --verify --deep --strict`, creates `Seer-notarization.zip` with
 `ditto -c -k --keepParent`, submits that ZIP and waits with `notarytool`,
 deletes the ZIP after acceptance, staples and validates the app, builds a
 compressed DMG with `hdiutil`, signs the DMG, submits the DMG to `notarytool`,
 staples and validates the DMG, checks both app and DMG with `spctl`, runs
-boundary checks, writes checksums/manifest, and deletes key material and the
-temporary keychain in an EXIT trap.
+boundary checks, and writes checksums/manifest. It explicitly destroys key
+material, the temporary keychain, API-key files, and in-memory credential
+variables before invoking repository Node code for final boundary checks or
+manifest generation; the EXIT trap repeats cleanup on every failure/signal.
 
 - [ ] **Step 5: Test failure paths without credentials**
 
@@ -2262,14 +2288,16 @@ on:
       - "v*.*.*"
 ```
 
-Use a protected `macos-release` environment. Grant the private workflow only
+Use a protected `macos-release` environment only on the signing job. Grant the private workflow only
 `contents: read` and `id-token: write`; use `RELEASES_REPO_TOKEN` only for
 commands against `OpenCoven/seer-releases`.
 
-Run on `macos-14-xlarge`, assert arm64, select Xcode 16.2 with the pinned setup
-action, install XcodeGen with Homebrew, and print both tool versions before the
-gate. Do not run the Glaze CLI on this clean release runner; run the shared
-TypeScript fixture suite and all standalone renderer/Swift/boundary tests.
+Run both jobs on separate `macos-14-xlarge` machines and assert arm64. In the
+preparation job only, select Xcode 16.2 with the pinned setup action, install
+XcodeGen with Homebrew, and print both tool versions before the gate. Do not
+run the Glaze CLI; run the shared TypeScript fixture suite and all standalone
+renderer/Swift/boundary tests in preparation. The signing job must not install
+XcodeGen, npm packages, or any build dependency.
 
 Immediately reject non-release tags with:
 
@@ -2280,20 +2308,30 @@ Immediately reject non-release tags with:
 }
 ```
 
-The job must:
+The workflow must use two distinct jobs and runner machines. The preparation
+job has no environment/secrets, uploads only the fixed unsigned archive and
+attestation, and exports the archive SHA-256 through trusted job output. The
+signing job downloads that artifact into a fresh workspace, checks out the
+same exact commit without installing dependencies, confirms the downloaded
+SHA-256 equals the preparation output, and invokes the signing-only script.
+Never combine these jobs, reuse a workspace, or use the same self-hosted runner.
+
+The jobs must:
 
 1. verify arm64 runner
 2. verify tag equals `MARKETING_VERSION`
 3. run the complete test/build/boundary gate
-4. call `package-macos-release.sh`
-5. create a draft release in `OpenCoven/seer-releases`
-6. upload only DMG, `SHA256SUMS`, `release-manifest.json`, and release notes
-7. download those assets into a fresh directory
-8. verify checksums, attach the downloaded DMG read-only with `hdiutil`, run
+4. call `prepare-macos-release-input.sh` without secrets
+5. transfer its two fixed outputs to a distinct signing runner
+6. call `package-macos-release.sh` with explicit archive, attestation, and SHA-256 inputs
+7. create a draft release in `OpenCoven/seer-releases`
+8. upload only DMG, `SHA256SUMS`, `release-manifest.json`, and release notes
+9. download those assets into a fresh directory
+10. verify checksums, attach the downloaded DMG read-only with `hdiutil`, run
    signature, Gatekeeper, Mach-O, dependency, source-map, path, and Glaze
    boundary checks against the mounted `Seer.app`, then detach it in an EXIT
    trap
-9. publish the draft only after successful re-verification
+11. publish the draft only after successful re-verification
 
 Use `gh release create --draft`, `gh release upload`, `gh release download`,
 and `gh release edit --draft=false` with `GH_REPO=OpenCoven/seer-releases`.

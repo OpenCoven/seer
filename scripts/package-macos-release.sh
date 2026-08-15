@@ -1,10 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 
+# Signing-only half of the release contract. Task 17 must run this in a fresh
+# job on a different machine/runner and download the two preparation artifacts.
+# Build tools are intentionally absent: a build and signing must never share a
+# user, checkout process tree, or machine.
+
 BUILD_ROOT=""
 LOCK_DIR=""
 RELEASE_DIR=""
 WORK_ROOT=""
+CREDENTIAL_ROOT=""
 KEYCHAIN_PATH=""
 CERTIFICATE_PATH=""
 API_KEY_PATH=""
@@ -16,20 +22,13 @@ DMG_MOUNTED=0
 MOUNT_POINT=""
 CLEANUP_STARTED=0
 
-cleanup() {
-  local status=$?
-  trap - EXIT HUP INT TERM
+fail() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+destroy_credentials() {
   set +e
-
-  if [[ "${CLEANUP_STARTED}" -eq 1 ]]; then
-    exit "${status}"
-  fi
-  CLEANUP_STARTED=1
-
-  if [[ "${DMG_MOUNTED}" -eq 1 && -n "${MOUNT_POINT}" ]]; then
-    hdiutil detach "${MOUNT_POINT}" >/dev/null 2>&1
-    DMG_MOUNTED=0
-  fi
   if [[ -n "${CERTIFICATE_PATH}" ]]; then
     rm -f "${CERTIFICATE_PATH}"
   fi
@@ -47,6 +46,47 @@ cleanup() {
     rm -f "${KEYCHAIN_PATH}"
     KEYCHAIN_CREATED=0
   fi
+  if [[ -n "${CREDENTIAL_ROOT}" ]]; then
+    rm -rf "${CREDENTIAL_ROOT}"
+  fi
+
+  SIGNING_CERTIFICATE_VALUE=""
+  SIGNING_CERTIFICATE_PASSWORD_VALUE=""
+  SIGNING_IDENTITY_VALUE=""
+  SIGNING_TEAM_ID_VALUE=""
+  NOTARY_API_ISSUER_VALUE=""
+  NOTARY_API_KEY_ID_VALUE=""
+  NOTARY_API_KEY_BASE64_VALUE=""
+  NOTARY_APPLE_ID_VALUE=""
+  NOTARY_APPLE_PASSWORD_VALUE=""
+  KEYCHAIN_PASSWORD=""
+  NOTARY_ARGS=()
+  unset \
+    SIGNING_CERTIFICATE_VALUE SIGNING_CERTIFICATE_PASSWORD_VALUE \
+    SIGNING_IDENTITY_VALUE SIGNING_TEAM_ID_VALUE \
+    NOTARY_API_ISSUER_VALUE NOTARY_API_KEY_ID_VALUE NOTARY_API_KEY_BASE64_VALUE \
+    NOTARY_APPLE_ID_VALUE NOTARY_APPLE_PASSWORD_VALUE KEYCHAIN_PASSWORD
+  for apple_variable in "${!APPLE_@}"; do
+    unset "${apple_variable}"
+  done
+  set -e
+}
+
+cleanup() {
+  local status=$?
+  trap - EXIT HUP INT TERM
+  set +e
+
+  if [[ "${CLEANUP_STARTED}" -eq 1 ]]; then
+    exit "${status}"
+  fi
+  CLEANUP_STARTED=1
+
+  if [[ "${DMG_MOUNTED}" -eq 1 && -n "${MOUNT_POINT}" ]]; then
+    hdiutil detach "${MOUNT_POINT}" >/dev/null 2>&1
+    DMG_MOUNTED=0
+  fi
+  destroy_credentials
   if [[ -n "${WORK_ROOT}" ]]; then
     rm -rf "${WORK_ROOT}"
   fi
@@ -69,11 +109,6 @@ trap 'handle_signal 1' HUP
 trap 'handle_signal 2' INT
 trap 'handle_signal 15' TERM
 
-fail() {
-  echo "error: $*" >&2
-  exit 1
-}
-
 require_value() {
   local name="$1"
   local value="$2"
@@ -83,72 +118,6 @@ require_value() {
   fi
 }
 
-run_unsigned_build() {
-  if [[ "$#" -ne 8 ]]; then
-    fail "internal unsigned build received invalid arguments"
-  fi
-
-  local repo_root="$1"
-  local project_spec="$2"
-  local xcodeproj="$3"
-  local derived_data_path="$4"
-  local archive_path="$5"
-  local signed_app="$6"
-  local version="$7"
-  local build_number="$8"
-  local signed_executable="${signed_app}/Contents/MacOS/Seer"
-
-  cd "${repo_root}"
-  xcodegen generate --spec "${project_spec}"
-  xcodebuild \
-    -project "${xcodeproj}" \
-    -scheme Seer \
-    -configuration Release \
-    -destination 'generic/platform=macOS' \
-    -derivedDataPath "${derived_data_path}" \
-    -archivePath "${archive_path}" \
-    ARCHS=arm64 \
-    ONLY_ACTIVE_ARCH=YES \
-    CODE_SIGNING_ALLOWED=NO \
-    CODE_SIGNING_REQUIRED=NO \
-    ENABLE_CODE_COVERAGE=NO \
-    CLANG_COVERAGE_MAPPING=NO \
-    ENABLE_HARDENED_RUNTIME=YES \
-    "MARKETING_VERSION=${version}" \
-    "CURRENT_PROJECT_VERSION=${build_number}" \
-    archive
-
-  if [[ ! -d "${signed_app}" || -L "${signed_app}" ]]; then
-    fail "xcodebuild did not produce a real Seer.app in the archive"
-  fi
-  if [[ ! -x "${signed_executable}" || -L "${signed_executable}" ]]; then
-    fail "archive is missing its real executable Contents/MacOS/Seer"
-  fi
-  if [[ "$(plutil -extract CFBundleShortVersionString raw -o - "${signed_app}/Contents/Info.plist")" != "${version}" ]]; then
-    fail "archive CFBundleShortVersionString does not match VERSION"
-  fi
-  if [[ "$(plutil -extract CFBundleVersion raw -o - "${signed_app}/Contents/Info.plist")" != "${build_number}" ]]; then
-    fail "archive CFBundleVersion does not match BUILD_NUMBER"
-  fi
-  if [[ "$(plutil -extract CFBundleIdentifier raw -o - "${signed_app}/Contents/Info.plist")" != "ai.opencoven.seer" ]]; then
-    fail "archive bundle identifier is not ai.opencoven.seer"
-  fi
-
-  strip -S "${signed_executable}"
-  if [[ "$(lipo -archs "${signed_executable}")" != "arm64" ]]; then
-    fail "release executable must contain exactly one arm64 slice"
-  fi
-}
-
-if [[ "${1:-}" == "--unsigned-build" ]]; then
-  shift
-  run_unsigned_build "$@"
-  exit 0
-fi
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
-
 if ! [[ "${VERSION:-}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
   fail "VERSION must be a stable semantic version in X.Y.Z form"
 fi
@@ -156,6 +125,8 @@ if ! [[ "${BUILD_NUMBER:-}" =~ ^[1-9][0-9]*$ ]]; then
   fail "BUILD_NUMBER must be a positive integer without leading zeros"
 fi
 
+# Keep the established missing-credential order before validating artifact
+# inputs, while still performing no filesystem side effect.
 require_value "APPLE_CERTIFICATE" "${APPLE_CERTIFICATE:-}" "signing"
 require_value "APPLE_CERTIFICATE_PASSWORD" "${APPLE_CERTIFICATE_PASSWORD:-}" "signing"
 require_value "APPLE_SIGNING_IDENTITY" "${APPLE_SIGNING_IDENTITY:-}" "signing"
@@ -192,11 +163,20 @@ fi
 if ! [[ "${WORKFLOW_RUN:-}" =~ ^[1-9][0-9]*$ ]]; then
   fail "WORKFLOW_RUN must be a positive decimal identifier without leading zeros"
 fi
+require_value "UNSIGNED_APP_ARCHIVE" "${UNSIGNED_APP_ARCHIVE:-}" "release-input"
+require_value "UNSIGNED_APP_ATTESTATION" "${UNSIGNED_APP_ATTESTATION:-}" "release-input"
+require_value "UNSIGNED_APP_SHA256" "${UNSIGNED_APP_SHA256:-}" "release-input"
+if ! [[ "${UNSIGNED_APP_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+  fail "UNSIGNED_APP_SHA256 must be a lowercase SHA-256 digest"
+fi
 
 RELEASE_VERSION="${VERSION}"
 RELEASE_BUILD_NUMBER="${BUILD_NUMBER}"
 RELEASE_SOURCE_COMMIT="${SOURCE_COMMIT}"
 RELEASE_WORKFLOW_RUN="${WORKFLOW_RUN}"
+RELEASE_INPUT_ARCHIVE="${UNSIGNED_APP_ARCHIVE}"
+RELEASE_INPUT_ATTESTATION="${UNSIGNED_APP_ATTESTATION}"
+RELEASE_INPUT_SHA256="${UNSIGNED_APP_SHA256}"
 SIGNING_CERTIFICATE_VALUE="${APPLE_CERTIFICATE}"
 SIGNING_CERTIFICATE_PASSWORD_VALUE="${APPLE_CERTIFICATE_PASSWORD}"
 SIGNING_IDENTITY_VALUE="${APPLE_SIGNING_IDENTITY}"
@@ -211,43 +191,112 @@ export -n \
   SIGNING_IDENTITY_VALUE SIGNING_TEAM_ID_VALUE \
   NOTARY_API_ISSUER_VALUE NOTARY_API_KEY_ID_VALUE NOTARY_API_KEY_BASE64_VALUE \
   NOTARY_APPLE_ID_VALUE NOTARY_APPLE_PASSWORD_VALUE
-
 for apple_variable in "${!APPLE_@}"; do
   unset "${apple_variable}"
 done
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
+
 for required_command in \
-  base64 codesign ditto grep hdiutil lipo mktemp node openssl plutil \
-  security spctl strip uname xcodebuild xcodegen xcrun
+  base64 codesign ditto git grep hdiutil lipo mktemp node openssl plutil \
+  security spctl uname xcrun
 do
   command -v "${required_command}" >/dev/null 2>&1 ||
     fail "required command not found on PATH: ${required_command}"
 done
+[[ -x /usr/bin/python3 ]] || fail "required system command not found: /usr/bin/python3"
 
-HOST_ARCH="$(uname -m)"
-if [[ "${HOST_ARCH}" != "arm64" ]]; then
+if [[ "$(uname -m)" != "arm64" ]]; then
   fail "signed macOS packaging requires an Apple Silicon (arm64) host"
+fi
+if [[ "$(git rev-parse --verify HEAD)" != "${RELEASE_SOURCE_COMMIT}" ]]; then
+  fail "SOURCE_COMMIT does not match the immutable signing checkout"
+fi
+if [[ -n "$(git status --porcelain=v1 --untracked-files=all)" ]]; then
+  fail "signing requires a clean checkout of SOURCE_COMMIT on its distinct runner"
 fi
 
 umask 077
-
 BUILD_ROOT="${REPO_ROOT}/build/macos"
 LOCK_DIR="${BUILD_ROOT}/.release-package.lock"
 RELEASE_DIR="${BUILD_ROOT}/release"
-
 mkdir -p "${BUILD_ROOT}"
 if ! mkdir "${LOCK_DIR}"; then
   fail "another macOS release packaging process holds ${LOCK_DIR}"
 fi
 LOCK_HELD=1
-
 WORK_ROOT="$(mktemp -d "${BUILD_ROOT}/.release-work.XXXXXXXX")"
-KEYCHAIN_PATH="${WORK_ROOT}/release-signing.keychain-db"
-CERTIFICATE_PATH="${WORK_ROOT}/developer-id.p12"
-API_KEY_PATH="${WORK_ROOT}/notary-api-key.p8"
-ARCHIVE_PATH="${WORK_ROOT}/Seer.xcarchive"
-DERIVED_DATA_PATH="${WORK_ROOT}/derived-data"
-SIGNED_APP="${ARCHIVE_PATH}/Products/Applications/Seer.app"
+
+VALIDATION_ROOT="${WORK_ROOT}/validation"
+UNSIGNED_ROOT="${WORK_ROOT}/unsigned"
+mkdir "${VALIDATION_ROOT}" "${UNSIGNED_ROOT}"
+NODE_BIN="$(command -v node)"
+SAFE_HOME="${HOME:-${WORK_ROOT}}"
+
+validate_release_input() {
+  local destination="$1"
+  /usr/bin/env -i \
+    PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+    HOME="${SAFE_HOME}" \
+    /usr/bin/python3 "${SCRIPT_DIR}/macos-release-input.py" validate \
+    --archive "${RELEASE_INPUT_ARCHIVE}" \
+    --attestation "${RELEASE_INPUT_ATTESTATION}" \
+    --expected-archive-sha256 "${RELEASE_INPUT_SHA256}" \
+    --expected-source-commit "${RELEASE_SOURCE_COMMIT}" \
+    --expected-version "${RELEASE_VERSION}" \
+    --expected-build-number "${RELEASE_BUILD_NUMBER}" \
+    --destination "${destination}"
+}
+
+run_repo_node() {
+  /usr/bin/env -i \
+    PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+    HOME="${SAFE_HOME}" \
+    "${NODE_BIN}" "$@"
+}
+
+# Validate an inert copy first. Repository JavaScript receives a minimal,
+# credential-free environment and is never run again until credential teardown.
+validate_release_input "${VALIDATION_ROOT}"
+VALIDATION_APP="${VALIDATION_ROOT}/Seer.app"
+VALIDATION_EXECUTABLE="${VALIDATION_APP}/Contents/MacOS/Seer"
+if [[ "$(plutil -extract CFBundleShortVersionString raw -o - "${VALIDATION_APP}/Contents/Info.plist")" != "${RELEASE_VERSION}" ]]; then
+  fail "unsigned app CFBundleShortVersionString does not match VERSION"
+fi
+if [[ "$(plutil -extract CFBundleVersion raw -o - "${VALIDATION_APP}/Contents/Info.plist")" != "${RELEASE_BUILD_NUMBER}" ]]; then
+  fail "unsigned app CFBundleVersion does not match BUILD_NUMBER"
+fi
+if [[ "$(plutil -extract CFBundleIdentifier raw -o - "${VALIDATION_APP}/Contents/Info.plist")" != "ai.opencoven.seer" ]]; then
+  fail "unsigned app bundle identifier is not ai.opencoven.seer"
+fi
+if [[ "$(lipo -archs "${VALIDATION_EXECUTABLE}")" != "arm64" ]]; then
+  fail "unsigned release executable must contain exactly one arm64 slice"
+fi
+run_repo_node "${SCRIPT_DIR}/check-release-boundary.mjs" \
+  --app "${VALIDATION_APP}" \
+  --forbid-path "${REPO_ROOT}" \
+  --forbid-path "${WORK_ROOT}"
+
+# Re-read, re-hash, and re-extract after the repository boundary process exits.
+# Mutable or mismatched artifact bytes cannot cross into the signing phase.
+validate_release_input "${UNSIGNED_ROOT}"
+rm -rf "${VALIDATION_ROOT}"
+SIGNED_APP="${UNSIGNED_ROOT}/Seer.app"
+SIGNED_EXECUTABLE="${SIGNED_APP}/Contents/MacOS/Seer"
+if [[ "$(plutil -extract CFBundleIdentifier raw -o - "${SIGNED_APP}/Contents/Info.plist")" != "ai.opencoven.seer" ]] ||
+  [[ "$(lipo -archs "${SIGNED_EXECUTABLE}")" != "arm64" ]]
+then
+  fail "unsigned app identity changed after boundary validation"
+fi
+
+# Nothing above this line creates a credential file, keychain, or child process
+# carrying signing values. Only trusted system signing/notary/DMG tools run
+# between this point and destroy_credentials.
+CREDENTIAL_ROOT="$(mktemp -d "${BUILD_ROOT}/.release-credentials.XXXXXXXX")"
+KEYCHAIN_PATH="${CREDENTIAL_ROOT}/release-signing.keychain-db"
+CERTIFICATE_PATH="${CREDENTIAL_ROOT}/developer-id.p12"
+API_KEY_PATH="${CREDENTIAL_ROOT}/notary-api-key.p8"
 APP_ZIP="${WORK_ROOT}/Seer-notarization.zip"
 DMG_ROOT="${WORK_ROOT}/dmg-root"
 DMG_NAME="Seer-v${RELEASE_VERSION}-arm64.dmg"
@@ -255,26 +304,6 @@ WORK_DMG="${WORK_ROOT}/${DMG_NAME}"
 MOUNT_POINT="${WORK_ROOT}/mounted-dmg"
 FINAL_STAGE="${WORK_ROOT}/release"
 ENTITLEMENTS_PATH="${REPO_ROOT}/apps/macos/Seer/Config/Seer.entitlements"
-PROJECT_SPEC="${REPO_ROOT}/apps/macos/Seer/project.yml"
-XCODEPROJ="${REPO_ROOT}/apps/macos/Seer/Seer.xcodeproj"
-
-UNSIGNED_BUILD_ARGS=(
-  --unsigned-build
-  "${REPO_ROOT}"
-  "${PROJECT_SPEC}"
-  "${XCODEPROJ}"
-  "${DERIVED_DATA_PATH}"
-  "${ARCHIVE_PATH}"
-  "${SIGNED_APP}"
-  "${RELEASE_VERSION}"
-  "${RELEASE_BUILD_NUMBER}"
-)
-if [[ -n "${SEER_RENDERER_LOCK_HELD:-}" ]]; then
-  /bin/bash "${BASH_SOURCE[0]}" "${UNSIGNED_BUILD_ARGS[@]}"
-else
-  node "${SCRIPT_DIR}/build-standalone-renderer.mjs" -- \
-    /bin/bash "${BASH_SOURCE[0]}" "${UNSIGNED_BUILD_ARGS[@]}"
-fi
 
 ORIGINAL_DEFAULT_KEYCHAIN="$(
   security default-keychain -d user |
@@ -361,20 +390,9 @@ submit_for_notarization() {
   )"; then
     fail "notarytool submission failed"
   fi
-  if ! printf "%s" "${response}" |
-    node -e '
-      let input = "";
-      process.stdin.setEncoding("utf8");
-      process.stdin.on("data", (chunk) => { input += chunk; });
-      process.stdin.on("end", () => {
-        try {
-          const result = JSON.parse(input);
-          process.exitCode = result.status === "Accepted" ? 0 : 1;
-        } catch {
-          process.exitCode = 1;
-        }
-      });
-    '
+  if ! /usr/bin/python3 -c \
+    'import json, sys; raise SystemExit(0 if json.load(sys.stdin).get("status") == "Accepted" else 1)' \
+    <<< "${response}"
   then
     fail "notarization result was not Accepted"
   fi
@@ -418,7 +436,11 @@ codesign --verify --strict --verbose=2 "${WORK_DMG}"
 spctl --assess --type execute --verbose=4 "${SIGNED_APP}"
 spctl --assess --type open --context context:primary-signature --verbose=4 "${WORK_DMG}"
 
-node "${SCRIPT_DIR}/check-release-boundary.mjs" \
+# Final signature/notarization gates passed. Erase every credential surface
+# before any repository JavaScript runs or a release artifact is published.
+destroy_credentials
+
+run_repo_node "${SCRIPT_DIR}/check-release-boundary.mjs" \
   --app "${SIGNED_APP}" \
   --forbid-path "${REPO_ROOT}" \
   --forbid-path "${WORK_ROOT}"
@@ -431,7 +453,7 @@ hdiutil attach \
   -nobrowse \
   -noautoopen \
   -mountpoint "${MOUNT_POINT}"
-node "${SCRIPT_DIR}/check-release-boundary.mjs" \
+run_repo_node "${SCRIPT_DIR}/check-release-boundary.mjs" \
   --dmg-root "${MOUNT_POINT}" \
   --forbid-path "${REPO_ROOT}" \
   --forbid-path "${WORK_ROOT}"
@@ -444,7 +466,7 @@ fi
 mkdir "${FINAL_STAGE}"
 cp -p "${WORK_DMG}" "${FINAL_STAGE}/${DMG_NAME}"
 chmod 0644 "${FINAL_STAGE}/${DMG_NAME}"
-node "${SCRIPT_DIR}/write-release-manifest.mjs" \
+run_repo_node "${SCRIPT_DIR}/write-release-manifest.mjs" \
   --version "${RELEASE_VERSION}" \
   --source-commit "${RELEASE_SOURCE_COMMIT}" \
   --workflow-run "${RELEASE_WORKFLOW_RUN}" \

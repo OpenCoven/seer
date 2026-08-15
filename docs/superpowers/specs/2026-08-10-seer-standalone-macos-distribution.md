@@ -416,30 +416,48 @@ App Store Connect API-key authentication is the default notarization path.
 fallback if API-key authentication is unavailable; the workflow selects one
 complete credential set and fails rather than mixing partial sets.
 
-The workflow creates a temporary keychain and deletes key material and the
-keychain in an `always()` cleanup step. Secret values are never written to
-artifacts or logs.
+Release preparation and signing are separate trust domains. Task 17 must use
+two distinct jobs on distinct runner machines; it must never reuse a
+self-hosted runner or workspace between them. The credential-free job runs
+`scripts/prepare-macos-release-input.sh`, which rejects every `APPLE_*`
+variable and publishes only `Seer-unsigned-arm64.tar` plus
+`unsigned-app-attestation.json`. The attestation binds the exact source commit,
+recursive app digest, arm64 architecture, bundle identifier, archive size, and
+archive SHA-256. The signing job downloads those files through the workflow
+artifact service and passes their paths and the preparation SHA-256 as
+`UNSIGNED_APP_ARCHIVE`, `UNSIGNED_APP_ATTESTATION`, and
+`UNSIGNED_APP_SHA256`.
+
+The signing job performs no dependency installation or build. It checks out
+the attested commit cleanly, validates and safely extracts the inert archive,
+runs the Task 14 boundary gate, and only then creates credential files and a
+temporary keychain. After notarization and signature checks it destroys the
+key files and keychain and unsets credential values before running repository
+Node code for final boundary scans or manifest generation. Secret values are
+never written to artifacts or logs.
 
 The release workflow:
 
-1. Checks out the exact private source tag.
-2. verifies the tag matches the app version.
-3. Runs the complete pull-request gate.
-4. Builds the production renderer without source maps.
-5. Archives an arm64 Release application for macOS 14+.
-6. Signs nested code and the app with Hardened Runtime and a secure timestamp.
-7. Verifies signatures with `codesign --verify --deep --strict`.
-8. Submits the app to `notarytool` and waits for acceptance.
-9. Staples and validates the notarization ticket.
-10. Builds and signs `Seer-vX.Y.Z-arm64.dmg`.
-11. Verifies Gatekeeper acceptance with `spctl`.
-12. Generates `SHA256SUMS` and a release manifest containing version, bundle
+1. Checks out the exact private source tag in a credential-free build job.
+2. Verifies the tag matches the app version and runs the complete pull-request gate.
+3. Builds the production renderer without source maps.
+4. Archives and boundary-checks an unsigned arm64 Release application for macOS 14+.
+5. Transfers only the attested unsigned archive and metadata to a fresh signing runner.
+6. Revalidates the archive, attestation, app digest, bundle identity, arm64 slice, and boundary before exposing credentials.
+7. Signs nested code and the app with Hardened Runtime and a secure timestamp.
+8. Verifies signatures with `codesign --verify --deep --strict`.
+9. Submits the app to `notarytool` and waits for acceptance.
+10. Staples and validates the notarization ticket.
+11. Builds and signs `Seer-vX.Y.Z-arm64.dmg`.
+12. Verifies Gatekeeper acceptance with `spctl`.
+13. Destroys signing material before final repository boundary/manifest code.
+14. Generates `SHA256SUMS` and a release manifest containing version, bundle
     identifier, source commit, workflow run, artifact hashes, and notarization
     result.
-13. Creates a draft release in `OpenCoven/seer-releases`.
-14. Uploads only the DMG, checksum file, release manifest, and release notes.
-15. Downloads and re-verifies every uploaded artifact.
-16. Publishes the release only after all checks pass.
+15. Creates a draft release in `OpenCoven/seer-releases`.
+16. Uploads only the DMG, checksum file, release manifest, and release notes.
+17. Downloads and re-verifies every uploaded artifact.
+18. Publishes the release only after all checks pass.
 
 The public release repository contains a product README and release metadata,
 not application source. Its automatically generated source archive therefore
