@@ -377,12 +377,60 @@ public final class AppSnapshotCoordinator {
         updateService: any UpdateChecking,
         sleeper: Sleeper = TaskSleeper()
     ) async -> AppSnapshotCoordinator {
+        let startupSnapshot = await loadStartupSnapshot(
+            settingsStore: settingsStore,
+            historyStore: historyStore,
+            updateService: updateService,
+            appVersion: appVersion
+        )
+
+        return makeWithScheduledUpdates(
+            settingsStore: settingsStore,
+            historyStore: historyStore,
+            power: power,
+            renderer: renderer,
+            clock: clock,
+            updateService: updateService,
+            sleeper: sleeper,
+            startupSnapshot: startupSnapshot
+        )
+    }
+
+    /// The shared first half of `makeAtStartupWithScheduledUpdates(...)`
+    /// above: loads `settingsStore`/`historyStore` exactly once each,
+    /// folds in every startup diagnostic (a corrupt/future-version/
+    /// unreadable settings or history file, plus any caller-supplied
+    /// `extraDiagnostics` — e.g. `AppDelegate.bootstrapProduction()`
+    /// folding in a failure to resolve its own Application Support
+    /// directory, rather than aborting bootstrap silently) with stable,
+    /// deduplicated, history-remapped ids, and returns the resulting
+    /// initial `AppSnapshot` — with `update` seeded purely from
+    /// `updateService.currentState()`'s already-cached value, never a
+    /// fresh network check (see `makeAtStartupWithScheduledUpdates`'s own
+    /// documentation above for why).
+    ///
+    /// Exposed as its own entry point — distinct from
+    /// `makeAtStartupWithScheduledUpdates(...)`, which simply calls this
+    /// and then `makeWithScheduledUpdates(...)` in sequence — so
+    /// `AppDelegate.bootstrapProduction()` can `await` exactly this load
+    /// *before* ever constructing any settings/history-dependent UI
+    /// (panel, status item, bridge): the app's required launch order is
+    /// accessory activation, then this load, then the coordinator/bridge/
+    /// panel/status item, in that order. Never called a second time for
+    /// the same store by any later step.
+    public static func loadStartupSnapshot(
+        settingsStore: SettingsStore,
+        historyStore: HistoryStore,
+        updateService: any UpdateChecking,
+        appVersion: String,
+        extraDiagnostics: [Diagnostic] = []
+    ) async -> AppSnapshot {
         let settingsResult = await settingsStore.load()
         _ = await historyStore.load()
         let historyDiagnostic = await historyStore.lastDiagnostic
         let historyStats = await historyStore.stats()
 
-        var diagnostics: [Diagnostic] = []
+        var diagnostics = extraDiagnostics
         if let settingsDiagnostic = settingsResult.diagnostic {
             diagnostics.append(settingsDiagnostic)
         }
@@ -398,14 +446,37 @@ public final class AppSnapshotCoordinator {
             lastScanAt: 0
         )
 
-        let snapshot = AppSnapshot(
+        return AppSnapshot(
             monitor: monitor,
             history: historyStats,
             update: await updateService.currentState(),
             diagnostics: dedupedByID(diagnostics),
             appVersion: appVersion
         )
+    }
 
+    /// The shared second half of `makeAtStartupWithScheduledUpdates(...)`
+    /// above: builds the fully wired coordinator/scheduler pair from an
+    /// already-computed `startupSnapshot` — see `loadStartupSnapshot(...)`
+    /// above — without ever loading `settingsStore`/`historyStore` again.
+    /// Deliberately synchronous (no `await` anywhere in its body): every
+    /// step it performs — allocating the coordinator/scheduler weak box,
+    /// constructing `UpdateScheduler`, and the coordinator's own plain
+    /// (non-async) initializer — is itself synchronous; only the
+    /// *loading* step this omits ever needs to await anything. Exists so
+    /// `AppDelegate.bootstrapProduction()` can build settings/history-
+    /// dependent UI (panel/status item) from `startupSnapshot` first, and
+    /// only then call this to finish constructing the coordinator itself.
+    static func makeWithScheduledUpdates(
+        settingsStore: SettingsStore,
+        historyStore: HistoryStore,
+        power: PowerAssertionService,
+        renderer: any AppSnapshotRendererSink,
+        clock: Clock,
+        updateService: any UpdateChecking,
+        sleeper: Sleeper = TaskSleeper(),
+        startupSnapshot: AppSnapshot
+    ) -> AppSnapshotCoordinator {
         let box = CoordinatorWeakBox()
         let scheduler = UpdateScheduler(
             clock: clock,
@@ -420,7 +491,7 @@ public final class AppSnapshotCoordinator {
             power: power,
             renderer: renderer,
             clock: clock,
-            initialSnapshot: snapshot,
+            initialSnapshot: startupSnapshot,
             updateService: updateService,
             updateScheduler: scheduler
         )
@@ -437,8 +508,26 @@ public final class AppSnapshotCoordinator {
     /// the app shell's own initial agent scan has already applied and its
     /// recurring monitor loop has already started, so a slow/hanging
     /// startup network check can never delay either of those.
+    ///
+    /// Rechecks `isShutDown` immediately after `checkForUpdates(force:)`
+    /// returns and *before* ever calling `updateScheduler.start()`.
+    /// `checkForUpdates(force:)` genuinely awaits (acquiring `gate`, then
+    /// the network round-trip itself), so `shutdown()` — which flags
+    /// `isShutDown` and calls `updateScheduler.stop()` synchronously,
+    /// ahead of its own `gate.acquire()` call, precisely so it need not
+    /// wait for whatever else is already queued or in flight — can fully
+    /// complete on some other concurrent caller entirely within that
+    /// window. Without this recheck, this call would resume from its own
+    /// `checkForUpdates(force:)` await and unconditionally start the
+    /// scheduler back up, undoing a shutdown that had already stopped it.
+    /// Reads `isShutDown` directly (no additional `gate` acquisition):
+    /// once `shutdown()` has set it, it can only ever have been set on
+    /// this same main actor, synchronously, with no way to un-set it
+    /// again — so a single read here needs no further serialization to be
+    /// race-free.
     public func performStartupUpdateCheckAndStartScheduler() async {
         await checkForUpdates(force: false)
+        guard !isShutDown else { return }
         await updateScheduler.start()
     }
 

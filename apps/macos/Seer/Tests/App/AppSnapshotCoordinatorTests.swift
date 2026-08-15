@@ -1237,6 +1237,74 @@ final class AppSnapshotCoordinatorTests: XCTestCase {
         )
     }
 
+    /// Reproduces the Task 12 race `performStartupUpdateCheckAndStartScheduler()`
+    /// must fence: the app shell calls it right after its own initial
+    /// scan/recurring loop have started (mirroring `AppDelegate
+    /// .bootstrapProduction()`), but shutdown begins — and fully
+    /// completes, stopping the scheduler — while that method's own
+    /// startup `checkForUpdates(force: false)` call is still genuinely
+    /// suspended inside the update service. Without rechecking
+    /// `isShutDown` immediately after that call returns and before ever
+    /// calling `updateScheduler.start()`, this method would resume and
+    /// unconditionally restart the scheduler shutdown had just stopped —
+    /// resurrecting periodic background checks after an orderly shutdown
+    /// already ran to completion.
+    func testPerformStartupUpdateCheckAndStartSchedulerNeverRestartsTheSchedulerAfterShutdownStoppedItWhileTheStartupCheckWasStillInFlight() async throws {
+        let updateService = SuspendableUpdateChecking()
+        let updateScheduler = FakeUpdateSchedulerControlling()
+        let (coordinator, _, _) = await makeCoordinator(
+            updateService: updateService,
+            updateScheduler: updateScheduler
+        )
+        // `makeAtStartup(...)` (via `makeCoordinator`) already starts the
+        // scheduler once, and its own construction-time check already
+        // consumed `SuspendableUpdateChecking`'s one auto-resolving call —
+        // establishing the baseline this test's own startup call/scheduler
+        // start must not exceed.
+        let startCallCountBeforeStartupPhase = updateScheduler.startCallCount
+        XCTAssertEqual(startCallCountBeforeStartupPhase, 1)
+
+        // Mirrors `AppDelegate.bootstrapProduction()`'s own step (6): the
+        // startup update check/scheduler start, called once the initial
+        // scan and recurring monitor loop have already begun. Its
+        // `checkForUpdates(force: false)` call passes the pre-await
+        // `!isShutDown` guard and calls through to the update service,
+        // whose response genuinely never arrives until this test resolves
+        // it below.
+        let startupTask = Task {
+            await coordinator.performStartupUpdateCheckAndStartScheduler()
+        }
+        await updateService.waitForCall()
+
+        // Shutdown is requested next — and, being able to complete
+        // without waiting for its own turn at `gate` for the parts that
+        // matter here, stops the scheduler and finishes entirely while
+        // the startup check above is still suspended.
+        let shutdownTask = Task {
+            try await coordinator.shutdown()
+        }
+        for _ in 0..<50 { await Task.yield() }
+        XCTAssertEqual(
+            updateScheduler.stopCallCount, 1,
+            "shutdown must stop the scheduler immediately, without waiting for the still-in-flight startup check to release the gate"
+        )
+
+        // Only now does the long-suspended startup check resolve.
+        await updateService.resolve(with: UpdateState(
+            checking: false,
+            availableVersion: nil,
+            releaseURL: nil,
+            lastCheckedAt: 1_700_000_000_000
+        ))
+        await startupTask.value
+        try await shutdownTask.value
+
+        XCTAssertEqual(
+            updateScheduler.startCallCount, startCallCountBeforeStartupPhase,
+            "the startup phase must never (re)start the scheduler once shutdown has already stopped it, even after its own in-flight check resolves"
+        )
+    }
+
     /// The `setIncludePrereleaseUpdates` counterpart of
     /// `testShutdownFlagsAnAlreadyQueuedScheduledCheckSoItNeverNetworkChecksOrPublishesAfterward`:
     /// a tray checkbox toggle already queued behind `gate` when

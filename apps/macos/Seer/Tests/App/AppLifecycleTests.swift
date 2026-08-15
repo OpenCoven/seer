@@ -474,4 +474,64 @@ final class AppLifecycleTests: XCTestCase {
         )
         XCTAssertEqual(fakeMonitor.stopCallCount, 1)
     }
+
+    /// Reproduces the lifecycle-fencing gap this fix closes: quit begins
+    /// while `beginMonitoring()`'s own initial scan is still suspended
+    /// inside `agentMonitor.scan()` — exactly the scenario
+    /// `testScanInFlightWhenTerminationBeginsNeverAppliesEvenAfterShutdownCompletes`
+    /// already covers for the *applied-scan* side of this race — but this
+    /// test instead asserts that `beginMonitoring()` must never go on to
+    /// start the recurring `scanLoopTask` at all once shutdown has
+    /// already completed by the time that initial scan finally resolves.
+    /// Without a `hasShutDown` check between the initial scan and
+    /// `startScanLoop(...)`, the loop would still start — resurrecting
+    /// monitoring work after an orderly shutdown already ran to
+    /// completion (stopped `agentMonitor`, shut down the coordinator,
+    /// cancelled bridge handlers) — even though nothing would apply its
+    /// *results* thanks to the already-tested `hasShutDown` guard inside
+    /// `performScanTick`. Detected deterministically here by releasing
+    /// the (otherwise indefinitely gated) sleeper afterward: if a loop
+    /// task had incorrectly started, it would immediately resume from its
+    /// sleep and dispatch a second `agentMonitor.scan()` call, bumping
+    /// `scanCallCount` past 1 the instant that scan is entered — this
+    /// fake increments its counter before ever awaiting a release, so no
+    /// arbitrary timing race is needed to observe the difference.
+    func testShutdownDuringInitialScanPreventsTheScanLoopFromEverStarting() async {
+        let fakeMonitor = GatedAgentMonitorControlling(
+            state: AgentMonitorState(active: true, keepingAwake: true, keepAwakeMode: .system, agents: [agent()], lastScanAt: 999)
+        )
+        let fakeCoordinator = FakeAppSnapshotCoordinating()
+        let sleeper = GatedSleeper()
+        let delegate = AppDelegate(coordinator: fakeCoordinator, agentMonitor: fakeMonitor, sleeper: sleeper)
+
+        let monitoringTask = Task { await delegate.beginMonitoring() }
+        await waitUntil { fakeMonitor.scanCallCount >= 1 }
+
+        var replies: [Bool] = []
+        _ = delegate.beginTermination { success in replies.append(success) }
+        await waitUntil { fakeCoordinator.shutdownCallCount == 1 }
+        await waitUntil { !replies.isEmpty }
+
+        // Only now let the still in-flight initial scan resolve — shutdown
+        // has already fully completed by this point. `beginMonitoring()`
+        // must observe `hasShutDown` immediately afterward and return
+        // without ever calling `startScanLoop`.
+        fakeMonitor.releaseScan()
+        await monitoringTask.value
+
+        // Wake whatever sleep a (bug-permitted) scan loop would be
+        // suspended in; if the loop had incorrectly started, this would
+        // trigger its second scan tick right away.
+        await sleeper.release()
+        try? await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertEqual(
+            fakeMonitor.scanCallCount, 1,
+            "no scan loop may start once shutdown has already begun, even once the in-flight initial scan finally resolves"
+        )
+        XCTAssertTrue(
+            fakeCoordinator.appliedScans.isEmpty,
+            "the still in-flight initial scan must not have applied either, once shutdown already began"
+        )
+    }
 }

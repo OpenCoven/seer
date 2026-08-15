@@ -55,6 +55,18 @@ final class MulticastRendererSink: AppSnapshotRendererSink {
     }
 }
 
+/// Diagnostic ids `AppDelegate.bootstrapProduction()` folds directly into
+/// the coordinator's own startup diagnostics — distinct from every id
+/// `AppSnapshotCoordinator`/`AtomicJSONStore` surface themselves — for
+/// bootstrap-level failures that must still let the app launch, visibly
+/// flagged, rather than aborting silently before any UI exists at all.
+enum AppBootstrapDiagnosticID {
+    /// Emitted when the real, user-domain Application Support directory
+    /// could not be resolved at all, so `bootstrapProduction()` fell back
+    /// to a temporary directory for settings/history instead.
+    static let applicationSupportUnresolved = "bootstrap.application-support.unresolved"
+}
+
 /// Root application delegate. Wires every service from Tasks 2–11 into the
 /// real menu-bar app shell: an accessory-activation launch that loads
 /// settings/history, builds the coordinator/bridge/panel/status item,
@@ -129,21 +141,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Production bootstrap
 
-    /// The real launch sequence, in the exact order the spec requires: (1)
-    /// accessory activation is already set by `ApplicationRuntime.run()`
-    /// before `NSApplication.run()` ever dispatches this method, and
-    /// reasserted here defensively; (2) settings/history are loaded
-    /// exactly once each — inside `AppSnapshotCoordinator
-    /// .makeAtStartupWithScheduledUpdates`, never a second time by this
-    /// method itself — while the coordinator/bridge/panel/status item are
-    /// created *without* performing any update-check network request or
-    /// starting the periodic update scheduler; (3) `beginMonitoring()`
-    /// then performs the initial agent scan/apply and (4) begins the
-    /// recurring three-second monitor loop; only once both of those have
-    /// happened does (5) `coordinator.performStartupUpdateCheckAndStartScheduler()`
-    /// run Seer's one-time startup update check and start the periodic
+    /// The real launch sequence, in the exact order the spec requires:
+    /// (1) accessory activation is already set by `ApplicationRuntime
+    /// .run()` before `NSApplication.run()` ever dispatches this method,
+    /// and reasserted here defensively; (2) settings/history are loaded
+    /// exactly once each — via `AppSnapshotCoordinator
+    /// .loadStartupSnapshot(...)`, awaited directly by this method,
+    /// before any settings/history-dependent UI exists at all — with any
+    /// bootstrap-level failure (e.g. an unresolvable Application Support
+    /// directory) folded in as a startup diagnostic rather than aborting
+    /// silently; (3) only once that load has completed are the panel,
+    /// status item, bridge, and coordinator (via `AppSnapshotCoordinator
+    /// .makeWithScheduledUpdates(...)`, which never reloads either store)
+    /// actually constructed — performing no update-check network request
+    /// and starting no scheduler yet; (4) `beginMonitoring()` then
+    /// performs the initial agent scan/apply and (5) begins the recurring
+    /// three-second monitor loop; only once both of those have happened,
+    /// and only if shutdown has not already begun in the meantime, does
+    /// (6) `coordinator.performStartupUpdateCheckAndStartScheduler()` run
+    /// Seer's one-time startup update check and start the periodic
     /// scheduler — so a slow/hanging network request can never delay the
-    /// menu bar icon or panel showing real monitoring state.
+    /// menu bar icon or panel showing real monitoring state. Because step
+    /// (2) genuinely awaits disk I/O before any tray icon exists, a quit
+    /// requested during that narrow window will simply find no tray to
+    /// show at all until this method reaches step (3) — the approved
+    /// tradeoff for never showing UI ahead of the state it depends on.
     private func bootstrapProduction() async {
         NSApp.setActivationPolicy(.accessory)
         NSApp.mainMenu = AppMainMenuBuilder.build(appName: "Seer") { [weak self] in
@@ -153,17 +175,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0.0"
         let clock = SystemClock()
 
+        // Resolves the real Application Support directory, falling back
+        // to a temporary directory — rather than aborting bootstrap
+        // silently — if it cannot be resolved at all; the failure is
+        // folded into the coordinator's own startup diagnostics below so
+        // it is still visibly surfaced once the UI exists.
+        var bootstrapDiagnostics: [Diagnostic] = []
         let applicationSupportDirectory: URL
+        do {
+            applicationSupportDirectory = try SettingsFileLocation.resolveApplicationSupportDirectory()
+        } catch {
+            applicationSupportDirectory = FileManager.default.temporaryDirectory
+            bootstrapDiagnostics.append(Diagnostic(
+                id: AppBootstrapDiagnosticID.applicationSupportUnresolved,
+                message: "Failed to resolve the Application Support directory; falling back to a temporary location: \(error)",
+                occurredAt: clock.nowMilliseconds()
+            ))
+        }
+
         let settingsURL: URL
         let historyURL: URL
         do {
-            applicationSupportDirectory = try SettingsFileLocation.resolveApplicationSupportDirectory()
             settingsURL = try SettingsFileLocation.settingsFileURL(applicationSupportDirectory: applicationSupportDirectory)
             historyURL = try HistoryFileLocation.historyFileURL(applicationSupportDirectory: applicationSupportDirectory)
         } catch {
-            // Without a resolvable Application Support location there is
-            // nowhere durable to persist settings/history at all; the app
-            // cannot usefully continue past this point.
+            // Even the fallback location above could not be prepared —
+            // there is truly nowhere to persist settings/history at all,
+            // so no `SettingsStore`/`HistoryStore` can even be
+            // constructed; the app cannot usefully continue past this
+            // point.
             return
         }
 
@@ -178,17 +218,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             currentVersion: appVersion
         )
 
+        // Step (2) of the required launch order: settings/history are
+        // loaded exactly once each, here, before any panel/status item/
+        // bridge — every one of which is genuine user-visible UI — is
+        // ever constructed. `startupSnapshot` seeds both the coordinator
+        // built below and the status item's initial prerelease-updates
+        // toggle; no later step ever reloads either store.
+        let startupSnapshot = await AppSnapshotCoordinator.loadStartupSnapshot(
+            settingsStore: settingsStore,
+            historyStore: historyStore,
+            updateService: updateService,
+            appVersion: appVersion,
+            extraDiagnostics: bootstrapDiagnostics
+        )
+
         let rendererRoot = SeerRendererRoot(url: Bundle.main.resourceURL!.appendingPathComponent("Renderer", isDirectory: true))
         let panel = PanelController(rendererRoot: rendererRoot, clock: clock)
         let rendererSink = RendererEventSink(javaScriptCaller: panel.webView)
 
-        // `includePrereleaseUpdates` starts at its default (`false`) here
-        // and is corrected immediately below, once the coordinator factory
-        // has actually loaded settings — this status item is never shown
-        // to the user before then, since building its menu requires an
-        // explicit later click. Reading `initialSettings` via a second,
-        // separate `settingsStore.load()` call here (as before) would
-        // re-read the settings file from disk a second time for no reason.
         let statusItem = StatusItemController(
             statusItem: NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength),
             actions: StatusItemController.Actions(
@@ -198,26 +245,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 viewLatestRelease: { [weak self] in self?.requestOpenLatestRelease() },
                 quit: { [weak self] in self?.requestQuit() }
             ),
-            initialSnapshot: .empty(version: appVersion),
-            includePrereleaseUpdates: false
+            initialSnapshot: startupSnapshot,
+            includePrereleaseUpdates: await settingsStore.current.includePrereleaseUpdates
         )
 
         let broadcastSink = MulticastRendererSink(sinks: [rendererSink, statusItem])
 
-        // Loads settings/history exactly once each and builds the
-        // coordinator/bridge target — performing no update-check network
-        // request and starting no scheduler yet (see this method's own
-        // documentation above for why).
-        let coordinator = await AppSnapshotCoordinator.makeAtStartupWithScheduledUpdates(
+        // Builds the coordinator/bridge target from the already-loaded
+        // `startupSnapshot` — never a second settings/history load —
+        // performing no update-check network request and starting no
+        // scheduler yet (see this method's own documentation above for
+        // why).
+        let coordinator = AppSnapshotCoordinator.makeWithScheduledUpdates(
             settingsStore: settingsStore,
             historyStore: historyStore,
             power: power,
             renderer: broadcastSink,
             clock: clock,
-            appVersion: appVersion,
-            updateService: updateService
+            updateService: updateService,
+            startupSnapshot: startupSnapshot
         )
-        statusItem.apply(includePrereleaseUpdates: await settingsStore.current.includePrereleaseUpdates)
 
         let router = StandaloneBridgeCommandRouter(
             snapshotGet: {
@@ -280,7 +327,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Only now — after the initial agent scan has applied and the
         // recurring monitor loop has started — run Seer's one-time
-        // startup update check and start the periodic scheduler.
+        // startup update check and start the periodic scheduler; but
+        // only if shutdown has not already begun in the meantime (e.g.
+        // quit requested while the initial scan above was still in
+        // flight). `hasShutDown` is set synchronously, ahead of any
+        // await, the instant `performOrderlyShutdownOnce()` begins (see
+        // that method's own documentation), so this check reliably
+        // observes a shutdown that started at any point up to and
+        // including `beginMonitoring()`'s own await above. Once
+        // shutdown has begun, `coordinator.shutdown()` may already have
+        // stopped the scheduler; starting a fresh network check/
+        // scheduler run here would silently undo that.
+        guard !hasShutDown else { return }
         await coordinator.performStartupUpdateCheckAndStartScheduler()
     }
 
@@ -319,11 +377,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Monitor scan loop (steps 4 & 5)
 
     /// Performs the initial agent scan (step 4), then begins the recurring
-    /// three-second monitor loop (step 5). Internal (not `private`) so
-    /// `AppLifecycleTests` can drive it directly against injected fakes.
+    /// three-second monitor loop (step 5) — unless shutdown has already
+    /// begun by the time the initial scan returns. `hasShutDown` is set
+    /// synchronously, ahead of any await, the instant
+    /// `performOrderlyShutdownOnce()` begins (see that method's own
+    /// documentation), so a quit requested while the initial scan above
+    /// was still in flight is reliably observed here, immediately after
+    /// that scan resolves and before the recurring loop is ever started.
+    /// Without this check, `startScanLoop` would still start the
+    /// recurring loop even though `performOrderlyShutdownOnce()` may
+    /// already have stopped `agentMonitor`/`coordinator` and finished
+    /// running — resurrecting monitoring work after shutdown. Internal
+    /// (not `private`) so `AppLifecycleTests` can drive it directly
+    /// against injected fakes.
     func beginMonitoring() async {
         guard let agentMonitor, let coordinator else { return }
         await performScanTick(agentMonitor: agentMonitor, coordinator: coordinator)
+        guard !hasShutDown else { return }
         startScanLoop(agentMonitor: agentMonitor, coordinator: coordinator)
     }
 
