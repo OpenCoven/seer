@@ -402,6 +402,7 @@ case "${MODE}" in
     [[ -f "${VERIFIED_STATE}" && ! -L "${VERIFIED_STATE}" ]] ||
       fail "verified release state is missing or unsafe"
 
+    verify_remote_lock
     response_metadata="$(rest_get_release "${STATE_WORK_DIR}/publish")"
     downloads_dir="$(download_assets "${response_metadata}" "${STATE_WORK_DIR}/publish")"
     release_id="$(
@@ -412,7 +413,6 @@ case "${MODE}" in
     [[ "${release_id}" =~ ^[1-9][0-9]*$ ]] ||
       fail "verified release binding has an invalid shape"
 
-    verify_remote_lock
     patch_response="${STATE_WORK_DIR}/publish-patch.json"
     [[ ! -e "${patch_response}" && ! -L "${patch_response}" ]] ||
       fail "publish response path must not preexist"
@@ -426,7 +426,6 @@ case "${MODE}" in
       "${GITHUB_API_URL:-https://api.github.com}/repos/${GH_REPO}/releases/${release_id}" ||
       fail "supported release publish request failed"
 
-    verify_remote_lock
     post_metadata="$(rest_get_release "${STATE_WORK_DIR}/post-publish")"
     post_downloads="$(download_assets "${post_metadata}" "${STATE_WORK_DIR}/post-publish")"
     node "${STATE_HELPER}" compare-published \
