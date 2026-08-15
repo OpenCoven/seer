@@ -81,6 +81,32 @@ public protocol AppSnapshotRendererSink: AnyObject {
     func emit(_ snapshot: AppSnapshot)
 }
 
+/// The `AppSnapshotCoordinator` operations Task 12's app shell (`AppDelegate`,
+/// its scan loop, and orderly termination) depends on. Abstracted behind a
+/// protocol — rather than the shell depending on the concrete `final class`
+/// directly — purely for testability: `AppLifecycleTests` can substitute a
+/// scripted fake coordinator to assert exactly when the shell scans, applies
+/// results, and shuts down, without standing up a real `SettingsStore`/
+/// `HistoryStore`/`PowerAssertionService`/`UpdateService` stack for every
+/// lifecycle test. `AppSnapshotCoordinator` conforms via the extension
+/// immediately below; production code always uses that real conformance.
+@MainActor
+public protocol AppSnapshotCoordinating: AnyObject {
+    var snapshot: AppSnapshot { get }
+    func applyScan(_ agents: [ActiveAgent], scannedAt: Int64) async
+    func applyScanFailure(occurredAt: Int64) async
+    func setKeepAwakeMode(_ mode: KeepAwakeMode) async throws
+    func clearHistory() async throws
+    @discardableResult
+    func checkForUpdates(force: Bool) async -> Bool
+    func setIncludePrereleaseUpdates(_ value: Bool) async throws
+    @discardableResult
+    func openLatestRelease() async -> Bool
+    func shutdown() async throws
+}
+
+extension AppSnapshotCoordinator: AppSnapshotCoordinating {}
+
 /// The single main-actor authority for Seer's visible state. Owns an
 /// immutable-per-publication `AppSnapshot`, cooperates with `SettingsStore`
 /// and `HistoryStore` (both already independently testable via their own
