@@ -79,12 +79,11 @@ public enum UpdateCheckError: Error, Equatable, Sendable {
 }
 
 /// Thrown by `UpdateService.setIncludePrerelease(_:)` only when the
-/// include-prerelease toggle did not commit. A committed rename followed
-/// by a failed directory sync uses
-/// `SetIncludePrereleaseDurabilityUncertainError` instead. The forced
-/// re-check against the newly selected stream this
-/// function otherwise always performs is never even attempted in that
-/// case, since there is nothing new to check against. Wraps the
+/// include-prerelease toggle did not commit at all (no rename ever
+/// happened). A committed rename followed by a failed directory sync uses
+/// `SetIncludePrereleaseDurabilityUncertainError` instead — which, unlike
+/// this case, still goes on to run the forced re-check below, since the
+/// newly selected stream's toggle is in fact durably in place. Wraps the
 /// underlying `SettingsStore`/`AtomicJSONStore` failure verbatim (itself
 /// always a `StorageError` — see `SettingsStore.setIncludePrereleaseUpdates
 /// (_:)`) so callers can inspect it, while still being able to tell a
@@ -100,13 +99,40 @@ public struct SetIncludePrereleasePersistError: Error, Equatable, Sendable {
 }
 
 /// The prerelease toggle reached the destination file, but syncing its
-/// containing directory failed. This is committed state, not a failed write;
-/// callers must adopt the value while keeping the durability warning visible.
+/// containing directory failed. This is committed state, not a failed
+/// write: the toggle is durably in place regardless, so
+/// `setIncludePrerelease(_:)` still performs its mandatory forced
+/// `check(force: true)` against the newly selected stream exactly as it
+/// would on an ordinary commit — a durability warning is a reason to keep
+/// the warning visible, never a reason to skip the check the toggle
+/// switch itself demands. `checkOutcome` carries whatever that check
+/// actually did (a fresh `UpdateState` on success, or a description of
+/// whatever it threw on failure) so a caller can adopt/report both the
+/// durability warning *and* the check's own result — neither ever
+/// discarding the other. (Previously this was thrown immediately, before
+/// the forced check was ever attempted, silently skipping the request
+/// whenever directory durability alone was uncertain.)
 public struct SetIncludePrereleaseDurabilityUncertainError: Error, Equatable, Sendable {
-    public let underlying: StorageError
+    /// What the mandatory forced `check(force: true)` this error's
+    /// durability warning is paired with actually resolved to.
+    public enum CheckOutcome: Equatable, Sendable {
+        /// The forced check completed successfully; this is its resulting
+        /// (already-persisted) `UpdateState` — the same value `check
+        /// (force:)` itself would have returned had persistence not also
+        /// been durability-uncertain.
+        case succeeded(UpdateState)
+        /// The forced check itself threw. `message` is
+        /// `String(describing:)` the thrown error (typically an
+        /// `UpdateCheckError`), diagnostic-only.
+        case failed(String)
+    }
 
-    public init(underlying: StorageError = .durabilityUncertain) {
+    public let underlying: StorageError
+    public let checkOutcome: CheckOutcome
+
+    public init(underlying: StorageError = .durabilityUncertain, checkOutcome: CheckOutcome) {
         self.underlying = underlying
+        self.checkOutcome = checkOutcome
     }
 }
 
@@ -281,26 +307,35 @@ public actor UpdateService {
     /// Persists the include-prerelease toggle (which also clears the
     /// cached `ETag`/`lastRelease` — see `SettingsStore
     /// .setIncludePrereleaseUpdates(_:)`) and then immediately forces a
-    /// fresh check against the newly selected stream. If the forced check
-    /// itself fails, the persisted toggle is *not* rolled back — the
-    /// setting change always succeeds independently of network
-    /// reachability — but the thrown `UpdateCheckError` still propagates
-    /// to the caller so it can surface the failure.
+    /// fresh check against the newly selected stream — including when
+    /// persistence itself only committed with uncertain directory
+    /// durability, since the toggle is durably in place on disk either
+    /// way and there is no reason to withhold the request the stream
+    /// switch itself demands. If the forced check itself fails, the
+    /// persisted toggle is *not* rolled back — the setting change always
+    /// succeeds independently of network reachability — but the failure
+    /// still propagates to the caller so it can surface it.
     ///
-    /// A noncommitting failure from the settings-persist step is thrown as
-    /// `SetIncludePrereleasePersistError`; committed-but-uncertain
-    /// durability has its own error above. Neither uses the same shape a
-    /// forced-check failure throws, so a caller
-    /// (`AppSnapshotCoordinator`) can distinguish, purely by catching
-    /// this specific type, "the toggle itself never committed" (the
-    /// forced check below is never even attempted) from "the toggle
-    /// committed, but the immediately-following network check failed"
-    /// (an ordinary `UpdateCheckError` from `check(force:)`). This
-    /// matters because only the *former* should ever cause a caller-
-    /// visible UI (e.g. Seer's tray checkbox) to keep showing its old
-    /// value — the latter's toggle is fully authoritative regardless of
-    /// whether the network happened to be reachable at that exact
-    /// moment.
+    /// A noncommitting failure from the settings-persist step (no rename
+    /// ever happened) is thrown as `SetIncludePrereleasePersistError`,
+    /// *before* attempting any check — there is nothing new on disk to
+    /// check against. Committed-but-uncertain durability instead always
+    /// throws `SetIncludePrereleaseDurabilityUncertainError`, carrying the
+    /// forced check's own outcome (`checkOutcome`) — success (with its
+    /// `UpdateState`) or failure (with a description) — so neither the
+    /// durability warning nor the check's result is ever lost. Neither of
+    /// these two error shapes is the plain `UpdateCheckError` an ordinary
+    /// (durability-certain) forced-check failure throws, so a caller
+    /// (`AppSnapshotCoordinator`) can distinguish, purely by catching each
+    /// distinct type, "the toggle itself never committed" from "the
+    /// toggle committed (with or without a durability warning), but the
+    /// immediately-following network check failed". This matters because
+    /// only the *former* should ever cause a caller-visible UI (e.g.
+    /// Seer's tray checkbox) to keep showing its old value — every
+    /// committed case's toggle is fully authoritative regardless of
+    /// whether the network happened to be reachable at that exact moment,
+    /// or whether the directory sync that followed the rename could be
+    /// confirmed.
     public func setIncludePrerelease(_ value: Bool) async throws -> UpdateState {
         // Synchronously invalidate any check already in flight *before*
         // ever awaiting anything — see `generation`'s documentation for
@@ -312,7 +347,22 @@ public actor UpdateService {
         do {
             try await settingsStore.setIncludePrereleaseUpdates(value)
         } catch StorageError.durabilityUncertain {
-            throw SetIncludePrereleaseDurabilityUncertainError()
+            // The rename itself already committed — only the following
+            // directory sync is unconfirmed — so the mandatory forced
+            // re-check against the newly selected stream still runs here,
+            // exactly as it would on an ordinary commit. Its outcome
+            // (success or failure) is captured, never allowed to
+            // interrupt propagating the durability warning itself, so a
+            // caller learns about both conditions from the one thrown
+            // error instead of losing whichever one didn't get to throw.
+            let checkOutcome: SetIncludePrereleaseDurabilityUncertainError.CheckOutcome
+            do {
+                let state = try await check(force: true)
+                checkOutcome = .succeeded(state)
+            } catch {
+                checkOutcome = .failed(String(describing: error))
+            }
+            throw SetIncludePrereleaseDurabilityUncertainError(checkOutcome: checkOutcome)
         } catch let storageError as StorageError {
             throw SetIncludePrereleasePersistError(underlying: storageError)
         }

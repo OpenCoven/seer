@@ -1071,7 +1071,17 @@ final class UpdateServiceTests: XCTestCase {
         XCTAssertEqual(state.availableVersion, "v1.2.0-beta.1")
     }
 
-    func testSetIncludePrereleaseReportsCommittedDurabilityUncertainSeparately() async throws {
+    // MARK: - setIncludePrerelease still runs the forced check when directory durability is uncertain
+
+    /// A committed-but-durability-uncertain persist must not skip the
+    /// mandatory forced re-check against the newly selected stream: the
+    /// toggle is durably on disk regardless of whether the following
+    /// directory sync could be confirmed, so there is no reason to
+    /// withhold the request. This is the fix for Task 12's finding —
+    /// `setIncludePrerelease(_:)` used to throw immediately on
+    /// `StorageError.durabilityUncertain`, before ever attempting
+    /// `check(force: true)`.
+    func testSetIncludePrereleaseContinuesTheForcedCheckAfterDurabilityUncertainPersistAndSurfacesBothOnSuccess() async throws {
         let fileSystem = InMemorySettingsFileSystem()
         let clock = MutableClock(now: 1_700_000_000_000)
         let settingsStore = makeSettingsStore(fileSystem: fileSystem, clock: clock)
@@ -1082,20 +1092,119 @@ final class UpdateServiceTests: XCTestCase {
             currentVersion: "1.0.0"
         )
         await fileSystem.setFailNextDirectorySync(SettingsFileSystemError.other("directory fsync failed"))
+        // Persistence commits `includePrereleaseUpdates = true` before the
+        // directory-sync failure surfaces, so the forced re-check below
+        // queries the bounded prerelease-mode endpoint, which decodes an
+        // *array* of releases — not the single-object shape `stable` mode
+        // expects.
+        let prereleaseArrayBody = Data("""
+        [{"tag_name":"v1.2.0-beta.1","html_url":"https://github.com/OpenCoven/seer/releases/tag/v1.2.0-beta.1","draft":false,"prerelease":true}]
+        """.utf8)
+        MockURLProtocol.enqueueStub(statusCode: 200, body: prereleaseArrayBody)
+
+        do {
+            _ = try await service.setIncludePrerelease(true)
+            XCTFail("expected committed-but-durability-uncertain error even though the forced check succeeded")
+        } catch let error as SetIncludePrereleaseDurabilityUncertainError {
+            XCTAssertEqual(error.underlying, .durabilityUncertain)
+            guard case .succeeded(let state) = error.checkOutcome else {
+                return XCTFail("expected the forced check to have succeeded, got \(error.checkOutcome)")
+            }
+            XCTAssertEqual(state.availableVersion, "v1.2.0-beta.1")
+        }
+
+        XCTAssertEqual(
+            MockURLProtocol.recordedRequests.count, 1,
+            "a durability-uncertain-but-committed persist must still perform the mandatory forced check's request"
+        )
+
+        // The menu's authoritative value (`includePrereleaseUpdates`) and
+        // the freshly checked release must both be visible via
+        // `currentState()`/`settingsStore.current`, exactly as an
+        // ordinary (durability-certain) forced check would leave them.
+        let state = await service.currentState()
+        XCTAssertEqual(state.availableVersion, "v1.2.0-beta.1")
+        let currentSettings = await settingsStore.current
+        XCTAssertTrue(currentSettings.includePrereleaseUpdates)
+        XCTAssertEqual(currentSettings.lastUpdateCheckAt, clock.now, "the scheduler must see a refreshed lastCheckedAt after a successful forced check")
+    }
+
+    /// Symmetric to the success case above: when the mandatory forced
+    /// check *also* fails, both the durability warning and the check
+    /// failure must be deterministically representable — neither ever
+    /// silently dropped in favor of the other.
+    func testSetIncludePrereleaseContinuesTheForcedCheckAfterDurabilityUncertainPersistAndSurfacesBothOnFailure() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let settingsStore = makeSettingsStore(fileSystem: fileSystem, clock: clock)
+        let service = UpdateService(
+            settingsStore: settingsStore,
+            session: makeMockSession(),
+            clock: clock,
+            currentVersion: "1.0.0"
+        )
+        await fileSystem.setFailNextDirectorySync(SettingsFileSystemError.other("directory fsync failed"))
+        // No stub enqueued: `MockURLProtocol` fails the request outright,
+        // exercising `UpdateCheckError.network(_:)`.
 
         do {
             _ = try await service.setIncludePrerelease(true)
             XCTFail("expected committed-but-durability-uncertain error")
         } catch let error as SetIncludePrereleaseDurabilityUncertainError {
             XCTAssertEqual(error.underlying, .durabilityUncertain)
+            guard case .failed(let message) = error.checkOutcome else {
+                return XCTFail("expected the forced check to have failed, got \(error.checkOutcome)")
+            }
+            XCTAssertFalse(message.isEmpty)
         }
 
+        XCTAssertEqual(
+            MockURLProtocol.recordedRequests.count, 1,
+            "a durability-uncertain-but-committed persist must still attempt the mandatory forced check's request, even if it goes on to fail"
+        )
+
+        // Persistence (the toggle itself) is unaffected by the failed
+        // check — `SettingsStore`/`AtomicJSONStore` never persist a new
+        // `lastUpdateCheckAt`/`ETag`/`lastRelease` on a thrown
+        // `UpdateCheckError` — while the toggle itself remains durably
+        // committed either way.
         let currentSettings = await settingsStore.current
-        let savedBytes = await fileSystem.contents(at: settingsURL)
         XCTAssertTrue(currentSettings.includePrereleaseUpdates)
-        let saved = try XCTUnwrap(savedBytes)
-        XCTAssertTrue(try JSONDecoder().decode(SettingsDocument.self, from: saved).includePrereleaseUpdates)
-        XCTAssertEqual(MockURLProtocol.recordedRequests.count, 0, "an uncertain persist must remain visible instead of continuing as ordinary success")
+        XCTAssertNil(currentSettings.lastUpdateCheckAt)
+    }
+
+    /// Preserves the ordinary (non-durability) persistence-failure path:
+    /// when the settings write never even commits (no rename happened —
+    /// simulated here via `setFailNextWrite`, distinct from a directory-
+    /// sync-only failure), `setIncludePrerelease(_:)` must throw
+    /// `SetIncludePrereleasePersistError` immediately and never attempt
+    /// the forced check at all, since there is nothing new on disk to
+    /// check against.
+    func testSetIncludePrereleaseUncommittedPersistenceFailureNeverAttemptsTheForcedCheck() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let settingsStore = makeSettingsStore(fileSystem: fileSystem, clock: clock)
+        let service = UpdateService(
+            settingsStore: settingsStore,
+            session: makeMockSession(),
+            clock: clock,
+            currentVersion: "1.0.0"
+        )
+        await fileSystem.setFailNextWrite(SettingsFileSystemError.other("disk full"))
+
+        do {
+            _ = try await service.setIncludePrerelease(true)
+            XCTFail("expected the uncommitted persistence failure to be thrown as SetIncludePrereleasePersistError")
+        } catch let error as SetIncludePrereleasePersistError {
+            XCTAssertEqual(error.underlying, .writeFailed)
+        }
+
+        XCTAssertEqual(
+            MockURLProtocol.recordedRequests.count, 0,
+            "an uncommitted persist must never fall through to the forced check's network request"
+        )
+        let currentSettings = await settingsStore.current
+        XCTAssertFalse(currentSettings.includePrereleaseUpdates, "an uncommitted write must never be reflected in the in-memory cache")
     }
 
     // MARK: - Concurrency: the later-started check wins, never the later-completed one

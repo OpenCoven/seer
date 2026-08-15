@@ -63,6 +63,17 @@ final class AppSnapshotCoordinatorTests: XCTestCase {
     private let settingsURL = URL(fileURLWithPath: "/Seer-Coordinator-Test/ai.opencoven.seer/settings.json")
     private let historyURL = URL(fileURLWithPath: "/Seer-Coordinator-Test/ai.opencoven.seer/history.json")
 
+    /// A `URLSession` routed through `MockURLProtocol` (defined in
+    /// `UpdateServiceTests.swift`, same test target) — used only by the
+    /// handful of coordinator tests that stand up a *real* `UpdateService`
+    /// instead of `FakeUpdateChecking`, so a forced re-check they trigger
+    /// never reaches the real network.
+    private func makeMockUpdateSession() -> URLSession {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [MockURLProtocol.self]
+        return URLSession(configuration: configuration)
+    }
+
     private func activeAgent(id: String = "codex:/fixtures/active.jsonl") -> ActiveAgent {
         ActiveAgent(
             id: id,
@@ -719,6 +730,7 @@ final class AppSnapshotCoordinatorTests: XCTestCase {
     }
 
     func testSetIncludePrereleaseUpdatesPublishesCommittedValueAndDurabilityDiagnosticWhenDirectorySyncFails() async throws {
+        MockURLProtocol.reset()
         let settingsFileSystem = InMemorySettingsFileSystem()
         let historyFileSystem = InMemorySettingsFileSystem()
         let clock = MutableClock(now: 1_700_000_000_000)
@@ -739,7 +751,7 @@ final class AppSnapshotCoordinatorTests: XCTestCase {
         )
         let updateService = UpdateService(
             settingsStore: settingsStore,
-            session: UpdateService.makeDefaultSession(),
+            session: makeMockUpdateSession(),
             clock: clock,
             currentVersion: "1.0.0"
         )
@@ -760,16 +772,68 @@ final class AppSnapshotCoordinatorTests: XCTestCase {
             startupSnapshot: startupSnapshot
         )
         await settingsFileSystem.setFailNextDirectorySync(SettingsFileSystemError.other("directory fsync failed"))
+        // The mandatory forced re-check `setIncludePrereleaseUpdates(_:)`
+        // still performs despite the durability warning must succeed here
+        // — this test asserts on both the request actually happening and
+        // the durability warning still being surfaced alongside it.
+        MockURLProtocol.enqueueStub(
+            statusCode: 200,
+            body: Data("""
+            [{"tag_name":"v1.2.0-beta.1","html_url":"https://github.com/OpenCoven/seer/releases/tag/v1.2.0-beta.1","draft":false,"prerelease":true}]
+            """.utf8)
+        )
 
         let outcome = try await coordinator.setIncludePrereleaseUpdates(true)
 
         guard case .persistedButDurabilityUncertain = outcome else {
             return XCTFail("expected committed durability-uncertain outcome, got \(outcome)")
         }
+        XCTAssertEqual(
+            MockURLProtocol.recordedRequests.count, 1,
+            "a durability-uncertain-but-committed persist must still perform the mandatory forced check's request"
+        )
         let authoritativeValue = await coordinator.includePrereleaseUpdates
         XCTAssertTrue(authoritativeValue)
         XCTAssertTrue(coordinator.snapshot.diagnostics.contains { $0.id == StorageDiagnosticID.durabilityUncertain })
+        XCTAssertFalse(
+            coordinator.snapshot.diagnostics.contains { $0.id == CoordinatorDiagnosticID.updatesCheckFailed },
+            "the forced check succeeded despite the durability warning, so no check-failed diagnostic must be surfaced"
+        )
         XCTAssertEqual(renderer.emittedSnapshots.last, coordinator.snapshot)
+    }
+
+    /// The failure counterpart: a committed-but-durability-uncertain
+    /// persist whose mandatory forced re-check *also* fails must
+    /// deterministically surface both conditions — the durability
+    /// warning and the check failure — as two distinct diagnostics, and
+    /// as a distinct `.persistedButDurabilityUncertainAndCheckFailed`
+    /// outcome, rather than either one silently suppressing the other.
+    func testSetIncludePrereleaseUpdatesSurfacesBothDurabilityAndCheckFailureWhenTheForcedCheckAlsoFails() async throws {
+        let updateService = FakeUpdateChecking()
+        let (coordinator, renderer, _) = await makeCoordinator(updateService: updateService)
+        let emittedBefore = renderer.emittedSnapshots.count
+
+        let durabilityError = SetIncludePrereleaseDurabilityUncertainError(
+            checkOutcome: .failed("simulated network failure")
+        )
+        updateService.setIncludePrereleaseResults = [.failure(durabilityError)]
+
+        let outcome = try await coordinator.setIncludePrereleaseUpdates(true)
+
+        guard case .persistedButDurabilityUncertainAndCheckFailed(let durabilityMessage, let checkMessage) = outcome else {
+            return XCTFail("expected .persistedButDurabilityUncertainAndCheckFailed, got \(outcome)")
+        }
+        XCTAssertFalse(durabilityMessage.isEmpty)
+        XCTAssertEqual(checkMessage, "simulated network failure")
+        XCTAssertTrue(
+            coordinator.snapshot.diagnostics.contains { $0.id == StorageDiagnosticID.durabilityUncertain },
+            "the durability warning must remain visible even though the forced check also failed"
+        )
+        XCTAssertTrue(
+            coordinator.snapshot.diagnostics.contains { $0.id == CoordinatorDiagnosticID.updatesCheckFailed },
+            "the forced check's own failure must remain visible alongside the durability warning"
+        )
+        XCTAssertEqual(renderer.emittedSnapshots.count, emittedBefore + 1, "this must still publish exactly one transition")
     }
 
     func testOpenLatestReleaseForwardsToUpdateServiceWithoutTouchingTheSnapshot() async {

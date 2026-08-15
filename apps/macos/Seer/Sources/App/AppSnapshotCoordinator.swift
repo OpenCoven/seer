@@ -141,9 +141,24 @@ public enum SetIncludePrereleaseUpdatesOutcome: Sendable, Equatable {
     /// underlying failure) is surfaced purely so a caller can log it
     /// too; the toggle itself is fully authoritative regardless.
     case persistedButCheckFailed(message: String)
-    /// The destination file and in-memory authoritative value were updated,
-    /// but syncing the containing directory could not be confirmed.
+    /// The destination file and in-memory authoritative value were
+    /// updated, but syncing the containing directory could not be
+    /// confirmed — and the mandatory forced re-check `UpdateService
+    /// .setIncludePrerelease(_:)` still ran against the newly selected
+    /// stream regardless (see its own documentation) *did* succeed.
+    /// `message` (diagnostic-only) describes the durability warning
+    /// alone; the toggle itself is fully authoritative.
     case persistedButDurabilityUncertain(message: String)
+    /// Both of the above at once: the toggle committed with an
+    /// unconfirmed directory sync, *and* the forced re-check that still
+    /// ran against the newly selected stream also failed. Recorded as two
+    /// separate visible diagnostics — `StorageDiagnosticID
+    /// .durabilityUncertain` and `CoordinatorDiagnosticID
+    /// .updatesCheckFailed` — on the published snapshot, so neither
+    /// condition is ever silently dropped in favor of the other.
+    /// `durabilityMessage`/`checkMessage` are each diagnostic-only; the
+    /// toggle itself remains fully authoritative regardless of either.
+    case persistedButDurabilityUncertainAndCheckFailed(durabilityMessage: String, checkMessage: String)
 }
 
 /// The single main-actor authority for Seer's visible state. Owns an
@@ -914,7 +929,14 @@ public final class AppSnapshotCoordinator {
     /// rethrown identically, which made `AppDelegate` leave its tray
     /// checkbox showing the *old* value even after the new one was
     /// already durably saved to disk (e.g. toggling the setting while
-    /// offline).
+    /// offline). Also distinguishes committed-but-durability-uncertain
+    /// persistence (`SetIncludePrereleaseDurabilityUncertainError`) — for
+    /// which the mandatory forced check still runs, exactly like an
+    /// ordinary commit, so `outcome` reflects both the durability warning
+    /// and however that check itself resolved (`.persistedButDurabilityUncertain`
+    /// on check success, `.persistedButDurabilityUncertainAndCheckFailed`
+    /// if it also failed) rather than ever silently skipping the request
+    /// the stream switch demands.
     @discardableResult
     public func setIncludePrereleaseUpdates(_ value: Bool) async throws -> SetIncludePrereleaseUpdatesOutcome {
         await gate.acquire()
@@ -952,13 +974,33 @@ public final class AppSnapshotCoordinator {
             idsToClear.insert(StorageDiagnosticID.durabilityUncertain)
             outcome = .success
         } catch let durabilityError as SetIncludePrereleaseDurabilityUncertainError {
-            updateState = await updateService.currentState()
+            // The toggle committed (the rename succeeded); only the
+            // following directory sync is unconfirmed. That warning is
+            // always surfaced, regardless of how the mandatory forced
+            // re-check `durabilityError.checkOutcome` carries turned out —
+            // neither condition is ever dropped in favor of the other.
             upserts.append(Diagnostic(
                 id: StorageDiagnosticID.durabilityUncertain,
-                message: "The prerelease setting was saved, but directory durability could not be confirmed: \(durabilityError)",
+                message: "The prerelease setting was saved, but directory durability could not be confirmed: \(durabilityError.underlying)",
                 occurredAt: clock.nowMilliseconds()
             ))
-            outcome = .persistedButDurabilityUncertain(message: String(describing: durabilityError))
+            switch durabilityError.checkOutcome {
+            case .succeeded(let state):
+                updateState = state
+                idsToClear.insert(CoordinatorDiagnosticID.updatesCheckFailed)
+                outcome = .persistedButDurabilityUncertain(message: String(describing: durabilityError.underlying))
+            case .failed(let checkMessage):
+                updateState = await updateService.currentState()
+                upserts.append(Diagnostic(
+                    id: CoordinatorDiagnosticID.updatesCheckFailed,
+                    message: "Update check failed: \(checkMessage)",
+                    occurredAt: clock.nowMilliseconds()
+                ))
+                outcome = .persistedButDurabilityUncertainAndCheckFailed(
+                    durabilityMessage: String(describing: durabilityError.underlying),
+                    checkMessage: checkMessage
+                )
+            }
         } catch let persistError as SetIncludePrereleasePersistError {
             // The toggle itself never committed: rethrow the same
             // distinctly-typed error immediately, before any snapshot/
