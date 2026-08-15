@@ -429,6 +429,107 @@ final class UpdateServiceTests: XCTestCase {
         XCTAssertEqual(MockURLProtocol.recordedRequests.count, 2)
     }
 
+    // MARK: 6b. Extreme persisted `lastUpdateCheckAt` cannot crash or permanently suppress the 24h gate
+
+    /// Regression test for a corrupted/future-dated persisted
+    /// `lastUpdateCheckAt` (e.g. `Int64.max`). Before the fix, `now -
+    /// lastCheckedAt` for such a value is still representable (no trap),
+    /// but is always deeply negative — so the unforced gate (`elapsed <
+    /// checkIntervalMs`) is satisfied forever, permanently suppressing
+    /// every future check. The normalized gate instead clamps a
+    /// future-dated value down to "now" the moment it's read, so it
+    /// becomes due exactly one bounded interval later — never
+    /// permanently.
+    func testCheckGateExtremeFutureLastCheckedAtClampsToABoundedNextDueTimeInsteadOfPermanentSuppression() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let settingsStore = makeSettingsStore(fileSystem: fileSystem, clock: clock)
+        try await settingsStore.recordUpdateCheck(etag: nil, lastCheckedAt: Int64.max, release: nil)
+        let service = UpdateService(
+            settingsStore: settingsStore,
+            session: makeMockSession(),
+            clock: clock,
+            currentVersion: "1.0.0"
+        )
+
+        let suppressed = try await service.check(force: false)
+        XCTAssertEqual(MockURLProtocol.recordedRequests.count, 0, "a corrupted future timestamp must still gate the very next call")
+        // Self-healed to "now" (not left at the corrupt `Int64.max`) so
+        // every subsequent gate check measures real elapsed time from
+        // this point forward instead of re-deriving a fresh "just
+        // checked" verdict from "now" on every call, which would suppress
+        // checks forever.
+        XCTAssertEqual(suppressed.lastCheckedAt, 1_700_000_000_000)
+
+        // Bounded: exactly one interval later, the gate must have
+        // cleared — never suppressed forever.
+        clock.now += UpdateService.checkIntervalMs
+        MockURLProtocol.enqueueStub(
+            statusCode: 200,
+            body: releaseJSON(tag: "v1.1.0", htmlURL: "https://github.com/OpenCoven/seer/releases/tag/v1.1.0")
+        )
+        let due = try await service.check(force: false)
+        XCTAssertEqual(MockURLProtocol.recordedRequests.count, 1, "an extreme future persisted timestamp must not suppress checks forever")
+        XCTAssertEqual(due.availableVersion, "v1.1.0")
+    }
+
+    /// Regression test for a corrupted/extreme-past persisted
+    /// `lastUpdateCheckAt` (e.g. `Int64.min`). Before the fix, `now -
+    /// Int64.min` overflows `Int64` and traps, crashing the app on the
+    /// very first gate check. The safe gate uses saturating subtraction,
+    /// which reports a huge-but-finite elapsed time instead — always past
+    /// the gate, so the check proceeds immediately, with no crash.
+    func testCheckGateExtremePastLastCheckedAtIsImmediatelyDueWithoutOverflowing() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let settingsStore = makeSettingsStore(fileSystem: fileSystem, clock: clock)
+        try await settingsStore.recordUpdateCheck(etag: nil, lastCheckedAt: Int64.min, release: nil)
+        let service = UpdateService(
+            settingsStore: settingsStore,
+            session: makeMockSession(),
+            clock: clock,
+            currentVersion: "1.0.0"
+        )
+
+        MockURLProtocol.enqueueStub(
+            statusCode: 200,
+            body: releaseJSON(tag: "v1.1.0", htmlURL: "https://github.com/OpenCoven/seer/releases/tag/v1.1.0")
+        )
+        let state = try await service.check(force: false)
+
+        XCTAssertEqual(
+            MockURLProtocol.recordedRequests.count,
+            1,
+            "Int64.min must never trap the gate's arithmetic and must be treated as immediately due"
+        )
+        XCTAssertEqual(state.availableVersion, "v1.1.0")
+    }
+
+    /// An extreme *clock* value (not a persisted one) must not trap the
+    /// gate's arithmetic either, and ordinary "elapsed way more than 24h
+    /// ago, so due now" semantics must still hold.
+    func testCheckGatePreservesOrdinary24HourSemanticsWithAnExtremeClockNow() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let clock = MutableClock(now: Int64.max - 1_000)
+        let settingsStore = makeSettingsStore(fileSystem: fileSystem, clock: clock)
+        try await settingsStore.recordUpdateCheck(etag: nil, lastCheckedAt: 0, release: nil)
+        let service = UpdateService(
+            settingsStore: settingsStore,
+            session: makeMockSession(),
+            clock: clock,
+            currentVersion: "1.0.0"
+        )
+
+        MockURLProtocol.enqueueStub(
+            statusCode: 200,
+            body: releaseJSON(tag: "v1.1.0", htmlURL: "https://github.com/OpenCoven/seer/releases/tag/v1.1.0")
+        )
+        let state = try await service.check(force: false)
+
+        XCTAssertEqual(MockURLProtocol.recordedRequests.count, 1, "an extreme clock 'now' must not trap the elapsed-time computation")
+        XCTAssertEqual(state.availableVersion, "v1.1.0")
+    }
+
     // MARK: 7. A running app's scheduler starts one new check at 24 hours
 
     func testRunningAppSchedulerStartsOneNewCheckAt24Hours() async throws {
@@ -666,6 +767,99 @@ final class UpdateServiceTests: XCTestCase {
             try await Task.sleep(nanoseconds: 2_000_000)
         }
         XCTFail("condition not met before timeout")
+    }
+
+    // MARK: 7d. Extreme persisted `lastCheckedAt` cannot crash or permanently suppress the scheduler
+
+    /// Regression test for `UpdateScheduler.nextDueAt` given a corrupted/
+    /// future-dated `lastCompletedCheckAt` (e.g. `Int64.max`). Before the
+    /// fix, adding `checkIntervalMs` to such a value overflows and traps;
+    /// even a naive saturating add alone would leave the due time pinned
+    /// at `Int64.max` forever — i.e. the scheduler would never check
+    /// again. The normalized computation clamps the value down to "now"
+    /// first, so the very next sleep is a single, bounded 24h — never
+    /// "forever".
+    func testSchedulerExtremeFutureLastCheckedAtSchedulesABounded24HourSleepInsteadOfNeverChecking() async throws {
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let sleeper = GatedSleeper()
+        let tracker = FakeScheduledCheckTracker()
+        let scheduler = UpdateScheduler(
+            clock: clock,
+            sleeper: sleeper,
+            lastCompletedCheckAt: { await tracker.lastCheckedAt },
+            performScheduledCheck: { await tracker.recordPerformScheduledCheck() }
+        )
+
+        await tracker.recordManualCheckCompletion(at: Int64.max)
+
+        await scheduler.start()
+        try await waitUntil { await sleeper.requestedCount >= 1 }
+
+        let nanoseconds = await sleeper.recordedNanoseconds.last
+        XCTAssertEqual(
+            nanoseconds,
+            UInt64(UpdateService.checkIntervalMs) * 1_000_000,
+            "a corrupted future persisted timestamp must schedule a bounded 24h sleep, never 'forever'"
+        )
+
+        await scheduler.stop()
+    }
+
+    /// Regression test for `UpdateScheduler.nextDueAt`/its loop given a
+    /// corrupted/extreme-past `lastCompletedCheckAt` (e.g. `Int64.min`).
+    /// Before the fix, `dueAt - now` (needed to compute how long to
+    /// sleep) overflows `Int64` and traps, crashing the scheduler's
+    /// background loop. The safe computation reports the check as
+    /// immediately due (a zero-length sleep) instead, with no crash.
+    func testSchedulerExtremePastLastCheckedAtSchedulesAnImmediateCheckWithoutOverflowing() async throws {
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let sleeper = GatedSleeper()
+        let tracker = FakeScheduledCheckTracker()
+        let scheduler = UpdateScheduler(
+            clock: clock,
+            sleeper: sleeper,
+            lastCompletedCheckAt: { await tracker.lastCheckedAt },
+            performScheduledCheck: { await tracker.recordPerformScheduledCheck() }
+        )
+
+        await tracker.recordManualCheckCompletion(at: Int64.min)
+
+        await scheduler.start()
+        try await waitUntil { await sleeper.requestedCount >= 1 }
+
+        let nanoseconds = await sleeper.recordedNanoseconds.last
+        XCTAssertEqual(nanoseconds, 0, "Int64.min must never trap the scheduler's arithmetic and must schedule an immediate check")
+
+        await scheduler.stop()
+    }
+
+    /// An extreme *clock* value (not a persisted one) must not trap the
+    /// scheduler's arithmetic either — a long-overdue check (by any
+    /// measure) must still be reported as immediately due.
+    func testSchedulerHandlesAnExtremeClockNowWithoutOverflowing() async throws {
+        let clock = MutableClock(now: Int64.max - 10)
+        let sleeper = GatedSleeper()
+        let tracker = FakeScheduledCheckTracker()
+        let scheduler = UpdateScheduler(
+            clock: clock,
+            sleeper: sleeper,
+            lastCompletedCheckAt: { await tracker.lastCheckedAt },
+            performScheduledCheck: { await tracker.recordPerformScheduledCheck() }
+        )
+
+        await tracker.recordManualCheckCompletion(at: 0)
+
+        await scheduler.start()
+        try await waitUntil { await sleeper.requestedCount >= 1 }
+
+        let nanoseconds = await sleeper.recordedNanoseconds.last
+        XCTAssertEqual(
+            nanoseconds,
+            0,
+            "an extreme clock 'now' must not trap and must report the long-overdue check as immediately due"
+        )
+
+        await scheduler.stop()
     }
 
     // MARK: 8. Release URLs must be HTTPS on github.com

@@ -3,6 +3,48 @@ import Foundation
 import AppKit
 #endif
 
+/// Overflow-safe `Int64` millisecond arithmetic for the 24-hour gate in
+/// `UpdateService.check(force:)` and `UpdateScheduler`'s due-time
+/// computation. Both operate on a *persisted* `Int64` (`lastUpdateCheckAt`)
+/// that could, through disk corruption or a bogus prior write, hold any
+/// value at all — including `Int64.min`/`Int64.max` — and Swift's plain
+/// `+`/`-` trap on overflow rather than wrapping, so naively subtracting an
+/// arbitrary persisted timestamp from "now" (or adding the 24h interval to
+/// one) can crash the whole app at startup or mid-schedule. Every use site
+/// below routes through `SafeTime` instead of a raw operator.
+enum SafeTime {
+    /// `lhs + rhs`, saturating at `Int64.max`/`Int64.min` instead of
+    /// trapping when the true sum would overflow.
+    static func saturatingAdd(_ lhs: Int64, _ rhs: Int64) -> Int64 {
+        let (result, overflow) = lhs.addingReportingOverflow(rhs)
+        guard overflow else { return result }
+        return rhs >= 0 ? Int64.max : Int64.min
+    }
+
+    /// `lhs - rhs`, saturating at `Int64.max`/`Int64.min` instead of
+    /// trapping when the true difference would overflow.
+    static func saturatingSubtract(_ lhs: Int64, _ rhs: Int64) -> Int64 {
+        let (result, overflow) = lhs.subtractingReportingOverflow(rhs)
+        guard overflow else { return result }
+        return rhs >= 0 ? Int64.min : Int64.max
+    }
+
+    /// Normalizes a persisted "last checked at" timestamp against `now`
+    /// before it is used in any elapsed-time/due-time arithmetic. A value
+    /// greater than `now` can only be corrupt (no completed check can have
+    /// a timestamp from the future) and, left unclamped, would make the
+    /// 24-hour gate believe a check "just happened" forever — permanently
+    /// suppressing every future check. Clamping it down to `now` instead
+    /// bounds the resulting next-due time to exactly one interval from now,
+    /// rather than never. Values at or before `now` (including
+    /// `Int64.min`) pass through unchanged; `saturatingSubtract`/
+    /// `saturatingAdd` at the actual call sites make those safe to combine
+    /// with `now`/the interval without overflowing.
+    static func normalizedLastCheckedAt(_ lastCheckedAt: Int64, now: Int64) -> Int64 {
+        min(lastCheckedAt, now)
+    }
+}
+
 /// Typed failures `UpdateService.check(force:)` can throw. A network
 /// failure (offline, DNS, TLS, timeout, ...) or an unexpected HTTP status
 /// or an undecodable response body are all reported through one of these
@@ -246,13 +288,38 @@ public actor UpdateService {
     ///   leaves every persisted field exactly as it was before the call.
     public func check(force: Bool) async throws -> UpdateState {
         let now = clock.nowMilliseconds()
-        let settings = await settingsStore.current
+        var settings = await settingsStore.current
 
         if !force,
-           let lastCheckedAt = settings.lastUpdateCheckAt,
-           now - lastCheckedAt < Self.checkIntervalMs
+           let lastCheckedAt = settings.lastUpdateCheckAt
         {
-            return stateFrom(settings: settings)
+            // See `SafeTime`: a future-dated `lastCheckedAt` can only be
+            // corrupt (no completed check can have a future timestamp).
+            // Clamping it down to `now` bounds *this* call's elapsed time
+            // to zero (i.e. still gated), but merely re-deriving that
+            // clamp from a fresh `now` on every subsequent call would
+            // suppress checks forever, since the persisted value never
+            // itself changes. Persisting the corrected value here —
+            // exactly once, even though this call performs no network
+            // check — fixes that: every later gate check measures real
+            // elapsed time from this point forward, bounding the very
+            // next actual check to one ordinary interval from now.
+            let normalized = SafeTime.normalizedLastCheckedAt(lastCheckedAt, now: now)
+            if normalized != lastCheckedAt {
+                try? await settingsStore.recordUpdateCheck(
+                    etag: settings.updateETag,
+                    lastCheckedAt: normalized,
+                    release: settings.lastRelease
+                )
+                settings.lastUpdateCheckAt = normalized
+            }
+            // Saturating subtraction so an extreme-past value (e.g.
+            // `Int64.min`) reports a huge-but-finite elapsed time —
+            // always past the gate — instead of trapping.
+            let elapsed = SafeTime.saturatingSubtract(now, normalized)
+            if elapsed < Self.checkIntervalMs {
+                return stateFrom(settings: settings)
+            }
         }
 
         let includePrerelease = settings.includePrereleaseUpdates
@@ -627,7 +694,17 @@ public actor UpdateScheduler {
     ) async {
         var dueAt = await nextDueAt(lastCompletedCheckAt: lastCompletedCheckAt, clock: clock)
         while !Task.isCancelled {
-            let remainingMs = max(0, dueAt - clock.nowMilliseconds())
+            // Bounded to `[0, checkIntervalMs]`: `dueAt`/`clock
+            // .nowMilliseconds()` can each independently be any `Int64`
+            // (a corrupt persisted timestamp, or — in tests — a
+            // deliberately extreme injected clock value), so a plain
+            // `dueAt - now` could trap, and even a saturating subtraction
+            // alone could still hand `UInt64(remainingMs) * 1_000_000`
+            // below a value large enough to overflow *that* multiplication.
+            // Clamping to the interval keeps every sleep both crash-safe
+            // and no longer than one ordinary scheduling period.
+            let elapsed = SafeTime.saturatingSubtract(dueAt, clock.nowMilliseconds())
+            let remainingMs = min(max(0, elapsed), UpdateService.checkIntervalMs)
             do {
                 try await sleeper.sleep(nanoseconds: UInt64(remainingMs) * 1_000_000)
             } catch {
@@ -652,7 +729,7 @@ public actor UpdateScheduler {
                 // from this failed attempt's own completion time instead,
                 // so a failing scheduled check still only retries once
                 // daily, exactly like a successful one.
-                dueAt = clock.nowMilliseconds() + UpdateService.checkIntervalMs
+                dueAt = SafeTime.saturatingAdd(clock.nowMilliseconds(), UpdateService.checkIntervalMs)
             }
         }
     }
@@ -669,7 +746,17 @@ public actor UpdateScheduler {
     ) async -> Int64 {
         let lastCheckedAt = await lastCompletedCheckAt()
         let now = clock.nowMilliseconds()
-        return (lastCheckedAt ?? now) + UpdateService.checkIntervalMs
+        // See `SafeTime`: a real persisted value gets clamped down to
+        // `now` if it's future-dated (corrupt) so a bogus value (e.g.
+        // `Int64.max`) can never push the next due time out to "never" —
+        // it instead becomes due a bounded 24h from now, exactly as if
+        // the check had just completed. An extreme-past value (e.g.
+        // `Int64.min`) passes through unclamped and is made overflow-safe
+        // by `saturatingAdd` below. `nil` (no check has ever completed)
+        // is unaffected — it still schedules the first check 24h from now,
+        // preserving ordinary startup semantics.
+        let normalized = lastCheckedAt.map { SafeTime.normalizedLastCheckedAt($0, now: now) } ?? now
+        return SafeTime.saturatingAdd(normalized, UpdateService.checkIntervalMs)
     }
 }
 

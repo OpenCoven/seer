@@ -11,7 +11,11 @@ const DEFAULT_SETTINGS: AppSettings = {
 };
 
 function isFileNotFound(error: unknown): boolean {
-  return error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT";
+  return (
+    error instanceof Error &&
+    "code" in error &&
+    (error as NodeJS.ErrnoException).code === "ENOENT"
+  );
 }
 
 function isKeepAwakeMode(value: unknown): value is KeepAwakeMode {
@@ -25,7 +29,9 @@ function normalizeSettings(value: unknown): AppSettings {
 
   const record = value as Record<string, unknown>;
   return {
-    keepAwakeMode: isKeepAwakeMode(record.keepAwakeMode) ? record.keepAwakeMode : DEFAULT_SETTINGS.keepAwakeMode,
+    keepAwakeMode: isKeepAwakeMode(record.keepAwakeMode)
+      ? record.keepAwakeMode
+      : DEFAULT_SETTINGS.keepAwakeMode,
     includePrereleaseUpdates:
       typeof record.includePrereleaseUpdates === "boolean"
         ? record.includePrereleaseUpdates
@@ -38,10 +44,17 @@ class SettingsStore {
   private settingsPath: string | null = null;
   private saveQueue: Promise<void> = Promise.resolve();
   private loaded = false;
+  private readonly resolveUserDataPath: () => string;
+
+  constructor(
+    resolveUserDataPath: () => string = () => app.getPath("userData"),
+  ) {
+    this.resolveUserDataPath = resolveUserDataPath;
+  }
 
   private async getSettingsPath(): Promise<string> {
     if (!this.settingsPath) {
-      const userDataPath = app.getPath("userData");
+      const userDataPath = this.resolveUserDataPath();
       await fs.mkdir(userDataPath, { recursive: true });
       this.settingsPath = path.join(userDataPath, "settings.json");
     }
@@ -74,42 +87,66 @@ class SettingsStore {
   }
 
   async setKeepAwakeMode(mode: KeepAwakeMode): Promise<AppSettings> {
-    await this.load();
-    const next = { ...this.cache, keepAwakeMode: mode };
-    // Only commit the in-memory cache once the write has actually succeeded —
-    // committing first (the previous behavior) would let a failed persist
-    // leave `get()` reporting a value that was never durably saved, which
-    // callers (e.g. UpdateService) rely on staying consistent with disk.
-    await this.persist(next);
-    this.cache = next;
-    return this.cache;
+    return this.mutate((current) => ({ ...current, keepAwakeMode: mode }));
   }
 
   async setIncludePrereleaseUpdates(value: boolean): Promise<AppSettings> {
-    await this.load();
-    const next = { ...this.cache, includePrereleaseUpdates: value };
-    await this.persist(next);
-    this.cache = next;
-    return this.cache;
+    return this.mutate((current) => ({
+      ...current,
+      includePrereleaseUpdates: value,
+    }));
   }
 
-  private async persist(snapshot: AppSettings): Promise<void> {
-    const save = this.saveQueue
+  // Runs the entire read-current -> derive-next -> persist -> cache-commit
+  // transaction as a single job chained onto `saveQueue`, so two
+  // concurrent setters can never both derive `next` from the same stale
+  // `this.cache` snapshot and silently clobber one another. Unlike the
+  // previous implementation (which computed `next` from `this.cache`
+  // *before* ever entering the queue), `transform` only runs once this
+  // job is actually dequeued — after every previously queued transaction
+  // has both persisted *and* committed its own cache update — so it
+  // always sees the latest value, not a stale one captured at call time.
+  //
+  // Only commits `this.cache` once the write has actually succeeded — a
+  // failed persist must never leave `get()` reporting a value that was
+  // never durably saved. A failure here also must never leave
+  // `saveQueue` permanently rejected (which would poison every later
+  // call): the `.catch(() => undefined)` below means each job always
+  // starts from a resolved queue regardless of whether the previous job
+  // threw, and the queue is advanced to a settled (always-resolved)
+  // continuation of this job rather than to the job's own
+  // (possibly-rejected) promise, while the rejection itself still
+  // propagates to this call's own caller via the returned `job` promise.
+  private async mutate(
+    transform: (current: AppSettings) => AppSettings,
+  ): Promise<AppSettings> {
+    await this.load();
+    const job = this.saveQueue
       .catch(() => undefined)
       .then(async () => {
-        const filePath = await this.getSettingsPath();
-        const tempPath = `${filePath}.${process.pid}.tmp`;
-        try {
-          await fs.writeFile(tempPath, JSON.stringify(snapshot, null, 2), "utf-8");
-          await fs.rename(tempPath, filePath);
-        } finally {
-          await fs.rm(tempPath, { force: true });
-        }
+        const next = transform(this.cache);
+        await this.writeToDisk(next);
+        this.cache = next;
+        return this.cache;
       });
+    this.saveQueue = job.then(
+      () => undefined,
+      () => undefined,
+    );
+    return job;
+  }
 
-    this.saveQueue = save;
-    await save;
+  private async writeToDisk(snapshot: AppSettings): Promise<void> {
+    const filePath = await this.getSettingsPath();
+    const tempPath = `${filePath}.${process.pid}.tmp`;
+    try {
+      await fs.writeFile(tempPath, JSON.stringify(snapshot, null, 2), "utf-8");
+      await fs.rename(tempPath, filePath);
+    } finally {
+      await fs.rm(tempPath, { force: true });
+    }
   }
 }
 
 export const settingsStore = new SettingsStore();
+export { SettingsStore };
