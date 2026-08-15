@@ -29,6 +29,10 @@ test("release workflow exists and has only the protected tag trigger and minimal
   assert.ok(existsSync(workflowPath), ".github/workflows/release-macos.yml must exist");
   assert.match(source, /^on:\n {2}push:\n {4}tags:\n {6}- "v\*\.\*\.\*"\n\npermissions:\n {2}contents: read\n {2}id-token: write$/m);
   assert.doesNotMatch(source, /\b(?:pull_request|workflow_dispatch|schedule):/);
+  assert.match(
+    source,
+    /concurrency:\n {2}group: release-macos-OpenCoven-seer-releases-\$\{\{ github\.ref_name \}\}\n {2}cancel-in-progress: false/,
+  );
   assert.deepEqual(
     [...source.matchAll(/^ {2}([a-z][a-z0-9-]*):\n {4}(?:name|needs|runs-on):/gm)].map((match) => match[1]),
     ["prepare", "sign-and-release"],
@@ -213,7 +217,10 @@ test("signing keeps build tools out and scopes the releases token to release pol
   for (const step of steps) {
     const hasToken = step.includes("secrets.RELEASES_REPO_TOKEN");
     const hasGhCommand = /\bgh (?:api|release)\b/.test(step);
-    const hasReleasePolicy = /scripts\/release-macos-draft\.sh (?:preflight|upload|capture|publish)/.test(step);
+    const hasReleasePolicy =
+      /scripts\/release-macos-draft\.sh (?:acquire-lock|preflight|upload|capture|publish|release-lock)/.test(
+        step,
+      );
     assert.equal(
       hasToken,
       hasGhCommand || hasReleasePolicy,
@@ -224,11 +231,15 @@ test("signing keeps build tools out and scopes the releases token to release pol
       assert.doesNotMatch(step, /secrets\.APPLE_/);
     }
   }
-  assert.doesNotMatch(`${signing}\n${draftPolicySource}`, /\bgh release delete\b|\bgh api\b[^\n]*-X DELETE/);
+  assert.doesNotMatch(
+    `${signing}\n${draftPolicySource}`,
+    /\bgh release delete\b|\/releases(?:\/[^\s"']*)?["']?\s+(?:--method|-X)\s+DELETE/,
+  );
 });
 
 test("draft policy resumes only bound allowlisted drafts and publishes after fresh verification", () => {
   const signing = jobBlock("sign-and-release");
+  const acquire = signing.indexOf("scripts/release-macos-draft.sh acquire-lock");
   const preflight = signing.indexOf("scripts/release-macos-draft.sh preflight");
   const upload = signing.indexOf("scripts/release-macos-draft.sh upload");
   const download = signing.indexOf("gh release download");
@@ -249,6 +260,13 @@ test("draft policy resumes only bound allowlisted drafts and publishes after fre
   assert.match(draftPolicyImplementation, /sourceTag/);
   assert.match(draftPolicyImplementation, /workflowRef/);
   assert.match(draftPolicyImplementation, /workflowRun/);
+  assert.match(draftPolicyImplementation, /workflowAttempt/);
+  assert.match(draftPolicySource, /immutable-releases/);
+  assert.match(draftPolicyImplementation, /release author/);
+  assert.match(draftPolicyImplementation, /release asset uploader/);
+  assert.match(draftPolicySource, /git\/tags/);
+  assert.match(draftPolicySource, /git\/refs/);
+  assert.match(draftPolicySource, /seer-release-lock-/);
   assert.match(draftPolicySource, /gh release create "\$\{SOURCE_TAG\}" --draft/);
   assert.match(draftPolicySource, /gh release upload "\$\{SOURCE_TAG\}"[\s\S]*--clobber/);
   assert.match(draftPolicyImplementation, /existing published release/);
@@ -266,15 +284,37 @@ test("draft policy resumes only bound allowlisted drafts and publishes after fre
   assert.match(signing, /RELEASE_BODY: \$\{\{ steps\.release-notes\.outputs\.path \}\}/);
   assert.match(signing, /RELEASE_DIR: \$\{\{ steps\.public-assets\.outputs\.directory \}\}/);
   assert.match(draftPolicySource, /--request PATCH/);
-  assert.match(draftPolicySource, /If-Match:/);
+  assert.doesNotMatch(draftPolicySource, /If-Match:/);
   assert.match(draftPolicySource, /releases\/\$\{release_id\}/);
   assert.doesNotMatch(draftPolicySource, /gh release edit/);
   assert.ok(
-    preflight !== -1 &&
+    acquire !== -1 &&
+      acquire < preflight &&
       preflight < upload &&
       upload < download &&
       download < scanner &&
       scanner < capture &&
       capture < publish,
   );
+});
+
+test("release lock is always relinquished and governance identity is protected-environment state", () => {
+  const signing = jobBlock("sign-and-release");
+  const steps = stepBlocks(signing);
+  const acquire = steps.find((step) => step.includes("release-macos-draft.sh acquire-lock"));
+  const release = steps.find((step) => step.includes("release-macos-draft.sh release-lock"));
+
+  assert.ok(acquire, "atomic release-lock acquisition step must exist");
+  assert.ok(release, "release-lock cleanup step must exist");
+  assert.match(release, /^\s+if: always\(\)$/m);
+  assert.match(release, /RELEASE_LOCK_ACQUIRED: \$\{\{ steps\.release-lock\.outputs\.acquired \}\}/);
+  assert.match(signing, /RELEASE_WRITER_LOGIN: \$\{\{ vars\.RELEASE_WRITER_LOGIN \}\}/);
+  assert.match(signing, /RELEASE_WRITER_ID: \$\{\{ vars\.RELEASE_WRITER_ID \}\}/);
+  assert.match(signing, /WORKFLOW_ATTEMPT: \$\{\{ github\.run_attempt \}\}/);
+  assert.match(draftPolicySource, /--method POST[\s\S]*repos\/\$\{GH_REPO\}\/git\/refs/);
+  assert.match(
+    draftPolicySource,
+    /--method DELETE[\s\S]*git\/refs\/tags\/\$\{LOCK_REF_NAME\}/,
+  );
+  assert.match(draftPolicyImplementation, /post-publish release state/);
 });

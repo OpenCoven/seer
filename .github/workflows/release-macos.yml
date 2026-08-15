@@ -2,9 +2,13 @@ name: Release standalone macOS app
 
 # This workflow runs only in the private OpenCoven/seer source repository.
 # Maintainers separately create the public OpenCoven/seer-releases repository,
-# its fine-grained RELEASES_REPO_TOKEN, the protected macos-release environment,
-# its required reviewers, variables, and Apple signing/notarization secrets.
+# its fine-grained RELEASES_REPO_TOKEN, immutable-releases protection, and the
+# protected macos-release environment with exact release-writer identity
+# variables, required reviewers, and Apple signing/notarization secrets.
 # This workflow never creates or configures those protected resources.
+# GitHub's release PATCH API has no supported compare-and-swap precondition.
+# Exclusivity is enforced by this workflow group plus an atomic tag-scoped lock
+# ref in the release repository; the lock is verified around every mutation.
 on:
   push:
     tags:
@@ -15,7 +19,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: release-macos-${{ github.ref }}
+  group: release-macos-OpenCoven-seer-releases-${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -255,6 +259,8 @@ jobs:
           BINARY_DISTRIBUTION_APPROVED: ${{ vars.BINARY_DISTRIBUTION_APPROVED }}
           PARITY_MATRIX_APPROVED: ${{ vars.PARITY_MATRIX_APPROVED }}
           CLEAN_MACHINE_VERIFIED_COMMIT: ${{ vars.CLEAN_MACHINE_VERIFIED_COMMIT }}
+          RELEASE_WRITER_LOGIN: ${{ vars.RELEASE_WRITER_LOGIN }}
+          RELEASE_WRITER_ID: ${{ vars.RELEASE_WRITER_ID }}
           SOURCE_REPOSITORY: ${{ github.repository }}
           SOURCE_REPOSITORY_PRIVATE: ${{ github.event.repository.private }}
           BUILD_NUMBER: ${{ github.run_number }}
@@ -277,6 +283,14 @@ jobs:
           }
           [[ "${CLEAN_MACHINE_VERIFIED_COMMIT}" == "${GITHUB_SHA}" ]] || {
             echo "error: clean-machine verification does not match GITHUB_SHA" >&2
+            exit 1
+          }
+          [[ "${RELEASE_WRITER_LOGIN}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,38})$ ]] || {
+            echo "error: RELEASE_WRITER_LOGIN must be a canonical GitHub login" >&2
+            exit 1
+          }
+          [[ "${RELEASE_WRITER_ID}" =~ ^[1-9][0-9]*$ ]] || {
+            echo "error: RELEASE_WRITER_ID must be a positive canonical GitHub user ID" >&2
             exit 1
           }
           [[ "${SOURCE_REPOSITORY}" == "OpenCoven/seer" && "${SOURCE_REPOSITORY_PRIVATE}" == "true" ]] || {
@@ -350,15 +364,34 @@ jobs:
             exit 1
           }
 
-      - name: Reject unsafe release collisions
+      - name: Acquire atomic tag-scoped release lock
+        id: release-lock
         env:
           GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
           GH_REPO: OpenCoven/seer-releases
+          RELEASE_WRITER_LOGIN: ${{ vars.RELEASE_WRITER_LOGIN }}
+          RELEASE_WRITER_ID: ${{ vars.RELEASE_WRITER_ID }}
           SOURCE_REPOSITORY: ${{ github.repository }}
           SOURCE_COMMIT: ${{ github.sha }}
           SOURCE_TAG: ${{ github.ref_name }}
           WORKFLOW_REF: ${{ github.workflow_ref }}
           WORKFLOW_RUN: ${{ github.run_id }}
+          WORKFLOW_ATTEMPT: ${{ github.run_attempt }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: bash scripts/release-macos-draft.sh acquire-lock
+
+      - name: Reject unsafe release collisions
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          GH_REPO: OpenCoven/seer-releases
+          RELEASE_WRITER_LOGIN: ${{ vars.RELEASE_WRITER_LOGIN }}
+          RELEASE_WRITER_ID: ${{ vars.RELEASE_WRITER_ID }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          SOURCE_TAG: ${{ github.ref_name }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_RUN: ${{ github.run_id }}
+          WORKFLOW_ATTEMPT: ${{ github.run_attempt }}
           VERSION: ${{ needs.prepare.outputs.version }}
         run: bash scripts/release-macos-draft.sh preflight
 
@@ -488,12 +521,15 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
           GH_REPO: OpenCoven/seer-releases
+          RELEASE_WRITER_LOGIN: ${{ vars.RELEASE_WRITER_LOGIN }}
+          RELEASE_WRITER_ID: ${{ vars.RELEASE_WRITER_ID }}
           VERSION: ${{ needs.prepare.outputs.version }}
           SOURCE_REPOSITORY: ${{ github.repository }}
           SOURCE_COMMIT: ${{ github.sha }}
           SOURCE_TAG: ${{ github.ref_name }}
           WORKFLOW_REF: ${{ github.workflow_ref }}
           WORKFLOW_RUN: ${{ github.run_id }}
+          WORKFLOW_ATTEMPT: ${{ github.run_attempt }}
           RELEASE_BODY: ${{ steps.release-notes.outputs.path }}
           RELEASE_DIR: build/macos/release
         run: bash scripts/release-macos-draft.sh upload
@@ -596,12 +632,15 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
           GH_REPO: OpenCoven/seer-releases
+          RELEASE_WRITER_LOGIN: ${{ vars.RELEASE_WRITER_LOGIN }}
+          RELEASE_WRITER_ID: ${{ vars.RELEASE_WRITER_ID }}
           VERSION: ${{ needs.prepare.outputs.version }}
           SOURCE_REPOSITORY: ${{ github.repository }}
           SOURCE_COMMIT: ${{ github.sha }}
           SOURCE_TAG: ${{ github.ref_name }}
           WORKFLOW_REF: ${{ github.workflow_ref }}
           WORKFLOW_RUN: ${{ github.run_id }}
+          WORKFLOW_ATTEMPT: ${{ github.run_attempt }}
           RELEASE_BODY: ${{ steps.release-notes.outputs.path }}
           RELEASE_DIR: ${{ steps.public-assets.outputs.directory }}
           VERIFIED_STATE: ${{ steps.public-assets.outputs.verified-state }}
@@ -612,14 +651,34 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
           GH_REPO: OpenCoven/seer-releases
+          RELEASE_WRITER_LOGIN: ${{ vars.RELEASE_WRITER_LOGIN }}
+          RELEASE_WRITER_ID: ${{ vars.RELEASE_WRITER_ID }}
           VERSION: ${{ needs.prepare.outputs.version }}
           SOURCE_REPOSITORY: ${{ github.repository }}
           SOURCE_COMMIT: ${{ github.sha }}
           SOURCE_TAG: ${{ github.ref_name }}
           WORKFLOW_REF: ${{ github.workflow_ref }}
           WORKFLOW_RUN: ${{ github.run_id }}
+          WORKFLOW_ATTEMPT: ${{ github.run_attempt }}
           RELEASE_BODY: ${{ steps.release-notes.outputs.path }}
           RELEASE_DIR: ${{ steps.public-assets.outputs.directory }}
           VERIFIED_STATE: ${{ steps.public-assets.outputs.verified-state }}
           STATE_WORK_DIR: ${{ steps.public-assets.outputs.state-directory }}
         run: bash scripts/release-macos-draft.sh publish
+
+      - name: Always release the exact owned remote lock
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          GH_REPO: OpenCoven/seer-releases
+          RELEASE_WRITER_LOGIN: ${{ vars.RELEASE_WRITER_LOGIN }}
+          RELEASE_WRITER_ID: ${{ vars.RELEASE_WRITER_ID }}
+          RELEASE_LOCK_ACQUIRED: ${{ steps.release-lock.outputs.acquired }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          SOURCE_TAG: ${{ github.ref_name }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_RUN: ${{ github.run_id }}
+          WORKFLOW_ATTEMPT: ${{ github.run_attempt }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: bash scripts/release-macos-draft.sh release-lock

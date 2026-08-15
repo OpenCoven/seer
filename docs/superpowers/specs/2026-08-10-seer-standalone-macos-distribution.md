@@ -409,7 +409,7 @@ Repository secrets follow the existing OpenCoven macOS convention:
 | `APPLE_ID` | Apple ID for the supported notarization fallback |
 | `APPLE_PASSWORD` | App-specific password for the notarization fallback |
 | `APPLE_TEAM_ID` | Apple Developer team ID |
-| `RELEASES_REPO_TOKEN` | Fine-grained token limited to release writes in `OpenCoven/seer-releases` |
+| `RELEASES_REPO_TOKEN` | Fine-grained token limited to contents/release writes and immutable-release configuration reads in `OpenCoven/seer-releases`; its exact identity is the sole release writer |
 
 App Store Connect API-key authentication is the default notarization path.
 `APPLE_ID`, `APPLE_PASSWORD`, and `APPLE_TEAM_ID` provide the documented
@@ -441,6 +441,13 @@ The release workflow:
 15. Downloads and re-verifies every uploaded artifact.
 16. Publishes the release only after all checks pass.
 
+Before step 13, the workflow acquires a tag-scoped lock ref atomically in the
+release repository. Its annotated tag binds the source tag, source commit,
+workflow run, and attempt to a verified existing release-repository commit.
+Workflow concurrency and this lock replace unsupported release `If-Match`
+compare-and-swap semantics. Every mutating phase verifies exact lock ownership;
+an `always()` step removes only the owned lock ref.
+
 The public release repository contains a product README and release metadata,
 not application source. Its automatically generated source archive therefore
 contains only that public repository's metadata.
@@ -452,6 +459,16 @@ contains only that public repository's metadata.
 - Failed workflows leave no published partial release. A draft may remain for
   maintainers to inspect or delete.
 - The cross-repository token is fine-grained and cannot read private source.
+- GitHub immutable releases must be enabled and is verified through the
+  repository API before release work. The published release must report itself
+  immutable.
+- The protected token's API login and numeric ID must match the configured
+  writer, and every release author and asset uploader must match that identity.
+- Immediately before publication, the workflow refetches canonical metadata
+  and freshly downloads every asset to compare release/asset IDs, sizes, server
+  digests, uploader identities, and hashes with captured state. It refetches
+  after the normal `draft:false` PATCH; any mismatch fails loudly and never
+  deletes the release.
 - Release jobs use a protected GitHub environment with required approval.
 - Workflow actions are pinned to immutable commit SHAs.
 - The build fails if the runner is not arm64.

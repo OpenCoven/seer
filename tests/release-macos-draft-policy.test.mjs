@@ -15,6 +15,23 @@ const sourceRepository = "OpenCoven/seer";
 const destinationRepository = "OpenCoven/seer-releases";
 const workflowRef = `${sourceRepository}/.github/workflows/release-macos.yml@refs/tags/${sourceTag}`;
 const workflowRun = "123";
+const workflowAttempt = "1";
+const releaseWriter = { id: 7, login: "release-writer" };
+const releaseRepoCommit = "c".repeat(40);
+const lockTagObjectSHA = "d".repeat(40);
+const lockRef = `refs/tags/seer-release-lock-${sourceTag}`;
+const lockTagName =
+  `seer-release-lock-${sourceTag}-${sourceCommit}-run-${workflowRun}-attempt-${workflowAttempt}`;
+const lockMessage =
+  `${JSON.stringify({
+    schema: 1,
+    sourceRepository,
+    sourceCommit,
+    sourceTag,
+    workflowRef,
+    workflowRun,
+    workflowAttempt,
+  })}\n`;
 const expectedAssets = [`Seer-v${version}-arm64.dmg`, "SHA256SUMS", "release-manifest.json"];
 const marker =
   `<!-- seer-release-provenance:{"schema":1,"sourceRepository":"${sourceRepository}",` +
@@ -34,6 +51,7 @@ function asset(name, id, contents = `${name}\n`, digest = true) {
     contents,
     size: Buffer.byteLength(contents),
     digest: digest ? `sha256:${sha256(contents)}` : null,
+    uploader: releaseWriter,
   };
 }
 
@@ -45,6 +63,8 @@ function matchingRelease(overrides = {}) {
     title: canonicalTitle,
     body: canonicalBody,
     updatedAt: "2026-08-15T18:00:00Z",
+    immutable: false,
+    author: releaseWriter,
     assets: expectedAssets.map((name, index) => asset(name, 100 + index)),
     ...overrides,
   };
@@ -78,12 +98,74 @@ const releaseJSON = () => ({
   name: state.release.title,
   body: state.release.body,
   updated_at: state.release.updatedAt,
-  assets: state.release.assets.map(({ id, name, size, digest }) => ({ id, name, size, digest })),
+  immutable: state.release.immutable,
+  author: state.release.author,
+  assets: state.release.assets.map(({ id, name, size, digest, uploader }) => ({
+    id, name, size, digest, uploader
+  })),
 });
 
-if (args[0] === "api" && endpoint === "repos/OpenCoven/seer-releases") {
+if (args[0] === "api" && args.includes("user")) {
   save();
-  console.log(state.visibility);
+  console.log(JSON.stringify(state.tokenUser));
+} else if (args[0] === "api" && endpoint === "repos/OpenCoven/seer-releases") {
+  save();
+  console.log(JSON.stringify({ visibility: state.visibility, default_branch: "main" }));
+} else if (args[0] === "api" && endpoint === "repos/OpenCoven/seer-releases/immutable-releases") {
+  save();
+  console.log(JSON.stringify({ enabled: state.immutableReleases, enforced_by_owner: false }));
+} else if (args[0] === "api" && endpoint === "repos/OpenCoven/seer-releases/git/ref/heads/main") {
+  save();
+  console.log(JSON.stringify({ ref: "refs/heads/main", object: { type: "commit", sha: state.releaseRepoCommit } }));
+} else if (args[0] === "api" && endpoint === \`repos/OpenCoven/seer-releases/git/commits/\${state.releaseRepoCommit}\`) {
+  save();
+  console.log(JSON.stringify({ sha: state.releaseRepoCommit }));
+} else if (args[0] === "api" && endpoint === "repos/OpenCoven/seer-releases/git/tags" && args.includes("POST")) {
+  const valueAfter = (name) => {
+    const index = args.lastIndexOf(name);
+    return index === -1 ? null : args[index + 1];
+  };
+  state.pendingLockTag = {
+    sha: state.lockTagObjectSHA,
+    tag: valueAfter("--raw-field")?.startsWith("tag=")
+      ? valueAfter("--raw-field").slice(4)
+      : args.find((arg) => arg.startsWith("tag="))?.slice(4),
+  };
+  const fields = Object.fromEntries(args.filter((arg) => arg.includes("=")).map((arg) => arg.split(/=(.*)/s).slice(0, 2)));
+  state.pendingLockTag = {
+    sha: state.lockTagObjectSHA,
+    tag: fields.tag,
+    message: fields.message,
+    object: { type: fields.type, sha: fields.object },
+  };
+  save();
+  console.log(JSON.stringify(state.pendingLockTag));
+} else if (args[0] === "api" && endpoint === "repos/OpenCoven/seer-releases/git/refs" && args.includes("POST")) {
+  if (state.lock) {
+    save();
+    console.error("gh: Reference already exists (HTTP 422)");
+    process.exit(1);
+  }
+  const fields = Object.fromEntries(args.filter((arg) => arg.includes("=")).map((arg) => arg.split(/=(.*)/s).slice(0, 2)));
+  state.lock = { ref: fields.ref, sha: fields.sha, tagObject: state.pendingLockTag };
+  save();
+  console.log(JSON.stringify({ ref: state.lock.ref, object: { type: "tag", sha: state.lock.sha } }));
+} else if (args[0] === "api" && endpoint === "repos/OpenCoven/seer-releases/git/ref/tags/seer-release-lock-v1.2.3") {
+  if (!state.lock) fail404();
+  save();
+  console.log(JSON.stringify({ ref: state.lock.ref, object: { type: "tag", sha: state.lock.sha } }));
+} else if (args[0] === "api" && endpoint === \`repos/OpenCoven/seer-releases/git/tags/\${state.lock?.sha}\`) {
+  if (!state.lock) fail404();
+  save();
+  console.log(JSON.stringify(state.lock.tagObject));
+} else if (
+  args[0] === "api" &&
+  endpoint === "repos/OpenCoven/seer-releases/git/refs/tags/seer-release-lock-v1.2.3" &&
+  args.includes("DELETE")
+) {
+  if (!state.lock) fail404();
+  state.lock = null;
+  save();
 } else if (args[0] === "api" && endpoint?.includes("/releases/tags/")) {
   if (!state.release) fail404();
   save();
@@ -125,6 +207,8 @@ if (args[0] === "api" && endpoint === "repos/OpenCoven/seer-releases") {
     body: readFileSync(args[notesIndex + 1], "utf8"),
     updatedAt: "2026-08-15T18:00:00Z",
     assets: [],
+    immutable: false,
+    author: state.tokenUser,
   };
   state.tagExists = true;
   save();
@@ -143,6 +227,7 @@ if (args[0] === "api" && endpoint === "repos/OpenCoven/seer-releases") {
       contentsEncoding: "base64",
       size: statSync(path).size,
       digest: \`sha256:\${createHash("sha256").update(contents).digest("hex")}\`,
+      uploader: state.tokenUser,
     });
   }
   state.nextAssetID = nextID;
@@ -202,7 +287,11 @@ const releaseJSON = () => JSON.stringify({
   name: state.release.title,
   body: state.release.body,
   updated_at: state.release.updatedAt,
-  assets: state.release.assets.map(({ id, name, size, digest }) => ({ id, name, size, digest })),
+  immutable: state.release.immutable,
+  author: state.release.author,
+  assets: state.release.assets.map(({ id, name, size, digest, uploader }) => ({
+    id, name, size, digest, uploader
+  })),
 });
 const assetBytes = (item) =>
   item.contentsEncoding === "base64" ? Buffer.from(item.contents, "base64") : Buffer.from(item.contents);
@@ -221,13 +310,11 @@ if (method === "GET" && url?.includes("/releases/tags/")) {
   writeResponse(200, assetBytes(item));
   save();
 } else if (method === "PATCH" && url?.includes("/releases/")) {
-  const ifMatch = headers.find((header) => header.startsWith("If-Match: "))?.slice("If-Match: ".length);
-  if (state.etagConflictOnPatch || ifMatch !== state.etag) {
-    writeResponse(412, JSON.stringify({ message: "Precondition Failed" }));
-    save();
-    process.exit(22);
-  }
   state.release.draft = false;
+  state.release.immutable = state.immutableReleases;
+  state.release.updatedAt = "2026-08-15T18:02:00Z";
+  if (state.postPublishMutation === "title") state.release.title += " foreign";
+  if (state.postPublishMutation === "asset-id") state.release.assets[0].id += 1000;
   writeResponse(200, JSON.stringify({ ...JSON.parse(releaseJSON()), draft: false }));
   save();
 } else {
@@ -259,10 +346,27 @@ function withHarness(callback, options = {}) {
       statePath,
       JSON.stringify({
         visibility: "public",
+        immutableReleases: options.immutableReleases ?? true,
+        tokenUser: options.tokenUser ?? releaseWriter,
+        releaseRepoCommit,
+        lockTagObjectSHA,
+        lock:
+          options.lock === undefined
+            ? {
+                ref: lockRef,
+                sha: lockTagObjectSHA,
+                tagObject: {
+                  sha: lockTagObjectSHA,
+                  tag: lockTagName,
+                  message: lockMessage,
+                  object: { type: "commit", sha: releaseRepoCommit },
+                },
+              }
+            : options.lock,
         release: options.release === undefined ? matchingRelease() : options.release,
         tagExists: options.tagExists ?? true,
         etag: options.etag ?? '"draft-etag"',
-        etagConflictOnPatch: false,
+        postPublishMutation: null,
         nextAssetID: 200,
         calls: [],
         authenticatedRequests: [],
@@ -291,7 +395,10 @@ function withHarness(callback, options = {}) {
           SOURCE_TAG: sourceTag,
           WORKFLOW_REF: workflowRef,
           WORKFLOW_RUN: workflowRun,
+          WORKFLOW_ATTEMPT: workflowAttempt,
           VERSION: version,
+          RELEASE_WRITER_LOGIN: releaseWriter.login,
+          RELEASE_WRITER_ID: String(releaseWriter.id),
           RELEASE_DIR: releaseDir,
           RELEASE_BODY: releaseBody,
           VERIFIED_STATE: verifiedState,
@@ -313,7 +420,7 @@ test("published releases are rejected without mutation", () => {
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /existing published release/);
     assert.ok(!state.calls.some((call) => call.includes("PATCH")));
-  }, { release: matchingRelease({ draft: false }) });
+  }, { release: matchingRelease({ draft: false, immutable: true }) });
 });
 
 test("preflight rejects modified title and any foreign or trailing release body", () => {
@@ -370,16 +477,28 @@ test("capture emits exact release, metadata, asset, byte, and notes bindings", (
     assert.equal(result.status, 0, result.stderr);
     const captured = JSON.parse(readFileSync(verifiedState, "utf8"));
     assert.equal(captured.releaseId, 42);
-    assert.equal(captured.etag, '"draft-etag"');
     assert.equal(captured.updatedAt, "2026-08-15T18:00:00Z");
     assert.equal(captured.tagName, sourceTag);
     assert.equal(captured.title, canonicalTitle);
     assert.equal(captured.body, canonicalBody);
+    assert.deepEqual(captured.author, releaseWriter);
     assert.equal(captured.notes.sha256, sha256(canonicalBody));
     assert.deepEqual(captured.assets.map(({ id }) => id), [100, 101, 102]);
     assert.deepEqual(
-      captured.assets.map(({ name, size, sha256: digest }) => ({ name, size, digest })),
-      expectedAssets.map((name) => ({ name, size: Buffer.byteLength(`${name}\n`), digest: sha256(`${name}\n`) })),
+      captured.assets.map(({ name, size, sha256: digest, serverDigest, uploader }) => ({
+        name,
+        size,
+        digest,
+        serverDigest,
+        uploader,
+      })),
+      expectedAssets.map((name) => ({
+        name,
+        size: Buffer.byteLength(`${name}\n`),
+        digest: sha256(`${name}\n`),
+        serverDigest: `sha256:${sha256(`${name}\n`)}`,
+        uploader: releaseWriter,
+      })),
     );
   });
 });
@@ -428,13 +547,17 @@ test("release policy rejects inherited xtrace before the token can be logged", (
   });
 });
 
-test("publish fails closed when title, notes body, asset id, size, or digest changes", () => {
+test("publish fails closed when canonical release or asset identity state changes", () => {
   const mutations = [
     ["title", (state) => { state.release.title += " changed"; }],
     ["body", (state) => { state.release.body += "foreign\n"; }],
+    ["author", (state) => { state.release.author = { id: 99, login: "foreign-writer" }; }],
     ["asset id", (state) => { state.release.assets[0].id = 999; }],
     ["asset size", (state) => { state.release.assets[0].size += 1; }],
     ["asset digest", (state) => { state.release.assets[0].digest = `sha256:${"f".repeat(64)}`; }],
+    ["asset uploader", (state) => {
+      state.release.assets[0].uploader = { id: 99, login: "foreign-writer" };
+    }],
   ];
 
   for (const [name, mutate] of mutations) {
@@ -475,7 +598,7 @@ test("publish re-downloads and re-hashes exact asset IDs when API digests are un
     const assetDownloads = after.calls.filter(
       (call) => call[0] === "curl" && call.some((arg) => arg.includes("/releases/assets/")),
     );
-    assert.equal(assetDownloads.length, expectedAssets.length * 2);
+    assert.equal(assetDownloads.length, expectedAssets.length * 3);
   });
 });
 
@@ -498,20 +621,98 @@ test("publish rejects changed remote bytes when API digests are unavailable", ()
   });
 });
 
-test("publish fails closed on an If-Match precondition conflict", () => {
-  withHarness(({ run, readState, writeState }) => {
-    assert.equal(run("capture").status, 0);
-    const state = readState();
-    state.etagConflictOnPatch = true;
-    writeState(state);
-    const result = run("publish");
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /precondition|conditional|publish/i);
-    assert.equal(readState().release.draft, true);
-  });
+test("atomic tag-scoped lock acquisition collides and only its exact owner releases it", () => {
+  withHarness(({ run, readState }) => {
+    const acquired = run("acquire-lock");
+    assert.equal(acquired.status, 0, acquired.stderr);
+    const held = readState().lock;
+    assert.equal(held.ref, lockRef);
+    assert.equal(held.tagObject.tag, lockTagName);
+    assert.equal(held.tagObject.message, lockMessage);
+    assert.deepEqual(held.tagObject.object, { type: "commit", sha: releaseRepoCommit });
+
+    const collision = run("acquire-lock");
+    assert.notEqual(collision.status, 0);
+    assert.match(collision.stderr, /already exists|lock/i);
+    assert.deepEqual(readState().lock, held);
+
+    const released = run("release-lock", { RELEASE_LOCK_ACQUIRED: "true" });
+    assert.equal(released.status, 0, released.stderr);
+    assert.equal(readState().lock, null);
+  }, { lock: null });
 });
 
-test("exact captured state publishes by release ID with conditional REST PATCH only", () => {
+test("foreign lock ownership, release author, and asset uploader fail closed", () => {
+  const cases = [
+    {
+      name: "lock",
+      options: {
+        lock: {
+          ref: lockRef,
+          sha: "e".repeat(40),
+          tagObject: {
+            sha: "e".repeat(40),
+            tag: `${lockTagName}-foreign`,
+            message: `${lockMessage}foreign`,
+            object: { type: "commit", sha: releaseRepoCommit },
+          },
+        },
+      },
+    },
+    {
+      name: "author",
+      options: { release: matchingRelease({ author: { id: 99, login: "foreign-writer" } }) },
+    },
+    {
+      name: "uploader",
+      options: {
+        release: matchingRelease({
+          assets: expectedAssets.map((name, index) => ({
+            ...asset(name, 100 + index),
+            ...(index === 0 ? { uploader: { id: 99, login: "foreign-writer" } } : {}),
+          })),
+        }),
+      },
+    },
+  ];
+  for (const { name, options } of cases) {
+    withHarness(({ run, readState }) => {
+      const result = run("preflight");
+      assert.notEqual(result.status, 0, `${name} must fail`);
+      assert.match(result.stderr, /lock|author|uploader|writer/i);
+      assert.equal(readState().release.draft, true);
+    }, options);
+  }
+});
+
+test("immutable release repository protection is mandatory and verifiable", () => {
+  withHarness(({ run, readState }) => {
+    const result = run("preflight");
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /immutable releases/i);
+    assert.equal(readState().release.draft, true);
+  }, { immutableReleases: false });
+});
+
+test("post-publish mismatch fails loudly without deleting the release", () => {
+  for (const mutation of ["title", "asset-id"]) {
+    withHarness(({ run, readState, writeState }) => {
+      assert.equal(run("capture").status, 0);
+      const state = readState();
+      state.postPublishMutation = mutation;
+      writeState(state);
+      const result = run("publish");
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /post-publish release state|canonical metadata|asset identity/i);
+      const after = readState();
+      assert.equal(after.release.draft, false);
+      assert.ok(!after.calls.some((call) => call[0] === "gh" && call[1] === "release" && call[2] === "delete"));
+      assert.ok(!after.calls.some((call) => call.includes("/releases/") && call.includes("DELETE")));
+    });
+  }
+});
+
+test("exact captured state publishes by release ID with supported REST PATCH and refetch", () => {
   withHarness(({ run, readState }) => {
     assert.equal(run("capture").status, 0);
     const result = run("publish");
@@ -521,9 +722,16 @@ test("exact captured state publishes by release ID with conditional REST PATCH o
     const patch = state.calls.find((call) => call[0] === "curl" && call.includes("PATCH"));
     assert.ok(patch);
     assert.ok(patch.some((arg) => arg.endsWith("/releases/42")));
-    assert.ok(patch.includes('If-Match: "draft-etag"'));
+    assert.ok(!patch.some((arg) => arg.startsWith("If-Match:")));
     assert.ok(patch.includes("Authorization: [REDACTED]"));
     assert.equal(state.authenticatedRequests.filter(({ method }) => method === "PATCH").length, 1);
+    assert.equal(
+      state.authenticatedRequests.filter(
+        ({ method, url }) => method === "GET" && url.includes("/releases/tags/"),
+      ).length,
+      3,
+    );
+    assert.equal(state.release.immutable, true);
     assert.doesNotMatch(`${result.stdout}\n${result.stderr}\n${JSON.stringify(state)}`, /test-token/);
     assert.ok(!state.calls.some((call) => call[0] === "gh" && call[1] === "release" && call[2] === "edit"));
     assert.ok(!state.calls.some((call) => call.includes("delete") || call.includes("DELETE")));

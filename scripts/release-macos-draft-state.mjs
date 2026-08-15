@@ -3,15 +3,8 @@
 import { createHash } from "node:crypto";
 import { readFileSync, statSync, writeFileSync } from "node:fs";
 
-const [
-  command,
-  metadataPath,
-  headersPath,
-  releaseDir,
-  notesPath,
-  statePath,
-  fallbackDir,
-] = process.argv.slice(2);
+const [command, metadataPath, _headersPath, releaseDir, notesPath, statePath, downloadsDir] =
+  process.argv.slice(2);
 
 const required = (name) => {
   const value = process.env[name];
@@ -24,15 +17,33 @@ const sourceCommit = required("SOURCE_COMMIT");
 const sourceTag = required("SOURCE_TAG");
 const workflowRef = required("WORKFLOW_REF");
 const workflowRun = required("WORKFLOW_RUN");
+const workflowAttempt = required("WORKFLOW_ATTEMPT");
 const version = required("VERSION");
 const destinationRepository = required("GH_REPO");
+const releaseWriter = {
+  id: Number(required("RELEASE_WRITER_ID")),
+  login: required("RELEASE_WRITER_LOGIN"),
+};
 const expectedTitle = `Seer ${version}`;
 const expectedMarker =
   `<!-- seer-release-provenance:{"schema":1,"sourceRepository":"${sourceRepository}",` +
   `"sourceCommit":"${sourceCommit}","sourceTag":"${sourceTag}","workflowRef":"${workflowRef}",` +
   `"workflowRun":"${workflowRun}"} -->`;
-const expectedBody = `${expectedMarker}\n\nSeer ${version} for Apple Silicon Macs running macOS 14 or later.\n`;
+const expectedBody =
+  `${expectedMarker}\n\nSeer ${version} for Apple Silicon Macs running macOS 14 or later.\n`;
 const expectedNames = [`Seer-v${version}-arm64.dmg`, "SHA256SUMS", "release-manifest.json"];
+const expectedLockTag =
+  `seer-release-lock-${sourceTag}-${sourceCommit}-run-${workflowRun}-attempt-${workflowAttempt}`;
+const expectedLockMessage =
+  `${JSON.stringify({
+    schema: 1,
+    sourceRepository,
+    sourceCommit,
+    sourceTag,
+    workflowRef,
+    workflowRun,
+    workflowAttempt,
+  })}\n`;
 
 function fail(message) {
   throw new Error(message);
@@ -42,21 +53,59 @@ function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
-function readJSON(path, description) {
+function parseJSON(source, description) {
   try {
-    return JSON.parse(readFileSync(path, "utf8"));
+    return JSON.parse(source);
   } catch {
     return fail(`${description} is not valid JSON`);
   }
 }
 
-function parseMetadata(value, { requireComplete }) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) fail("release metadata has an invalid shape");
-  const { id, draft, tag_name: tagName, name: title, body, updated_at: updatedAt, assets } = value;
+function readJSON(path, description) {
+  return parseJSON(readFileSync(path, "utf8"), description);
+}
+
+async function readStdinJSON(description) {
+  const chunks = [];
+  for await (const chunk of process.stdin) chunks.push(chunk);
+  return parseJSON(Buffer.concat(chunks).toString("utf8"), description);
+}
+
+function validateUser(value, description) {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    !Number.isSafeInteger(value.id) ||
+    value.id <= 0 ||
+    typeof value.login !== "string" ||
+    value.id !== releaseWriter.id ||
+    value.login !== releaseWriter.login
+  ) {
+    fail(`${description} does not match the exact protected release writer identity`);
+  }
+  return { id: value.id, login: value.login };
+}
+
+function parseMetadata(value, { requireComplete, expectedDraft }) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    fail("release metadata has an invalid shape");
+  }
+  const {
+    id,
+    draft,
+    immutable,
+    tag_name: tagName,
+    name: title,
+    body,
+    updated_at: updatedAt,
+    author,
+    assets,
+  } = value;
   if (
     !Number.isSafeInteger(id) ||
     id <= 0 ||
     typeof draft !== "boolean" ||
+    typeof immutable !== "boolean" ||
     typeof tagName !== "string" ||
     typeof title !== "string" ||
     typeof body !== "string" ||
@@ -66,12 +115,17 @@ function parseMetadata(value, { requireComplete }) {
   ) {
     fail("release metadata has an invalid shape");
   }
+  if (expectedDraft !== undefined && draft !== expectedDraft) {
+    fail(expectedDraft ? "verified release is no longer a draft" : "post-publish release is still a draft");
+  }
+  if (!draft && !immutable) fail("published release is not protected by immutable releases");
   if (tagName !== sourceTag) fail(`draft release tag does not match ${sourceTag}`);
-  if (title !== expectedTitle) fail("draft canonical title does not match");
+  if (title !== expectedTitle) fail("release canonical title does not match");
   if (body.split("\n", 1)[0] !== expectedMarker) {
     fail("draft provenance marker does not match the source commit, tag, repository, and workflow");
   }
-  if (body !== expectedBody) fail("draft canonical body does not match exactly");
+  if (body !== expectedBody) fail("release canonical body does not match exactly");
+  const normalizedAuthor = validateUser(author, "release author");
 
   const seenNames = new Set();
   const seenIDs = new Set();
@@ -89,31 +143,46 @@ function parseMetadata(value, { requireComplete }) {
       fail("release asset metadata has an invalid shape");
     }
     if (!expectedNames.includes(item.name)) fail("draft contains a foreign release asset");
-    if (seenNames.has(item.name) || seenIDs.has(item.id)) fail("draft contains duplicate release asset metadata");
+    if (seenNames.has(item.name) || seenIDs.has(item.id)) {
+      fail("draft contains duplicate release asset metadata");
+    }
     seenNames.add(item.name);
     seenIDs.add(item.id);
     if (typeof item.digest === "string" && !/^sha256:[0-9a-f]{64}$/.test(item.digest)) {
       fail(`release asset ${item.name} has an invalid digest`);
     }
-    return { id: item.id, name: item.name, size: item.size, digest: item.digest ?? null };
+    return {
+      id: item.id,
+      name: item.name,
+      size: item.size,
+      serverDigest: item.digest ?? null,
+      uploader: validateUser(item.uploader, `release asset uploader for ${item.name}`),
+    };
   });
 
-  const complete = expectedNames.every((name) => seenNames.has(name)) && normalizedAssets.length === expectedNames.length;
-  if (requireComplete && !complete) fail("draft release does not contain the complete public asset allowlist");
+  const complete =
+    expectedNames.every((name) => seenNames.has(name)) &&
+    normalizedAssets.length === expectedNames.length;
+  if (requireComplete && !complete) {
+    fail("draft release does not contain the complete public asset allowlist");
+  }
   normalizedAssets.sort((a, b) => expectedNames.indexOf(a.name) - expectedNames.indexOf(b.name));
-  return { id, draft, tagName, title, body, updatedAt, assets: normalizedAssets, complete };
+  return {
+    id,
+    draft,
+    immutable,
+    tagName,
+    title,
+    body,
+    updatedAt,
+    author: normalizedAuthor,
+    assets: normalizedAssets,
+    complete,
+  };
 }
 
 function readMetadata(path, options) {
   return parseMetadata(readJSON(path, "release metadata"), options);
-}
-
-function readETag(path) {
-  const headers = readFileSync(path, "utf8");
-  const matches = [...headers.matchAll(/^etag:\s*(.+?)\r?$/gim)];
-  const etag = matches.at(-1)?.[1]?.trim();
-  if (!etag) fail("release metadata response did not include an ETag");
-  return etag;
 }
 
 function regularFile(path, description) {
@@ -127,44 +196,45 @@ function regularFile(path, description) {
   return { bytes: readFileSync(path), size: stat.size };
 }
 
-function validateLocal(metadata, localDir, localNotes, downloadsDir) {
+function validateLocal(metadata, localDir, localNotes, freshDownloads) {
   const notes = regularFile(localNotes, "release notes");
-  if (notes.bytes.toString("utf8") !== expectedBody) fail("local release notes do not match the canonical body");
-  const boundAssets = [];
-
+  if (notes.bytes.toString("utf8") !== expectedBody) {
+    fail("local release notes do not match the canonical body");
+  }
+  const assets = [];
   for (const expectedName of expectedNames) {
     const remote = metadata.assets.find(({ name }) => name === expectedName);
     if (!remote) fail(`release metadata is missing ${expectedName}`);
     const local = regularFile(`${localDir}/${expectedName}`, `local release asset ${expectedName}`);
-    if (local.size !== remote.size) fail(`release asset ${expectedName} size does not match local verified bytes`);
-    const digest = sha256(local.bytes);
-    if (remote.digest !== null) {
-      if (remote.digest !== `sha256:${digest}`) {
-        fail(`release asset ${expectedName} digest does not match local verified bytes`);
-      }
-    } else {
-      const downloaded = regularFile(`${downloadsDir}/${remote.id}`, `fresh download for release asset ${expectedName}`);
-      if (!downloaded.bytes.equals(local.bytes)) {
-        fail(`fresh download for release asset ${expectedName} does not match local verified bytes`);
-      }
+    if (local.size !== remote.size) {
+      fail(`release asset ${expectedName} size does not match local verified bytes`);
     }
-    boundAssets.push({ id: remote.id, name: expectedName, size: local.size, sha256: digest });
+    const digest = sha256(local.bytes);
+    if (remote.serverDigest !== null && remote.serverDigest !== `sha256:${digest}`) {
+      fail(`release asset ${expectedName} digest does not match local verified bytes`);
+    }
+    const downloaded = regularFile(
+      `${freshDownloads}/${remote.id}`,
+      `fresh download for release asset ${expectedName}`,
+    );
+    if (!downloaded.bytes.equals(local.bytes)) {
+      fail(`fresh download for release asset ${expectedName} does not match local verified bytes`);
+    }
+    assets.push({ ...remote, sha256: digest });
   }
-
   return {
     notes: { size: notes.size, sha256: sha256(notes.bytes) },
-    assets: boundAssets,
+    assets,
   };
 }
 
 function validateStateShape(state) {
   if (
     !state ||
-    state.schema !== 1 ||
+    state.schema !== 2 ||
     state.repository !== destinationRepository ||
     !Number.isSafeInteger(state.releaseId) ||
     state.releaseId <= 0 ||
-    typeof state.etag !== "string" ||
     typeof state.updatedAt !== "string" ||
     state.tagName !== sourceTag ||
     state.title !== expectedTitle ||
@@ -177,6 +247,7 @@ function validateStateShape(state) {
   ) {
     fail("verified release state has an invalid shape or provenance");
   }
+  validateUser(state.author, "verified release author");
   for (const [index, item] of state.assets.entries()) {
     if (
       !item ||
@@ -185,23 +256,40 @@ function validateStateShape(state) {
       item.name !== expectedNames[index] ||
       !Number.isSafeInteger(item.size) ||
       item.size < 0 ||
+      !(item.serverDigest === null || /^sha256:[0-9a-f]{64}$/.test(item.serverDigest)) ||
       !/^[0-9a-f]{64}$/.test(item.sha256)
     ) {
       fail("verified release state has invalid asset bindings");
     }
+    validateUser(item.uploader, `verified release asset uploader for ${item.name}`);
+  }
+}
+
+function compareCanonical(metadata, local, state, { compareUpdatedAt, context }) {
+  if (metadata.id !== state.releaseId) fail(`${context} release ID changed after verification`);
+  if (
+    metadata.tagName !== state.tagName ||
+    metadata.title !== state.title ||
+    metadata.body !== state.body ||
+    JSON.stringify(metadata.author) !== JSON.stringify(state.author)
+  ) {
+    fail(`${context} canonical metadata changed after verification`);
+  }
+  if (compareUpdatedAt && metadata.updatedAt !== state.updatedAt) {
+    fail(`${context} updated_at changed after verification`);
+  }
+  if (local.notes.size !== state.notes.size || local.notes.sha256 !== state.notes.sha256) {
+    fail(`${context} local release notes changed after verification`);
+  }
+  if (JSON.stringify(local.assets) !== JSON.stringify(state.assets)) {
+    fail(`${context} release asset identity, size, server digest, uploader, or bytes changed`);
   }
 }
 
 async function runInspect() {
-  const chunks = [];
-  for await (const chunk of process.stdin) chunks.push(chunk);
-  let value;
-  try {
-    value = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-  } catch {
-    fail("release metadata is not valid JSON");
-  }
-  const metadata = parseMetadata(value, { requireComplete: false });
+  const metadata = parseMetadata(await readStdinJSON("release metadata"), {
+    requireComplete: false,
+  });
   process.stdout.write(
     [
       `id=${metadata.id}`,
@@ -212,11 +300,9 @@ async function runInspect() {
   );
 }
 
-function runMissing() {
+function runDownloads() {
   const metadata = readMetadata(metadataPath, { requireComplete: true });
-  for (const item of metadata.assets) {
-    if (item.digest === null) process.stdout.write(`${item.id}\t${item.name}\n`);
-  }
+  for (const item of metadata.assets) process.stdout.write(`${item.id}\t${item.name}\n`);
 }
 
 function runValidateNotes() {
@@ -227,60 +313,96 @@ function runValidateNotes() {
 }
 
 function runCapture() {
-  const metadata = readMetadata(metadataPath, { requireComplete: true });
-  if (!metadata.draft) fail("existing published release cannot be captured as a draft");
-  const etag = readETag(headersPath);
-  const local = validateLocal(metadata, releaseDir, notesPath, fallbackDir);
+  const metadata = readMetadata(metadataPath, { requireComplete: true, expectedDraft: true });
+  const local = validateLocal(metadata, releaseDir, notesPath, downloadsDir);
   const state = {
-    schema: 1,
+    schema: 2,
     repository: destinationRepository,
     releaseId: metadata.id,
-    etag,
     updatedAt: metadata.updatedAt,
     tagName: metadata.tagName,
     title: metadata.title,
     body: metadata.body,
+    author: metadata.author,
     notes: local.notes,
     assets: local.assets,
   };
   writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, { flag: "wx", mode: 0o600 });
 }
 
-function runCompare() {
-  const metadata = readMetadata(metadataPath, { requireComplete: true });
-  if (!metadata.draft) fail("verified draft is no longer a draft");
-  const etag = readETag(headersPath);
+function runCompare({ published }) {
+  const metadata = readMetadata(metadataPath, {
+    requireComplete: true,
+    expectedDraft: !published,
+  });
   const state = readJSON(statePath, "verified release state");
   validateStateShape(state);
-  const local = validateLocal(metadata, releaseDir, notesPath, fallbackDir);
-
-  if (metadata.id !== state.releaseId) fail("release ID changed after verification");
-  if (etag !== state.etag) fail("release ETag changed after verification");
-  if (metadata.updatedAt !== state.updatedAt) fail("release updated_at changed after verification");
-  if (metadata.tagName !== state.tagName || metadata.title !== state.title || metadata.body !== state.body) {
-    fail("release canonical metadata changed after verification");
-  }
-  if (local.notes.size !== state.notes.size || local.notes.sha256 !== state.notes.sha256) {
-    fail("local release notes changed after verification");
-  }
-  if (JSON.stringify(local.assets) !== JSON.stringify(state.assets)) {
-    fail("release asset identity, size, or digest changed after verification");
-  }
-  process.stdout.write(`${state.releaseId}\n${state.etag}\n`);
+  const local = validateLocal(metadata, releaseDir, notesPath, downloadsDir);
+  compareCanonical(metadata, local, state, {
+    compareUpdatedAt: !published,
+    context: published ? "post-publish release state" : "pre-publish release state",
+  });
+  process.stdout.write(`${state.releaseId}\n`);
 }
 
-function runVerifyPatch() {
-  const response = readJSON(metadataPath, "publish response");
-  const state = readJSON(statePath, "verified release state");
-  validateStateShape(state);
+async function runIdentity() {
+  validateUser(await readStdinJSON("authenticated user"), "authenticated token user");
+}
+
+async function runRepository() {
+  const repository = await readStdinJSON("release repository metadata");
   if (
-    response.id !== state.releaseId ||
-    response.draft !== false ||
-    response.tag_name !== state.tagName ||
-    response.name !== state.title ||
-    response.body !== state.body
+    !repository ||
+    repository.visibility !== "public" ||
+    typeof repository.default_branch !== "string" ||
+    !/^[A-Za-z0-9._/-]+$/.test(repository.default_branch)
   ) {
-    fail("conditional publish response did not match the verified release");
+    fail("release destination must be public with a canonical default branch");
+  }
+  process.stdout.write(`${repository.default_branch}\n`);
+}
+
+async function runImmutable() {
+  const setting = await readStdinJSON("immutable releases setting");
+  if (!setting || setting.enabled !== true) {
+    fail("immutable releases must be enabled for the release repository");
+  }
+}
+
+async function runRef() {
+  const ref = await readStdinJSON("Git reference");
+  if (
+    !ref ||
+    typeof ref.ref !== "string" ||
+    !ref.object ||
+    !["commit", "tag"].includes(ref.object.type) ||
+    !/^[0-9a-f]{40}$/.test(ref.object.sha)
+  ) {
+    fail("Git reference has an invalid shape");
+  }
+  process.stdout.write(`${ref.object.type}\n${ref.object.sha}\n`);
+}
+
+async function runLockTag() {
+  const tag = await readStdinJSON("release lock tag");
+  if (
+    !tag ||
+    !/^[0-9a-f]{40}$/.test(tag.sha) ||
+    tag.tag !== expectedLockTag ||
+    tag.message !== expectedLockMessage ||
+    !tag.object ||
+    tag.object.type !== "commit" ||
+    !/^[0-9a-f]{40}$/.test(tag.object.sha)
+  ) {
+    fail("release lock ownership metadata does not match this tag and source run");
+  }
+  process.stdout.write(`${tag.sha}\n${tag.object.sha}\n`);
+}
+
+async function runCommit() {
+  const commit = await readStdinJSON("release lock target commit");
+  if (!commit || commit.sha !== metadataPath || !/^[0-9a-f]{40}$/.test(commit.sha)) {
+    fail("release lock does not point to the verified release-repository commit");
   }
 }
 
@@ -289,8 +411,8 @@ try {
     case "inspect":
       await runInspect();
       break;
-    case "missing":
-      runMissing();
+    case "downloads":
+      runDownloads();
       break;
     case "validate-notes":
       runValidateNotes();
@@ -299,13 +421,34 @@ try {
       runCapture();
       break;
     case "compare":
-      runCompare();
+      runCompare({ published: false });
       break;
-    case "verify-patch":
-      runVerifyPatch();
+    case "compare-published":
+      runCompare({ published: true });
+      break;
+    case "identity":
+      await runIdentity();
+      break;
+    case "repository":
+      await runRepository();
+      break;
+    case "immutable":
+      await runImmutable();
+      break;
+    case "ref":
+      await runRef();
+      break;
+    case "lock-tag":
+      await runLockTag();
+      break;
+    case "commit":
+      await runCommit();
       break;
     default:
-      fail("usage: release-macos-draft-state.mjs inspect|missing|validate-notes|capture|compare|verify-patch");
+      fail(
+        "usage: release-macos-draft-state.mjs inspect|downloads|validate-notes|capture|compare|" +
+          "compare-published|identity|repository|immutable|ref|lock-tag|commit",
+      );
   }
 } catch (error) {
   console.error(`error: ${error instanceof Error ? error.message : String(error)}`);

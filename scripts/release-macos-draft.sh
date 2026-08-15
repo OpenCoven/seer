@@ -14,10 +14,11 @@ fail() {
 }
 
 MODE="${1:-}"
-[[ "$#" -eq 1 ]] || fail "usage: release-macos-draft.sh marker|preflight|upload|capture|publish"
+USAGE="usage: release-macos-draft.sh marker|acquire-lock|preflight|upload|capture|publish|release-lock"
+[[ "$#" -eq 1 ]] || fail "${USAGE}"
 case "${MODE}" in
-  marker | preflight | upload | capture | publish) ;;
-  *) fail "usage: release-macos-draft.sh marker|preflight|upload|capture|publish" ;;
+  marker | acquire-lock | preflight | upload | capture | publish | release-lock) ;;
+  *) fail "${USAGE}" ;;
 esac
 
 SOURCE_REPOSITORY="${SOURCE_REPOSITORY:-}"
@@ -42,32 +43,157 @@ EXPECTED_WORKFLOW_REF="${SOURCE_REPOSITORY}/.github/workflows/release-macos.yml@
   fail "workflow run must be a positive canonical identifier"
 
 EXPECTED_MARKER="<!-- seer-release-provenance:{\"schema\":1,\"sourceRepository\":\"${SOURCE_REPOSITORY}\",\"sourceCommit\":\"${SOURCE_COMMIT}\",\"sourceTag\":\"${SOURCE_TAG}\",\"workflowRef\":\"${WORKFLOW_REF}\",\"workflowRun\":\"${WORKFLOW_RUN}\"} -->"
-EXPECTED_BODY="${EXPECTED_MARKER}"$'\n\n'"Seer ${VERSION} for Apple Silicon Macs running macOS 14 or later."$'\n'
 
 if [[ "${MODE}" == "marker" ]]; then
   printf '%s\n' "${EXPECTED_MARKER}"
   exit 0
 fi
 
+WORKFLOW_ATTEMPT="${WORKFLOW_ATTEMPT:-}"
+[[ "${WORKFLOW_ATTEMPT}" =~ ^[1-9][0-9]*$ ]] ||
+  fail "workflow attempt must be a positive canonical identifier"
 GH_TOKEN="${GH_TOKEN:-}"
 [[ -n "${GH_TOKEN}" ]] || fail "GH_TOKEN is required"
 GH_REPO="${GH_REPO:-}"
 [[ "${GH_REPO}" == "OpenCoven/seer-releases" ]] ||
   fail "release destination must be OpenCoven/seer-releases"
+RELEASE_WRITER_LOGIN="${RELEASE_WRITER_LOGIN:-}"
+RELEASE_WRITER_ID="${RELEASE_WRITER_ID:-}"
+[[ "${RELEASE_WRITER_LOGIN}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,38})$ ]] ||
+  fail "protected release writer login is invalid"
+[[ "${RELEASE_WRITER_ID}" =~ ^[1-9][0-9]*$ ]] ||
+  fail "protected release writer ID is invalid"
 command -v gh >/dev/null 2>&1 || fail "gh is required"
 command -v node >/dev/null 2>&1 || fail "node is required"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 STATE_HELPER="${SCRIPT_DIR}/release-macos-draft-state.mjs"
-[[ -f "${STATE_HELPER}" && ! -L "${STATE_HELPER}" ]] || fail "release state helper is missing or unsafe"
+[[ -f "${STATE_HELPER}" && ! -L "${STATE_HELPER}" ]] ||
+  fail "release state helper is missing or unsafe"
 
+GH_API_VERSION="2026-03-10"
 EXPECTED_ASSETS=("Seer-v${VERSION}-arm64.dmg" "SHA256SUMS" "release-manifest.json")
 RELEASE_ENDPOINT="repos/${GH_REPO}/releases/tags/${SOURCE_TAG}"
+LOCK_REF_NAME="seer-release-lock-${SOURCE_TAG}"
+LOCK_REF="refs/tags/${LOCK_REF_NAME}"
+LOCK_TAG_NAME="${LOCK_REF_NAME}-${SOURCE_COMMIT}-run-${WORKFLOW_RUN}-attempt-${WORKFLOW_ATTEMPT}"
+LOCK_MESSAGE="$(
+  printf '{"schema":1,"sourceRepository":"%s","sourceCommit":"%s","sourceTag":"%s","workflowRef":"%s","workflowRun":"%s","workflowAttempt":"%s"}\n' \
+    "${SOURCE_REPOSITORY}" "${SOURCE_COMMIT}" "${SOURCE_TAG}" "${WORKFLOW_REF}" \
+    "${WORKFLOW_RUN}" "${WORKFLOW_ATTEMPT}"
+)"
+LOCK_MESSAGE+=$'\n'
 RELEASE_EXISTS=0
 RELEASE_ID=""
 RELEASE_DRAFT=""
 RELEASE_ASSET_COUNT=0
 RELEASE_ASSETS_COMPLETE=""
+DEFAULT_BRANCH=""
+
+api() {
+  gh api --header "X-GitHub-Api-Version: ${GH_API_VERSION}" "$@"
+}
+
+require_repository_governance() {
+  local response
+  response="$(api user)"
+  printf '%s' "${response}" | node "${STATE_HELPER}" identity
+
+  response="$(api "repos/${GH_REPO}")"
+  DEFAULT_BRANCH="$(printf '%s' "${response}" | node "${STATE_HELPER}" repository)"
+  [[ -n "${DEFAULT_BRANCH}" ]] || fail "release repository default branch is missing"
+
+  response="$(api "repos/${GH_REPO}/immutable-releases")"
+  printf '%s' "${response}" | node "${STATE_HELPER}" immutable
+}
+
+verify_commit_exists() {
+  local commit_sha="$1"
+  local response
+  response="$(api "repos/${GH_REPO}/git/commits/${commit_sha}")"
+  printf '%s' "${response}" | node "${STATE_HELPER}" commit "${commit_sha}"
+}
+
+verify_remote_lock() {
+  local ref_response
+  local ref_summary
+  local ref_type
+  local ref_sha
+  local tag_response
+  local tag_summary
+  local tag_sha
+  local commit_sha
+
+  ref_response="$(api "repos/${GH_REPO}/git/ref/tags/${LOCK_REF_NAME}")" ||
+    fail "release lock is missing"
+  ref_summary="$(printf '%s' "${ref_response}" | node "${STATE_HELPER}" ref)"
+  ref_type="$(printf '%s\n' "${ref_summary}" | /usr/bin/sed -n '1p')"
+  ref_sha="$(printf '%s\n' "${ref_summary}" | /usr/bin/sed -n '2p')"
+  [[ "${ref_type}" == "tag" && "${ref_sha}" =~ ^[0-9a-f]{40}$ ]] ||
+    fail "release lock ref does not target an annotated ownership tag"
+
+  tag_response="$(api "repos/${GH_REPO}/git/tags/${ref_sha}")"
+  tag_summary="$(printf '%s' "${tag_response}" | node "${STATE_HELPER}" lock-tag)"
+  tag_sha="$(printf '%s\n' "${tag_summary}" | /usr/bin/sed -n '1p')"
+  commit_sha="$(printf '%s\n' "${tag_summary}" | /usr/bin/sed -n '2p')"
+  [[ "${tag_sha}" == "${ref_sha}" ]] ||
+    fail "release lock tag identity changed"
+  verify_commit_exists "${commit_sha}"
+}
+
+acquire_remote_lock() {
+  local branch_response
+  local branch_summary
+  local branch_type
+  local commit_sha
+  local tag_response
+  local tag_summary
+  local tag_sha
+  local ref_response
+  local status
+
+  branch_response="$(api "repos/${GH_REPO}/git/ref/heads/${DEFAULT_BRANCH}")"
+  branch_summary="$(printf '%s' "${branch_response}" | node "${STATE_HELPER}" ref)"
+  branch_type="$(printf '%s\n' "${branch_summary}" | /usr/bin/sed -n '1p')"
+  commit_sha="$(printf '%s\n' "${branch_summary}" | /usr/bin/sed -n '2p')"
+  [[ "${branch_type}" == "commit" && "${commit_sha}" =~ ^[0-9a-f]{40}$ ]] ||
+    fail "release repository default branch does not point to a commit"
+  verify_commit_exists "${commit_sha}"
+
+  tag_response="$(
+    api --method POST "repos/${GH_REPO}/git/tags" \
+      --raw-field "tag=${LOCK_TAG_NAME}" \
+      --raw-field "message=${LOCK_MESSAGE}" \
+      --raw-field "object=${commit_sha}" \
+      --raw-field "type=commit"
+  )"
+  tag_summary="$(printf '%s' "${tag_response}" | node "${STATE_HELPER}" lock-tag)"
+  tag_sha="$(printf '%s\n' "${tag_summary}" | /usr/bin/sed -n '1p')"
+  [[ "${tag_sha}" =~ ^[0-9a-f]{40}$ ]] || fail "release lock tag object is invalid"
+
+  set +e
+  ref_response="$(
+    api --method POST "repos/${GH_REPO}/git/refs" \
+      --raw-field "ref=${LOCK_REF}" \
+      --raw-field "sha=${tag_sha}" 2>&1
+  )"
+  status=$?
+  set -e
+  [[ "${status}" -eq 0 ]] ||
+    fail "atomic release lock already exists or could not be acquired"
+
+  if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+    printf 'acquired=true\n' >> "${GITHUB_OUTPUT}"
+  fi
+  printf '%s' "${ref_response}" | node "${STATE_HELPER}" ref >/dev/null
+  verify_remote_lock
+}
+
+release_remote_lock() {
+  [[ "${RELEASE_LOCK_ACQUIRED:-}" == "true" ]] || return 0
+  verify_remote_lock
+  api --method DELETE "repos/${GH_REPO}/git/refs/tags/${LOCK_REF_NAME}" >/dev/null
+}
 
 query_release() {
   local field_count
@@ -76,10 +202,9 @@ query_release() {
   local summary
 
   set +e
-  response="$(gh api "${RELEASE_ENDPOINT}" 2>&1)"
+  response="$(api "${RELEASE_ENDPOINT}" 2>&1)"
   status=$?
   set -e
-
   if [[ "${status}" -ne 0 ]]; then
     if /usr/bin/grep -Eq '\(HTTP 404\)|^HTTP/[0-9.]+ 404 ' <<< "${response}"; then
       RELEASE_EXISTS=0
@@ -125,7 +250,7 @@ require_remote_tag_absent() {
   local response
   local status
   set +e
-  response="$(gh api --include "repos/${GH_REPO}/git/ref/tags/${SOURCE_TAG}" 2>&1)"
+  response="$(api --include "repos/${GH_REPO}/git/ref/tags/${SOURCE_TAG}" 2>&1)"
   status=$?
   set -e
   if [[ "${status}" -eq 0 ]]; then
@@ -158,7 +283,6 @@ validate_local_release() {
   )"
   [[ "${entry_count}" -eq "${#EXPECTED_ASSETS[@]}" ]] ||
     fail "local release directory must contain exactly the public asset allowlist"
-
   local expected
   for expected in "${EXPECTED_ASSETS[@]}"; do
     [[ -f "${RELEASE_DIR}/${expected}" && ! -L "${RELEASE_DIR}/${expected}" ]] ||
@@ -177,57 +301,64 @@ validate_state_paths() {
 
 rest_get_release() {
   local prefix="$1"
-  local headers="${prefix}.headers"
   local metadata="${prefix}.json"
-  [[ ! -e "${headers}" && ! -L "${headers}" && ! -e "${metadata}" && ! -L "${metadata}" ]] ||
-    fail "release state response paths must not preexist"
+  [[ ! -e "${metadata}" && ! -L "${metadata}" ]] ||
+    fail "release state response path must not preexist"
   curl --fail-with-body --silent --show-error \
     --request GET \
     --header "Accept: application/vnd.github+json" \
     --header "Authorization: Bearer ${GH_TOKEN}" \
-    --header "X-GitHub-Api-Version: 2022-11-28" \
-    --dump-header "${headers}" \
+    --header "X-GitHub-Api-Version: ${GH_API_VERSION}" \
     --output "${metadata}" \
     "${GITHUB_API_URL:-https://api.github.com}/repos/${GH_REPO}/releases/tags/${SOURCE_TAG}"
-  printf '%s\n%s\n' "${metadata}" "${headers}"
+  printf '%s\n' "${metadata}"
 }
 
-download_missing_digests() {
+download_assets() {
   local metadata="$1"
   local prefix="$2"
-  local missing="${prefix}.missing"
-  local fallback="${prefix}.assets"
-  [[ ! -e "${missing}" && ! -L "${missing}" && ! -e "${fallback}" && ! -L "${fallback}" ]] ||
-    fail "release digest fallback paths must not preexist"
-  mkdir "${fallback}"
-  node "${STATE_HELPER}" missing "${metadata}" > "${missing}"
+  local list="${prefix}.downloads"
+  local downloads="${prefix}.assets"
+  [[ ! -e "${list}" && ! -L "${list}" && ! -e "${downloads}" && ! -L "${downloads}" ]] ||
+    fail "release download paths must not preexist"
+  mkdir "${downloads}"
+  node "${STATE_HELPER}" downloads "${metadata}" > "${list}"
   local asset_id
   local asset_name
   while IFS=$'\t' read -r asset_id asset_name; do
     [[ "${asset_id}" =~ ^[1-9][0-9]*$ ]] || fail "release asset id is invalid"
-    [[ " ${EXPECTED_ASSETS[*]} " == *" ${asset_name} "* ]] || fail "release asset name is invalid"
+    [[ " ${EXPECTED_ASSETS[*]} " == *" ${asset_name} "* ]] ||
+      fail "release asset name is invalid"
     curl --fail-with-body --silent --show-error --location \
       --request GET \
       --header "Accept: application/octet-stream" \
       --header "Authorization: Bearer ${GH_TOKEN}" \
-      --header "X-GitHub-Api-Version: 2022-11-28" \
-      --output "${fallback}/${asset_id}" \
+      --header "X-GitHub-Api-Version: ${GH_API_VERSION}" \
+      --output "${downloads}/${asset_id}" \
       "${GITHUB_API_URL:-https://api.github.com}/repos/${GH_REPO}/releases/assets/${asset_id}"
-  done < "${missing}"
-  printf '%s\n' "${fallback}"
+  done < "${list}"
+  printf '%s\n' "${downloads}"
 }
 
-visibility="$(gh api "repos/${GH_REPO}" --jq '.visibility')"
-[[ "${visibility}" == "public" ]] || fail "release destination must be public"
+require_repository_governance
 
 case "${MODE}" in
+  acquire-lock)
+    acquire_remote_lock
+    ;;
+  release-lock)
+    release_remote_lock
+    ;;
   preflight)
+    verify_remote_lock
     inspect_release
     if [[ "${RELEASE_EXISTS}" -eq 0 ]]; then
       require_remote_tag_absent
     fi
+    verify_remote_lock
     ;;
   upload)
+    verify_remote_lock
     validate_local_release
     inspect_release
     if [[ "${RELEASE_EXISTS}" -eq 0 ]]; then
@@ -235,6 +366,7 @@ case "${MODE}" in
       gh release create "${SOURCE_TAG}" --draft \
         --title "Seer ${VERSION}" \
         --notes-file "${RELEASE_BODY}"
+      verify_remote_lock
       inspect_release
       [[ "${RELEASE_EXISTS}" -eq 1 ]] ||
         fail "new draft release could not be verified"
@@ -244,69 +376,63 @@ case "${MODE}" in
       "${RELEASE_DIR}/SHA256SUMS" \
       "${RELEASE_DIR}/release-manifest.json" \
       --clobber
+    verify_remote_lock
     inspect_release
     require_complete_remote_assets
     ;;
   capture)
     command -v curl >/dev/null 2>&1 || fail "curl is required"
+    verify_remote_lock
     validate_local_release
     validate_state_paths
     [[ ! -e "${VERIFIED_STATE}" && ! -L "${VERIFIED_STATE}" ]] ||
       fail "verified release state path must not preexist"
-    response_paths="$(rest_get_release "${STATE_WORK_DIR}/capture")"
-    response_metadata="$(printf '%s\n' "${response_paths}" | /usr/bin/sed -n '1p')"
-    response_headers="$(printf '%s\n' "${response_paths}" | /usr/bin/sed -n '2p')"
-    [[ -n "${response_metadata}" && -n "${response_headers}" ]] ||
-      fail "release state response paths have an invalid shape"
-    fallback_dir="$(download_missing_digests "${response_metadata}" "${STATE_WORK_DIR}/capture")"
+    response_metadata="$(rest_get_release "${STATE_WORK_DIR}/capture")"
+    downloads_dir="$(download_assets "${response_metadata}" "${STATE_WORK_DIR}/capture")"
     node "${STATE_HELPER}" capture \
-      "${response_metadata}" "${response_headers}" \
-      "${RELEASE_DIR}" "${RELEASE_BODY}" "${VERIFIED_STATE}" "${fallback_dir}"
+      "${response_metadata}" "" \
+      "${RELEASE_DIR}" "${RELEASE_BODY}" "${VERIFIED_STATE}" "${downloads_dir}"
+    verify_remote_lock
     ;;
   publish)
     command -v curl >/dev/null 2>&1 || fail "curl is required"
+    verify_remote_lock
     validate_local_release
     validate_state_paths
     [[ -f "${VERIFIED_STATE}" && ! -L "${VERIFIED_STATE}" ]] ||
       fail "verified release state is missing or unsafe"
-    response_paths="$(rest_get_release "${STATE_WORK_DIR}/publish")"
-    response_metadata="$(printf '%s\n' "${response_paths}" | /usr/bin/sed -n '1p')"
-    response_headers="$(printf '%s\n' "${response_paths}" | /usr/bin/sed -n '2p')"
-    [[ -n "${response_metadata}" && -n "${response_headers}" ]] ||
-      fail "release state response paths have an invalid shape"
-    fallback_dir="$(download_missing_digests "${response_metadata}" "${STATE_WORK_DIR}/publish")"
-    publish_binding="$(
+
+    response_metadata="$(rest_get_release "${STATE_WORK_DIR}/publish")"
+    downloads_dir="$(download_assets "${response_metadata}" "${STATE_WORK_DIR}/publish")"
+    release_id="$(
       node "${STATE_HELPER}" compare \
-        "${response_metadata}" "${response_headers}" \
-        "${RELEASE_DIR}" "${RELEASE_BODY}" "${VERIFIED_STATE}" "${fallback_dir}"
+        "${response_metadata}" "" \
+        "${RELEASE_DIR}" "${RELEASE_BODY}" "${VERIFIED_STATE}" "${downloads_dir}"
     )"
-    [[ "$(printf '%s\n' "${publish_binding}" | /usr/bin/wc -l | /usr/bin/tr -d ' ')" -eq 2 ]] ||
-      fail "verified release binding has an invalid shape"
-    release_id="$(printf '%s\n' "${publish_binding}" | /usr/bin/sed -n '1p')"
-    release_etag="$(printf '%s\n' "${publish_binding}" | /usr/bin/sed -n '2p')"
-    [[ "${release_id}" =~ ^[1-9][0-9]*$ && -n "${release_etag}" ]] ||
+    [[ "${release_id}" =~ ^[1-9][0-9]*$ ]] ||
       fail "verified release binding has an invalid shape"
 
-    patch_headers="${STATE_WORK_DIR}/publish-patch.headers"
+    verify_remote_lock
     patch_response="${STATE_WORK_DIR}/publish-patch.json"
-    [[ ! -e "${patch_headers}" && ! -L "${patch_headers}" &&
-      ! -e "${patch_response}" && ! -L "${patch_response}" ]] ||
-      fail "conditional publish response paths must not preexist"
-    set +e
+    [[ ! -e "${patch_response}" && ! -L "${patch_response}" ]] ||
+      fail "publish response path must not preexist"
     curl --fail-with-body --silent --show-error \
       --request PATCH \
       --header "Accept: application/vnd.github+json" \
       --header "Authorization: Bearer ${GH_TOKEN}" \
-      --header "X-GitHub-Api-Version: 2022-11-28" \
-      --header "If-Match: ${release_etag}" \
+      --header "X-GitHub-Api-Version: ${GH_API_VERSION}" \
       --data '{"draft":false}' \
-      --dump-header "${patch_headers}" \
       --output "${patch_response}" \
-      "${GITHUB_API_URL:-https://api.github.com}/repos/${GH_REPO}/releases/${release_id}"
-    patch_status=$?
-    set -e
-    [[ "${patch_status}" -eq 0 ]] ||
-      fail "conditional publish failed; release precondition may have changed"
-    node "${STATE_HELPER}" verify-patch "${patch_response}" "" "" "" "${VERIFIED_STATE}" ""
+      "${GITHUB_API_URL:-https://api.github.com}/repos/${GH_REPO}/releases/${release_id}" ||
+      fail "supported release publish request failed"
+
+    verify_remote_lock
+    post_metadata="$(rest_get_release "${STATE_WORK_DIR}/post-publish")"
+    post_downloads="$(download_assets "${post_metadata}" "${STATE_WORK_DIR}/post-publish")"
+    node "${STATE_HELPER}" compare-published \
+      "${post_metadata}" "" \
+      "${RELEASE_DIR}" "${RELEASE_BODY}" "${VERIFIED_STATE}" "${post_downloads}" >/dev/null ||
+      fail "post-publish release state differs from the exact verified draft; release was not deleted"
+    verify_remote_lock
     ;;
 esac

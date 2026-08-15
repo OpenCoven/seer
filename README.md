@@ -123,15 +123,28 @@ source, logs, artifacts, or documentation:
   `APPLE_API_KEY`, and `APPLE_API_KEY_BASE64`; or the fallback `APPLE_ID` and
   `APPLE_PASSWORD` (with `APPLE_TEAM_ID`)
 - Publication: `RELEASES_REPO_TOKEN`, a fine-grained token restricted to
-  release writes in `OpenCoven/seer-releases`, with no private-source access
+  contents/release writes and read-only immutable-release configuration in
+  `OpenCoven/seer-releases`, with no private-source access. That protected token
+  identity must be the repository's sole release writer.
 
-The protected environment must require reviewers and define all three release
-gates:
+The protected environment must require reviewers and define these release
+gates and exact writer bindings:
 
 - `BINARY_DISTRIBUTION_APPROVED` must be exactly `true`
 - `PARITY_MATRIX_APPROVED` must be exactly `true`
 - `CLEAN_MACHINE_VERIFIED_COMMIT` must be the lowercase 40-character release
   commit and must equal the workflow's `GITHUB_SHA`
+- `RELEASE_WRITER_LOGIN` and `RELEASE_WRITER_ID` must exactly identify the
+  fine-grained token owner returned by GitHub's API
+
+`OpenCoven/seer-releases` must have GitHub immutable releases enabled. The
+workflow verifies that repository setting before release work and verifies the
+published release is immutable. GitHub does not support `If-Match` compare and
+swap for release `PATCH`: workflow concurrency and an atomically created,
+tag-scoped remote lock ref serialize cooperative runs instead. The annotated
+lock binds the source tag, commit, workflow run, and attempt to an existing
+release-repository commit; every mutating phase revalidates it, and an
+`always()` step deletes only that exact owned lock ref.
 
 Only these public asset names are allowed:
 
@@ -144,7 +157,11 @@ release-manifest.json
 Release notes are generated separately without local paths. The workflow
 creates/resumes a provenance-bound draft, downloads and verifies those assets,
 and publishes only after signing, notarization, stapling, Gatekeeper, checksum,
-and boundary checks pass.
+and boundary checks pass. Immediately before the supported publish `PATCH`, it
+refetches metadata and freshly downloads every asset to compare IDs, sizes,
+server digests, uploader identity, and hashes with captured verified state. It
+refetches again after publication and fails loudly on any mismatch without
+deleting the release.
 
 Three external administrative actions each require a separate, explicit
 approval: (1) create the public `OpenCoven/seer-releases` repository, (2)
