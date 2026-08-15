@@ -29,6 +29,11 @@ DerivedData/
 # (as opposed to the repo-root `/build/` above).
 apps/macos/Seer/build/
 build/macos/
+# scripts/build-macos-app.sh's own fixed output locations (already covered
+# by `/build/` above; listed explicitly so the local unsigned build's
+# derived data and copied .app are never mistaken for tracked artifacts).
+build/macos/derived-data/
+build/macos/unsigned/
 *.xcarchive
 *.dmg
 apps/macos/**/notarization/

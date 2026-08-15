@@ -10,6 +10,10 @@
   "scripts": {
     "build": "node glaze.ts build",
     "build:standalone-renderer": "vite build --config vite.standalone.config.ts",
+    "generate:macos": "xcodegen generate --spec apps/macos/Seer/project.yml",
+    "test:macos": "xcodebuild test -project apps/macos/Seer/Seer.xcodeproj -scheme Seer -destination 'platform=macOS,arch=arm64' CODE_SIGNING_ALLOWED=NO",
+    "build:macos": "bash scripts/build-macos-app.sh",
+    "check:standalone-boundary": "node scripts/check-standalone-boundary.mjs",
     "dev": "node glaze.ts dev",
     "dev:renderer": "node glaze.ts dev:renderer",
     "lint": "node glaze.ts lint",
