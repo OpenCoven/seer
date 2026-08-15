@@ -134,6 +134,27 @@ function writeExecutable(path, source) {
   chmodSync(path, 0o755);
 }
 
+function readCodesignSigningArgv(path) {
+  const fields = readFileSync(path).toString().split("\0");
+  const invocations = [];
+  let current = null;
+  for (const field of fields) {
+    if (field === "BEGIN") {
+      assert.equal(current, null);
+      current = [];
+    } else if (field === "END") {
+      assert.notEqual(current, null);
+      invocations.push(current);
+      current = null;
+    } else if (field !== "") {
+      assert.notEqual(current, null);
+      current.push(field);
+    }
+  }
+  assert.equal(current, null);
+  return invocations;
+}
+
 function completeSigningEnvironment(overrides = {}) {
   return {
     PATH: process.env.PATH,
@@ -1218,8 +1239,10 @@ function makeSigningOnlyStubs(
   const logPath = join(scratch, "signing.log");
   const nodeEnvironment = join(scratch, "node.env");
   const backgroundEnvironment = join(scratch, "background.env");
+  const codesignArgvPath = join(scratch, "codesign-signing.argv");
   const defaultKeychainState = join(scratch, "default-keychain");
   const keychainPointer = join(scratch, "keychain-path");
+  const userKeychainState = join(scratch, "user-keychains");
   const dmgImage = join(scratch, "dmg-image");
   const mountPointer = join(scratch, "mount-path");
   const pauseReady = join(scratch, "pause-ready");
@@ -1228,8 +1251,13 @@ function makeSigningOnlyStubs(
   const precredentialCommandLog = join(scratch, "precredential-commands.log");
   const signedState = join(scratch, "codesign-signed");
   const sourceCommit = signingSourceCommit;
+  const originalUserKeychains = [
+    join(scratch, "login.keychain-db"),
+    join(scratch, "team signing.keychain-db"),
+  ];
   mkdirSync(bin);
-  writeFileSync(defaultKeychainState, `${join(scratch, "login.keychain-db")}\n`);
+  writeFileSync(defaultKeychainState, `${originalUserKeychains[0]}\n`);
+  writeFileSync(userKeychainState, `${originalUserKeychains.join("\n")}\n`);
 
   writeExecutable(join(bin, "uname"), 'printf "arm64\\n"\n');
   writeExecutable(
@@ -1277,6 +1305,17 @@ case "\${operation}" in
       printf '"%s"\\n' "$(cat ${JSON.stringify(defaultKeychainState)})"
     elif [[ "\${2:-}" == "-s" ]]; then
       printf "%s\\n" "\${3}" > ${JSON.stringify(defaultKeychainState)}
+    fi
+    ;;
+  list-keychains)
+    if [[ "\${4:-}" == "-s" ]]; then
+      : > ${JSON.stringify(userKeychainState)}
+      shift 4
+      printf "%s\\n" "$@" > ${JSON.stringify(userKeychainState)}
+    else
+      while IFS= read -r keychain; do
+        [[ -z "\${keychain}" ]] || printf '"%s"\\n' "\${keychain}"
+      done < ${JSON.stringify(userKeychainState)}
     fi
     ;;
   create-keychain)
@@ -1333,6 +1372,24 @@ if [[ "\${display}" == 1 ]]; then
 elif [[ "\${verify}" == 1 ]]; then
   printf "codesign:verify\\n" >> ${JSON.stringify(logPath)}
 else
+  printf "BEGIN\\0" >> ${JSON.stringify(codesignArgvPath)}
+  printf "%s\\0" "$@" >> ${JSON.stringify(codesignArgvPath)}
+  printf "END\\0" >> ${JSON.stringify(codesignArgvPath)}
+  expected_keychain="$(cat ${JSON.stringify(keychainPointer)})"
+  keychain_argument=""
+  keychain_count=0
+  previous=""
+  for argument in "$@"; do
+    if [[ "\${previous}" == "--keychain" ]]; then
+      keychain_argument="\${argument}"
+      keychain_count=$((keychain_count + 1))
+    fi
+    previous="\${argument}"
+  done
+  if [[ "\${keychain_count}" -ne 1 || "\${keychain_argument}" != "\${expected_keychain}" ]]; then
+    printf "codesign signing invocation used a missing or wrong keychain\\n" >&2
+    exit 91
+  fi
   printf "signed\\n" > ${JSON.stringify(signedState)}
   printf "codesign:sign\\n" >> ${JSON.stringify(logPath)}
 fi
@@ -1454,6 +1511,7 @@ esac
       SEER_TEST_COMMAND_LOG: precredentialCommandLog,
     },
     backgroundEnvironment,
+    codesignArgvPath,
     defaultKeychainState,
     keychainPointer,
     logPath,
@@ -1462,6 +1520,8 @@ esac
     pauseReady,
     precredentialAttackMarker,
     precredentialCommandLog,
+    originalUserKeychains,
+    userKeychainState,
   };
 }
 
@@ -1626,13 +1686,16 @@ test("signing-only flow cleans credentials before repository code and never runs
     const input = createAttestedInput(scratch);
     const {
       backgroundEnvironment,
+      codesignArgvPath,
       defaultKeychainState,
       env,
       keychainPointer,
       logPath,
       nodeEnvironment,
+      originalUserKeychains,
       precredentialAttackMarker,
       precredentialCommandLog,
+      userKeychainState,
     } = makeSigningOnlyStubs(scratch, input, { backgroundAttack: true });
 
     const result = runPackage(env);
@@ -1676,6 +1739,19 @@ test("signing-only flow cleans credentials before repository code and never runs
     );
     const keychainPath = readFileSync(keychainPointer, "utf8").trim();
     assert.ok(!existsSync(keychainPath));
+    assert.deepEqual(
+      readFileSync(userKeychainState, "utf8").trim().split("\n"),
+      originalUserKeychains,
+      "cleanup must restore the exact original user keychain search list",
+    );
+    const signingArgv = readCodesignSigningArgv(codesignArgvPath);
+    assert.equal(signingArgv.length, 2, "the app and DMG must each be signed once");
+    for (const argv of signingArgv) {
+      const keychainIndex = argv.indexOf("--keychain");
+      assert.notEqual(keychainIndex, -1, `missing --keychain in codesign argv: ${argv.join(" ")}`);
+      assert.equal(argv[keychainIndex + 1], keychainPath);
+      assert.equal(argv.lastIndexOf("--keychain"), keychainIndex, "codesign keychain must be unambiguous");
+    }
 
     const capturedNodeEnvironment = readFileSync(nodeEnvironment, "utf8");
     assert.doesNotMatch(capturedNodeEnvironment, /^APPLE_/m);

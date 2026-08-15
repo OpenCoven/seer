@@ -36,9 +36,11 @@ KEYCHAIN_PATH=""
 CERTIFICATE_PATH=""
 API_KEY_PATH=""
 ORIGINAL_DEFAULT_KEYCHAIN=""
+ORIGINAL_USER_KEYCHAINS=()
 LOCK_HELD=0
 KEYCHAIN_CREATED=0
 DEFAULT_KEYCHAIN_CHANGED=0
+USER_KEYCHAIN_LIST_CHANGED=0
 DMG_MOUNTED=0
 MOUNT_POINT=""
 CLEANUP_STARTED=0
@@ -92,6 +94,12 @@ destroy_credentials() {
       cleanup_failed=1
     DEFAULT_KEYCHAIN_CHANGED=0
   fi
+  if [[ "${USER_KEYCHAIN_LIST_CHANGED}" -eq 1 ]]; then
+    run_system_tool "${SYSTEM_SECURITY}" list-keychains -d user -s \
+      "${ORIGINAL_USER_KEYCHAINS[@]}" >/dev/null 2>&1 ||
+      cleanup_failed=1
+    USER_KEYCHAIN_LIST_CHANGED=0
+  fi
   if [[ -n "${KEYCHAIN_PATH}" ]] &&
     [[ "${KEYCHAIN_CREATED}" -eq 1 || -e "${KEYCHAIN_PATH}" ]]
   then
@@ -115,6 +123,7 @@ destroy_credentials() {
   NOTARY_APPLE_PASSWORD_VALUE=""
   KEYCHAIN_PASSWORD=""
   NOTARY_ARGS=()
+  ORIGINAL_USER_KEYCHAINS=()
   unset \
     SIGNING_CERTIFICATE_VALUE SIGNING_CERTIFICATE_PASSWORD_VALUE \
     SIGNING_IDENTITY_VALUE SIGNING_TEAM_ID_VALUE \
@@ -606,6 +615,21 @@ ORIGINAL_DEFAULT_KEYCHAIN="${ORIGINAL_DEFAULT_KEYCHAIN%\"}"
 [[ -n "${ORIGINAL_DEFAULT_KEYCHAIN}" ]] ||
   fail "unable to determine the original default user keychain"
 
+if ! ORIGINAL_USER_KEYCHAIN_LIST="$(
+  run_system_tool "${SYSTEM_SECURITY}" list-keychains -d user
+)"; then
+  fail "unable to determine the original user keychain search list"
+fi
+while IFS= read -r keychain_line; do
+  keychain_line="${keychain_line#"${keychain_line%%[![:space:]]*}"}"
+  keychain_line="${keychain_line%"${keychain_line##*[![:space:]]}"}"
+  [[ -z "${keychain_line}" ]] && continue
+  if [[ "${keychain_line:0:1}" != '"' || "${keychain_line: -1}" != '"' ]]; then
+    fail "unable to parse the original user keychain search list"
+  fi
+  ORIGINAL_USER_KEYCHAINS+=("${keychain_line:1:${#keychain_line}-2}")
+done <<< "${ORIGINAL_USER_KEYCHAIN_LIST}"
+
 printf '%s' "${SIGNING_CERTIFICATE_VALUE}" |
   run_system_tool "${SYSTEM_BASE64}" --decode > "${CERTIFICATE_PATH}" ||
   fail "APPLE_CERTIFICATE is not valid base64"
@@ -619,6 +643,9 @@ KEYCHAIN_PASSWORD="$(run_system_tool "${SYSTEM_OPENSSL}" rand -hex 32)"
 export -n KEYCHAIN_PASSWORD
 KEYCHAIN_CREATED=1
 run_system_tool "${SYSTEM_SECURITY}" create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+USER_KEYCHAIN_LIST_CHANGED=1
+run_system_tool "${SYSTEM_SECURITY}" list-keychains -d user -s \
+  "${KEYCHAIN_PATH}" "${ORIGINAL_USER_KEYCHAINS[@]}"
 run_system_tool "${SYSTEM_SECURITY}" set-keychain-settings -lut 21600 "${KEYCHAIN_PATH}"
 run_system_tool "${SYSTEM_SECURITY}" unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
 run_system_tool "${SYSTEM_SECURITY}" import "${CERTIFICATE_PATH}" \
@@ -640,6 +667,7 @@ run_system_tool "${SYSTEM_SECURITY}" default-keychain -s "${KEYCHAIN_PATH}"
 
 run_system_tool "${SYSTEM_CODESIGN}" \
   --force \
+  --keychain "${KEYCHAIN_PATH}" \
   --sign "${SIGNING_IDENTITY_VALUE}" \
   --options runtime \
   --timestamp \
@@ -714,6 +742,7 @@ run_system_tool "${SYSTEM_HDIUTIL}" create \
 
 run_system_tool "${SYSTEM_CODESIGN}" \
   --force \
+  --keychain "${KEYCHAIN_PATH}" \
   --sign "${SIGNING_IDENTITY_VALUE}" \
   --timestamp \
   "${WORK_DMG}"
