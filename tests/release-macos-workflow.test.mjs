@@ -9,6 +9,9 @@ const workflowPath = join(repoRoot, ".github", "workflows", "release-macos.yml")
 const source = existsSync(workflowPath) ? readFileSync(workflowPath, "utf8") : "";
 const draftPolicyPath = join(repoRoot, "scripts", "release-macos-draft.sh");
 const draftPolicySource = existsSync(draftPolicyPath) ? readFileSync(draftPolicyPath, "utf8") : "";
+const draftStateHelperPath = join(repoRoot, "scripts", "release-macos-draft-state.mjs");
+const draftStateHelperSource = existsSync(draftStateHelperPath) ? readFileSync(draftStateHelperPath, "utf8") : "";
+const draftPolicyImplementation = `${draftPolicySource}\n${draftStateHelperSource}`;
 
 function jobBlock(name, nextName) {
   const start = source.indexOf(`  ${name}:\n`);
@@ -210,7 +213,7 @@ test("signing keeps build tools out and scopes the releases token to release pol
   for (const step of steps) {
     const hasToken = step.includes("secrets.RELEASES_REPO_TOKEN");
     const hasGhCommand = /\bgh (?:api|release)\b/.test(step);
-    const hasReleasePolicy = /scripts\/release-macos-draft\.sh (?:preflight|upload|publish)/.test(step);
+    const hasReleasePolicy = /scripts\/release-macos-draft\.sh (?:preflight|upload|capture|publish)/.test(step);
     assert.equal(
       hasToken,
       hasGhCommand || hasReleasePolicy,
@@ -230,6 +233,7 @@ test("draft policy resumes only bound allowlisted drafts and publishes after fre
   const upload = signing.indexOf("scripts/release-macos-draft.sh upload");
   const download = signing.indexOf("gh release download");
   const scanner = signing.indexOf("node scripts/check-release-boundary.mjs", download);
+  const capture = signing.indexOf("scripts/release-macos-draft.sh capture");
   const publish = signing.indexOf("scripts/release-macos-draft.sh publish");
 
   assert.match(signing, /expected=\("Seer-v\$\{VERSION\}-arm64\.dmg" "SHA256SUMS" "release-manifest\.json"\)/);
@@ -239,17 +243,17 @@ test("draft policy resumes only bound allowlisted drafts and publishes after fre
   assert.match(signing, /SOURCE_TAG: \$\{\{ github\.ref_name \}\}/);
   assert.match(signing, /WORKFLOW_REF: \$\{\{ github\.workflow_ref \}\}/);
   assert.match(signing, /WORKFLOW_RUN: \$\{\{ github\.run_id \}\}/);
-  assert.match(draftPolicySource, /seer-release-provenance:/);
-  assert.match(draftPolicySource, /sourceRepository/);
-  assert.match(draftPolicySource, /sourceCommit/);
-  assert.match(draftPolicySource, /sourceTag/);
-  assert.match(draftPolicySource, /workflowRef/);
-  assert.match(draftPolicySource, /workflowRun/);
+  assert.match(draftPolicyImplementation, /seer-release-provenance:/);
+  assert.match(draftPolicyImplementation, /sourceRepository/);
+  assert.match(draftPolicyImplementation, /sourceCommit/);
+  assert.match(draftPolicyImplementation, /sourceTag/);
+  assert.match(draftPolicyImplementation, /workflowRef/);
+  assert.match(draftPolicyImplementation, /workflowRun/);
   assert.match(draftPolicySource, /gh release create "\$\{SOURCE_TAG\}" --draft/);
   assert.match(draftPolicySource, /gh release upload "\$\{SOURCE_TAG\}"[\s\S]*--clobber/);
-  assert.match(draftPolicySource, /existing published release/);
-  assert.match(draftPolicySource, /provenance marker does not match/);
-  assert.match(draftPolicySource, /foreign release asset/);
+  assert.match(draftPolicyImplementation, /existing published release/);
+  assert.match(draftPolicyImplementation, /provenance marker does not match/);
+  assert.match(draftPolicyImplementation, /foreign release asset/);
   assert.match(signing, /gh release download[\s\S]*--pattern "Seer-v\$\{VERSION\}-arm64\.dmg"[\s\S]*--pattern "SHA256SUMS"[\s\S]*--pattern "release-manifest\.json"/);
   assert.match(signing, /shasum -a 256 -c SHA256SUMS/);
   assert.match(signing, /trap cleanup EXIT/);
@@ -258,12 +262,19 @@ test("draft policy resumes only bound allowlisted drafts and publishes after fre
   assert.match(signing, /codesign --verify --deep --strict/);
   assert.match(signing, /spctl --assess --type execute/);
   assert.match(signing, /node scripts\/check-release-boundary\.mjs[\s\S]*--dmg-root/);
-  assert.match(draftPolicySource, /gh release edit "\$\{SOURCE_TAG\}" --draft=false/);
+  assert.match(signing, /VERIFIED_STATE: \$\{\{ steps\.public-assets\.outputs\.verified-state \}\}/);
+  assert.match(signing, /RELEASE_BODY: \$\{\{ steps\.release-notes\.outputs\.path \}\}/);
+  assert.match(signing, /RELEASE_DIR: \$\{\{ steps\.public-assets\.outputs\.directory \}\}/);
+  assert.match(draftPolicySource, /--request PATCH/);
+  assert.match(draftPolicySource, /If-Match:/);
+  assert.match(draftPolicySource, /releases\/\$\{release_id\}/);
+  assert.doesNotMatch(draftPolicySource, /gh release edit/);
   assert.ok(
     preflight !== -1 &&
       preflight < upload &&
       upload < download &&
       download < scanner &&
-      scanner < publish,
+      scanner < capture &&
+      capture < publish,
   );
 });

@@ -503,10 +503,15 @@ jobs:
         run: |
           set -euo pipefail
           verify_dir="${RUNNER_TEMP}/seer-public-assets-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          state_dir="${RUNNER_TEMP}/seer-release-state-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           [[ ! -e "${verify_dir}" && ! -L "${verify_dir}" ]]
+          [[ ! -e "${state_dir}" && ! -L "${state_dir}" ]]
           umask 077
           mkdir "${verify_dir}"
+          mkdir "${state_dir}"
           printf 'directory=%s\n' "${verify_dir}" >> "${GITHUB_OUTPUT}"
+          printf 'state-directory=%s\n' "${state_dir}" >> "${GITHUB_OUTPUT}"
+          printf 'verified-state=%s\n' "${state_dir}/verified-release-state.json" >> "${GITHUB_OUTPUT}"
 
       - name: Download only draft release assets
         env:
@@ -587,6 +592,22 @@ jobs:
           /usr/bin/hdiutil detach "${mount_point}"
           mounted=0
 
+      - name: Capture the exact verified draft state
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          GH_REPO: OpenCoven/seer-releases
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          SOURCE_TAG: ${{ github.ref_name }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_RUN: ${{ github.run_id }}
+          RELEASE_BODY: ${{ steps.release-notes.outputs.path }}
+          RELEASE_DIR: ${{ steps.public-assets.outputs.directory }}
+          VERIFIED_STATE: ${{ steps.public-assets.outputs.verified-state }}
+          STATE_WORK_DIR: ${{ steps.public-assets.outputs.state-directory }}
+        run: bash scripts/release-macos-draft.sh capture
+
       - name: Publish only the verified draft
         env:
           GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
@@ -597,4 +618,8 @@ jobs:
           SOURCE_TAG: ${{ github.ref_name }}
           WORKFLOW_REF: ${{ github.workflow_ref }}
           WORKFLOW_RUN: ${{ github.run_id }}
+          RELEASE_BODY: ${{ steps.release-notes.outputs.path }}
+          RELEASE_DIR: ${{ steps.public-assets.outputs.directory }}
+          VERIFIED_STATE: ${{ steps.public-assets.outputs.verified-state }}
+          STATE_WORK_DIR: ${{ steps.public-assets.outputs.state-directory }}
         run: bash scripts/release-macos-draft.sh publish
