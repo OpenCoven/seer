@@ -77,7 +77,9 @@ function buildContextMenu(state: AgentMonitorState, bounds?: Rectangle): Menu {
           {
             label: `View Seer ${latestUpdate.availableVersion}`,
             click: () => {
-              void updateService.openCurrentRelease();
+              void updateService.openCurrentRelease().catch((error: unknown) => {
+                logger.error("tray", "Failed to open release page", error);
+              });
             },
           } satisfies MenuItemConstructorOptions,
         ]

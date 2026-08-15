@@ -34,6 +34,11 @@ function makeHarness(options: {
   let settings: UpdateSettings = {
     includePrereleaseUpdates: options.includePrereleaseUpdates ?? false,
   };
+  // Mirrors SettingsStore's transactional contract: the in-memory value is
+  // only ever committed once the (simulated) write actually succeeds, so a
+  // scripted failure here exercises the same "old value survives a failed
+  // persist" guarantee the real store provides.
+  let persistError: Error | null = null;
 
   const service = new UpdateService({
     currentVersion: options.currentVersion ?? "1.0.0",
@@ -48,6 +53,7 @@ function makeHarness(options: {
       get: () => settings,
       setIncludePrereleaseUpdates: async (value) => {
         persisted.push(value);
+        if (persistError) throw persistError;
         settings = { includePrereleaseUpdates: value };
         return settings;
       },
@@ -64,6 +70,12 @@ function makeHarness(options: {
     persisted,
     advance(milliseconds: number) {
       now += milliseconds;
+    },
+    failNextPersist(error: Error) {
+      persistError = error;
+    },
+    clearPersistFailure() {
+      persistError = null;
     },
   };
 }
@@ -290,6 +302,46 @@ test("toggling prereleases persists, clears stream cache, and forces one check",
   assert.equal(harness.calls.length, 2);
   assert.equal(harness.calls[1].url, "https://api.github.com/repos/OpenCoven/seer-releases/releases?per_page=20");
   assert.equal((harness.calls[1].init?.headers as Record<string, string>)["If-None-Match"], undefined);
+  assert.equal(state.availableVersion, "v2.0.0-beta.1");
+});
+
+test("a failed settings persistence while toggling prereleases invalidates stream state without starting a new check, and a later successful toggle still works", async () => {
+  const harness = makeHarness({
+    responses: [
+      Response.json(release(), { headers: { ETag: '"stable"' } }),
+      Response.json([
+        release("v2.0.0-beta.1", "https://github.com/OpenCoven/seer/releases/tag/v2.0.0-beta.1", false, true),
+      ]),
+    ],
+  });
+  const before = await harness.service.check({ force: true });
+  assert.equal(harness.calls.length, 1);
+
+  harness.failNextPersist(new Error("disk full"));
+  await assert.rejects(() => harness.service.setIncludePrereleaseUpdates(true), /disk full/);
+
+  // The (simulated) SettingsStore never committed the new value, so the
+  // service must keep reporting the old setting rather than a half-applied
+  // toggle.
+  assert.equal(harness.service.includesPrereleaseUpdates(), false);
+  // A failed persist must never itself kick off a new check.
+  assert.equal(harness.calls.length, 1);
+  // Stream state was invalidated rather than silently retaining the old
+  // stable release — paired with the still-unchanged old setting above,
+  // this is never a self-contradictory snapshot (e.g. a stale prerelease
+  // release surviving alongside `includePrereleaseUpdates: false`).
+  assert.deepEqual(harness.service.getState(), {
+    checking: false,
+    availableVersion: null,
+    releaseURL: null,
+    lastCheckedAt: null,
+  });
+  assert.notDeepEqual(harness.service.getState(), before);
+
+  harness.clearPersistFailure();
+  const state = await harness.service.setIncludePrereleaseUpdates(true);
+  assert.equal(harness.service.includesPrereleaseUpdates(), true);
+  assert.equal(harness.calls.length, 2);
   assert.equal(state.availableVersion, "v2.0.0-beta.1");
 });
 

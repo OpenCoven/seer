@@ -381,7 +381,14 @@ export class UpdateService {
   }
 
   async setIncludePrereleaseUpdates(value: boolean): Promise<UpdateState> {
-    await this.settings.setIncludePrereleaseUpdates(value);
+    // Bump the generation and invalidate the stream ETags/state *before* the
+    // first await, not after. This closes two related races: (1) any check()
+    // already in flight for the stream we're switching away from can never
+    // resolve into `isCurrent()` and clobber the state we're about to clear,
+    // and (2) if persistence below fails, the externally observable state is
+    // already the cleared/invalidated one rather than a stale, possibly
+    // stream-mismatched release held over from before the toggle.
+    this.generation += 1;
     this.stableEtag = null;
     this.prereleaseEtag = null;
     this.state = {
@@ -391,6 +398,16 @@ export class UpdateService {
       lastCheckedAt: null,
     };
     this.publish();
+
+    // `settings.setIncludePrereleaseUpdates` (SettingsStore) only commits its
+    // own cache once the write to disk succeeds, so on failure `settings.get()`
+    // keeps reporting the *old* value. Propagating the rejection here (instead
+    // of swallowing it and calling `check()`) means a failed persist never
+    // starts a new check — the invalidated stream state above stays paired
+    // with that unchanged old setting, rather than presenting a
+    // half-toggled, self-contradictory snapshot.
+    await this.settings.setIncludePrereleaseUpdates(value);
+
     return this.check({ force: true });
   }
 

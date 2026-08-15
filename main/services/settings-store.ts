@@ -75,20 +75,25 @@ class SettingsStore {
 
   async setKeepAwakeMode(mode: KeepAwakeMode): Promise<AppSettings> {
     await this.load();
-    this.cache = { ...this.cache, keepAwakeMode: mode };
-    await this.persist();
+    const next = { ...this.cache, keepAwakeMode: mode };
+    // Only commit the in-memory cache once the write has actually succeeded —
+    // committing first (the previous behavior) would let a failed persist
+    // leave `get()` reporting a value that was never durably saved, which
+    // callers (e.g. UpdateService) rely on staying consistent with disk.
+    await this.persist(next);
+    this.cache = next;
     return this.cache;
   }
 
   async setIncludePrereleaseUpdates(value: boolean): Promise<AppSettings> {
     await this.load();
-    this.cache = { ...this.cache, includePrereleaseUpdates: value };
-    await this.persist();
+    const next = { ...this.cache, includePrereleaseUpdates: value };
+    await this.persist(next);
+    this.cache = next;
     return this.cache;
   }
 
-  private async persist(): Promise<void> {
-    const snapshot = { ...this.cache };
+  private async persist(snapshot: AppSettings): Promise<void> {
     const save = this.saveQueue
       .catch(() => undefined)
       .then(async () => {
