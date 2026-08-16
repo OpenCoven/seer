@@ -33,6 +33,9 @@ const exitedLeaderGroupPath = join(here, "helpers", "renderer-exited-leader-grou
 const publicationKillHookPath = join(here, "helpers", "renderer-publication-kill-hook.mjs");
 const reclaimKillHookPath = join(here, "helpers", "renderer-reclaim-kill-hook.mjs");
 const releaseKillHookPath = join(here, "helpers", "renderer-release-kill-hook.mjs");
+const consumerGatePath = join(repoRoot, "scripts", "renderer-consumer-gate.mjs");
+const consumerSetupKillHookPath = join(here, "helpers", "renderer-consumer-setup-kill-hook.mjs");
+const consumerMarkerPath = join(here, "helpers", "renderer-consumer-marker.mjs");
 
 function runWrapper({ env = {}, consumerArgs = [], root = repoRoot, script = wrapperPath } = {}) {
   const args = [script];
@@ -57,6 +60,70 @@ function runWrapper({ env = {}, consumerArgs = [], root = repoRoot, script = wra
     child.on("close", (code, signal) => resolve({ code, signal, stdout, stderr }));
   });
   return { child, completed };
+}
+
+test("detached consumers are held behind a recorded wrapper process-group gate", () => {
+  assert.equal(existsSync(consumerGatePath), true);
+  const wrapperSource = readFileSync(wrapperPath, "utf8");
+  const gateSource = readFileSync(consumerGatePath, "utf8");
+  assert.match(gateSource, /SEER_RENDERER_CONSUMER_GATE_FD/);
+  assert.match(gateSource, /timeout/i);
+  assert.match(wrapperSource, /runConsumerSetupTestHook\("spawned"\)/);
+  assert.match(wrapperSource, /runConsumerSetupTestHook\("handlers"\)/);
+  assert.match(wrapperSource, /runConsumerSetupTestHook\("metadata"\)/);
+  assert.match(wrapperSource, /runConsumerSetupTestHook\("gate"\)/);
+  assert.match(wrapperSource, /recordChild[\s\S]*gate\.write/s);
+});
+
+for (const phase of ["spawned", "handlers", "metadata", "gate"]) {
+  test(`hard kill during consumer ${phase} phase cannot launch an unrecorded consumer`, async () => {
+    mkdirSync(join(repoRoot, "build"), { recursive: true });
+    const scratch = mkdtempSync(join(repoRoot, "build", `renderer-consumer-${phase}-`));
+    const readyPath = join(scratch, "ready");
+    const markerPath = join(scratch, "consumer-started");
+    const lockDir = join(repoRoot, ".seer-standalone-renderer.lock");
+    try {
+      const killed = runWrapper({
+        env: {
+          SEER_RENDERER_BUILD_TEST_BUILDER: testBuilderPath,
+          SEER_RENDERER_BUILD_TEST_MARKER: `consumer-${phase}`,
+          SEER_RENDERER_CONSUMER_SETUP_TEST_HOOK: consumerSetupKillHookPath,
+          SEER_RENDERER_CONSUMER_SETUP_TEST_PHASE: phase,
+          SEER_RENDERER_CONSUMER_SETUP_TEST_READY_PATH: readyPath,
+          SEER_RENDERER_CONSUMER_TEST_MARKER: markerPath,
+          SEER_RENDERER_CONSUMER_GATE_TIMEOUT_MS: "500",
+        },
+        consumerArgs: [process.execPath, consumerMarkerPath],
+      });
+      await waitForFile(readyPath, 120_000);
+      const result = await killed.completed;
+      assert.equal(result.signal, "SIGKILL");
+      assert.equal(existsSync(markerPath), false, "consumer must remain blocked until the durable gate release");
+
+      const childMetadataPath = join(lockDir, "child.json");
+      if (existsSync(childMetadataPath)) {
+        const child = JSON.parse(readFileSync(childMetadataPath, "utf8"));
+        await waitForProcessGroupExit(child.processGroupId);
+      } else {
+        await new Promise((resolve) => setTimeout(resolve, 150));
+      }
+
+      const recovered = await runWrapper({
+        env: {
+          SEER_RENDERER_BUILD_TEST_BUILDER: testBuilderPath,
+          SEER_RENDERER_BUILD_TEST_MARKER: `recovered-${phase}`,
+          SEER_RENDERER_LOCK_STALE_MS: "0",
+          SEER_RENDERER_LOCK_POLL_MS: "5",
+          SEER_RENDERER_LOCK_WAIT_MS: "5000",
+        },
+      }).completed;
+      assert.equal(recovered.code, 0, recovered.stderr);
+      assert.equal(existsSync(lockDir), false);
+    } finally {
+      rmSync(lockDir, { recursive: true, force: true });
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
 }
 
 async function waitForFile(path, timeoutMs = 20_000) {
@@ -148,6 +215,7 @@ function createRendererFixture(scratch) {
     "tsconfig.standalone.json",
     "tsconfig.json",
     "scripts/build-standalone-renderer.mjs",
+    "scripts/renderer-consumer-gate.mjs",
     "scripts/renderer-build-identity.mjs",
   ]) {
     cpSync(join(repoRoot, relativePath), join(fixtureRepo, relativePath));

@@ -38,6 +38,7 @@ const repoRoot = dirname(here);
 const lockDir = join(repoRoot, ".seer-standalone-renderer.lock");
 const ownerPath = join(lockDir, "owner.json");
 const childPath = join(lockDir, "child.json");
+const consumerGatePath = join(here, "renderer-consumer-gate.mjs");
 const legacyReclaimPath = `${lockDir}.reclaiming`;
 const reclaimOwnerName = "reclaim.json";
 const reclaimTempNamePattern = /^\.reclaim-([1-9][0-9]*)-[0-9a-f]{32}\.tmp$/;
@@ -356,6 +357,19 @@ function runReleaseTestHook(phase) {
   if (result.error) throw result.error;
   if (result.status !== 0) {
     throw new Error(`renderer release test hook exited with status ${result.status}`);
+  }
+}
+
+function runConsumerSetupTestHook(phase) {
+  const hookPath = process.env.SEER_RENDERER_CONSUMER_SETUP_TEST_HOOK;
+  if (!hookPath || process.env.SEER_RENDERER_CONSUMER_SETUP_TEST_PHASE !== phase) return;
+  const result = spawnSync(process.execPath, [hookPath, phase], {
+    env: process.env,
+    stdio: "inherit",
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(`renderer consumer setup test hook exited with status ${result.status}`);
   }
 }
 
@@ -1206,7 +1220,7 @@ async function acquireLock() {
       let activeChildInfo = null;
       return {
         token,
-        recordChild(pid, processGroupId) {
+        recordChild(pid, processGroupId, metadata = {}) {
           const childProcessStartIdentity = readProcessStartIdentity(pid);
           if (!childProcessStartIdentity) {
             throw new Error("unable to identify spawned renderer process start");
@@ -1218,6 +1232,7 @@ async function acquireLock() {
             createdAtMs: Date.now(),
             bootIdentity,
             processStartIdentity: childProcessStartIdentity,
+            ...metadata,
           })}\n`;
           let descriptor = null;
           let createdInfo = null;
@@ -1321,7 +1336,11 @@ function trace(event, token) {
 function signalChild(child, processGroupId, processStartIdentity, signal, leaderExited = false) {
   if (Number.isSafeInteger(processGroupId) && processGroupId > 0) {
     const currentStartIdentity = readProcessStartIdentity(child.pid);
-    if (currentStartIdentity && (leaderExited || currentStartIdentity !== processStartIdentity)) {
+    if (
+      currentStartIdentity &&
+      (leaderExited ||
+        (processStartIdentity !== null && currentStartIdentity !== processStartIdentity))
+    ) {
       return;
     }
     if (
@@ -1369,15 +1388,23 @@ async function terminateRemainingProcessGroup(child, processGroupId, processStar
   }
 }
 
-async function run(lock, command, args, { cwd = repoRoot, env = process.env } = {}) {
+async function run(
+  lock,
+  command,
+  args,
+  { cwd = repoRoot, env = process.env, consumerSetupHooks = false } = {},
+) {
   await new Promise((resolve, reject) => {
     const detached = process.platform !== "win32";
     let child;
     try {
-      child = spawn(command, args, {
+      child = spawn(process.execPath, [consumerGatePath, command, ...args], {
         cwd,
-        env,
-        stdio: "inherit",
+        env: {
+          ...env,
+          SEER_RENDERER_CONSUMER_GATE_FD: "3",
+        },
+        stdio: ["inherit", "inherit", "inherit", "pipe"],
         detached,
       });
     } catch (error) {
@@ -1390,8 +1417,19 @@ async function run(lock, command, args, { cwd = repoRoot, env = process.env } = 
     let exitResult = null;
     let childRecorded = false;
     let childProcessStartIdentity = null;
-    let processGroupId = null;
+    let processGroupId =
+      Number.isSafeInteger(child.pid) && child.pid > 0 && detached ? child.pid : null;
+    const gate = child.stdio[3];
     const handlers = new Map();
+    const failSetup = (error) => {
+      setupError = error;
+      gate?.destroy();
+      try {
+        signalChild(child, processGroupId, childProcessStartIdentity, "SIGTERM");
+      } catch {
+        // The setup error is authoritative.
+      }
+    };
     const cleanupHandlers = () => {
       for (const [signal, handler] of handlers) process.off(signal, handler);
     };
@@ -1403,9 +1441,12 @@ async function run(lock, command, args, { cwd = repoRoot, env = process.env } = 
     });
     child.once("close", (code, signal) => {
       cleanupHandlers();
+      gate?.destroy();
       void (async () => {
-        if (childRecorded) {
+        if (childRecorded || setupError) {
           await terminateRemainingProcessGroup(child, processGroupId, childProcessStartIdentity);
+        }
+        if (childRecorded) {
           lock.clearChild();
           childRecorded = false;
         }
@@ -1427,28 +1468,49 @@ async function run(lock, command, args, { cwd = repoRoot, env = process.env } = 
         }
       })().catch(reject);
     });
+    try {
+      if (consumerSetupHooks) runConsumerSetupTestHook("spawned");
+    } catch (error) {
+      failSetup(error);
+      return;
+    }
 
     if (!Number.isSafeInteger(child.pid) || child.pid <= 0) {
       setupError = new Error(`${command} spawned without a process id`);
-      return;
-    }
-    processGroupId = detached ? child.pid : null;
-    try {
-      childProcessStartIdentity = lock.recordChild(child.pid, processGroupId);
-      childRecorded = true;
-    } catch (error) {
-      setupError = error;
-      try {
-        child.kill("SIGTERM");
-      } catch {
-        // The metadata setup error is authoritative.
-      }
       return;
     }
     for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
       const handler = () => signalChild(child, processGroupId, childProcessStartIdentity, signal);
       handlers.set(signal, handler);
       process.once(signal, handler);
+    }
+    try {
+      if (consumerSetupHooks) runConsumerSetupTestHook("handlers");
+    } catch (error) {
+      failSetup(error);
+      return;
+    }
+    try {
+      childProcessStartIdentity = lock.recordChild(child.pid, processGroupId, {
+        role: "consumer-gate",
+        command,
+        arguments: args,
+      });
+      childRecorded = true;
+    } catch (error) {
+      failSetup(error);
+      return;
+    }
+    try {
+      if (consumerSetupHooks) runConsumerSetupTestHook("metadata");
+      if (!gate || !gate.writable) {
+        throw new Error("renderer consumer gate pipe is unavailable");
+      }
+      if (consumerSetupHooks) runConsumerSetupTestHook("gate");
+      gate.write("G");
+      gate.end();
+    } catch (error) {
+      failSetup(error);
     }
   });
 }
@@ -2187,6 +2249,7 @@ async function main() {
       trace("consumer-start", lock.token);
       await run(lock, consumer[0], consumer.slice(1), {
         env: { ...process.env, SEER_RENDERER_LOCK_HELD: lock.token },
+        consumerSetupHooks: true,
       });
       trace("consumer-end", lock.token);
     }
