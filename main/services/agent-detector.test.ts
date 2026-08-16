@@ -101,6 +101,50 @@ test("Cursor SQLite skips every malformed value independently", async () => {
   });
 });
 
+test("Cursor SQLite isolates malformed header rows and still returns a later valid composer", async () => {
+  await withDatabase(async (database) => {
+    insertRows(database, [
+      {
+        key: "composerData:null-header",
+        value: JSON.stringify({
+          status: "completed",
+          lastUpdatedAt: now,
+          fullConversationHeadersOnly: [null],
+        }),
+      },
+      {
+        key: "composerData:primitive-header",
+        value: JSON.stringify({
+          status: "completed",
+          lastUpdatedAt: now,
+          fullConversationHeadersOnly: [42],
+        }),
+      },
+      {
+        key: "composerData:invalid-fields",
+        value: JSON.stringify({
+          status: "completed",
+          fullConversationHeadersOnly: [{ type: "1", createdAt: now }],
+        }),
+      },
+      {
+        key: "composerData:valid",
+        value: JSON.stringify({ status: "generating", lastUpdatedAt: now }),
+      },
+    ]);
+
+    const active = await detectCursorComposerActivity(now, database);
+
+    assert.deepEqual(active.map(({ identity }) => identity), ["valid"]);
+  });
+
+  assert.match(
+    detectorSource,
+    /try\s*\{[\s\S]*assessCursorComposerRecord[\s\S]*\}\s*catch\s*\{[\s\S]*Skipped malformed Cursor composer row/,
+  );
+  assert.doesNotMatch(detectorSource, /Skipped malformed Cursor composer row[\s\S]{0,120}\b(?:key|value|record)\b/);
+});
+
 test("session traversal bounds all entries in a huge directory while retaining recent candidates", async () => {
   await withScratch(async (root) => {
     const timestamp = new Date(now);

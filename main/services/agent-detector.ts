@@ -399,16 +399,22 @@ export async function detectCursorComposerActivity(
       }
       if (!record || typeof record !== "object" || Array.isArray(record)) return;
 
-      const assessment = assessCursorComposerRecord(record as CursorComposerRecord, now);
-      if (!assessment.active) return;
-      active.push({
-        ...assessment,
-        filePath: dbPath,
-        identity: key.slice("composerData:".length),
-      });
-      if (active.length >= CURSOR_MAX_ACTIVE_CANDIDATES) {
-        intentionallyStopped = true;
-        child.kill("SIGTERM");
+      try {
+        const assessment = assessCursorComposerRecord(record as CursorComposerRecord, now);
+        if (!assessment.active) return;
+        active.push({
+          ...assessment,
+          filePath: dbPath,
+          identity: key.slice("composerData:".length),
+        });
+        if (active.length >= CURSOR_MAX_ACTIVE_CANDIDATES) {
+          intentionallyStopped = true;
+          child.kill("SIGTERM");
+        }
+      } catch {
+        logger.debug("detector", "Skipped malformed Cursor composer row", {
+          reason: "assessment exception",
+        });
       }
     };
 

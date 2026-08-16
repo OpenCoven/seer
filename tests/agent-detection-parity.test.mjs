@@ -63,6 +63,74 @@ test("Cursor continuation flags use strict booleans without refreshing malformed
   }, now).active, false);
 });
 
+test("Cursor headers reject null, primitive, and non-array shapes without throwing", () => {
+  for (const headers of [
+    null,
+    {},
+    [null],
+    [true],
+    [1],
+    ["header"],
+    [[]],
+  ]) {
+    assert.doesNotThrow(() => {
+      const assessment = assessCursorComposerRecord({
+        status: "completed",
+        lastUpdatedAt: now,
+        fullConversationHeadersOnly: headers,
+      }, now);
+      assert.equal(assessment.active, false);
+      assert.equal(assessment.reason, "malformed cursor composer");
+    });
+  }
+});
+
+test("Cursor header proxies and throwing getters are contained as malformed records", () => {
+  const throwingPrototype = new Proxy({}, {
+    getPrototypeOf() {
+      throw new Error("private row content");
+    },
+  });
+  const throwingType = {};
+  Object.defineProperty(throwingType, "type", {
+    get() {
+      throw new Error("private row content");
+    },
+  });
+
+  for (const header of [throwingPrototype, throwingType]) {
+    const assessment = assessCursorComposerRecord({
+      status: "completed",
+      fullConversationHeadersOnly: [header],
+    }, now);
+    assert.equal(assessment.active, false);
+    assert.equal(assessment.reason, "malformed cursor composer");
+  }
+});
+
+test("Cursor headers require strict field types, finite timestamps, and finite durations", () => {
+  const malformedHeaders = [
+    [{ type: "1", createdAt: now }],
+    [{ type: 1, createdAt: null }],
+    [{ type: 1, createdAt: Number.NaN }],
+    [{ type: 1, createdAt: Number.POSITIVE_INFINITY }],
+    [{ type: 1, createdAt: "not-a-timestamp" }],
+    [{ type: 1, createdAt: now, grouping: null }],
+    [{ type: 1, createdAt: now, grouping: { turnDurationMs: Number.NaN } }],
+    [{ type: 1, createdAt: now, grouping: { turnDurationMs: -1 } }],
+    [{ type: 1, createdAt: now, grouping: { shellStatus: true } }],
+  ];
+
+  for (const fullConversationHeadersOnly of malformedHeaders) {
+    const assessment = assessCursorComposerRecord({
+      status: "completed",
+      fullConversationHeadersOnly,
+    }, now);
+    assert.equal(assessment.active, false);
+    assert.equal(assessment.reason, "malformed cursor composer");
+  }
+});
+
 const APPROVED_FAMILIES = [
   "claude-code",
   "codex",

@@ -759,6 +759,16 @@ export type CursorConversationHeader = {
   grouping?: unknown;
 };
 
+type ValidatedCursorConversationHeader = {
+  type: 1 | 2;
+  createdAt: number;
+  grouping: {
+    toolFormerStatus?: string;
+    shellStatus?: string;
+    turnDurationMs?: number;
+  };
+};
+
 export const CURSOR_RUNNING_TOOL_STATUSES = new Set([
   "loading",
   "running",
@@ -789,9 +799,124 @@ export function cursorProjectLabel(record: CursorComposerRecord): string | undef
 }
 
 export function cursorHeaderGrouping(header: CursorConversationHeader): Record<string, unknown> {
-  return header.grouping && typeof header.grouping === "object"
+  return isPlainCursorObject(header.grouping)
     ? (header.grouping as Record<string, unknown>)
     : {};
+}
+
+function isPlainCursorObject(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function parseCursorTimestamp(value: unknown): number | null {
+  let parsed: number;
+  if (typeof value === "number" && Number.isFinite(value)) {
+    parsed = value > 1e12 ? value : value * 1000;
+  } else if (typeof value === "string" && value.trim()) {
+    parsed = Date.parse(value);
+  } else {
+    return null;
+  }
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function validateOptionalString(record: Record<string, unknown>, field: string): boolean {
+  return record[field] === undefined || typeof record[field] === "string";
+}
+
+function validateCursorRecordFields(record: Record<string, unknown>): boolean {
+  for (const field of [
+    "status",
+    "name",
+    "subtitle",
+    "unifiedMode",
+  ]) {
+    if (!validateOptionalString(record, field)) return false;
+  }
+  for (const field of [
+    "lastUpdatedAt",
+    "createdAt",
+    "conversationCheckpointLastUpdatedAt",
+  ]) {
+    if (record[field] !== undefined && parseCursorTimestamp(record[field]) === null) return false;
+  }
+  if (
+    record.isContinuationInProgress !== undefined &&
+    typeof record.isContinuationInProgress !== "boolean"
+  ) {
+    return false;
+  }
+  if (
+    record.generatingBubbleIds !== undefined &&
+    (!Array.isArray(record.generatingBubbleIds) ||
+      !record.generatingBubbleIds.every((value) => typeof value === "string"))
+  ) {
+    return false;
+  }
+  if (record.workspaceIdentifier !== undefined) {
+    if (!isPlainCursorObject(record.workspaceIdentifier)) return false;
+    const workspace = record.workspaceIdentifier;
+    if (!validateOptionalString(workspace, "id")) return false;
+    if (workspace.uri !== undefined) {
+      if (!isPlainCursorObject(workspace.uri)) return false;
+      if (
+        !validateOptionalString(workspace.uri, "fsPath") ||
+        !validateOptionalString(workspace.uri, "path")
+      ) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+function validateCursorHeaders(value: unknown): ValidatedCursorConversationHeader[] | null {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) return null;
+
+  const headers: ValidatedCursorConversationHeader[] = [];
+  for (const candidate of value) {
+    if (!isPlainCursorObject(candidate)) return null;
+    if (candidate.type !== 1 && candidate.type !== 2) return null;
+    const createdAt = parseCursorTimestamp(candidate.createdAt);
+    if (createdAt === null) return null;
+
+    let grouping: ValidatedCursorConversationHeader["grouping"] = {};
+    if (candidate.grouping !== undefined) {
+      if (!isPlainCursorObject(candidate.grouping)) return null;
+      const rawGrouping = candidate.grouping;
+      if (
+        !validateOptionalString(rawGrouping, "toolFormerStatus") ||
+        !validateOptionalString(rawGrouping, "shellStatus")
+      ) {
+        return null;
+      }
+      const duration = rawGrouping.turnDurationMs;
+      if (
+        duration !== undefined &&
+        (typeof duration !== "number" || !Number.isFinite(duration) || duration < 0)
+      ) {
+        return null;
+      }
+      grouping = {
+        ...(typeof rawGrouping.toolFormerStatus === "string"
+          ? { toolFormerStatus: rawGrouping.toolFormerStatus }
+          : {}),
+        ...(typeof rawGrouping.shellStatus === "string"
+          ? { shellStatus: rawGrouping.shellStatus }
+          : {}),
+        ...(typeof duration === "number" ? { turnDurationMs: duration } : {}),
+      };
+    }
+    headers.push({ type: candidate.type, createdAt, grouping });
+  }
+  return headers;
+}
+
+function malformedCursorAssessment(): TurnAssessment {
+  return { active: false, lastActivityAt: 0, reason: "malformed cursor composer" };
 }
 
 /**
@@ -803,18 +928,30 @@ export function assessCursorComposerRecord(
   record: CursorComposerRecord,
   now: number,
 ): TurnAssessment & { label?: string } {
+  try {
+    return assessValidatedCursorComposerRecord(record, now);
+  } catch {
+    return malformedCursorAssessment();
+  }
+}
+
+function assessValidatedCursorComposerRecord(
+  record: CursorComposerRecord,
+  now: number,
+): TurnAssessment & { label?: string } {
+  if (!isPlainCursorObject(record) || !validateCursorRecordFields(record)) {
+    return malformedCursorAssessment();
+  }
+  const headers = validateCursorHeaders(record.fullConversationHeadersOnly);
+  if (headers === null) return malformedCursorAssessment();
+
   const status = typeof record.status === "string" ? record.status : "none";
   const generatingIds = Array.isArray(record.generatingBubbleIds) ? record.generatingBubbleIds : [];
   const continuation = record.isContinuationInProgress === true;
   const label = cursorProjectLabel(record);
-  const malformedContinuation =
-    record.isContinuationInProgress !== undefined &&
-    typeof record.isContinuationInProgress !== "boolean";
-
-  let lastActivityAt = parseTimestamp(
-    record.conversationCheckpointLastUpdatedAt ?? record.lastUpdatedAt ?? record.createdAt,
-    malformedContinuation ? 0 : now,
-  );
+  const timestamp =
+    record.conversationCheckpointLastUpdatedAt ?? record.lastUpdatedAt ?? record.createdAt;
+  let lastActivityAt = timestamp === undefined ? now : (parseCursorTimestamp(timestamp) ?? 0);
 
   if (status === "generating" || continuation || generatingIds.length > 0) {
     let reason = "generating";
@@ -830,10 +967,6 @@ export function assessCursorComposerRecord(
       label,
     };
   }
-
-  const headers = Array.isArray(record.fullConversationHeadersOnly)
-    ? (record.fullConversationHeadersOnly as CursorConversationHeader[])
-    : [];
 
   let openUserTurnAt: number | null = null;
   let sawCompletedTurnAfterUser = false;
