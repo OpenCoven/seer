@@ -193,7 +193,7 @@ public struct HistoryDocument: VersionedDocument {
                 name: aggregateAgentName(familyID: familyID, fallback: sourceTotal.name),
                 durationMs: 0
             )
-            familyTotal.durationMs = addingClamped(familyTotal.durationMs, sourceTotal.durationMs)
+            familyTotal.durationMs = saturatingAdd(familyTotal.durationMs, sourceTotal.durationMs)
             normalized[familyID] = familyTotal
         }
         return normalized
@@ -211,9 +211,18 @@ public struct HistoryDocument: VersionedDocument {
         return AGENT_KINDS.first(where: { $0.id.rawValue == familyID })?.name ?? fallback
     }
 
-    private static func addingClamped(_ left: Int64, _ right: Int64) -> Int64 {
-        let (sum, overflow) = left.addingReportingOverflow(right)
+    static func saturatingAdd(_ left: Int64, _ right: Int64) -> Int64 {
+        let nonNegativeLeft = max(left, 0)
+        let nonNegativeRight = max(right, 0)
+        let (sum, overflow) = nonNegativeLeft.addingReportingOverflow(nonNegativeRight)
         return overflow ? Int64.max : sum
+    }
+
+    static func saturatingAdd(_ left: Int, _ right: Int) -> Int {
+        let nonNegativeLeft = max(left, 0)
+        let nonNegativeRight = max(right, 0)
+        let (sum, overflow) = nonNegativeLeft.addingReportingOverflow(nonNegativeRight)
+        return overflow ? Int.max : sum
     }
 
     private static func decodeDaily(_ container: KeyedDecodingContainer<CodingKeys>) -> [String: Int64] {
@@ -478,7 +487,7 @@ public actor HistoryStore {
                     agents: []
                 )
             } else {
-                let delta = min(max(now - lastTickAt, 0), Self.maxTickDeltaMs)
+                let delta = cappedTickDelta(now: now)
                 if delta > 0 {
                     applyDelta(delta, state: state, now: now)
                     await scheduleSaveIfNeeded()
@@ -493,12 +502,12 @@ public actor HistoryStore {
 
     private func applyDelta(_ delta: Int64, state: AgentMonitorState, now: Int64) {
         guard var session = current else { return }
-        session.durationMs += delta
+        session.durationMs = HistoryDocument.saturatingAdd(session.durationMs, delta)
         session.mode = state.keepAwakeMode
-        data.totalAwakeMs += delta
+        data.totalAwakeMs = HistoryDocument.saturatingAdd(data.totalAwakeMs, delta)
 
         let key = dayKey(for: now)
-        data.daily[key, default: 0] += delta
+        data.daily[key] = HistoryDocument.saturatingAdd(data.daily[key] ?? 0, delta)
 
         for agent in state.agents {
             addAgentTime(to: &session.agents, id: agent.id, name: agent.name, delta: delta)
@@ -507,7 +516,7 @@ public actor HistoryStore {
                 name: HistoryDocument.aggregateAgentName(familyID: familyID, fallback: agent.name),
                 durationMs: 0
             )
-            total.durationMs += delta
+            total.durationMs = HistoryDocument.saturatingAdd(total.durationMs, delta)
             data.agentTotals[familyID] = total
         }
 
@@ -516,11 +525,17 @@ public actor HistoryStore {
 
     private func addAgentTime(to agents: inout [AgentUsage], id: String, name: String, delta: Int64) {
         if let index = agents.firstIndex(where: { $0.id == id }) {
-            agents[index].durationMs += delta
+            agents[index].durationMs = HistoryDocument.saturatingAdd(agents[index].durationMs, delta)
             agents[index].name = name
         } else {
             agents.append(AgentUsage(id: id, name: name, durationMs: delta))
         }
+    }
+
+    private func cappedTickDelta(now: Int64) -> Int64 {
+        guard now > lastTickAt else { return 0 }
+        let (elapsed, overflow) = now.subtractingReportingOverflow(lastTickAt)
+        return overflow ? Self.maxTickDeltaMs : min(elapsed, Self.maxTickDeltaMs)
     }
 
     private func closeCurrentSession(endedAt: Int64) {
@@ -531,7 +546,7 @@ public actor HistoryStore {
             if data.sessions.count > Self.maximumSessions {
                 data.sessions.removeLast(data.sessions.count - Self.maximumSessions)
             }
-            data.sessionCount += 1
+            data.sessionCount = HistoryDocument.saturatingAdd(data.sessionCount, 1)
         }
         current = nil
     }

@@ -623,6 +623,80 @@ final class HistoryStoreTests: XCTestCase {
         XCTAssertEqual(decoded.sessions.count, HistoryStore.maximumSessions)
     }
 
+    func testMaximumPersistedCountersSaturateAcrossRecordFlushStatsAndMigration() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let json = """
+        {
+          "version": 1,
+          "totalAwakeMs": \(Int64.max),
+          "sessionCount": \(Int.max),
+          "agentTotals": {
+            "codex:first": {"name": "Codex", "durationMs": \(Int64.max)},
+            "codex:second": {"name": "Codex", "durationMs": 1},
+            "untrusted:first": {"name": "Unknown", "durationMs": \(Int64.max)},
+            "another-unknown:second": {"name": "Unknown", "durationMs": 1}
+          },
+          "daily": {"1970-01-01": \(Int64.max)},
+          "sessions": [
+            {
+              "id": "max-session",
+              "startedAt": 0,
+              "endedAt": 1,
+              "durationMs": \(Int64.max),
+              "mode": "system",
+              "agents": [
+                {"id": "codex:max-session-agent", "name": "Codex", "durationMs": \(Int64.max)}
+              ]
+            }
+          ]
+        }
+        """
+        await fileSystem.seedFile(at: historyURL, contents: Data(json.utf8))
+        let store = makeStore(fileSystem: fileSystem)
+
+        _ = await store.load()
+        await store.record(activeState(agents: [("codex:live", "Codex")], at: clock.now))
+        clock.now = 2_000
+        await store.record(activeState(agents: [("codex:live", "Codex")], at: clock.now))
+
+        var stats = await store.stats()
+        XCTAssertEqual(stats.totalAwakeMs, Int64.max)
+        XCTAssertEqual(stats.todayAwakeMs, Int64.max)
+        XCTAssertEqual(stats.sessionCount, Int.max)
+        XCTAssertEqual(stats.perAgent.first(where: { $0.id == "codex" })?.durationMs, Int64.max)
+        XCTAssertEqual(stats.perAgent.first(where: { $0.id == "other" })?.durationMs, Int64.max)
+        XCTAssertEqual(stats.currentSession?.durationMs, 1_000)
+        XCTAssertEqual(stats.currentSession?.agents.first?.durationMs, 1_000)
+
+        stats = try await store.flush(at: 3_000)
+        XCTAssertEqual(stats.sessionCount, Int.max)
+        XCTAssertNil(stats.currentSession)
+
+        let persistedData = await fileSystem.contents(at: historyURL)
+        let persistedBytes = try XCTUnwrap(persistedData)
+        let persisted = try JSONDecoder().decode(HistoryDocument.self, from: persistedBytes)
+        XCTAssertEqual(persisted.totalAwakeMs, Int64.max)
+        XCTAssertEqual(persisted.sessionCount, Int.max)
+        XCTAssertEqual(persisted.daily["1970-01-01"], Int64.max)
+        XCTAssertEqual(persisted.agentTotals["codex"]?.durationMs, Int64.max)
+        XCTAssertEqual(persisted.agentTotals["other"]?.durationMs, Int64.max)
+        XCTAssertEqual(
+            persisted.sessions.first(where: { $0.id == "max-session" })?.durationMs,
+            Int64.max
+        )
+        XCTAssertEqual(
+            persisted.sessions
+                .first(where: { $0.id == "max-session" })?
+                .agents.first?
+                .durationMs,
+            Int64.max
+        )
+
+        let responsiveStats = await store.stats()
+        XCTAssertEqual(responsiveStats.totalAwakeMs, Int64.max)
+        XCTAssertEqual(responsiveStats.sessionCount, Int.max)
+    }
+
     // MARK: 14b. Snapshots do not expose mutable internal state
 
     func testStatsSnapshotsDoNotExposeMutableInternalState() async throws {
