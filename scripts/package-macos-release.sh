@@ -82,34 +82,60 @@ run_system_tool() {
 
 destroy_credentials() {
   local cleanup_failed=0
-  set +e
+  local restoration_pending=0
   if [[ -n "${CERTIFICATE_PATH}" ]]; then
     run_system_tool "${SYSTEM_RM}" -f "${CERTIFICATE_PATH}" || cleanup_failed=1
   fi
   if [[ -n "${API_KEY_PATH}" ]]; then
     run_system_tool "${SYSTEM_RM}" -f "${API_KEY_PATH}" || cleanup_failed=1
   fi
-  if [[ "${DEFAULT_KEYCHAIN_CHANGED}" -eq 1 && -n "${ORIGINAL_DEFAULT_KEYCHAIN}" ]]; then
-    run_system_tool "${SYSTEM_SECURITY}" default-keychain -s "${ORIGINAL_DEFAULT_KEYCHAIN}" >/dev/null 2>&1 ||
+  if [[ "${DEFAULT_KEYCHAIN_CHANGED}" -eq 1 ]]; then
+    if [[ -n "${ORIGINAL_DEFAULT_KEYCHAIN}" ]] &&
+      run_system_tool "${SYSTEM_SECURITY}" default-keychain -s "${ORIGINAL_DEFAULT_KEYCHAIN}" \
+        >/dev/null 2>&1
+    then
+      DEFAULT_KEYCHAIN_CHANGED=0
+      ORIGINAL_DEFAULT_KEYCHAIN=""
+    else
       cleanup_failed=1
-    DEFAULT_KEYCHAIN_CHANGED=0
+    fi
   fi
   if [[ "${USER_KEYCHAIN_LIST_CHANGED}" -eq 1 ]]; then
-    run_system_tool "${SYSTEM_SECURITY}" list-keychains -d user -s \
-      "${ORIGINAL_USER_KEYCHAINS[@]}" >/dev/null 2>&1 ||
+    if run_system_tool "${SYSTEM_SECURITY}" list-keychains -d user -s \
+      "${ORIGINAL_USER_KEYCHAINS[@]}" >/dev/null 2>&1
+    then
+      USER_KEYCHAIN_LIST_CHANGED=0
+      ORIGINAL_USER_KEYCHAINS=()
+    else
       cleanup_failed=1
-    USER_KEYCHAIN_LIST_CHANGED=0
+    fi
+  fi
+  if [[ "${DEFAULT_KEYCHAIN_CHANGED}" -eq 1 || "${USER_KEYCHAIN_LIST_CHANGED}" -eq 1 ]]; then
+    restoration_pending=1
+    cleanup_failed=1
   fi
   if [[ -n "${KEYCHAIN_PATH}" ]] &&
     [[ "${KEYCHAIN_CREATED}" -eq 1 || -e "${KEYCHAIN_PATH}" ]]
   then
-    run_system_tool "${SYSTEM_SECURITY}" delete-keychain "${KEYCHAIN_PATH}" >/dev/null 2>&1 ||
-      cleanup_failed=1
-    run_system_tool "${SYSTEM_RM}" -f "${KEYCHAIN_PATH}" || cleanup_failed=1
-    KEYCHAIN_CREATED=0
+    if [[ "${restoration_pending}" -eq 0 ]]; then
+      if run_system_tool "${SYSTEM_SECURITY}" delete-keychain "${KEYCHAIN_PATH}" >/dev/null 2>&1; then
+        KEYCHAIN_CREATED=0
+        run_system_tool "${SYSTEM_RM}" -f "${KEYCHAIN_PATH}" || cleanup_failed=1
+      else
+        cleanup_failed=1
+      fi
+    fi
   fi
   if [[ -n "${CREDENTIAL_ROOT}" ]]; then
-    run_system_tool "${SYSTEM_RM}" -rf "${CREDENTIAL_ROOT}" || cleanup_failed=1
+    if [[ "${DEFAULT_KEYCHAIN_CHANGED}" -eq 0 ]] &&
+      [[ "${USER_KEYCHAIN_LIST_CHANGED}" -eq 0 ]] &&
+      [[ "${KEYCHAIN_CREATED}" -eq 0 ]] &&
+      [[ -z "${KEYCHAIN_PATH}" || ! -e "${KEYCHAIN_PATH}" ]]
+    then
+      run_system_tool "${SYSTEM_RM}" -rf "${CREDENTIAL_ROOT}" || cleanup_failed=1
+    else
+      cleanup_failed=1
+    fi
   fi
 
   SIGNING_CERTIFICATE_VALUE=""
@@ -123,7 +149,6 @@ destroy_credentials() {
   NOTARY_APPLE_PASSWORD_VALUE=""
   KEYCHAIN_PASSWORD=""
   NOTARY_ARGS=()
-  ORIGINAL_USER_KEYCHAINS=()
   unset \
     SIGNING_CERTIFICATE_VALUE SIGNING_CERTIFICATE_PASSWORD_VALUE \
     SIGNING_IDENTITY_VALUE SIGNING_TEAM_ID_VALUE \
@@ -132,7 +157,11 @@ destroy_credentials() {
   for apple_variable in "${!APPLE_@}"; do
     unset "${apple_variable}"
   done
-  set -e
+  if [[ "${restoration_pending}" -eq 1 ]]; then
+    echo "error: user keychain restoration incomplete; temporary signing keychain retained for recovery" >&2
+  elif [[ "${KEYCHAIN_CREATED}" -eq 1 || ( -n "${KEYCHAIN_PATH}" && -e "${KEYCHAIN_PATH}" ) ]]; then
+    echo "error: temporary signing keychain teardown incomplete; keychain retained for recovery" >&2
+  fi
   return "${cleanup_failed}"
 }
 

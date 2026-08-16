@@ -1231,7 +1231,9 @@ function makeSigningOnlyStubs(
     notarizationMode = "api-key",
     backgroundAttack = false,
     credentialCleanupFailure = false,
+    defaultRestoreFailures = 0,
     pauseAt = "",
+    searchRestoreFailures = 0,
     signingSourceCommit = "a".repeat(40),
   } = {},
 ) {
@@ -1241,7 +1243,9 @@ function makeSigningOnlyStubs(
   const backgroundEnvironment = join(scratch, "background.env");
   const codesignArgvPath = join(scratch, "codesign-signing.argv");
   const defaultKeychainState = join(scratch, "default-keychain");
+  const defaultRestoreAttempts = join(scratch, "default-restore-attempts");
   const keychainPointer = join(scratch, "keychain-path");
+  const searchRestoreAttempts = join(scratch, "search-restore-attempts");
   const userKeychainState = join(scratch, "user-keychains");
   const dmgImage = join(scratch, "dmg-image");
   const mountPointer = join(scratch, "mount-path");
@@ -1304,11 +1308,31 @@ case "\${operation}" in
     if [[ "\${2:-}" == "-d" ]]; then
       printf '"%s"\\n' "$(cat ${JSON.stringify(defaultKeychainState)})"
     elif [[ "\${2:-}" == "-s" ]]; then
+      if [[ "\${3}" == ${JSON.stringify(originalUserKeychains[0])} ]]; then
+        attempt=0
+        if [[ -e ${JSON.stringify(defaultRestoreAttempts)} ]]; then
+          IFS= read -r attempt < ${JSON.stringify(defaultRestoreAttempts)}
+        fi
+        attempt=$((attempt + 1))
+        printf "%s\\n" "\${attempt}" > ${JSON.stringify(defaultRestoreAttempts)}
+        printf "security:default-keychain:restore\\n" >> ${JSON.stringify(logPath)}
+        if (( attempt <= ${defaultRestoreFailures} )); then exit 81; fi
+      fi
       printf "%s\\n" "\${3}" > ${JSON.stringify(defaultKeychainState)}
     fi
     ;;
   list-keychains)
     if [[ "\${4:-}" == "-s" ]]; then
+      if [[ "\${5:-}" == ${JSON.stringify(originalUserKeychains[0])} ]]; then
+        attempt=0
+        if [[ -e ${JSON.stringify(searchRestoreAttempts)} ]]; then
+          IFS= read -r attempt < ${JSON.stringify(searchRestoreAttempts)}
+        fi
+        attempt=$((attempt + 1))
+        printf "%s\\n" "\${attempt}" > ${JSON.stringify(searchRestoreAttempts)}
+        printf "security:list-keychains:restore\\n" >> ${JSON.stringify(logPath)}
+        if (( attempt <= ${searchRestoreFailures} )); then exit 82; fi
+      fi
       : > ${JSON.stringify(userKeychainState)}
       shift 4
       printf "%s\\n" "$@" > ${JSON.stringify(userKeychainState)}
@@ -1513,6 +1537,7 @@ esac
     backgroundEnvironment,
     codesignArgvPath,
     defaultKeychainState,
+    defaultRestoreAttempts,
     keychainPointer,
     logPath,
     mountPointer,
@@ -1521,6 +1546,7 @@ esac
     precredentialAttackMarker,
     precredentialCommandLog,
     originalUserKeychains,
+    searchRestoreAttempts,
     userKeychainState,
   };
 }
@@ -1680,7 +1706,7 @@ with tarfile.open(${JSON.stringify(archive)}, "w", format=tarfile.USTAR_FORMAT) 
   }
 });
 
-test("signing-only flow cleans credentials before repository code and never runs build tools", async () => {
+test("signing-only flow repeats credential destruction idempotently before repository code", async () => {
   await withScratchAsync("release-sign-success-", async (scratch) => {
     rmSync(releaseRoot, { recursive: true, force: true });
     const input = createAttestedInput(scratch);
@@ -1688,6 +1714,7 @@ test("signing-only flow cleans credentials before repository code and never runs
       backgroundEnvironment,
       codesignArgvPath,
       defaultKeychainState,
+      defaultRestoreAttempts,
       env,
       keychainPointer,
       logPath,
@@ -1695,6 +1722,7 @@ test("signing-only flow cleans credentials before repository code and never runs
       originalUserKeychains,
       precredentialAttackMarker,
       precredentialCommandLog,
+      searchRestoreAttempts,
       userKeychainState,
     } = makeSigningOnlyStubs(scratch, input, { backgroundAttack: true });
 
@@ -1744,6 +1772,9 @@ test("signing-only flow cleans credentials before repository code and never runs
       originalUserKeychains,
       "cleanup must restore the exact original user keychain search list",
     );
+    assert.equal(readFileSync(defaultRestoreAttempts, "utf8").trim(), "1");
+    assert.equal(readFileSync(searchRestoreAttempts, "utf8").trim(), "1");
+    assert.equal((log.match(/^security:delete-keychain$/gm) ?? []).length, 1);
     const signingArgv = readCodesignSigningArgv(codesignArgvPath);
     assert.equal(signingArgv.length, 2, "the app and DMG must each be signed once");
     for (const argv of signingArgv) {
@@ -1792,23 +1823,166 @@ test("signing-only flow cleans credentials before repository code and never runs
   });
 });
 
+for (const [name, failureOptions] of [
+  ["default keychain", { defaultRestoreFailures: 1 }],
+  ["keychain search list", { searchRestoreFailures: 1 }],
+]) {
+  test(`EXIT cleanup retries a transient ${name} restoration independently`, () => {
+    withScratch(`release-sign-transient-${name.replaceAll(" ", "-")}-`, (scratch) => {
+      rmSync(releaseRoot, { recursive: true, force: true });
+      const input = createAttestedInput(scratch);
+      const {
+        defaultKeychainState,
+        defaultRestoreAttempts,
+        env,
+        keychainPointer,
+        logPath,
+        nodeEnvironment,
+        originalUserKeychains,
+        searchRestoreAttempts,
+        userKeychainState,
+      } = makeSigningOnlyStubs(scratch, input, failureOptions);
+
+      const result = runPackage(env);
+
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /credential teardown/i);
+      assert.ok(!existsSync(nodeEnvironment), "repository code must remain blocked after a retry");
+      assert.equal(readFileSync(defaultKeychainState, "utf8").trim(), originalUserKeychains[0]);
+      assert.deepEqual(readFileSync(userKeychainState, "utf8").trim().split("\n"), originalUserKeychains);
+      const keychainPath = readFileSync(keychainPointer, "utf8").trim();
+      assert.ok(!existsSync(keychainPath), "the temporary keychain must be deleted after retry succeeds");
+      assert.equal(
+        readFileSync(defaultRestoreAttempts, "utf8").trim(),
+        failureOptions.defaultRestoreFailures ? "2" : "1",
+      );
+      assert.equal(
+        readFileSync(searchRestoreAttempts, "utf8").trim(),
+        failureOptions.searchRestoreFailures ? "2" : "1",
+      );
+      const log = readFileSync(logPath, "utf8");
+      assert.equal((log.match(/^security:delete-keychain$/gm) ?? []).length, 1);
+      for (const value of credentialValues) {
+        assert.ok(!`${result.stdout}${result.stderr}${log}`.includes(value), `logged credential value ${value}`);
+      }
+      assertNoPackagingLeaves();
+    });
+  });
+}
+
+for (const [name, failureOptions, expectedDefaultRestored, expectedSearchRestored] of [
+  ["default failure", { defaultRestoreFailures: 99 }, false, true],
+  ["search-list failure", { searchRestoreFailures: 99 }, true, false],
+]) {
+  test(`partial keychain restoration retains referenced temporary state after ${name}`, () => {
+    withScratch(`release-sign-partial-${name.replaceAll(" ", "-")}-`, (scratch) => {
+      rmSync(releaseRoot, { recursive: true, force: true });
+      const input = createAttestedInput(scratch);
+      const {
+        defaultKeychainState,
+        env,
+        keychainPointer,
+        logPath,
+        nodeEnvironment,
+        originalUserKeychains,
+        userKeychainState,
+      } = makeSigningOnlyStubs(scratch, input, failureOptions);
+      let credentialRoot = "";
+      try {
+        const result = runPackage(env);
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, /keychain restoration incomplete/i);
+        assert.ok(!existsSync(nodeEnvironment));
+        const keychainPath = readFileSync(keychainPointer, "utf8").trim();
+        credentialRoot = dirname(keychainPath);
+        assert.ok(existsSync(keychainPath), "a still-referenced temporary keychain must be retained");
+        assert.equal(
+          readFileSync(defaultKeychainState, "utf8").trim(),
+          expectedDefaultRestored ? originalUserKeychains[0] : keychainPath,
+        );
+        assert.deepEqual(
+          readFileSync(userKeychainState, "utf8").trim().split("\n"),
+          expectedSearchRestored ? originalUserKeychains : [keychainPath, ...originalUserKeychains],
+        );
+        const log = readFileSync(logPath, "utf8");
+        assert.doesNotMatch(log, /^security:delete-keychain$/m);
+        for (const value of credentialValues) {
+          assert.ok(!`${result.stdout}${result.stderr}${log}`.includes(value), `logged credential value ${value}`);
+        }
+        assertNoPackagingLeaves();
+      } finally {
+        if (credentialRoot) rmSync(credentialRoot, { recursive: true, force: true });
+      }
+    });
+  });
+}
+
+test("failed default and search-list restorations retain their exact state and keychain", () => {
+  withScratch("release-sign-both-restore-failures-", (scratch) => {
+    rmSync(releaseRoot, { recursive: true, force: true });
+    const input = createAttestedInput(scratch);
+    const {
+      defaultKeychainState,
+      defaultRestoreAttempts,
+      env,
+      keychainPointer,
+      logPath,
+      originalUserKeychains,
+      searchRestoreAttempts,
+      userKeychainState,
+    } = makeSigningOnlyStubs(scratch, input, {
+      defaultRestoreFailures: 99,
+      searchRestoreFailures: 99,
+    });
+    let credentialRoot = "";
+    try {
+      const result = runPackage(env);
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /keychain restoration incomplete/i);
+      const keychainPath = readFileSync(keychainPointer, "utf8").trim();
+      credentialRoot = dirname(keychainPath);
+      assert.ok(existsSync(keychainPath));
+      assert.equal(readFileSync(defaultKeychainState, "utf8").trim(), keychainPath);
+      assert.deepEqual(readFileSync(userKeychainState, "utf8").trim().split("\n"), [
+        keychainPath,
+        ...originalUserKeychains,
+      ]);
+      assert.equal(readFileSync(defaultRestoreAttempts, "utf8").trim(), "2");
+      assert.equal(readFileSync(searchRestoreAttempts, "utf8").trim(), "2");
+      const log = readFileSync(logPath, "utf8");
+      assert.doesNotMatch(log, /^security:delete-keychain$/m);
+      for (const value of credentialValues) {
+        assert.ok(!`${result.stdout}${result.stderr}${log}`.includes(value), `logged credential value ${value}`);
+      }
+      assertNoPackagingLeaves();
+    } finally {
+      if (credentialRoot) rmSync(credentialRoot, { recursive: true, force: true });
+    }
+  });
+});
+
 test("repository code stays blocked if credential teardown fails", () => {
   withScratch("release-sign-cleanup-failure-", (scratch) => {
     rmSync(releaseRoot, { recursive: true, force: true });
     const input = createAttestedInput(scratch);
-    const { env, logPath, nodeEnvironment } = makeSigningOnlyStubs(scratch, input, {
+    const { env, keychainPointer, logPath, nodeEnvironment } = makeSigningOnlyStubs(scratch, input, {
       credentialCleanupFailure: true,
     });
+    let credentialRoot = "";
+    try {
+      const result = runPackage(env);
 
-    const result = runPackage(env);
-
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /credential teardown/i);
-    const log = readFileSync(logPath, "utf8");
-    assert.doesNotMatch(log, /^node:/m);
-    assert.ok(!existsSync(nodeEnvironment));
-    assert.ok(!existsSync(releaseRoot));
-    assertNoPackagingLeaves();
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /credential teardown/i);
+      const log = readFileSync(logPath, "utf8");
+      assert.doesNotMatch(log, /^node:/m);
+      assert.ok(!existsSync(nodeEnvironment));
+      assert.ok(!existsSync(releaseRoot));
+      credentialRoot = dirname(readFileSync(keychainPointer, "utf8").trim());
+      assertNoPackagingLeaves();
+    } finally {
+      if (credentialRoot) rmSync(credentialRoot, { recursive: true, force: true });
+    }
   });
 });
 
@@ -1869,3 +2043,63 @@ for (const [signal, pauseAt, expectedStatus] of [
     });
   });
 }
+
+test("signal cleanup retains a keychain still referenced after restoration failure", async () => {
+  await withScratchAsync("release-sign-signal-restore-failure-", async (scratch) => {
+    rmSync(releaseRoot, { recursive: true, force: true });
+    removePackagingLeavesForTest();
+    const input = createAttestedInput(scratch);
+    const {
+      defaultKeychainState,
+      env,
+      keychainPointer,
+      logPath,
+      originalUserKeychains,
+      pauseReady,
+      userKeychainState,
+    } = makeSigningOnlyStubs(scratch, input, {
+      pauseAt: "after-keychain",
+      searchRestoreFailures: 99,
+    });
+    const run = runPackageAsync(env);
+    let closed = false;
+    let credentialRoot = "";
+    run.completed.then(() => {
+      closed = true;
+    });
+    try {
+      await waitForFile(pauseReady);
+      process.kill(-run.child.pid, "SIGTERM");
+      const result = await run.completed;
+      assert.equal(result.signal, null);
+      assert.equal(result.code, 143, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+      assert.match(result.stderr, /keychain restoration incomplete/i);
+      const keychainPath = readFileSync(keychainPointer, "utf8").trim();
+      credentialRoot = dirname(keychainPath);
+      assert.ok(existsSync(keychainPath), "signal cleanup must retain a referenced keychain");
+      assert.equal(readFileSync(defaultKeychainState, "utf8").trim(), originalUserKeychains[0]);
+      assert.deepEqual(readFileSync(userKeychainState, "utf8").trim().split("\n"), [
+        keychainPath,
+        ...originalUserKeychains,
+      ]);
+      const log = readFileSync(logPath, "utf8");
+      assert.doesNotMatch(log, /^security:delete-keychain$/m);
+      for (const value of credentialValues) {
+        assert.ok(!`${result.stdout}${result.stderr}${log}`.includes(value), `logged credential value ${value}`);
+      }
+      assert.ok(!existsSync(releaseRoot));
+      assertNoPackagingLeaves();
+    } finally {
+      if (!closed) {
+        try {
+          process.kill(-run.child.pid, "SIGKILL");
+        } catch (error) {
+          if (error.code !== "ESRCH") throw error;
+        }
+        await run.completed;
+      }
+      if (credentialRoot) rmSync(credentialRoot, { recursive: true, force: true });
+      removePackagingLeavesForTest();
+    }
+  });
+});
