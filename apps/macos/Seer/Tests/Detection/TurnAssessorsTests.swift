@@ -270,6 +270,33 @@ final class TurnAssessorsTests: XCTestCase {
         XCTAssertEqual(parseTimestamp(nil, fallbackMs: 7), 7)
     }
 
+    func testISO8601ParserReusesItsTwoFormatStrategies() {
+        let counter = LockedCompilationCounter()
+        let parser = ISO8601TimestampParser { includesFractionalSeconds in
+            counter.increment()
+            return Date.ISO8601FormatStyle(
+                includingFractionalSeconds: includesFractionalSeconds
+            )
+        }
+
+        func requireSendable<T: Sendable>(_: T) {}
+        requireSendable(parser)
+        XCTAssertEqual(counter.value, 2)
+
+        for _ in 0..<100 {
+            XCTAssertEqual(parser.parseToMilliseconds("2026-08-10T12:00:00.123Z"), 1_786_363_200_123)
+            XCTAssertEqual(parser.parseToMilliseconds("2026-08-10T12:00:00Z"), 1_786_363_200_000)
+            XCTAssertEqual(parser.parseToMilliseconds("2026-08-10T14:30:00+02:30"), 1_786_363_200_000)
+            XCTAssertNil(parser.parseToMilliseconds("not-a-timestamp"))
+        }
+
+        XCTAssertEqual(
+            counter.value,
+            2,
+            "parse calls must reuse the fractional and nonfractional strategies"
+        )
+    }
+
     func testGrokProjectLabelDecodesPercentEncodedCwd() {
         let path = "/home/user/.grok/sessions/%2Fhome%2Fuser%2Fmy-app/session-1/events.jsonl"
         // "my" is a 2-character lowercase word left untouched by titleCaseWords.
@@ -486,10 +513,9 @@ final class TurnAssessorsTests: XCTestCase {
         XCTAssertFalse(ancient.active)
     }
 
-    /// The Cursor composer assessor reads timestamps through `parseTimestamp`
-    /// too (`conversationCheckpointLastUpdatedAt`/`lastUpdatedAt`/`createdAt`),
-    /// so it must survive the same huge-JSON-number trap.
-    func testAssessCursorComposerRecordSurvivesHugeFutureTimestampJSON() throws {
+    /// Cursor activity requires a finite timestamp inside ECMAScript Date's
+    /// supported range, so a huge finite JSON number is malformed and stale.
+    func testAssessCursorComposerRecordRejectsHugeFutureTimestampJSON() throws {
         let json = #"""
         {"status":"none","lastUpdatedAt":1e300,"fullConversationHeadersOnly":[]}
         """#
@@ -498,8 +524,9 @@ final class TurnAssessorsTests: XCTestCase {
         )
         let now: Int64 = 1_786_449_620_000
         let assessment = assessCursorComposerRecord(record, now: now)
-        XCTAssertEqual(assessment.lastActivityAt, Int64.max)
+        XCTAssertEqual(assessment.lastActivityAt, 0)
         XCTAssertFalse(assessment.active)
+        XCTAssertEqual(assessment.reason, "malformed cursor composer")
     }
 
     /// Direct boundary tests for the saturating subtraction helper backing
@@ -660,7 +687,7 @@ final class TurnAssessorsTests: XCTestCase {
         let now: Int64 = 1_786_449_620_000
         let assessment = assessCursorHeaderType(true, now: now)
         XCTAssertFalse(assessment.active, "a JSON boolean `type` must never open a user turn")
-        XCTAssertEqual(assessment.reason, "completed")
+        XCTAssertEqual(assessment.reason, "malformed cursor composer")
     }
 
     /// `1.0` is the exact same JS/JSON number as `1` (`1.0 === 1` is `true`
@@ -679,7 +706,7 @@ final class TurnAssessorsTests: XCTestCase {
         let now: Int64 = 1_786_449_620_000
         let assessment = assessCursorHeaderType(1.5, now: now)
         XCTAssertFalse(assessment.active, "1.5 is not strictly === 1 and must never open a user turn")
-        XCTAssertEqual(assessment.reason, "completed")
+        XCTAssertEqual(assessment.reason, "malformed cursor composer")
     }
 
     /// `"1" !== 1` under strict equality (no numeric coercion); a JSON
@@ -689,7 +716,7 @@ final class TurnAssessorsTests: XCTestCase {
         let now: Int64 = 1_786_449_620_000
         let assessment = assessCursorHeaderType("1", now: now)
         XCTAssertFalse(assessment.active, "a JSON string \"1\" must never open a user turn")
-        XCTAssertEqual(assessment.reason, "completed")
+        XCTAssertEqual(assessment.reason, "malformed cursor composer")
     }
 
     /// Normal fixture behavior must be unaffected: an integer JSON `type: 1`
@@ -720,8 +747,86 @@ final class TurnAssessorsTests: XCTestCase {
         )
 
         XCTAssertFalse(assessment.active)
-        XCTAssertEqual(assessment.reason, "completed")
+        XCTAssertEqual(assessment.reason, "malformed cursor composer")
         XCTAssertNotEqual(assessment.lastActivityAt, now)
+    }
+
+    func testCursorRecordPrimitivesAndMissingActivityTimestampsNeverRefreshAcrossScans() {
+        let now: Int64 = 1_786_449_620_000
+        let malformedRecords: [JSONObject] = [
+            [
+                "status": NSNull(),
+                "lastUpdatedAt": now,
+                "fullConversationHeadersOnly": [],
+            ],
+            [
+                "status": NSNumber(value: 1),
+                "lastUpdatedAt": now,
+                "fullConversationHeadersOnly": [],
+            ],
+            [
+                "status": "generating",
+                "lastUpdatedAt": NSNull(),
+                "fullConversationHeadersOnly": [],
+            ],
+            [
+                "status": "generating",
+                "lastUpdatedAt": true,
+                "fullConversationHeadersOnly": [],
+            ],
+            [
+                "status": "generating",
+                "fullConversationHeadersOnly": [],
+            ],
+            [
+                "status": "completed",
+                "isContinuationInProgress": NSNumber(value: 1),
+                "fullConversationHeadersOnly": [],
+            ],
+            [
+                "status": "generating",
+                "lastUpdatedAt": now,
+                "generatingBubbleIds": [NSNumber(value: 1)],
+                "fullConversationHeadersOnly": [],
+            ],
+        ]
+
+        for scanNow in [now, now + 1_000, now + 60_000] {
+            for record in malformedRecords {
+                let assessment = assessCursorComposerRecord(record, now: scanNow)
+                XCTAssertFalse(assessment.active)
+                XCTAssertEqual(assessment.reason, "malformed cursor composer")
+                XCTAssertNotEqual(assessment.lastActivityAt, scanNow)
+            }
+        }
+    }
+
+    func testCursorMixedHeadersProcessOnlyValidEntriesWithoutPerpetualFreshness() {
+        let now: Int64 = 1_786_449_620_000
+        let record: JSONObject = [
+            "status": "completed",
+            "lastUpdatedAt": now - 60_000,
+            "fullConversationHeadersOnly": [
+                NSNull(),
+                true,
+                NSNumber(value: 42),
+                "header",
+                [],
+                ["type": "1", "createdAt": now],
+                ["type": 1, "createdAt": NSNull()],
+                ["type": 1, "createdAt": now - 1_000],
+            ] as [Any],
+        ]
+
+        let fresh = assessCursorComposerRecord(record, now: now)
+        XCTAssertTrue(fresh.active)
+        XCTAssertEqual(fresh.lastActivityAt, now - 1_000)
+        XCTAssertEqual(fresh.reason, "user prompt")
+
+        let repeated = assessCursorComposerRecord(record, now: now + turnActiveGraceMs + 1)
+        XCTAssertFalse(repeated.active)
+        XCTAssertEqual(repeated.lastActivityAt, now - 1_000)
+        XCTAssertEqual(repeated.reason, "stale user prompt")
     }
 
     func testAssessCodexTurnDistinguishesApprovalFromCompletion() {

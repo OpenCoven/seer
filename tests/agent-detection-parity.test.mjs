@@ -57,10 +57,26 @@ test("Cursor continuation flags use strict booleans without refreshing malformed
 
   assert.equal(assessCursorComposerRecord({
     isContinuationInProgress: true,
+    lastUpdatedAt: now,
   }, now).active, true);
   assert.equal(assessCursorComposerRecord({
     isContinuationInProgress: false,
   }, now).active, false);
+});
+
+test("Cursor activity signals require an explicit valid timestamp", () => {
+  for (const timestamp of [undefined, null, true, "not-a-timestamp", Number.NaN, Number.POSITIVE_INFINITY]) {
+    const record = {
+      status: "generating",
+      generatingBubbleIds: ["bubble"],
+      ...(timestamp === undefined ? {} : { lastUpdatedAt: timestamp }),
+    };
+    for (const scanNow of [now, now + 1_000, now + 60_000]) {
+      const assessment = assessCursorComposerRecord(record, scanNow);
+      assert.equal(assessment.active, false);
+      assert.notEqual(assessment.lastActivityAt, scanNow);
+    }
+  }
 });
 
 test("Cursor headers reject null, primitive, and non-array shapes without throwing", () => {
@@ -129,6 +145,33 @@ test("Cursor headers require strict field types, finite timestamps, and finite d
     assert.equal(assessment.active, false);
     assert.equal(assessment.reason, "malformed cursor composer");
   }
+});
+
+test("Cursor mixed headers process valid entries without refreshing malformed entries", () => {
+  const record = {
+    status: "completed",
+    lastUpdatedAt: now - 60_000,
+    fullConversationHeadersOnly: [
+      null,
+      true,
+      42,
+      "header",
+      [],
+      { type: "1", createdAt: now },
+      { type: 1, createdAt: null },
+      { type: 1, createdAt: now - 1_000 },
+    ],
+  };
+
+  const fresh = assessCursorComposerRecord(record, now);
+  assert.equal(fresh.active, true);
+  assert.equal(fresh.lastActivityAt, now - 1_000);
+  assert.equal(fresh.reason, "user prompt");
+
+  const repeated = assessCursorComposerRecord(record, now + 45_001);
+  assert.equal(repeated.active, false);
+  assert.equal(repeated.lastActivityAt, now - 1_000);
+  assert.equal(repeated.reason, "stale user prompt");
 });
 
 const APPROVED_FAMILIES = [

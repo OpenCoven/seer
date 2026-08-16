@@ -819,7 +819,7 @@ function parseCursorTimestamp(value: unknown): number | null {
   } else {
     return null;
   }
-  return Number.isFinite(parsed) ? parsed : null;
+  return Number.isFinite(parsed) && Math.abs(parsed) <= MAX_SUPPORTED_TIMESTAMP_MS ? parsed : null;
 }
 
 function validateOptionalString(record: Record<string, unknown>, field: string): boolean {
@@ -878,27 +878,27 @@ function validateCursorHeaders(value: unknown): ValidatedCursorConversationHeade
 
   const headers: ValidatedCursorConversationHeader[] = [];
   for (const candidate of value) {
-    if (!isPlainCursorObject(candidate)) return null;
-    if (candidate.type !== 1 && candidate.type !== 2) return null;
+    if (!isPlainCursorObject(candidate)) continue;
+    if (candidate.type !== 1 && candidate.type !== 2) continue;
     const createdAt = parseCursorTimestamp(candidate.createdAt);
-    if (createdAt === null) return null;
+    if (createdAt === null) continue;
 
     let grouping: ValidatedCursorConversationHeader["grouping"] = {};
     if (candidate.grouping !== undefined) {
-      if (!isPlainCursorObject(candidate.grouping)) return null;
+      if (!isPlainCursorObject(candidate.grouping)) continue;
       const rawGrouping = candidate.grouping;
       if (
         !validateOptionalString(rawGrouping, "toolFormerStatus") ||
         !validateOptionalString(rawGrouping, "shellStatus")
       ) {
-        return null;
+        continue;
       }
       const duration = rawGrouping.turnDurationMs;
       if (
         duration !== undefined &&
         (typeof duration !== "number" || !Number.isFinite(duration) || duration < 0)
       ) {
-        return null;
+        continue;
       }
       grouping = {
         ...(typeof rawGrouping.toolFormerStatus === "string"
@@ -912,6 +912,7 @@ function validateCursorHeaders(value: unknown): ValidatedCursorConversationHeade
     }
     headers.push({ type: candidate.type, createdAt, grouping });
   }
+  if (value.length > 0 && headers.length === 0) return null;
   return headers;
 }
 
@@ -951,9 +952,10 @@ function assessValidatedCursorComposerRecord(
   const label = cursorProjectLabel(record);
   const timestamp =
     record.conversationCheckpointLastUpdatedAt ?? record.lastUpdatedAt ?? record.createdAt;
-  let lastActivityAt = timestamp === undefined ? now : (parseCursorTimestamp(timestamp) ?? 0);
+  let lastActivityAt = timestamp === undefined ? 0 : (parseCursorTimestamp(timestamp) ?? 0);
 
   if (status === "generating" || continuation || generatingIds.length > 0) {
+    if (timestamp === undefined) return malformedCursorAssessment();
     let reason = "generating";
     if (generatingIds.length > 0) reason = "generating bubbles";
     else if (continuation) reason = "continuation in progress";

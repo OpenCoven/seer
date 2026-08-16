@@ -32,6 +32,7 @@ public let genericMtimeWindowMs: Int64 = 20_000
 /// Tolerates small wall-clock/filesystem skew without allowing corrupt
 /// far-future timestamps to remain active indefinitely.
 public let timestampFutureSkewMs: Int64 = 5_000
+private let maxSupportedTimestampMs: Double = 8_640_000_000_000_000
 
 // MARK: - Numeric/timestamp helpers
 
@@ -104,23 +105,41 @@ public func isRecentTimestamp(_ timestampMs: Int64, now: Int64, within graceMs: 
     return age >= -timestampFutureSkewMs && age <= graceMs
 }
 
+struct ISO8601TimestampParser: Sendable {
+    typealias StrategyFactory = @Sendable (Bool) -> Date.ISO8601FormatStyle
+
+    private let withFractionalSeconds: Date.ISO8601FormatStyle
+    private let withoutFractionalSeconds: Date.ISO8601FormatStyle
+
+    init(
+        strategyFactory: StrategyFactory = {
+            Date.ISO8601FormatStyle(includingFractionalSeconds: $0)
+        }
+    ) {
+        withFractionalSeconds = strategyFactory(true)
+        withoutFractionalSeconds = strategyFactory(false)
+    }
+
+    func parseToMilliseconds(_ text: String) -> Int64? {
+        let parsed: Date
+        if let fractional = try? withFractionalSeconds.parse(text) {
+            parsed = fractional
+        } else if let plain = try? withoutFractionalSeconds.parse(text) {
+            parsed = plain
+        } else {
+            return nil
+        }
+        return saturatingInt64((parsed.timeIntervalSince1970 * 1000).rounded())
+    }
+}
+
+private let sharedISO8601TimestampParser = ISO8601TimestampParser()
+
 /// Parses an ISO 8601 timestamp (with or without fractional seconds) to Unix
 /// milliseconds, mirroring `Date.parse` for the timestamp formats every
 /// fixture and session format in this corpus uses.
 func parseISO8601ToMs(_ text: String) -> Int64? {
-    let withFractional = ISO8601DateFormatter()
-    withFractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    if let date = withFractional.date(from: text) {
-        return saturatingInt64((date.timeIntervalSince1970 * 1000).rounded())
-    }
-
-    let plain = ISO8601DateFormatter()
-    plain.formatOptions = [.withInternetDateTime]
-    if let date = plain.date(from: text) {
-        return saturatingInt64((date.timeIntervalSince1970 * 1000).rounded())
-    }
-
-    return nil
+    sharedISO8601TimestampParser.parseToMilliseconds(text)
 }
 
 /// Mirrors `parseTimestamp` in the TS policy: a finite JSON number greater
@@ -760,27 +779,129 @@ public func cursorProjectLabel(_ record: JSONObject) -> String? {
     return nil
 }
 
-func cursorHeaderGrouping(_ header: JSONObject) -> JSONObject {
-    asRecord(header["grouping"]) ?? [:]
+private struct ValidatedCursorConversationHeader {
+    let type: Int
+    let createdAt: Int64
+    let grouping: JSONObject
+}
+
+private func parseCursorTimestamp(_ value: Any?) -> Int64? {
+    if let numeric = finiteNumber(value) {
+        let milliseconds = numeric > 1e12 ? numeric : numeric * 1_000
+        guard milliseconds.isFinite, abs(milliseconds) <= maxSupportedTimestampMs else {
+            return nil
+        }
+        return saturatingInt64(milliseconds)
+    }
+    guard let text = value as? String,
+          !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+          let milliseconds = parseISO8601ToMs(text),
+          abs(Double(milliseconds)) <= maxSupportedTimestampMs else {
+        return nil
+    }
+    return milliseconds
+}
+
+private func hasValidOptionalString(_ record: JSONObject, field: String) -> Bool {
+    guard let value = record[field] else { return true }
+    return value is String
+}
+
+private func validateCursorRecordFields(_ record: JSONObject) -> Bool {
+    for field in ["status", "name", "subtitle", "unifiedMode"] {
+        if !hasValidOptionalString(record, field: field) { return false }
+    }
+    for field in ["lastUpdatedAt", "createdAt", "conversationCheckpointLastUpdatedAt"] {
+        if let value = record[field], parseCursorTimestamp(value) == nil { return false }
+    }
+    if let value = record["isContinuationInProgress"], strictCursorBoolean(value) == nil {
+        return false
+    }
+    if let value = record["generatingBubbleIds"] {
+        guard let values = value as? [Any], values.allSatisfy({ $0 is String }) else {
+            return false
+        }
+    }
+    if let value = record["workspaceIdentifier"] {
+        guard let workspace = asRecord(value),
+              hasValidOptionalString(workspace, field: "id") else {
+            return false
+        }
+        if let uriValue = workspace["uri"] {
+            guard let uri = asRecord(uriValue),
+                  hasValidOptionalString(uri, field: "fsPath"),
+                  hasValidOptionalString(uri, field: "path") else {
+                return false
+            }
+        }
+    }
+    return true
+}
+
+private func validateCursorHeaders(_ value: Any?) -> [ValidatedCursorConversationHeader]? {
+    guard let value else { return [] }
+    guard let candidates = value as? [Any] else { return nil }
+
+    var headers: [ValidatedCursorConversationHeader] = []
+    for candidate in candidates {
+        guard let header = asRecord(candidate),
+              let rawType = finiteNumber(header["type"]),
+              rawType == 1 || rawType == 2,
+              let createdAt = parseCursorTimestamp(header["createdAt"]) else {
+            continue
+        }
+
+        var grouping: JSONObject = [:]
+        if let groupingValue = header["grouping"] {
+            guard let rawGrouping = asRecord(groupingValue),
+                  hasValidOptionalString(rawGrouping, field: "toolFormerStatus"),
+                  hasValidOptionalString(rawGrouping, field: "shellStatus") else {
+                continue
+            }
+            if let durationValue = rawGrouping["turnDurationMs"] {
+                guard let duration = finiteNumber(durationValue), duration >= 0 else {
+                    continue
+                }
+            }
+            grouping = rawGrouping
+        }
+        headers.append(
+            ValidatedCursorConversationHeader(
+                type: Int(rawType),
+                createdAt: createdAt,
+                grouping: grouping
+            )
+        )
+    }
+    return candidates.isEmpty || !headers.isEmpty ? headers : nil
+}
+
+private func malformedCursorAssessment() -> TurnAssessment {
+    TurnAssessment(active: false, lastActivityAt: 0, reason: "malformed cursor composer")
 }
 
 /// Cursor often leaves composer status stuck at "completed" on disk while a turn
 /// is still running (especially during shell/tool waits). Prefer conversation
 /// headers: an open user turn without turnDurationMs, or a tool still loading.
 public func assessCursorComposerRecord(_ record: JSONObject, now: Int64) -> TurnAssessment {
+    guard validateCursorRecordFields(record),
+          let headers = validateCursorHeaders(record["fullConversationHeadersOnly"]) else {
+        return malformedCursorAssessment()
+    }
+
     let status = record["status"] as? String ?? "none"
     let generatingIds = record["generatingBubbleIds"] as? [Any] ?? []
-    let rawContinuation = record["isContinuationInProgress"]
-    let continuation = strictCursorBoolean(rawContinuation) == true
+    let continuation = strictCursorBoolean(record["isContinuationInProgress"]) == true
     let label = cursorProjectLabel(record)
-    let malformedContinuation = rawContinuation != nil && strictCursorBoolean(rawContinuation) == nil
-
-    var lastActivityAt = parseTimestamp(
-        firstNonNull(record["conversationCheckpointLastUpdatedAt"], record["lastUpdatedAt"], record["createdAt"]),
-        fallbackMs: malformedContinuation ? 0 : now
+    let rawTimestamp = firstNonNull(
+        record["conversationCheckpointLastUpdatedAt"],
+        record["lastUpdatedAt"],
+        record["createdAt"]
     )
+    var lastActivityAt = parseCursorTimestamp(rawTimestamp) ?? 0
 
     if status == "generating" || continuation || !generatingIds.isEmpty {
+        guard rawTimestamp != nil else { return malformedCursorAssessment() }
         var reason = "generating"
         if !generatingIds.isEmpty {
             reason = "generating bubbles"
@@ -797,18 +918,16 @@ public func assessCursorComposerRecord(_ record: JSONObject, now: Int64) -> Turn
         )
     }
 
-    let headers = record["fullConversationHeadersOnly"] as? [JSONObject] ?? []
-
     var openUserTurnAt: Int64?
     var sawCompletedTurnAfterUser = false
     var openTurnTouchesTools = false
     var runningTool = false
 
     for header in headers {
-        let createdAt = parseTimestamp(header["createdAt"], fallbackMs: lastActivityAt)
+        let createdAt = header.createdAt
         if createdAt > lastActivityAt { lastActivityAt = createdAt }
 
-        let grouping = cursorHeaderGrouping(header)
+        let grouping = header.grouping
         let toolStatus = (grouping["toolFormerStatus"] as? String)?.lowercased() ?? ""
         let shellStatus = (grouping["shellStatus"] as? String)?.lowercased() ?? ""
 
@@ -828,8 +947,7 @@ public func assessCursorComposerRecord(_ record: JSONObject, now: Int64) -> Turn
         // keeps only genuine JSON numbers, and `== 1` keeps only the exact
         // value `1` (an integral float like `1.0` still matches, mirroring
         // JS's single numeric type; `1.5` does not).
-        let headerType = finiteNumber(header["type"])
-        if headerType == 1 {
+        if header.type == 1 {
             openUserTurnAt = createdAt
             sawCompletedTurnAfterUser = false
             openTurnTouchesTools = false

@@ -614,7 +614,11 @@ final class SessionSnapshotSourceTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: home) }
         let dbURL = home
             .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
-        makeCursorFixtureDatabase(at: dbURL, key: "composerData:abc123", valueJSON: #"{"status":"generating"}"#)
+        makeCursorFixtureDatabase(
+            at: dbURL,
+            key: "composerData:abc123",
+            valueJSON: #"{"status":"generating","lastUpdatedAt":1700000000000}"#
+        )
 
         let source = NativeSessionSnapshotSource(homeDirectory: home)
         let evidence = try await source.snapshot(now: fixedNow)
@@ -632,7 +636,11 @@ final class SessionSnapshotSourceTests: XCTestCase {
         makeEmptyCursorFixtureDatabase(at: dbURL)
         insertCursorFixtureRecord(at: dbURL, key: "composerData:00-invalid", value: #"{"status":"#)
         insertCursorFixtureRecord(at: dbURL, key: "composerData:01-array", value: #"["generating"]"#)
-        insertCursorFixtureRecord(at: dbURL, key: "composerData:02-valid", value: #"{"status":"generating"}"#)
+        insertCursorFixtureRecord(
+            at: dbURL,
+            key: "composerData:02-valid",
+            value: #"{"status":"generating","lastUpdatedAt":1700000000000}"#
+        )
 
         let evidence = try await NativeSessionSnapshotSource(homeDirectory: home).snapshot(now: fixedNow)
 
@@ -652,6 +660,74 @@ final class SessionSnapshotSourceTests: XCTestCase {
         let evidence = try await NativeSessionSnapshotSource(homeDirectory: home).snapshot(now: fixedNow)
 
         XCTAssertTrue(evidence.filter { $0.family == .cursor }.isEmpty)
+    }
+
+    func testCursorMalformedPrimitivesAndMissingTimestampsStayInactiveAcrossRepeatedScans() async throws {
+        let home = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let dbURL = home
+            .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+        makeEmptyCursorFixtureDatabase(at: dbURL)
+        let records = [
+            #"{"status":7,"lastUpdatedAt":1700000000000}"#,
+            #"{"status":null,"lastUpdatedAt":1700000000000}"#,
+            #"{"status":"generating"}"#,
+            #"{"status":"generating","lastUpdatedAt":null}"#,
+            #"{"status":"generating","lastUpdatedAt":true}"#,
+            #"{"status":"completed","isContinuationInProgress":1}"#,
+            #"{"status":"completed","fullConversationHeadersOnly":[null,true,42,"header",[],{"type":1}]}"#,
+        ]
+        for (index, record) in records.enumerated() {
+            insertCursorFixtureRecord(
+                at: dbURL,
+                key: String(format: "composerData:malformed-%02d", index),
+                value: record
+            )
+        }
+
+        let source = NativeSessionSnapshotSource(homeDirectory: home)
+        for scanNow in [fixedNow, fixedNow + 1_000, fixedNow + 60_000] {
+            let evidence = try await source.snapshot(now: scanNow)
+            XCTAssertTrue(evidence.filter { $0.family == .cursor }.isEmpty)
+        }
+    }
+
+    func testCursorMixedHeadersUseValidTimestampWithoutRefreshingOnLaterScans() async throws {
+        let home = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let dbURL = home
+            .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+        makeCursorFixtureDatabase(
+            at: dbURL,
+            key: "composerData:mixed",
+            valueJSON: """
+            {
+              "status": "completed",
+              "lastUpdatedAt": \(fixedNow - 60_000),
+              "fullConversationHeadersOnly": [
+                null,
+                true,
+                42,
+                "header",
+                [],
+                {"type": "1", "createdAt": \(fixedNow)},
+                {"type": 1, "createdAt": null},
+                {"type": 1, "createdAt": \(fixedNow - 1_000)}
+              ]
+            }
+            """
+        )
+        let source = NativeSessionSnapshotSource(homeDirectory: home)
+
+        let fresh = try await source.snapshot(now: fixedNow)
+        XCTAssertEqual(fresh.filter { $0.family == .cursor }.map(\.identity), ["mixed"])
+        XCTAssertEqual(
+            fresh.first { $0.family == .cursor }?.lastActivityAt,
+            fixedNow - 1_000
+        )
+
+        let stale = try await source.snapshot(now: fixedNow + turnActiveGraceMs + 1)
+        XCTAssertTrue(stale.filter { $0.family == .cursor }.isEmpty)
     }
 
     func testCursorMalformedAndStalePrefixesBeyondFormerRawCapDoNotHideActiveComposer() async throws {
@@ -696,7 +772,7 @@ final class SessionSnapshotSourceTests: XCTestCase {
         insertCursorFixtureRecord(
             at: dbURL,
             key: "composerData:\(injectionLikeIdentity)",
-            value: #"{"status":"generating","name":"'); DROP TABLE cursorDiskKV; --"}"#
+            value: #"{"status":"generating","lastUpdatedAt":1700000000000,"name":"'); DROP TABLE cursorDiskKV; --"}"#
         )
 
         let evidence = try await NativeSessionSnapshotSource(homeDirectory: home).snapshot(now: fixedNow)
@@ -715,7 +791,7 @@ final class SessionSnapshotSourceTests: XCTestCase {
         defer { sqlite3_close(writer) }
         exec("PRAGMA wal_checkpoint(TRUNCATE)", on: writer)
         exec(
-            #"INSERT INTO cursorDiskKV (key, value) VALUES ('composerData:wal-active', '{"status":"generating"}')"#,
+            #"INSERT INTO cursorDiskKV (key, value) VALUES ('composerData:wal-active', '{"status":"generating","lastUpdatedAt":1700000000000}')"#,
             on: writer
         )
         XCTAssertTrue(FileManager.default.fileExists(atPath: dbURL.path + "-wal"))
@@ -734,7 +810,7 @@ final class SessionSnapshotSourceTests: XCTestCase {
         let writer = try openCursorWriter(at: dbURL, wal: true)
         defer { sqlite3_close(writer) }
         exec(
-            #"INSERT INTO cursorDiskKV (key, value) VALUES ('composerData:snapshot', '{"status":"generating"}')"#,
+            #"INSERT INTO cursorDiskKV (key, value) VALUES ('composerData:snapshot', '{"status":"generating","lastUpdatedAt":1700000000000}')"#,
             on: writer
         )
 

@@ -321,8 +321,21 @@
       "expected": {
         "active": false,
         "source": "session",
-        "detail": "Cursor Future Project · Writing",
+        "detail": "Working",
         "id": "cursor:cursor-future-composer"
+      }
+    },
+    {
+      "id": "cursor-malformed-record",
+      "family": "cursor",
+      "kind": "session",
+      "format": "cursor",
+      "fixtureFile": "cursor-malformed.json",
+      "expected": {
+        "active": false,
+        "source": "session",
+        "detail": "Working",
+        "id": "cursor:cursor-malformed-composer"
       }
     },
     {
