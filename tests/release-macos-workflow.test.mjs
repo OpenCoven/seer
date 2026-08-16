@@ -218,7 +218,7 @@ test("signing keeps build tools out and scopes the releases token to release pol
     const hasToken = step.includes("secrets.RELEASES_REPO_TOKEN");
     const hasGhCommand = /\bgh (?:api|release)\b/.test(step);
     const hasReleasePolicy =
-      /scripts\/release-macos-draft\.sh (?:acquire-lock|preflight|upload|capture|publish|release-lock)/.test(
+      /scripts\/release-macos-draft\.sh (?:acquire-lock|reconcile-published|preflight|upload|capture|publish|release-lock)/.test(
         step,
       );
     assert.equal(
@@ -235,6 +235,48 @@ test("signing keeps build tools out and scopes the releases token to release pol
     `${signing}\n${draftPolicySource}`,
     /\bgh release delete\b|\/releases(?:\/[^\s"']*)?["']?\s+(?:--method|-X)\s+DELETE/,
   );
+});
+
+test("a valid published reconciliation skips every signing, packaging, upload, and publish step", () => {
+  const signing = jobBlock("sign-and-release");
+  const steps = stepBlocks(signing);
+  const reconciliation = steps.find((step) =>
+    step.includes("release-macos-draft.sh reconcile-published"),
+  );
+  const reconcileIndex = signing.indexOf(reconciliation ?? "missing");
+  const packageIndex = signing.indexOf("bash scripts/package-macos-release.sh");
+
+  assert.ok(reconciliation, "the signing job must reconcile a published release");
+  assert.match(reconciliation, /id: published-reconciliation/);
+  assert.match(reconciliation, /GH_TOKEN: \$\{\{ secrets\.RELEASES_REPO_TOKEN \}\}/);
+  assert.match(reconciliation, /existing-published-state/);
+  assert.ok(reconcileIndex < packageIndex);
+
+  const skippedNames = [
+    "Create empty release-input destination",
+    "Download only the prepared input artifact",
+    "Verify attested input and distinct runner identity",
+    "Sign and notarize attested input",
+    "Allowlist public package outputs",
+    "Create or resume draft and upload only public assets",
+    "Capture the exact verified draft state",
+    "Publish only the verified draft",
+  ];
+  for (const name of skippedNames) {
+    const step = steps.find((candidate) => candidate.includes(`- name: ${name}`));
+    assert.ok(step, `${name} step must exist`);
+    assert.match(
+      step,
+      /^\s+if: steps\.published-reconciliation\.outputs\.published != 'true'$/m,
+      `${name} must be skipped after successful published reconciliation`,
+    );
+  }
+
+  const appleSecretSteps = steps.filter((step) => /\$\{\{\s*secrets\.APPLE_/.test(step));
+  assert.ok(appleSecretSteps.length > 0);
+  for (const step of appleSecretSteps) {
+    assert.match(step, /^\s+if: steps\.published-reconciliation\.outputs\.published != 'true'$/m);
+  }
 });
 
 test("draft policy resumes only bound allowlisted drafts and publishes after fresh verification", () => {
@@ -270,7 +312,7 @@ test("draft policy resumes only bound allowlisted drafts and publishes after fre
   assert.match(draftPolicySource, /gh release create "\$\{SOURCE_TAG\}" --draft --verify-tag/);
   assert.match(draftPolicySource, /--target "\$\{DESTINATION_ANCHOR_COMMIT\}"/);
   assert.match(draftPolicySource, /gh release upload "\$\{SOURCE_TAG\}"[\s\S]*--clobber/);
-  assert.match(draftPolicyImplementation, /exact immutable published state/);
+  assert.match(draftPolicyImplementation, /existing-published-state evidence/);
   assert.match(draftPolicyImplementation, /provenance marker does not match/);
   assert.match(draftPolicyImplementation, /foreign release asset/);
   assert.match(signing, /gh release download[\s\S]*--pattern "Seer-v\$\{VERSION\}-arm64\.dmg"[\s\S]*--pattern "SHA256SUMS"[\s\S]*--pattern "release-manifest\.json"/);

@@ -3,8 +3,16 @@
 import { createHash } from "node:crypto";
 import { readFileSync, statSync, writeFileSync } from "node:fs";
 
-const [command, metadataPath, _headersPath, releaseDir, notesPath, statePath, downloadsDir] =
-  process.argv.slice(2);
+const [
+  command,
+  metadataPath,
+  _headersPath,
+  releaseDir,
+  notesPath,
+  statePath,
+  downloadsDir,
+  publishedDir,
+] = process.argv.slice(2);
 
 const required = (name) => {
   const value = process.env[name];
@@ -204,6 +212,198 @@ function regularFile(path, description) {
   }
   if (!stat.isFile()) fail(`${description} is not a regular file`);
   return { bytes: readFileSync(path), size: stat.size };
+}
+
+function exactKeys(value, expected) {
+  return (
+    value &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...expected].sort())
+  );
+}
+
+function validatePublishedDownloads(metadata, freshDownloads) {
+  const downloaded = new Map();
+  for (const remote of metadata.assets) {
+    const file = regularFile(
+      `${freshDownloads}/${remote.id}`,
+      `fresh download for release asset ${remote.name}`,
+    );
+    if (file.size !== remote.size) {
+      fail(`release asset ${remote.name} size does not match its fresh download`);
+    }
+    const digest = sha256(file.bytes);
+    if (remote.serverDigest !== null && remote.serverDigest !== `sha256:${digest}`) {
+      fail(`release asset ${remote.name} digest does not match its fresh download`);
+    }
+    downloaded.set(remote.name, { ...file, sha256: digest });
+  }
+
+  const dmgName = expectedNames[0];
+  const dmg = downloaded.get(dmgName);
+  const checksums = downloaded.get("SHA256SUMS");
+  const expectedChecksums = `${dmg.sha256}  ${dmgName}\n`;
+  if (checksums.bytes.toString("utf8") !== expectedChecksums) {
+    fail("SHA256SUMS does not contain the exact published DMG hash");
+  }
+
+  const manifestFile = downloaded.get("release-manifest.json");
+  const manifest = parseJSON(manifestFile.bytes.toString("utf8"), "release manifest");
+  const manifestKeys = [
+    "artifacts",
+    "bundleIdentifier",
+    "notarization",
+    "sourceCommit",
+    "version",
+    "workflowRun",
+  ];
+  if (!exactKeys(manifest, manifestKeys)) {
+    fail("release manifest schema is invalid");
+  }
+  if (manifest.version !== version) fail("release manifest version does not match");
+  if (manifest.sourceCommit !== sourceCommit) {
+    fail("release manifest source commit does not match");
+  }
+  if (manifest.bundleIdentifier !== "ai.opencoven.seer") {
+    fail("release manifest bundle identifier does not match");
+  }
+  if (manifest.notarization !== "accepted") {
+    fail("release manifest notarization status is not accepted");
+  }
+  if (manifest.workflowRun !== workflowRun) {
+    fail("release manifest workflow run does not match");
+  }
+  if (
+    !Array.isArray(manifest.artifacts) ||
+    manifest.artifacts.length !== 1 ||
+    !exactKeys(manifest.artifacts[0], ["name", "sha256", "size"])
+  ) {
+    fail("release manifest artifact schema is invalid");
+  }
+  const artifact = manifest.artifacts[0];
+  if (
+    artifact.name !== dmgName ||
+    artifact.sha256 !== dmg.sha256 ||
+    artifact.size !== dmg.size ||
+    !Number.isSafeInteger(artifact.size) ||
+    artifact.size < 0
+  ) {
+    fail("release manifest DMG hash, size, or name does not match the published DMG");
+  }
+
+  return {
+    manifest,
+    assets: metadata.assets.map((remote) => ({
+      ...remote,
+      sha256: downloaded.get(remote.name).sha256,
+    })),
+    downloaded,
+  };
+}
+
+function buildExistingPublishedState(metadata, validated) {
+  return {
+    schema: 1,
+    kind: "existing-published-state",
+    repository: destinationRepository,
+    releaseId: metadata.id,
+    updatedAt: metadata.updatedAt,
+    tagName: metadata.tagName,
+    destinationAnchorCommit,
+    title: metadata.title,
+    body: metadata.body,
+    prerelease: metadata.prerelease,
+    immutable: metadata.immutable,
+    author: metadata.author,
+    assets: validated.assets,
+    manifest: validated.manifest,
+    platformChecks: [
+      "apple-signature",
+      "notarization",
+      "gatekeeper",
+      "mounted-volume-allowlist",
+      "arm64-mach-o",
+      "system-dependencies",
+      "standalone-boundary",
+    ],
+  };
+}
+
+function validateExistingPublishedStateShape(state) {
+  if (
+    !state ||
+    state.schema !== 1 ||
+    state.kind !== "existing-published-state" ||
+    state.repository !== destinationRepository ||
+    !Number.isSafeInteger(state.releaseId) ||
+    state.releaseId <= 0 ||
+    typeof state.updatedAt !== "string" ||
+    state.tagName !== sourceTag ||
+    state.destinationAnchorCommit !== destinationAnchorCommit ||
+    state.title !== expectedTitle ||
+    state.body !== expectedBody ||
+    state.prerelease !== false ||
+    state.immutable !== true ||
+    !Array.isArray(state.assets) ||
+    state.assets.length !== expectedNames.length ||
+    JSON.stringify(state.platformChecks) !==
+      JSON.stringify([
+        "apple-signature",
+        "notarization",
+        "gatekeeper",
+        "mounted-volume-allowlist",
+        "arm64-mach-o",
+        "system-dependencies",
+        "standalone-boundary",
+      ])
+  ) {
+    fail("existing-published-state evidence has an invalid shape or provenance");
+  }
+  validateUser(state.author, "existing published release author");
+}
+
+function validateMaterializedPublished(validated, directory) {
+  for (const name of expectedNames) {
+    const materialized = regularFile(
+      `${directory}/${name}`,
+      `materialized published release asset ${name}`,
+    );
+    const downloaded = validated.downloaded.get(name);
+    if (materialized.size !== downloaded.size || !materialized.bytes.equals(downloaded.bytes)) {
+      fail(`materialized published release asset ${name} changed after validation`);
+    }
+  }
+}
+
+function runMaterializePublished() {
+  const metadata = readMetadata(metadataPath, { requireComplete: true, expectedDraft: false });
+  const validated = validatePublishedDownloads(metadata, downloadsDir);
+  for (const name of expectedNames) {
+    writeFileSync(`${publishedDir}/${name}`, validated.downloaded.get(name).bytes, {
+      flag: "wx",
+      mode: 0o644,
+    });
+  }
+}
+
+function runCaptureExistingPublished() {
+  const metadata = readMetadata(metadataPath, { requireComplete: true, expectedDraft: false });
+  const validated = validatePublishedDownloads(metadata, downloadsDir);
+  validateMaterializedPublished(validated, releaseDir);
+  const state = buildExistingPublishedState(metadata, validated);
+  writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+}
+
+function runCompareExistingPublished() {
+  const metadata = readMetadata(metadataPath, { requireComplete: true, expectedDraft: false });
+  const validated = validatePublishedDownloads(metadata, downloadsDir);
+  const state = readJSON(statePath, "existing-published-state evidence");
+  validateExistingPublishedStateShape(state);
+  const current = buildExistingPublishedState(metadata, validated);
+  if (JSON.stringify(current) !== JSON.stringify(state)) {
+    fail("existing-published-state evidence does not match the current immutable published release");
+  }
 }
 
 function validateLocal(metadata, localDir, localNotes, freshDownloads) {
@@ -559,6 +759,15 @@ try {
     case "verify-published-local":
       runVerifyPublishedLocal();
       break;
+    case "materialize-published":
+      runMaterializePublished();
+      break;
+    case "capture-existing-published":
+      runCaptureExistingPublished();
+      break;
+    case "compare-existing-published":
+      runCompareExistingPublished();
+      break;
     case "identity":
       await runIdentity();
       break;
@@ -589,8 +798,9 @@ try {
     default:
       fail(
         "usage: release-macos-draft-state.mjs inspect|downloads|validate-notes|capture|compare|" +
-          "compare-published|verify-published-local|identity|repository|immutable|ref|tag-target|" +
-          "lock-tag|lock-owner|run-status|commit",
+          "compare-published|verify-published-local|materialize-published|" +
+          "capture-existing-published|compare-existing-published|identity|repository|immutable|" +
+          "ref|tag-target|lock-tag|lock-owner|run-status|commit",
       );
   }
 } catch (error) {

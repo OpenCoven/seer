@@ -14,10 +14,10 @@ fail() {
 }
 
 MODE="${1:-}"
-USAGE="usage: release-macos-draft.sh marker|verify-source-tag|acquire-lock|preflight|upload|capture|publish|release-lock"
+USAGE="usage: release-macos-draft.sh marker|verify-source-tag|acquire-lock|reconcile-published|preflight|upload|capture|publish|release-lock"
 [[ "$#" -eq 1 ]] || fail "${USAGE}"
 case "${MODE}" in
-  marker | verify-source-tag | acquire-lock | preflight | upload | capture | publish | release-lock) ;;
+  marker | verify-source-tag | acquire-lock | reconcile-published | preflight | upload | capture | publish | release-lock) ;;
   *) fail "${USAGE}" ;;
 esac
 
@@ -60,6 +60,17 @@ STATE_HELPER="${SCRIPT_DIR}/release-macos-draft-state.mjs"
 [[ -f "${STATE_HELPER}" && ! -L "${STATE_HELPER}" ]] ||
   fail "release state helper is missing or unsafe"
 GH_API_VERSION="2026-03-10"
+
+if [[ "${SEER_RELEASE_TEST_MODE:-0}" == "1" ]]; then
+  [[ "${GITHUB_ACTIONS:-false}" != "true" ]] ||
+    fail "SEER_RELEASE_TEST_MODE is forbidden when GITHUB_ACTIONS=true"
+  [[ "${SEER_RELEASE_TEST_PLATFORM_VERIFIER:-}" == /* &&
+    -f "${SEER_RELEASE_TEST_PLATFORM_VERIFIER}" &&
+    ! -L "${SEER_RELEASE_TEST_PLATFORM_VERIFIER}" ]] ||
+    fail "test platform verifier must be an absolute regular file"
+elif [[ -n "${SEER_RELEASE_TEST_PLATFORM_VERIFIER:-}" ]]; then
+  fail "test platform verifier requires SEER_RELEASE_TEST_MODE=1"
+fi
 
 resolve_remote_tag_commit() {
   local repository="$1"
@@ -428,6 +439,16 @@ ensure_destination_tag() {
     fail "destination tag collision does not resolve to the exact captured anchor commit"
 }
 
+verify_destination_tag() {
+  [[ "${DESTINATION_ANCHOR_COMMIT}" =~ ^[0-9a-f]{40}$ ]] ||
+    fail "destination anchor commit is unavailable"
+  local resolved
+  resolved="$(destination_tag_commit)" ||
+    fail "published release destination tag is missing or unreadable"
+  [[ "${resolved}" == "${DESTINATION_ANCHOR_COMMIT}" ]] ||
+    fail "published release destination tag does not resolve to the exact captured anchor commit"
+}
+
 require_complete_remote_assets() {
   [[ "${RELEASE_ASSET_COUNT}" -eq "${#EXPECTED_ASSETS[@]}" &&
     "${RELEASE_ASSETS_COMPLETE}" == "true" ]] ||
@@ -508,6 +529,118 @@ download_assets() {
   printf '%s\n' "${downloads}"
 }
 
+verify_published_platform() {
+  local directory="$1"
+  local dmg="${directory}/Seer-v${VERSION}-arm64.dmg"
+  if [[ "${SEER_RELEASE_TEST_MODE:-0}" == "1" ]]; then
+    node "${SEER_RELEASE_TEST_PLATFORM_VERIFIER}" "${directory}" "${dmg}" ||
+      fail "Apple signature or notarization validation failed"
+    return
+  fi
+
+  (
+    set -euo pipefail
+    local mount_point="${STATE_WORK_DIR}/existing-published-mount"
+    local mounted=0
+    cleanup_published_mount() {
+      local status=$?
+      trap - EXIT HUP INT TERM
+      set +e
+      if [[ "${mounted}" -eq 1 ]]; then
+        /usr/bin/hdiutil detach "${mount_point}" >/dev/null
+      fi
+      /bin/rmdir "${mount_point}" >/dev/null 2>&1
+      exit "${status}"
+    }
+    trap cleanup_published_mount EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    /usr/bin/codesign --verify --strict --verbose=2 "${dmg}"
+    /usr/bin/xcrun stapler validate "${dmg}"
+    /usr/sbin/spctl --assess --type open --context context:primary-signature --verbose=4 "${dmg}"
+
+    [[ ! -e "${mount_point}" && ! -L "${mount_point}" ]]
+    /bin/mkdir "${mount_point}"
+    /usr/bin/hdiutil attach "${dmg}" \
+      -readonly \
+      -nobrowse \
+      -noautoopen \
+      -mountpoint "${mount_point}"
+    mounted=1
+
+    local app="${mount_point}/Seer.app"
+    node "${SCRIPT_DIR}/check-release-boundary.mjs" \
+      --dmg-root "${mount_point}" \
+      --forbid-path "${GITHUB_WORKSPACE:-${SCRIPT_DIR}}" \
+      --forbid-path "${directory}"
+    /usr/bin/codesign --verify --deep --strict --verbose=2 "${app}"
+    /usr/bin/xcrun stapler validate "${app}"
+    /usr/sbin/spctl --assess --type execute --verbose=4 "${app}"
+    [[ "$(/usr/bin/lipo -archs "${app}/Contents/MacOS/Seer")" == "arm64" ]]
+
+    /usr/bin/hdiutil detach "${mount_point}"
+    mounted=0
+    /bin/rmdir "${mount_point}"
+  )
+}
+
+reconcile_published() {
+  verify_remote_lock
+  inspect_release
+  if [[ "${RELEASE_EXISTS}" -eq 0 || "${RELEASE_DRAFT}" == "true" ]]; then
+    if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+      printf 'published=false\n' >> "${GITHUB_OUTPUT}"
+    else
+      printf 'published=false\n'
+    fi
+    return
+  fi
+
+  require_complete_remote_assets
+  verify_destination_tag
+  verify_source_tag
+  command -v curl >/dev/null 2>&1 || fail "curl is required"
+  STATE_WORK_DIR="${STATE_WORK_DIR:-}"
+  [[ -d "${STATE_WORK_DIR}" && ! -L "${STATE_WORK_DIR}" ]] ||
+    fail "published reconciliation requires a fresh safe state work directory"
+  local published_dir="${STATE_WORK_DIR}/existing-published-release"
+  local evidence="${STATE_WORK_DIR}/existing-published-state.json"
+  [[ ! -e "${published_dir}" && ! -L "${published_dir}" &&
+    ! -e "${evidence}" && ! -L "${evidence}" ]] ||
+    fail "published reconciliation paths must not preexist"
+  /bin/mkdir "${published_dir}"
+
+  local metadata
+  local downloads
+  metadata="$(rest_get_release "${STATE_WORK_DIR}/existing-published-initial")"
+  downloads="$(download_assets "${metadata}" "${STATE_WORK_DIR}/existing-published-initial")"
+  node "${STATE_HELPER}" materialize-published \
+    "${metadata}" "" "" "" "" "${downloads}" "${published_dir}"
+  verify_published_platform "${published_dir}"
+
+  local final_metadata
+  local final_downloads
+  final_metadata="$(rest_get_release "${STATE_WORK_DIR}/existing-published-final")"
+  final_downloads="$(download_assets "${final_metadata}" "${STATE_WORK_DIR}/existing-published-final")"
+  node "${STATE_HELPER}" capture-existing-published \
+    "${final_metadata}" "" "${published_dir}" "" "${evidence}" "${final_downloads}"
+  verify_remote_lock
+  verify_source_tag
+
+  if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+    {
+      printf 'published=true\n'
+      printf 'existing-published-state=%s\n' "${evidence}"
+      printf 'release-directory=%s\n' "${published_dir}"
+    } >> "${GITHUB_OUTPUT}"
+  else
+    printf 'published=true\nexisting-published-state=%s\nrelease-directory=%s\n' \
+      "${evidence}" "${published_dir}"
+  fi
+}
+
 require_repository_governance
 
 case "${MODE}" in
@@ -517,6 +650,9 @@ case "${MODE}" in
   release-lock)
     release_remote_lock
     ;;
+  reconcile-published)
+    reconcile_published
+    ;;
   preflight)
     verify_remote_lock
     inspect_release
@@ -525,22 +661,12 @@ case "${MODE}" in
     ;;
   upload)
     verify_remote_lock
-    validate_local_release
     inspect_release
     ensure_destination_tag
     if [[ "${RELEASE_EXISTS}" -eq 1 && "${RELEASE_DRAFT}" == "false" ]]; then
-      command -v curl >/dev/null 2>&1 || fail "curl is required"
-      STATE_WORK_DIR="${STATE_WORK_DIR:-}"
-      [[ -d "${STATE_WORK_DIR}" && ! -L "${STATE_WORK_DIR}" ]] ||
-        fail "published retry verification requires a safe state work directory"
-      response_metadata="$(rest_get_release "${STATE_WORK_DIR}/published-upload")"
-      downloads_dir="$(download_assets "${response_metadata}" "${STATE_WORK_DIR}/published-upload")"
-      node "${STATE_HELPER}" verify-published-local \
-        "${response_metadata}" "" \
-        "${RELEASE_DIR}" "${RELEASE_BODY}" "" "${downloads_dir}"
-      verify_remote_lock
-      exit 0
+      fail "immutable published release must be reconciled before upload; refusing to overwrite it"
     fi
+    validate_local_release
     if [[ "${RELEASE_EXISTS}" -eq 0 ]]; then
       gh release create "${SOURCE_TAG}" --draft --verify-tag \
         --target "${DESTINATION_ANCHOR_COMMIT}" \
@@ -577,6 +703,37 @@ case "${MODE}" in
   publish)
     command -v curl >/dev/null 2>&1 || fail "curl is required"
     verify_remote_lock
+    if [[ -n "${EXISTING_PUBLISHED_STATE:-}" ]]; then
+      [[ -f "${EXISTING_PUBLISHED_STATE}" && ! -L "${EXISTING_PUBLISHED_STATE}" ]] ||
+        fail "existing-published-state evidence is missing or unsafe"
+      STATE_WORK_DIR="${STATE_WORK_DIR:-}"
+      [[ -d "${STATE_WORK_DIR}" && ! -L "${STATE_WORK_DIR}" ]] ||
+        fail "existing-published-state verification requires a safe state work directory"
+      [[ "$(cd "${STATE_WORK_DIR}" && pwd -P)" == \
+        "$(cd "$(dirname "${EXISTING_PUBLISHED_STATE}")" && pwd -P)" ]] ||
+        fail "existing-published-state evidence must be inside the state work directory"
+      verify_source_tag
+      response_metadata="$(rest_get_release "${STATE_WORK_DIR}/existing-published-compare")"
+      downloads_dir="$(
+        download_assets "${response_metadata}" "${STATE_WORK_DIR}/existing-published-compare"
+      )"
+      comparison_dir="${STATE_WORK_DIR}/existing-published-compare-release"
+      [[ ! -e "${comparison_dir}" && ! -L "${comparison_dir}" ]] ||
+        fail "existing-published-state comparison directory must not preexist"
+      /bin/mkdir "${comparison_dir}"
+      node "${STATE_HELPER}" materialize-published \
+        "${response_metadata}" "" "" "" "" "${downloads_dir}" "${comparison_dir}"
+      verify_published_platform "${comparison_dir}"
+      node "${STATE_HELPER}" compare-existing-published \
+        "${response_metadata}" "" "" "" "${EXISTING_PUBLISHED_STATE}" "${downloads_dir}"
+      verify_remote_lock
+      verify_source_tag
+      exit 0
+    fi
+    inspect_release
+    if [[ "${RELEASE_EXISTS}" -eq 1 && "${RELEASE_DRAFT}" == "false" ]]; then
+      fail "existing-published-state evidence is required for an immutable published release"
+    fi
     validate_local_release
     validate_state_paths
     [[ -f "${VERIFIED_STATE}" && ! -L "${VERIFIED_STATE}" ]] ||
@@ -594,19 +751,7 @@ case "${MODE}" in
     compare_status=$?
     set -e
     if [[ "${compare_status}" -ne 0 ]]; then
-      set +e
-      published_result="$(
-        node "${STATE_HELPER}" compare-published \
-          "${response_metadata}" "" \
-          "${RELEASE_DIR}" "${RELEASE_BODY}" "${VERIFIED_STATE}" "${downloads_dir}" 2>&1
-      )"
-      published_status=$?
-      set -e
-      if [[ "${published_status}" -eq 0 ]]; then
-        verify_remote_lock
-        exit 0
-      fi
-      fail "release is neither the exact verified draft nor exact immutable published state; draft comparison: ${release_id}; published comparison: ${published_result}"
+      fail "release is not the exact verified draft; independently validated existing-published-state evidence is required for an immutable published release: ${release_id}"
     fi
     [[ "${release_id}" =~ ^[1-9][0-9]*$ ]] ||
       fail "verified release binding has an invalid shape"

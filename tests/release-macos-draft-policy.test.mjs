@@ -90,6 +90,36 @@ function matchingRelease(overrides = {}) {
   };
 }
 
+function publishedAssets({
+  dmgContents = "signed-and-notarized-dmg-generated-at-2026-08-15T18:02:00Z\n",
+  manifestOverrides = {},
+  checksumDigest,
+} = {}) {
+  const dmgName = expectedAssets[0];
+  const dmgDigest = sha256(dmgContents);
+  const manifest = {
+    artifacts: [
+      {
+        name: dmgName,
+        sha256: dmgDigest,
+        size: Buffer.byteLength(dmgContents),
+      },
+    ],
+    bundleIdentifier: "ai.opencoven.seer",
+    notarization: "accepted",
+    sourceCommit,
+    version,
+    workflowRun,
+    ...manifestOverrides,
+  };
+  const contents = [
+    dmgContents,
+    `${checksumDigest ?? dmgDigest}  ${dmgName}\n`,
+    `${JSON.stringify(manifest, null, 2)}\n`,
+  ];
+  return expectedAssets.map((name, index) => asset(name, 100 + index, contents[index]));
+}
+
 function writeFakeGh(scratch) {
   const script = join(scratch, "fake-gh.mjs");
   const bin = join(scratch, "bin");
@@ -431,9 +461,23 @@ function withHarness(callback, options = {}) {
     const releaseDir = join(scratch, "release");
     const releaseBody = join(scratch, "release-notes.md");
     const verifiedState = join(scratch, "verified-state.json");
+    const githubOutput = join(scratch, "github-output");
+    const platformLog = join(scratch, "platform-verifier.log");
+    const platformVerifier = join(scratch, "platform-verifier.mjs");
     mkdirSync(releaseDir);
     writeFileSync(releaseBody, canonicalBody);
     for (const name of expectedAssets) writeFileSync(join(releaseDir, name), `${name}\n`);
+    writeFileSync(
+      platformVerifier,
+      `import { appendFileSync } from "node:fs";
+appendFileSync(process.env.FAKE_PLATFORM_LOG, JSON.stringify(process.argv.slice(2)) + "\\n");
+if (process.env.FAKE_PLATFORM_RESULT === "fail") {
+  console.error("stub: Apple signature or notarization validation failed");
+  process.exit(1);
+}
+`,
+    );
+    chmodSync(platformVerifier, 0o755);
     writeFileSync(
       statePath,
       JSON.stringify({
@@ -514,11 +558,25 @@ function withHarness(callback, options = {}) {
           RELEASE_BODY: releaseBody,
           VERIFIED_STATE: verifiedState,
           STATE_WORK_DIR: scratch,
+          GITHUB_OUTPUT: githubOutput,
+          SEER_RELEASE_TEST_MODE: "1",
+          SEER_RELEASE_TEST_PLATFORM_VERIFIER: platformVerifier,
+          FAKE_PLATFORM_LOG: platformLog,
           ...env,
         },
       });
 
-    return callback({ run, readState, writeState, releaseDir, releaseBody, verifiedState, scratch });
+    return callback({
+      run,
+      readState,
+      writeState,
+      releaseDir,
+      releaseBody,
+      verifiedState,
+      githubOutput,
+      platformLog,
+      scratch,
+    });
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }
@@ -976,7 +1034,7 @@ test("ambiguous publish responses are reconciled against exact post-request stat
   }
 });
 
-test("an exact immutable published release completes a retried publish idempotently", () => {
+test("publish requires independent evidence for a preexisting immutable release", () => {
   withHarness(({ run, readState, writeState }) => {
     assert.equal(run("capture").status, 0);
     const state = readState();
@@ -987,19 +1045,19 @@ test("an exact immutable published release completes a retried publish idempoten
 
     const result = run("publish");
 
-    assert.equal(result.status, 0, result.stderr);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /existing-published-state evidence is required/i);
     assert.ok(!readState().authenticatedRequests.some(({ method }) => method === "PATCH"));
   });
 });
 
-test("full workflow retry accepts only an exact immutable published release", () => {
+test("upload never clobbers an immutable published release", () => {
   withHarness(({ run, readState }) => {
     assert.equal(run("preflight").status, 0);
-    assert.equal(run("upload").status, 0);
-    assert.equal(run("capture").status, 0);
-    const result = run("publish");
+    const result = run("upload");
 
-    assert.equal(result.status, 0, result.stderr);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /reconciled|refusing to overwrite/i);
     assert.ok(!readState().calls.some(
       (call) => call[0] === "gh" && call[1] === "release" && call[2] === "upload",
     ));
@@ -1011,7 +1069,143 @@ test("full workflow retry accepts only an exact immutable published release", ()
       updatedAt: "2026-08-15T18:02:00Z",
     }),
   });
+});
 
+test("published reconciliation validates remote timestamped assets without comparing rebuilt bytes", () => {
+    const remoteAssets = publishedAssets();
+    withHarness(({ run, readState, releaseDir, githubOutput, platformLog, scratch }) => {
+      assert.notEqual(
+        readFileSync(join(releaseDir, expectedAssets[0])),
+        remoteAssets[0].contents,
+        "the rebuilt test artifact must differ from the published timestamped artifact",
+      );
+
+      const result = run("reconcile-published");
+
+      assert.equal(result.status, 0, result.stderr);
+      const outputs = readFileSync(githubOutput, "utf8");
+      assert.match(outputs, /^published=true$/m);
+      assert.match(outputs, /^existing-published-state=.+$/m);
+      assert.match(outputs, /^release-directory=.+$/m);
+      assert.equal(readFileSync(platformLog, "utf8").trim().split("\n").length, 1);
+      assert.ok(!readState().calls.some(
+        (call) => call[0] === "gh" && call[1] === "release" && call[2] === "upload",
+      ));
+      assert.ok(!readState().authenticatedRequests.some(({ method }) => method === "PATCH"));
+      assert.ok(readFileSync(join(scratch, "existing-published-state.json"), "utf8").includes(
+        '"kind": "existing-published-state"',
+      ));
+    }, {
+      release: matchingRelease({
+        draft: false,
+        immutable: true,
+        updatedAt: "2026-08-15T18:02:00Z",
+        assets: remoteAssets,
+      }),
+    });
+});
+
+test("published reconciliation fails closed on source, manifest, hash, or signature mismatch", () => {
+    const cases = [
+      {
+        name: "source",
+        release: matchingRelease({
+          draft: false,
+          immutable: true,
+          body: canonicalBody.replace(sourceCommit, "b".repeat(40)),
+          assets: publishedAssets(),
+        }),
+        env: {},
+        pattern: /provenance|source/i,
+      },
+      {
+        name: "manifest",
+        release: matchingRelease({
+          draft: false,
+          immutable: true,
+          assets: publishedAssets({ manifestOverrides: { sourceCommit: "b".repeat(40) } }),
+        }),
+        env: {},
+        pattern: /manifest.*source commit/i,
+      },
+      {
+        name: "hash",
+        release: matchingRelease({
+          draft: false,
+          immutable: true,
+          assets: publishedAssets({ checksumDigest: "f".repeat(64) }),
+        }),
+        env: {},
+        pattern: /SHA256SUMS|checksum|DMG hash/i,
+      },
+      {
+        name: "signature",
+        release: matchingRelease({
+          draft: false,
+          immutable: true,
+          assets: publishedAssets(),
+        }),
+        env: { FAKE_PLATFORM_RESULT: "fail" },
+        pattern: /signature|notarization/i,
+      },
+    ];
+
+    for (const entry of cases) {
+      withHarness(({ run, readState }) => {
+        const result = run("reconcile-published", entry.env);
+        assert.notEqual(result.status, 0, `${entry.name} mismatch must fail`);
+        assert.match(result.stderr, entry.pattern);
+        assert.ok(!readState().authenticatedRequests.some(({ method }) => method === "PATCH"));
+        assert.ok(!readState().calls.some(
+          (call) => call[0] === "gh" && call[1] === "release" && call[2] === "upload",
+        ));
+      }, { release: entry.release });
+    }
+});
+
+test("published reconciliation rejects foreign assets and never mutates the release", () => {
+    withHarness(({ run, readState }) => {
+      const result = run("reconcile-published");
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /foreign release asset/);
+      assert.ok(!readState().calls.some(
+        (call) => call.includes("DELETE") || call.includes("PATCH") || call.includes("upload"),
+      ));
+    }, {
+      release: matchingRelease({
+        draft: false,
+        immutable: true,
+        assets: [...publishedAssets(), asset("foreign-debug-symbols.zip", 999)],
+      }),
+    });
+});
+
+test("publish accepts independently reconciled existing-published-state evidence", () => {
+    const remoteAssets = publishedAssets();
+    withHarness(({ run, releaseDir, readState }) => {
+      assert.equal(run("reconcile-published").status, 0);
+      writeFileSync(
+        join(releaseDir, expectedAssets[0]),
+        "different-locally-rebuilt-timestamped-signature\n",
+      );
+
+      const result = run("publish", {
+        EXISTING_PUBLISHED_STATE: join(dirname(releaseDir), "existing-published-state.json"),
+      });
+
+      assert.equal(result.status, 0, result.stderr);
+      assert.ok(!readState().authenticatedRequests.some(({ method }) => method === "PATCH"));
+    }, {
+      release: matchingRelease({
+        draft: false,
+        immutable: true,
+        updatedAt: "2026-08-15T18:02:00Z",
+        assets: remoteAssets,
+      }),
+    });
+});
+
+test("full workflow retry rejects a foreign immutable published release", () => {
   withHarness(({ run }) => {
     const result = run("preflight");
     assert.notEqual(result.status, 0);

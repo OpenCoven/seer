@@ -382,7 +382,36 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
         run: bash scripts/release-macos-draft.sh acquire-lock
 
+      - name: Create fresh published-reconciliation directory
+        id: published-reconciliation-state
+        run: |
+          set -euo pipefail
+          state_dir="${RUNNER_TEMP}/seer-existing-published-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          [[ ! -e "${state_dir}" && ! -L "${state_dir}" ]]
+          umask 077
+          mkdir "${state_dir}"
+          printf 'directory=%s\n' "${state_dir}" >> "${GITHUB_OUTPUT}"
+
+      - name: Reconcile immutable existing-published-state before signing
+        id: published-reconciliation
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          SOURCE_GITHUB_TOKEN: ${{ github.token }}
+          GH_REPO: OpenCoven/seer-releases
+          RELEASE_WRITER_LOGIN: ${{ vars.RELEASE_WRITER_LOGIN }}
+          RELEASE_WRITER_ID: ${{ vars.RELEASE_WRITER_ID }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          SOURCE_TAG: ${{ github.ref_name }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_RUN: ${{ github.run_id }}
+          WORKFLOW_ATTEMPT: ${{ github.run_attempt }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          STATE_WORK_DIR: ${{ steps.published-reconciliation-state.outputs.directory }}
+        run: bash scripts/release-macos-draft.sh reconcile-published
+
       - name: Reject unsafe release collisions
+        if: steps.published-reconciliation.outputs.published != 'true'
         env:
           GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
           GH_REPO: OpenCoven/seer-releases
@@ -398,6 +427,7 @@ jobs:
         run: bash scripts/release-macos-draft.sh preflight
 
       - name: Create empty release-input destination
+        if: steps.published-reconciliation.outputs.published != 'true'
         run: |
           set -euo pipefail
           [[ ! -e build/macos/release-input && ! -L build/macos/release-input ]]
@@ -410,6 +440,7 @@ jobs:
       # files one level deeper even with a single ID, breaking the flat
       # `release-input/{archive,attestation}` paths the signing step expects.
       - name: Download only the prepared input artifact
+        if: steps.published-reconciliation.outputs.published != 'true'
         # v4.3.0, resolved from refs/tags/v4
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
@@ -417,6 +448,7 @@ jobs:
           path: build/macos/release-input
 
       - name: Verify attested input and distinct runner identity
+        if: steps.published-reconciliation.outputs.published != 'true'
         id: signing-input
         env:
           PREPARE_RUNNER_ID: ${{ needs.prepare.outputs.prepare-runner-id }}
@@ -454,6 +486,7 @@ jobs:
           printf 'signing-runner-id=%s\n' "${SIGNING_RUNNER_ID}" >> "${GITHUB_OUTPUT}"
 
       - name: Verify source tag still resolves to the attested commit
+        if: steps.published-reconciliation.outputs.published != 'true'
         env:
           SOURCE_GITHUB_TOKEN: ${{ github.token }}
           GH_REPO: OpenCoven/seer-releases
@@ -473,6 +506,7 @@ jobs:
       # its temporary keychain and notarization material, and only then invokes
       # the checked-in Task 14 boundary scanner and manifest writer with Node.
       - name: Sign and notarize attested input
+        if: steps.published-reconciliation.outputs.published != 'true'
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
           BUILD_NUMBER: ${{ github.run_number }}
@@ -496,6 +530,7 @@ jobs:
         run: bash scripts/package-macos-release.sh
 
       - name: Allowlist public package outputs
+        if: steps.published-reconciliation.outputs.published != 'true'
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
@@ -515,6 +550,7 @@ jobs:
           done
 
       - name: Generate path-free public release notes separately
+        if: steps.published-reconciliation.outputs.published != 'true'
         id: release-notes
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
@@ -535,6 +571,7 @@ jobs:
           printf 'path=%s\n' "${notes_path}" >> "${GITHUB_OUTPUT}"
 
       - name: Create published-retry verification directory
+        if: steps.published-reconciliation.outputs.published != 'true'
         id: published-retry-state
         run: |
           set -euo pipefail
@@ -545,6 +582,7 @@ jobs:
           printf 'directory=%s\n' "${state_dir}" >> "${GITHUB_OUTPUT}"
 
       - name: Create or resume draft and upload only public assets
+        if: steps.published-reconciliation.outputs.published != 'true'
         env:
           GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
           GH_REPO: OpenCoven/seer-releases
@@ -563,6 +601,7 @@ jobs:
         run: bash scripts/release-macos-draft.sh upload
 
       - name: Create fresh public-asset verification directory
+        if: steps.published-reconciliation.outputs.published != 'true'
         id: public-assets
         run: |
           set -euo pipefail
@@ -578,6 +617,7 @@ jobs:
           printf 'verified-state=%s\n' "${state_dir}/verified-release-state.json" >> "${GITHUB_OUTPUT}"
 
       - name: Download only draft release assets
+        if: steps.published-reconciliation.outputs.published != 'true'
         env:
           GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
           GH_REPO: OpenCoven/seer-releases
@@ -592,6 +632,7 @@ jobs:
             --pattern "release-manifest.json"
 
       - name: Verify downloaded DMG and mounted app after credential teardown
+        if: steps.published-reconciliation.outputs.published != 'true'
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
           VERIFY_DIR: ${{ steps.public-assets.outputs.directory }}
@@ -657,6 +698,7 @@ jobs:
           mounted=0
 
       - name: Capture the exact verified draft state
+        if: steps.published-reconciliation.outputs.published != 'true'
         env:
           GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
           GH_REPO: OpenCoven/seer-releases
@@ -676,6 +718,7 @@ jobs:
         run: bash scripts/release-macos-draft.sh capture
 
       - name: Publish only the verified draft
+        if: steps.published-reconciliation.outputs.published != 'true'
         env:
           GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
           SOURCE_GITHUB_TOKEN: ${{ github.token }}
