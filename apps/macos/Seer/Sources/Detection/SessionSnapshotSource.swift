@@ -57,6 +57,24 @@ private let cursorMaximumRows = 200
 /// defending against a pathological/corrupted row forcing an unbounded
 /// `JSONSerialization` allocation.
 private let cursorMaximumValueBytes = 4_000_000
+/// Keeps a locked live Cursor database from stalling the three-second scan loop.
+let cursorSQLiteBusyTimeoutMilliseconds: Int32 = 100
+
+/// Operational SQLite failures propagate through `AgentDetector` so
+/// `AgentMonitor` retains its last good state and publishes a scan diagnostic.
+enum CursorSessionScanError: Error, Equatable, Sendable, CustomStringConvertible {
+    case databaseBusy(code: Int32)
+    case databaseFailure(operation: String, code: Int32)
+
+    var description: String {
+        switch self {
+        case .databaseBusy(let code):
+            return "Cursor session database is busy or locked (SQLite code \(code))"
+        case .databaseFailure(let operation, let code):
+            return "Cursor session database \(operation) failed (SQLite code \(code))"
+        }
+    }
+}
 
 /// One session/transcript candidate discovered during a bounded directory
 /// walk, prior to being opened or assessed.
@@ -101,7 +119,7 @@ public struct NativeSessionSnapshotSource: SessionSnapshotProviding {
             case .none:
                 continue
             case .cursor:
-                evidence.append(contentsOf: SessionSnapshotSource.cursorEvidence(homeDirectory: homeDirectory, homeCanonical: homeCanonical, now: now))
+                evidence.append(contentsOf: try SessionSnapshotSource.cursorEvidence(homeDirectory: homeDirectory, homeCanonical: homeCanonical, now: now))
             case .claude, .codex, .grok, .genericMtime:
                 evidence.append(contentsOf: SessionSnapshotSource.familyEvidence(kind: kind, homeDirectory: homeDirectory, homeCanonical: homeCanonical, now: now))
             }
@@ -432,13 +450,12 @@ enum SessionSnapshotSource {
     /// Cursor's IDE composer/agent state lives in a fixed, known path
     /// beneath home: `Library/Application Support/Cursor/User/globalStorage/state.vscdb`.
     /// Applies the exact same lstat/no-symlink/root-containment sequence as
-    /// every other transcript before ever touching SQLite, then opens the
-    /// database read-only via the SQLite C API through the already
-    /// symlink-verified descriptor (`/dev/fd/<fd>`), so SQLite's own
-    /// internal `open()` can never be tricked into following a symlink
-    /// substituted after the verification above. Never shells out to
-    /// `sqlite3`.
-    static func cursorEvidence(homeDirectory: URL, homeCanonical: String, now: Int64) -> [SessionTurnEvidence] {
+    /// every other transcript before ever touching SQLite. The verified
+    /// descriptor remains open while SQLite opens that canonical path in
+    /// read-only mode, allowing SQLite to discover a live WAL/SHM pair; the
+    /// path inode is then checked against the descriptor again before any
+    /// query runs. Never shells out to `sqlite3`.
+    static func cursorEvidence(homeDirectory: URL, homeCanonical: String, now: Int64) throws -> [SessionTurnEvidence] {
         let dbURL = homeDirectory
             .appendingPathComponent("Library", isDirectory: true)
             .appendingPathComponent("Application Support", isDirectory: true)
@@ -450,21 +467,50 @@ enum SessionSnapshotSource {
         guard let fd = openVerifiedRegularFile(at: dbURL.path, root: homeCanonical) else { return [] }
         defer { close(fd) }
 
-        return queryCursorComposers(fd: fd, now: now)
+        guard let canonicalParent = canonicalPath(of: dbURL.deletingLastPathComponent().path) else { return [] }
+        let validatedPath = canonicalParent + "/" + dbURL.lastPathComponent
+        return try queryCursorComposers(fd: fd, validatedPath: validatedPath, now: now)
     }
 
-    private static func queryCursorComposers(fd: Int32, now: Int64) -> [SessionTurnEvidence] {
-        // Read-only, immutable URI over the already-verified descriptor —
-        // SQLite is never given the original path string, so it cannot
-        // reopen (and potentially follow a symlink at) a different inode
-        // than the one already checked above.
-        let uri = "file:/dev/fd/\(fd)?immutable=1"
+    static func queryCursorComposers(
+        fd: Int32,
+        validatedPath: String,
+        now: Int64,
+        onSnapshotEstablished: (() -> Void)? = nil
+    ) throws -> [SessionTurnEvidence] {
+        let uri = URL(fileURLWithPath: validatedPath).absoluteString + "?mode=ro"
         var db: OpaquePointer?
         let openRC = sqlite3_open_v2(uri, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil)
         defer {
             if let db { sqlite3_close(db) }
         }
-        guard openRC == SQLITE_OK, let db else { return [] }
+        try checkCursorSQLite(openRC, operation: "open")
+        guard let db else {
+            throw CursorSessionScanError.databaseFailure(operation: "open", code: openRC)
+        }
+
+        var verifiedStat = stat()
+        var pathStat = stat()
+        guard fstat(fd, &verifiedStat) == 0,
+              lstat(validatedPath, &pathStat) == 0,
+              (pathStat.st_mode & S_IFMT) == S_IFREG,
+              verifiedStat.st_dev == pathStat.st_dev,
+              verifiedStat.st_ino == pathStat.st_ino else {
+            throw CursorSessionScanError.databaseFailure(operation: "identity verification", code: SQLITE_CANTOPEN)
+        }
+
+        sqlite3_extended_result_codes(db, 1)
+        try checkCursorSQLite(
+            sqlite3_busy_timeout(db, cursorSQLiteBusyTimeoutMilliseconds),
+            operation: "busy timeout configuration"
+        )
+        try executeCursorSQL(db, sql: "BEGIN", operation: "begin read transaction")
+        var transactionOpen = true
+        defer {
+            if transactionOpen {
+                sqlite3_exec(db, "ROLLBACK", nil, nil, nil)
+            }
+        }
 
         let sinceMs = now - sessionCandidateWindowMs
         let sql = """
@@ -483,16 +529,28 @@ enum SessionSnapshotSource {
         """
 
         var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return [] }
+        let prepareRC = sqlite3_prepare_v2(db, sql, -1, &statement, nil)
+        try checkCursorSQLite(prepareRC, operation: "prepare composer query")
+        guard let statement else {
+            throw CursorSessionScanError.databaseFailure(operation: "prepare composer query", code: prepareRC)
+        }
         defer { sqlite3_finalize(statement) }
 
-        sqlite3_bind_int64(statement, 1, sinceMs)
-        sqlite3_bind_int64(statement, 2, sinceMs)
-        sqlite3_bind_int64(statement, 3, sinceMs)
+        try checkCursorSQLite(sqlite3_bind_int64(statement, 1, sinceMs), operation: "bind composer query")
+        try checkCursorSQLite(sqlite3_bind_int64(statement, 2, sinceMs), operation: "bind composer query")
+        try checkCursorSQLite(sqlite3_bind_int64(statement, 3, sinceMs), operation: "bind composer query")
 
         var evidence: [SessionTurnEvidence] = []
         var rowCount = 0
-        while rowCount < cursorMaximumRows, sqlite3_step(statement) == SQLITE_ROW {
+        var stepRC = sqlite3_step(statement)
+        if stepRC != SQLITE_DONE {
+            try checkCursorSQLiteRow(stepRC, operation: "establish composer snapshot")
+        }
+        onSnapshotEstablished?()
+        while rowCount < cursorMaximumRows {
+            if stepRC == SQLITE_DONE { break }
+            try checkCursorSQLiteRow(stepRC, operation: "read composer query")
+            defer { stepRC = sqlite3_step(statement) }
             rowCount += 1
 
             guard let keyCString = sqlite3_column_text(statement, 0) else { continue }
@@ -521,7 +579,29 @@ enum SessionSnapshotSource {
             ))
         }
 
+        try executeCursorSQL(db, sql: "COMMIT", operation: "commit read transaction")
+        transactionOpen = false
         evidence.sort { $0.lastActivityAt > $1.lastActivityAt }
         return evidence
+    }
+
+    private static func executeCursorSQL(_ db: OpaquePointer, sql: String, operation: String) throws {
+        try checkCursorSQLite(sqlite3_exec(db, sql, nil, nil, nil), operation: operation)
+    }
+
+    private static func checkCursorSQLite(_ code: Int32, operation: String) throws {
+        guard code != SQLITE_OK else { return }
+        let primaryCode = code & 0xFF
+        if primaryCode == SQLITE_BUSY || primaryCode == SQLITE_LOCKED {
+            throw CursorSessionScanError.databaseBusy(code: code)
+        }
+        throw CursorSessionScanError.databaseFailure(operation: operation, code: code)
+    }
+
+    private static func checkCursorSQLiteRow(_ code: Int32, operation: String) throws {
+        guard code == SQLITE_ROW else {
+            try checkCursorSQLite(code, operation: operation)
+            throw CursorSessionScanError.databaseFailure(operation: operation, code: code)
+        }
     }
 }

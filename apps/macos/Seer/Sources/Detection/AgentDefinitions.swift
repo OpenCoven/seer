@@ -30,6 +30,38 @@ public enum SessionFormat: String, Equatable, Sendable {
     case none
 }
 
+/// Compilation seam used to characterize definition initialization without
+/// adding timing assertions to the process-matching performance test.
+struct ProcessRegexCompiler: Sendable {
+    private let onCompilation: @Sendable () -> Void
+
+    init(onCompilation: @escaping @Sendable () -> Void = {}) {
+        self.onCompilation = onCompilation
+    }
+
+    fileprivate func compile(
+        pattern: String,
+        options: NSRegularExpression.Options
+    ) -> SendableProcessRegex {
+        onCompilation()
+        return SendableProcessRegex(pattern: pattern, options: options)
+    }
+}
+
+private final class SendableProcessRegex: @unchecked Sendable {
+    private let expression: NSRegularExpression?
+
+    init(pattern: String, options: NSRegularExpression.Options) {
+        expression = try? NSRegularExpression(pattern: pattern, options: options)
+    }
+
+    func matches(_ command: String) -> Bool {
+        guard let expression else { return false }
+        let fullRange = NSRange(command.startIndex..<command.endIndex, in: command)
+        return expression.firstMatch(in: command, options: [], range: fullRange) != nil
+    }
+}
+
 /// A single process-command matcher: an ICU-compatible regex pattern plus
 /// whether it should compile case-insensitively. Mirrors one `RegExp`
 /// literal from `processMatchers` in the TS policy exactly, including its
@@ -42,18 +74,36 @@ public enum SessionFormat: String, Equatable, Sendable {
 public struct ProcessMatcher: Equatable, Sendable {
     public let pattern: String
     public let caseInsensitive: Bool
+    private let compiledRegex: SendableProcessRegex
 
     public init(_ pattern: String, caseInsensitive: Bool = true) {
+        self.init(pattern, caseInsensitive: caseInsensitive, regexCompiler: ProcessRegexCompiler())
+    }
+
+    init(
+        _ pattern: String,
+        caseInsensitive: Bool = true,
+        regexCompiler: ProcessRegexCompiler
+    ) {
         self.pattern = pattern
         self.caseInsensitive = caseInsensitive
+        var options: NSRegularExpression.Options = []
+        if caseInsensitive { options.insert(.caseInsensitive) }
+        compiledRegex = regexCompiler.compile(pattern: pattern, options: options)
+    }
+
+    public static func == (lhs: ProcessMatcher, rhs: ProcessMatcher) -> Bool {
+        lhs.pattern == rhs.pattern && lhs.caseInsensitive == rhs.caseInsensitive
+    }
+
+    func matches(_ command: String) -> Bool {
+        compiledRegex.matches(command)
     }
 }
 
 /// Mirrors `AgentKind` in `main/services/agent-detection-policy.ts`.
-/// Regex patterns are kept as raw ICU-compatible pattern strings (not
-/// precompiled `NSRegularExpression`s) so this value stays a plain,
-/// unconditionally `Sendable` value type; `matchAgentKind` compiles them
-/// on demand.
+/// Process regexes are compiled once when each definition is initialized and
+/// held by an immutable, `Sendable` wrapper for reuse across scans.
 public struct AgentKind: Equatable, Sendable {
     public let id: AgentFamily
     public let name: String
@@ -95,14 +145,21 @@ public struct AgentKind: Equatable, Sendable {
 /// `AGENT_KINDS` in `main/services/agent-detection-policy.ts`. Process
 /// matchers, session roots/extensions/formats, and fallback flags are
 /// preserved verbatim from the TypeScript source.
-public let AGENT_KINDS: [AgentKind] = [
+public let AGENT_KINDS: [AgentKind] = makeAgentKinds()
+
+func makeAgentKinds(regexCompiler: ProcessRegexCompiler = ProcessRegexCompiler()) -> [AgentKind] {
+    func matcher(_ pattern: String, caseInsensitive: Bool = true) -> ProcessMatcher {
+        ProcessMatcher(pattern, caseInsensitive: caseInsensitive, regexCompiler: regexCompiler)
+    }
+
+    return [
     AgentKind(
         id: .claudeCode,
         name: "Claude Code",
         processMatchers: [
-            ProcessMatcher(#"(^|[/\s])claude(\s|$)"#),
-            ProcessMatcher(#"@anthropic-ai/claude-code"#, caseInsensitive: false),
-            ProcessMatcher(#"claude[-_]code"#),
+            matcher(#"(^|[/\s])claude(\s|$)"#),
+            matcher(#"@anthropic-ai/claude-code"#, caseInsensitive: false),
+            matcher(#"claude[-_]code"#),
         ],
         sessionRoots: [".claude/projects"],
         sessionExtensions: [".jsonl"],
@@ -113,8 +170,8 @@ public let AGENT_KINDS: [AgentKind] = [
         id: .codex,
         name: "Codex",
         processMatchers: [
-            ProcessMatcher(#"(^|[/\s])codex(\s|$)"#),
-            ProcessMatcher(#"@openai/codex"#, caseInsensitive: false),
+            matcher(#"(^|[/\s])codex(\s|$)"#),
+            matcher(#"@openai/codex"#, caseInsensitive: false),
         ],
         sessionRoots: [".codex/sessions"],
         sessionExtensions: [".jsonl"],
@@ -126,9 +183,9 @@ public let AGENT_KINDS: [AgentKind] = [
         name: "Grok",
         // The launcher lives in ~/.grok/bin; the real binary is ~/.grok/downloads/grok-<ver>-macos-*.
         processMatchers: [
-            ProcessMatcher(#"(^|[/\s])grok(\s|$)"#),
-            ProcessMatcher(#"\.grok/(?:bin|downloads)/"#),
-            ProcessMatcher(#"grok-\d+\.\d+\.\d+-macos"#),
+            matcher(#"(^|[/\s])grok(\s|$)"#),
+            matcher(#"\.grok/(?:bin|downloads)/"#),
+            matcher(#"grok-\d+\.\d+\.\d+-macos"#),
         ],
         sessionRoots: [".grok/sessions"],
         sessionExtensions: [".jsonl"],
@@ -141,8 +198,8 @@ public let AGENT_KINDS: [AgentKind] = [
         id: .gemini,
         name: "Gemini CLI",
         processMatchers: [
-            ProcessMatcher(#"(^|[/\s])gemini(\s|$)"#),
-            ProcessMatcher(#"@google/gemini-cli"#, caseInsensitive: false),
+            matcher(#"(^|[/\s])gemini(\s|$)"#),
+            matcher(#"@google/gemini-cli"#, caseInsensitive: false),
         ],
         sessionRoots: [".gemini"],
         sessionExtensions: [".jsonl", ".json"],
@@ -151,7 +208,7 @@ public let AGENT_KINDS: [AgentKind] = [
     AgentKind(
         id: .aider,
         name: "Aider",
-        processMatchers: [ProcessMatcher(#"(^|[/\s])aider(\s|$)"#)],
+        processMatchers: [matcher(#"(^|[/\s])aider(\s|$)"#)],
         sessionRoots: [],
         sessionExtensions: [],
         sessionFormat: .none
@@ -159,7 +216,7 @@ public let AGENT_KINDS: [AgentKind] = [
     AgentKind(
         id: .opencode,
         name: "OpenCode",
-        processMatchers: [ProcessMatcher(#"(^|[/\s])opencode(\s|$)"#)],
+        processMatchers: [matcher(#"(^|[/\s])opencode(\s|$)"#)],
         sessionRoots: [".local/share/opencode", ".config/opencode"],
         sessionExtensions: [".jsonl", ".json"],
         sessionFormat: .genericMtime
@@ -167,7 +224,7 @@ public let AGENT_KINDS: [AgentKind] = [
     AgentKind(
         id: .goose,
         name: "Goose",
-        processMatchers: [ProcessMatcher(#"(^|[/\s])goose(\s|$)"#)],
+        processMatchers: [matcher(#"(^|[/\s])goose(\s|$)"#)],
         sessionRoots: [".config/goose"],
         sessionExtensions: [".jsonl", ".json"],
         sessionFormat: .genericMtime
@@ -176,8 +233,8 @@ public let AGENT_KINDS: [AgentKind] = [
         id: .amp,
         name: "Amp",
         processMatchers: [
-            ProcessMatcher(#"(^|[/\s])amp(\s|$)"#),
-            ProcessMatcher(#"@sourcegraph/amp"#, caseInsensitive: false),
+            matcher(#"(^|[/\s])amp(\s|$)"#),
+            matcher(#"@sourcegraph/amp"#, caseInsensitive: false),
         ],
         sessionRoots: [],
         sessionExtensions: [],
@@ -189,9 +246,9 @@ public let AGENT_KINDS: [AgentKind] = [
         // IDE agent is detected via composer state; process matchers cover the CLI only.
         // Do not match bare Cursor.app — it stays open while idle.
         processMatchers: [
-            ProcessMatcher(#"(^|[/\s])cursor-agent(\s|$)"#),
-            ProcessMatcher(#"cursor-agent-svc"#),
-            ProcessMatcher(#"cursor(?:-agent)?(?:\.js)?\s+--agent\b"#),
+            matcher(#"(^|[/\s])cursor-agent(\s|$)"#),
+            matcher(#"cursor-agent-svc"#),
+            matcher(#"cursor(?:-agent)?(?:\.js)?\s+--agent\b"#),
         ],
         sessionRoots: [],
         sessionExtensions: [],
@@ -202,17 +259,18 @@ public let AGENT_KINDS: [AgentKind] = [
         id: .continueAgent,
         name: "Continue",
         processMatchers: [
-            ProcessMatcher(#"continue-cli"#),
-            ProcessMatcher(#"@continuedev/cli"#, caseInsensitive: false),
+            matcher(#"continue-cli"#),
+            matcher(#"@continuedev/cli"#, caseInsensitive: false),
         ],
         sessionRoots: [".continue/sessions"],
         sessionExtensions: [".jsonl", ".json"],
         sessionFormat: .genericMtime
     ),
-]
+    ]
+}
 
-/// Compiles each candidate's process matchers on demand and returns the
-/// first `AgentKind` whose patterns match `command`, mirroring
+/// Uses each candidate's precompiled process matchers and returns the first
+/// `AgentKind` whose patterns match `command`, mirroring
 /// `matchAgentKind` in the TypeScript policy: patterns are tried in
 /// declaration order (first match wins) and each pattern's case-sensitivity
 /// is applied exactly as declared — most are `/i` (case-insensitive), but
@@ -220,15 +278,13 @@ public let AGENT_KINDS: [AgentKind] = [
 /// non-global JS `RegExp.test` semantics (a plain "does this match
 /// anywhere" check, no lastIndex state).
 public func matchAgentKind(command: String) -> AgentKind? {
-    let fullRange = NSRange(command.startIndex..<command.endIndex, in: command)
-    for kind in AGENT_KINDS {
+    matchAgentKind(command: command, kinds: AGENT_KINDS)
+}
+
+func matchAgentKind(command: String, kinds: [AgentKind]) -> AgentKind? {
+    for kind in kinds {
         for matcher in kind.processMatchers {
-            var options: NSRegularExpression.Options = []
-            if matcher.caseInsensitive { options.insert(.caseInsensitive) }
-            guard let regex = try? NSRegularExpression(pattern: matcher.pattern, options: options) else {
-                continue
-            }
-            if regex.firstMatch(in: command, options: [], range: fullRange) != nil {
+            if matcher.matches(command) {
                 return kind
             }
         }

@@ -10,6 +10,23 @@ import XCTest
 /// restating any expected value, so both languages are proven to agree on
 /// the exact same corpus.
 final class TurnAssessorsTests: XCTestCase {
+    private final class LockedCompilationCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storage = 0
+
+        func increment() {
+            lock.lock()
+            storage += 1
+            lock.unlock()
+        }
+
+        var value: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return storage
+        }
+    }
+
     // MARK: - Shared fixture oracle
 
     private struct FixtureOracle: Decodable {
@@ -559,17 +576,40 @@ final class TurnAssessorsTests: XCTestCase {
                 }
                 XCTAssertTrue(patternIndex >= 0 && patternIndex < kind.processMatchers.count, testCase.id)
                 let matcher = kind.processMatchers[patternIndex]
-                var options: NSRegularExpression.Options = []
-                if matcher.caseInsensitive { options.insert(.caseInsensitive) }
-                let regex = try XCTUnwrap(try? NSRegularExpression(pattern: matcher.pattern, options: options))
-                let range = NSRange(testCase.command.startIndex..<testCase.command.endIndex, in: testCase.command)
-                let matches = regex.firstMatch(in: testCase.command, options: [], range: range) != nil
-                XCTAssertEqual(matches, expectedMatch, testCase.id)
+                XCTAssertEqual(matcher.matches(testCase.command), expectedMatch, testCase.id)
 
             default:
                 XCTFail("unknown matcherCases kind \(testCase.kind)")
             }
         }
+    }
+
+    func testProcessDefinitionsCompileEachPatternOnceOutsideMatchingHotLoop() {
+        let counter = LockedCompilationCounter()
+        let definitions = makeAgentKinds(
+            regexCompiler: ProcessRegexCompiler(onCompilation: counter.increment)
+        )
+        let patternCount = definitions.reduce(0) { $0 + $1.processMatchers.count }
+        XCTAssertGreaterThan(patternCount, 0)
+        XCTAssertEqual(patternCount, AGENT_KINDS.reduce(0) { $0 + $1.processMatchers.count })
+        XCTAssertEqual(counter.value, patternCount)
+
+        let commands = [
+            "/opt/homebrew/bin/claude",
+            "npx @openai/codex",
+            "/Users/example/.grok/downloads/grok-1.2.3-macos-arm64",
+            "cursor-agent --agent",
+            "definitely-not-an-agent",
+        ]
+        for index in 0..<10_000 {
+            _ = matchAgentKind(command: commands[index % commands.count], kinds: definitions)
+        }
+
+        XCTAssertEqual(
+            counter.value,
+            patternCount,
+            "matching thousands of processes must reuse the definitions' precompiled regexes"
+        )
     }
 
     /// Structural guard: exactly the five scoped-package patterns

@@ -521,6 +521,34 @@ final class SessionSnapshotSourceTests: XCTestCase {
         XCTAssertEqual(sqlite3_step(statement), SQLITE_DONE)
     }
 
+    private func makeEmptyCursorFixtureDatabase(at url: URL) {
+        try! FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &db), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        XCTAssertEqual(sqlite3_exec(db, "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)", nil, nil, nil), SQLITE_OK)
+    }
+
+    private func openCursorWriter(at url: URL, wal: Bool) throws -> OpaquePointer {
+        var db: OpaquePointer?
+        let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI
+        XCTAssertEqual(sqlite3_open_v2(url.path, &db, flags, nil), SQLITE_OK)
+        let writer = try XCTUnwrap(db)
+        if wal {
+            XCTAssertEqual(sqlite3_exec(writer, "PRAGMA journal_mode=WAL", nil, nil, nil), SQLITE_OK)
+            XCTAssertEqual(sqlite3_exec(writer, "PRAGMA wal_autocheckpoint=0", nil, nil, nil), SQLITE_OK)
+        }
+        return writer
+    }
+
+    private func exec(_ sql: String, on db: OpaquePointer) {
+        var errorMessage: UnsafeMutablePointer<CChar>?
+        let result = sqlite3_exec(db, sql, nil, nil, &errorMessage)
+        let message = errorMessage.map { String(cString: $0) } ?? ""
+        sqlite3_free(errorMessage)
+        XCTAssertEqual(result, SQLITE_OK, message)
+    }
+
     func testNativeSourceProducesEvidenceFromASyntheticCursorDatabase() async throws {
         let home = makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: home) }
@@ -534,6 +562,97 @@ final class SessionSnapshotSourceTests: XCTestCase {
         let cursorEvidence = evidence.filter { $0.family == .cursor }
         XCTAssertEqual(cursorEvidence.count, 1)
         XCTAssertEqual(cursorEvidence.first?.identity, "abc123")
+    }
+
+    func testNativeSourceReadsActiveComposerCommittedOnlyToLiveWAL() async throws {
+        let home = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let dbURL = home
+            .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+        makeEmptyCursorFixtureDatabase(at: dbURL)
+
+        let writer = try openCursorWriter(at: dbURL, wal: true)
+        defer { sqlite3_close(writer) }
+        exec("PRAGMA wal_checkpoint(TRUNCATE)", on: writer)
+        exec(
+            #"INSERT INTO cursorDiskKV (key, value) VALUES ('composerData:wal-active', '{"status":"generating"}')"#,
+            on: writer
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dbURL.path + "-wal"))
+
+        let evidence = try await NativeSessionSnapshotSource(homeDirectory: home).snapshot(now: fixedNow)
+
+        XCTAssertTrue(evidence.contains { $0.family == .cursor && $0.identity == "wal-active" })
+    }
+
+    func testCursorReadUsesConsistentSnapshotWhileWALWriterCommits() throws {
+        let home = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let dbURL = home
+            .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+        makeEmptyCursorFixtureDatabase(at: dbURL)
+        let writer = try openCursorWriter(at: dbURL, wal: true)
+        defer { sqlite3_close(writer) }
+        exec(
+            #"INSERT INTO cursorDiskKV (key, value) VALUES ('composerData:snapshot', '{"status":"generating"}')"#,
+            on: writer
+        )
+
+        let fd = try XCTUnwrap(SessionSnapshotSource.openVerifiedRegularFile(
+            at: dbURL.path,
+            root: canonicalRoot(home)
+        ))
+        defer { close(fd) }
+
+        let beforeCommit = try SessionSnapshotSource.queryCursorComposers(
+            fd: fd,
+            validatedPath: dbURL.path,
+            now: fixedNow
+        )
+        XCTAssertEqual(beforeCommit.map(\.identity), ["snapshot"])
+
+        let evidence = try SessionSnapshotSource.queryCursorComposers(
+            fd: fd,
+            validatedPath: dbURL.path,
+            now: fixedNow,
+            onSnapshotEstablished: {
+                self.exec(
+                    #"UPDATE cursorDiskKV SET value = '{"status":"completed","lastUpdatedAt":0}' WHERE key = 'composerData:snapshot'"#,
+                    on: writer
+                )
+            }
+        )
+
+        XCTAssertEqual(evidence.map(\.identity), ["snapshot"])
+        let afterCommit = try SessionSnapshotSource.queryCursorComposers(
+            fd: fd,
+            validatedPath: dbURL.path,
+            now: fixedNow
+        )
+        XCTAssertTrue(afterCommit.isEmpty)
+    }
+
+    func testCursorBusyDatabaseThrowsTypedBoundedScanFailure() async throws {
+        let home = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let dbURL = home
+            .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+        makeEmptyCursorFixtureDatabase(at: dbURL)
+
+        let writer = try openCursorWriter(at: dbURL, wal: false)
+        defer { sqlite3_close(writer) }
+        exec("BEGIN EXCLUSIVE", on: writer)
+        defer { sqlite3_exec(writer, "ROLLBACK", nil, nil, nil) }
+
+        do {
+            _ = try await NativeSessionSnapshotSource(homeDirectory: home).snapshot(now: fixedNow)
+            XCTFail("a locked Cursor database must fail the scan instead of returning stale empty evidence")
+        } catch let error as CursorSessionScanError {
+            XCTAssertEqual(error, .databaseBusy(code: SQLITE_BUSY))
+            XCTAssertEqual(cursorSQLiteBusyTimeoutMilliseconds, 100)
+        } catch {
+            XCTFail("expected typed CursorSessionScanError, got \(error)")
+        }
     }
 
     func testNativeSourceProducesZeroEvidenceForASymlinkedCursorDatabaseOutsideRoot() async throws {
