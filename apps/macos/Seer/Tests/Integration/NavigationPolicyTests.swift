@@ -517,7 +517,8 @@ final class NavigationPolicyTests: XCTestCase {
         try await settingsStore.recordUpdateCheck(
             etag: nil,
             lastCheckedAt: clock.nowMilliseconds(),
-            release: PersistedRelease(version: "9.9.9", url: "https://evil.example.com/fake-release")
+            release: PersistedRelease(version: "9.9.9", url: "https://evil.example.com/fake-release"),
+            expectedIncludePrereleaseUpdates: false
         )
         let openedTampered = await updateService.openCurrentRelease()
         XCTAssertFalse(openedTampered)
@@ -529,7 +530,8 @@ final class NavigationPolicyTests: XCTestCase {
         try await settingsStore.recordUpdateCheck(
             etag: nil,
             lastCheckedAt: clock.nowMilliseconds(),
-            release: PersistedRelease(version: "1.2.0", url: "https://github.com/OpenCoven/seer-releases/releases/tag/v1.2.0")
+            release: PersistedRelease(version: "1.2.0", url: "https://github.com/OpenCoven/seer-releases/releases/tag/v1.2.0"),
+            expectedIncludePrereleaseUpdates: false
         )
         let openedValid = await updateService.openCurrentRelease()
         XCTAssertTrue(openedValid)

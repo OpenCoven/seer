@@ -67,7 +67,8 @@ public enum UpdateCheckError: Error, Equatable, Sendable {
     /// `check(force:)` found a corrupt (future-dated) persisted
     /// `lastUpdateCheckAt` (see `SafeTime.normalizedLastCheckedAt(_:now:)`)
     /// and attempting to persist the repaired value through
-    /// `SettingsStore.recordUpdateCheck(etag:lastCheckedAt:release:)`
+    /// `SettingsStore.recordUpdateCheck(etag:lastCheckedAt:release:
+    /// expectedIncludePrereleaseUpdates:)`
     /// itself failed. `SettingsStore`/`AtomicJSONStore` retain their
     /// previous persisted value on any failed write, so treating this as
     /// a success would falsely report the gate as satisfied while the
@@ -218,46 +219,20 @@ public actor UpdateService {
     /// once, and the first one to *return* must not report `isChecking =
     /// false` while the second is still outstanding.
     private var activeCheckCount = 0
-    /// Monotonically increases every time a `check(force:)` call actually
-    /// starts a network round-trip (i.e. every time `activeCheckCount`
-    /// above is incremented), *and* synchronously — before ever awaiting
-    /// anything — at the very start of `setIncludePrerelease(_:)`. Each
-    /// `check(force:)` call captures its own value (`myGeneration`) before
-    /// awaiting `session.data(for:)`, and only persists its result if
-    /// `generation` is *still* exactly that value once the await returns —
-    /// i.e. only if no other `check(force:)` call (or `setIncludePrerelease`
-    /// stream switch) started in the meantime. Because actors are
-    /// reentrant across `await`, two overlapping calls (e.g. a manual/
-    /// scheduled stable-stream check racing a `setIncludePrerelease(true)`
-    /// switch to the prerelease stream) can each have a request in flight
-    /// at once, and whichever *returns* first is not necessarily the one
-    /// whose ETag/release should end up persisted: persisting completion
-    /// order instead of start order would let an older, slower request
-    /// stomp a newer one's fresher result, or let one stream's ETag land
-    /// after a switch to the other stream. This makes the call that
-    /// *started* last always win — never the one that merely *finishes*
-    /// last — and every stale/superseded call instead returns whatever the
-    /// winning call (or, if it hasn't completed yet, whatever was already
-    /// persisted) ends up leaving in `SettingsStore`.
+    /// Monotonically increases whenever a network check starts and at the
+    /// synchronous beginning of a stream transition. It cheaply supersedes
+    /// older in-flight work and makes the last-started ordinary check win.
     ///
-    /// `setIncludePrerelease(_:)`'s own synchronous bump exists because,
-    /// without it, an old-stream check already in flight when the switch
-    /// begins would still hold a `myGeneration` ticket that remains valid
-    /// (`generation` not yet advanced) throughout `setIncludePrerelease`'s
-    /// own `await settingsStore.setIncludePrereleaseUpdates(value)` call —
-    /// `generation` was previously only ever advanced later, inside the
-    /// forced `check(force: true)` this function goes on to make. That
-    /// old call could then complete *during* that await and persist its
-    /// now-stale (old-stream) ETag/release right on top of the freshly
-    /// cleared state, and that stale write would survive even if the
-    /// subsequent forced check against the *new* stream then itself
-    /// fails — silently resurrecting the previous stream's cached release
-    /// after a switch. Bumping `generation` as the very first, synchronous
-    /// statement here — actor code runs to completion up to its first
-    /// suspension point, so no other task can interleave before this
-    /// executes — invalidates any such in-flight call immediately, before
-    /// settings are ever touched, regardless of how the forced check that
-    /// follows resolves.
+    /// Generation is deliberately not the transactional stream guard. Actor
+    /// reentrancy lets a new `check(force:)` start while
+    /// `setIncludePrerelease(_:)` is awaiting persistence: that check can
+    /// read the old stream after the transition's initial bump and capture
+    /// the resulting current generation. Every cache write therefore also
+    /// supplies its expected stream to `SettingsStore.recordUpdateCheck`,
+    /// which compares it with the freshest on-disk selection under the
+    /// atomic mutation lock. The settings predicate is load-bearing;
+    /// generation avoids unnecessary stale work and orders checks within a
+    /// stream.
     private var generation: Int64 = 0
 
     public init(
@@ -337,11 +312,9 @@ public actor UpdateService {
     /// or whether the directory sync that followed the rename could be
     /// confirmed.
     public func setIncludePrerelease(_ value: Bool) async throws -> UpdateState {
-        // Synchronously invalidate any check already in flight *before*
-        // ever awaiting anything — see `generation`'s documentation for
-        // why this must happen here, ahead of the settings mutation
-        // below, rather than only later inside the forced `check(force:
-        // true)` call this function goes on to make.
+        // Invalidate checks already in flight before awaiting persistence.
+        // A check that starts during that await is protected by
+        // SettingsStore's transactional expected-stream predicate.
         generation += 1
 
         do {
@@ -440,16 +413,24 @@ public actor UpdateService {
             // actually confirmed it.
             let normalized = SafeTime.normalizedLastCheckedAt(lastCheckedAt, now: now)
             if normalized != lastCheckedAt {
+                let expectedIncludePrerelease = settings.includePrereleaseUpdates
                 do {
-                    try await settingsStore.recordUpdateCheck(
+                    let result = try await settingsStore.recordUpdateCheck(
                         etag: settings.updateETag,
                         lastCheckedAt: normalized,
-                        release: settings.lastRelease
+                        release: settings.lastRelease,
+                        expectedIncludePrereleaseUpdates: expectedIncludePrerelease
                     )
+                    guard result == .recorded else {
+                        return await currentState()
+                    }
                 } catch {
                     throw UpdateCheckError.timestampRepairFailed(String(describing: error))
                 }
-                settings.lastUpdateCheckAt = normalized
+                settings = await settingsStore.current
+                guard settings.includePrereleaseUpdates == expectedIncludePrerelease else {
+                    return stateFrom(settings: settings)
+                }
             }
             // Saturating subtraction so an extreme-past value (e.g.
             // `Int64.min`) reports a huge-but-finite elapsed time —
@@ -496,7 +477,16 @@ public actor UpdateService {
         do {
             (data, response) = try await session.data(for: request)
         } catch {
+            guard myGeneration == generation else {
+                finishActiveCheck()
+                return await currentState()
+            }
             throw UpdateCheckError.network(error.localizedDescription)
+        }
+
+        guard myGeneration == generation else {
+            finishActiveCheck()
+            return await currentState()
         }
 
         guard let httpResponse = response as? HTTPURLResponse else {
@@ -504,22 +494,26 @@ public actor UpdateService {
         }
 
         if httpResponse.statusCode == 304 {
-            // A newer `check(force:)` call has started since this one
-            // began — its own result (whether already persisted or still
-            // in flight) must win. This call's own (now-stale) 304 must
-            // not touch `SettingsStore` at all, and its return value
-            // reflects whatever is currently persisted instead of its own
-            // discarded outcome.
-            guard myGeneration == generation else {
+            let completedAt = clock.nowMilliseconds()
+            let result: RecordUpdateCheckResult
+            do {
+                result = try await settingsStore.recordUpdateCheck(
+                    etag: settings.updateETag,
+                    lastCheckedAt: completedAt,
+                    release: settings.lastRelease,
+                    expectedIncludePrereleaseUpdates: includePrerelease
+                )
+            } catch {
+                guard myGeneration == generation else {
+                    finishActiveCheck()
+                    return await currentState()
+                }
+                throw error
+            }
+            guard myGeneration == generation, result == .recorded else {
                 finishActiveCheck()
                 return await currentState()
             }
-            let completedAt = clock.nowMilliseconds()
-            try await settingsStore.recordUpdateCheck(
-                etag: settings.updateETag,
-                lastCheckedAt: completedAt,
-                release: settings.lastRelease
-            )
             finishActiveCheck()
             return await currentState()
         }
@@ -540,16 +534,6 @@ public actor UpdateService {
             throw UpdateCheckError.malformedReleasePayload
         }
 
-        // Same staleness check as the 304 branch above, for the same
-        // reason: a newer call started while this one's request was still
-        // in flight, so this (older) call's freshly-fetched 200 result
-        // must not overwrite whatever that newer call has (or will)
-        // persist.
-        guard myGeneration == generation else {
-            finishActiveCheck()
-            return await currentState()
-        }
-
         let selected = Self.selectBestRelease(from: releases)
         let newEtag = httpResponse.value(forHTTPHeaderField: "Etag")
 
@@ -561,7 +545,25 @@ public actor UpdateService {
         }
 
         let completedAt = clock.nowMilliseconds()
-        try await settingsStore.recordUpdateCheck(etag: newEtag, lastCheckedAt: completedAt, release: persistedRelease)
+        let result: RecordUpdateCheckResult
+        do {
+            result = try await settingsStore.recordUpdateCheck(
+                etag: newEtag,
+                lastCheckedAt: completedAt,
+                release: persistedRelease,
+                expectedIncludePrereleaseUpdates: includePrerelease
+            )
+        } catch {
+            guard myGeneration == generation else {
+                finishActiveCheck()
+                return await currentState()
+            }
+            throw error
+        }
+        guard myGeneration == generation, result == .recorded else {
+            finishActiveCheck()
+            return await currentState()
+        }
         finishActiveCheck()
         return await currentState()
     }

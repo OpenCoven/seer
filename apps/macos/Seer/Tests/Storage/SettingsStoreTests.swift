@@ -65,8 +65,14 @@ final class SettingsStoreTests: XCTestCase {
         _ = await store.load()
 
         let release = PersistedRelease(version: "v1.3.0", url: "https://github.com/OpenCoven/seer/releases/tag/v1.3.0")
-        try await store.recordUpdateCheck(etag: "\"abc123\"", lastCheckedAt: 1_700_000_500_000, release: release)
+        let result = try await store.recordUpdateCheck(
+            etag: "\"abc123\"",
+            lastCheckedAt: 1_700_000_500_000,
+            release: release,
+            expectedIncludePrereleaseUpdates: false
+        )
 
+        XCTAssertEqual(result, .recorded)
         let current = await store.current
         XCTAssertEqual(current.updateETag, "\"abc123\"")
         XCTAssertEqual(current.lastUpdateCheckAt, 1_700_000_500_000)
@@ -86,13 +92,56 @@ final class SettingsStoreTests: XCTestCase {
         _ = await store.load()
 
         let release = PersistedRelease(version: "v1.3.0", url: "https://github.com/OpenCoven/seer/releases/tag/v1.3.0")
-        try await store.recordUpdateCheck(etag: "\"abc123\"", lastCheckedAt: 1_700_000_500_000, release: release)
-        try await store.recordUpdateCheck(etag: nil, lastCheckedAt: 1_700_000_600_000, release: nil)
+        try await store.recordUpdateCheck(
+            etag: "\"abc123\"",
+            lastCheckedAt: 1_700_000_500_000,
+            release: release,
+            expectedIncludePrereleaseUpdates: false
+        )
+        try await store.recordUpdateCheck(
+            etag: nil,
+            lastCheckedAt: 1_700_000_600_000,
+            release: nil,
+            expectedIncludePrereleaseUpdates: false
+        )
 
         let current = await store.current
         XCTAssertNil(current.updateETag)
         XCTAssertEqual(current.lastUpdateCheckAt, 1_700_000_600_000)
         XCTAssertNil(current.lastRelease)
+    }
+
+    func testRecordUpdateCheckRejectsStaleExpectedStreamAgainstFreshOnDiskSelection() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let staleStore = makeSettingsStore(fileSystem: fileSystem)
+        let switchingStore = makeSettingsStore(fileSystem: fileSystem)
+        _ = await staleStore.load()
+        _ = await switchingStore.load()
+
+        try await switchingStore.setIncludePrereleaseUpdates(true)
+
+        let staleRelease = PersistedRelease(
+            version: "v1.1.0",
+            url: "https://github.com/OpenCoven/seer/releases/tag/v1.1.0"
+        )
+        let result = try await staleStore.recordUpdateCheck(
+            etag: "\"stable-etag\"",
+            lastCheckedAt: 1_700_000_500_000,
+            release: staleRelease,
+            expectedIncludePrereleaseUpdates: false
+        )
+
+        XCTAssertEqual(result, .staleStreamTransition)
+        let current = await staleStore.current
+        XCTAssertTrue(current.includePrereleaseUpdates)
+        XCTAssertNil(current.updateETag)
+        XCTAssertNil(current.lastUpdateCheckAt)
+        XCTAssertNil(current.lastRelease)
+
+        let persistedBytes = await fileSystem.contents(at: settingsURL)
+        let savedBytes = try XCTUnwrap(persistedBytes)
+        let decoded = try JSONDecoder().decode(SettingsDocument.self, from: savedBytes)
+        XCTAssertEqual(decoded, current)
     }
 
     func testSetIncludePrereleaseUpdatesClearsCachedUpdateMetadata() async throws {
@@ -101,7 +150,12 @@ final class SettingsStoreTests: XCTestCase {
         _ = await store.load()
 
         let release = PersistedRelease(version: "v1.3.0", url: "https://github.com/OpenCoven/seer/releases/tag/v1.3.0")
-        try await store.recordUpdateCheck(etag: "\"abc123\"", lastCheckedAt: 1_700_000_500_000, release: release)
+        try await store.recordUpdateCheck(
+            etag: "\"abc123\"",
+            lastCheckedAt: 1_700_000_500_000,
+            release: release,
+            expectedIncludePrereleaseUpdates: false
+        )
 
         try await store.setIncludePrereleaseUpdates(true)
 

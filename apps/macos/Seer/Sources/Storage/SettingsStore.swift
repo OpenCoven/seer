@@ -66,6 +66,17 @@ public struct SettingsDocument: VersionedDocument {
     }
 }
 
+/// The transactional outcome of recording an update check. A stale stream
+/// transition is an expected supersession, not a storage failure.
+public enum RecordUpdateCheckResult: Equatable, Sendable {
+    case recorded
+    case staleStreamTransition
+}
+
+private struct StaleUpdateStreamTransition: Error, Sendable {
+    let current: SettingsDocument
+}
+
 /// Resolves the on-disk location of Seer's standalone settings file. Always
 /// `<Application Support>/ai.opencoven.seer/settings.json` — never any other
 /// application's identifier or path.
@@ -237,26 +248,56 @@ public actor SettingsStore {
     /// Modified` result (the latter passing through its own prior
     /// `etag`/`release` unchanged, since only `lastUpdateCheckAt` actually
     /// changed): either way, this is the one place that update-check state
-    /// is written to disk.
-    public func recordUpdateCheck(etag: String?, lastCheckedAt: Int64, release: PersistedRelease?) async throws {
+    /// is written to disk. The write is conditional on the selected stream
+    /// still matching the one the request used. That comparison happens
+    /// against the freshest on-disk document under the atomic update lock,
+    /// so a response that crossed a stable/prerelease transition is refused
+    /// even when this actor's cached document was stale when the call began.
+    @discardableResult
+    public func recordUpdateCheck(
+        etag: String?,
+        lastCheckedAt: Int64,
+        release: PersistedRelease?,
+        expectedIncludePrereleaseUpdates: Bool
+    ) async throws -> RecordUpdateCheckResult {
         await gate.acquire()
         do {
-            try await performRecordUpdateCheck(etag: etag, lastCheckedAt: lastCheckedAt, release: release)
+            let result = try await performRecordUpdateCheck(
+                etag: etag,
+                lastCheckedAt: lastCheckedAt,
+                release: release,
+                expectedIncludePrereleaseUpdates: expectedIncludePrereleaseUpdates
+            )
             await gate.release()
+            return result
         } catch {
             await gate.release()
             throw error
         }
     }
 
-    private func performRecordUpdateCheck(etag: String?, lastCheckedAt: Int64, release: PersistedRelease?) async throws {
+    private func performRecordUpdateCheck(
+        etag: String?,
+        lastCheckedAt: Int64,
+        release: PersistedRelease?,
+        expectedIncludePrereleaseUpdates: Bool
+    ) async throws -> RecordUpdateCheckResult {
         await ensureLoaded()
-        try await applyUpdate { document in
-            var updated = document
-            updated.updateETag = etag
-            updated.lastUpdateCheckAt = lastCheckedAt
-            updated.lastRelease = release
-            return updated
+        do {
+            try await applyUpdate { document in
+                guard document.includePrereleaseUpdates == expectedIncludePrereleaseUpdates else {
+                    throw StaleUpdateStreamTransition(current: document)
+                }
+                var updated = document
+                updated.updateETag = etag
+                updated.lastUpdateCheckAt = lastCheckedAt
+                updated.lastRelease = release
+                return updated
+            }
+            return .recorded
+        } catch let transition as StaleUpdateStreamTransition {
+            current = transition.current
+            return .staleStreamTransition
         }
     }
 
@@ -274,7 +315,7 @@ public actor SettingsStore {
     /// cache is never left stale relative to disk and a subsequent
     /// mutation always starts from the value actually on disk, never
     /// reverting it.
-    private func applyUpdate(_ transform: @Sendable (SettingsDocument) -> SettingsDocument) async throws {
+    private func applyUpdate(_ transform: @Sendable (SettingsDocument) throws -> SettingsDocument) async throws {
         do {
             current = try await store.update(transform)
         } catch let error as StorageUpdateError<SettingsDocument> {

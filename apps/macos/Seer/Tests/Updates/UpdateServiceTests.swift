@@ -123,6 +123,28 @@ private actor RecordingReleaseOpener: ReleaseURLOpening {
     }
 }
 
+private final class ObservableClock: Clock, @unchecked Sendable {
+    private struct State {
+        var callCount = 0
+    }
+
+    private let now: Int64
+    private let state = OSAllocatedUnfairLock(initialState: State())
+
+    init(now: Int64) {
+        self.now = now
+    }
+
+    func nowMilliseconds() -> Int64 {
+        state.withLock { $0.callCount += 1 }
+        return now
+    }
+
+    var callCount: Int {
+        state.withLock { $0.callCount }
+    }
+}
+
 // MARK: - GatedSleeper
 
 /// A test-only `Sleeper` whose `sleep(nanoseconds:)` call suspends
@@ -444,7 +466,12 @@ final class UpdateServiceTests: XCTestCase {
         let fileSystem = InMemorySettingsFileSystem()
         let clock = MutableClock(now: 1_700_000_000_000)
         let settingsStore = makeSettingsStore(fileSystem: fileSystem, clock: clock)
-        try await settingsStore.recordUpdateCheck(etag: nil, lastCheckedAt: Int64.max, release: nil)
+        try await settingsStore.recordUpdateCheck(
+            etag: nil,
+            lastCheckedAt: Int64.max,
+            release: nil,
+            expectedIncludePrereleaseUpdates: false
+        )
         let service = UpdateService(
             settingsStore: settingsStore,
             session: makeMockSession(),
@@ -492,7 +519,12 @@ final class UpdateServiceTests: XCTestCase {
         let fileSystem = InMemorySettingsFileSystem()
         let clock = MutableClock(now: 1_700_000_000_000)
         let settingsStore = makeSettingsStore(fileSystem: fileSystem, clock: clock)
-        try await settingsStore.recordUpdateCheck(etag: nil, lastCheckedAt: Int64.max, release: nil)
+        try await settingsStore.recordUpdateCheck(
+            etag: nil,
+            lastCheckedAt: Int64.max,
+            release: nil,
+            expectedIncludePrereleaseUpdates: false
+        )
         let service = UpdateService(
             settingsStore: settingsStore,
             session: makeMockSession(),
@@ -565,7 +597,12 @@ final class UpdateServiceTests: XCTestCase {
         let fileSystem = InMemorySettingsFileSystem()
         let clock = MutableClock(now: 1_700_000_000_000)
         let settingsStore = makeSettingsStore(fileSystem: fileSystem, clock: clock)
-        try await settingsStore.recordUpdateCheck(etag: nil, lastCheckedAt: Int64.min, release: nil)
+        try await settingsStore.recordUpdateCheck(
+            etag: nil,
+            lastCheckedAt: Int64.min,
+            release: nil,
+            expectedIncludePrereleaseUpdates: false
+        )
         let service = UpdateService(
             settingsStore: settingsStore,
             session: makeMockSession(),
@@ -594,7 +631,12 @@ final class UpdateServiceTests: XCTestCase {
         let fileSystem = InMemorySettingsFileSystem()
         let clock = MutableClock(now: Int64.max - 1_000)
         let settingsStore = makeSettingsStore(fileSystem: fileSystem, clock: clock)
-        try await settingsStore.recordUpdateCheck(etag: nil, lastCheckedAt: 0, release: nil)
+        try await settingsStore.recordUpdateCheck(
+            etag: nil,
+            lastCheckedAt: 0,
+            release: nil,
+            expectedIncludePrereleaseUpdates: false
+        )
         let service = UpdateService(
             settingsStore: settingsStore,
             session: makeMockSession(),
@@ -1305,6 +1347,175 @@ final class UpdateServiceTests: XCTestCase {
         // never its own now-discarded stable-stream result.
         XCTAssertEqual(stableResult.availableVersion, "v1.2.0-beta.1", "a stale, superseded check must never report its own discarded result")
         XCTAssertFalse(finalState.checking, "no check remains in flight once both overlapping calls have completed")
+    }
+
+    func testCheckStartedDuringSuspendedStreamSwitchCannotPublishStableResultAfterPrereleaseCompletes() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let settingsStore = makeSettingsStore(fileSystem: fileSystem, clock: clock)
+        let service = UpdateService(
+            settingsStore: settingsStore,
+            session: makeMockSession(),
+            clock: clock,
+            currentVersion: "1.0.0"
+        )
+        let stableGate = RequestGate()
+        let prereleaseGate = RequestGate()
+
+        MockURLProtocol.enqueueStub(
+            statusCode: 200,
+            headers: ["Etag": "\"stable-etag\""],
+            body: releaseJSON(tag: "v1.1.0", htmlURL: "https://github.com/OpenCoven/seer/releases/tag/v1.1.0"),
+            gate: stableGate
+        )
+        MockURLProtocol.enqueueStub(
+            statusCode: 200,
+            headers: ["Etag": "\"prerelease-etag\""],
+            body: Data("""
+            [{"tag_name":"v1.2.0-beta.1","html_url":"https://github.com/OpenCoven/seer/releases/tag/v1.2.0-beta.1","draft":false,"prerelease":true}]
+            """.utf8),
+            gate: prereleaseGate
+        )
+
+        await fileSystem.armSuspension("writeFileAndSynchronize")
+        let switchTask = Task { try await service.setIncludePrerelease(true) }
+        await fileSystem.waitUntilEntered("writeFileAndSynchronize")
+
+        let staleStableTask = Task { try await service.check(force: true) }
+        try await waitUntil { MockURLProtocol.recordedRequests.count == 1 }
+
+        await fileSystem.resumeSuspension("writeFileAndSynchronize")
+        try await waitUntil { MockURLProtocol.recordedRequests.count == 2 }
+        prereleaseGate.open()
+        let switchedState = try await switchTask.value
+        XCTAssertEqual(switchedState.availableVersion, "v1.2.0-beta.1")
+
+        stableGate.open()
+        let staleStableState = try await staleStableTask.value
+        XCTAssertEqual(staleStableState.availableVersion, "v1.2.0-beta.1")
+
+        MockURLProtocol.enqueueStub(statusCode: 304)
+        _ = try await service.check(force: true)
+
+        let finalSettings = await settingsStore.current
+        XCTAssertTrue(finalSettings.includePrereleaseUpdates)
+        XCTAssertEqual(finalSettings.updateETag, "\"prerelease-etag\"")
+        XCTAssertEqual(finalSettings.lastRelease?.version, "v1.2.0-beta.1")
+
+        let requests = MockURLProtocol.recordedRequests
+        XCTAssertEqual(requests.count, 3)
+        XCTAssertNil(requests[0].url?.query)
+        XCTAssertNil(requests[0].value(forHTTPHeaderField: "If-None-Match"))
+        XCTAssertEqual(requests[1].url?.query, "per_page=20")
+        XCTAssertNil(requests[1].value(forHTTPHeaderField: "If-None-Match"))
+        XCTAssertEqual(requests[2].url?.query, "per_page=20")
+        XCTAssertEqual(requests[2].value(forHTTPHeaderField: "If-None-Match"), "\"prerelease-etag\"")
+    }
+
+    func testCheckQueuedDuringStreamSwitchCannotRestoreStableCacheWhenForcedPrereleaseCheckFails() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let serviceClock = ObservableClock(now: 1_700_000_000_000)
+        let settingsStore = makeSettingsStore(
+            fileSystem: fileSystem,
+            clock: FixedClock(fixedMilliseconds: 1_700_000_000_000)
+        )
+        let service = UpdateService(
+            settingsStore: settingsStore,
+            session: makeMockSession(),
+            clock: serviceClock,
+            currentVersion: "1.0.0"
+        )
+        let stableGate = RequestGate()
+
+        MockURLProtocol.enqueueStub(
+            statusCode: 200,
+            headers: ["Etag": "\"stable-etag\""],
+            body: releaseJSON(tag: "v1.1.0", htmlURL: "https://github.com/OpenCoven/seer/releases/tag/v1.1.0"),
+            gate: stableGate
+        )
+
+        await fileSystem.armSuspension("writeFileAndSynchronize")
+        let switchTask = Task { try await service.setIncludePrerelease(true) }
+        await fileSystem.waitUntilEntered("writeFileAndSynchronize")
+
+        let staleStableTask = Task { try await service.check(force: true) }
+        try await waitUntil { MockURLProtocol.recordedRequests.count == 1 }
+
+        stableGate.open()
+        try await waitUntil { serviceClock.callCount >= 2 }
+        for _ in 0..<50 {
+            await Task.yield()
+        }
+
+        await fileSystem.armSuspension("readFile")
+        await fileSystem.resumeSuspension("writeFileAndSynchronize")
+        await fileSystem.waitUntilEntered("readFile")
+        try await waitUntil { MockURLProtocol.recordedRequests.count == 2 }
+
+        do {
+            _ = try await switchTask.value
+            XCTFail("expected the forced prerelease check to fail")
+        } catch let error as UpdateCheckError {
+            guard case .network = error else {
+                return XCTFail("expected .network, got \(error)")
+            }
+        }
+
+        await fileSystem.resumeSuspension("readFile")
+        let staleState = try await staleStableTask.value
+        XCTAssertNil(staleState.availableVersion)
+
+        let finalSettings = await settingsStore.current
+        XCTAssertTrue(finalSettings.includePrereleaseUpdates)
+        XCTAssertNil(finalSettings.updateETag)
+        XCTAssertNil(finalSettings.lastUpdateCheckAt)
+        XCTAssertNil(finalSettings.lastRelease)
+    }
+
+    func testCheckStartedDuringFailedStreamSwitchCanStillPersistForUnchangedStableStream() async throws {
+        let fileSystem = InMemorySettingsFileSystem()
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let settingsStore = makeSettingsStore(fileSystem: fileSystem, clock: clock)
+        let service = UpdateService(
+            settingsStore: settingsStore,
+            session: makeMockSession(),
+            clock: clock,
+            currentVersion: "1.0.0"
+        )
+        let stableGate = RequestGate()
+
+        MockURLProtocol.enqueueStub(
+            statusCode: 200,
+            headers: ["Etag": "\"stable-etag\""],
+            body: releaseJSON(tag: "v1.1.0", htmlURL: "https://github.com/OpenCoven/seer/releases/tag/v1.1.0"),
+            gate: stableGate
+        )
+
+        await fileSystem.armSuspension("writeFileAndSynchronize")
+        let switchTask = Task { try await service.setIncludePrerelease(true) }
+        await fileSystem.waitUntilEntered("writeFileAndSynchronize")
+
+        let stableTask = Task { try await service.check(force: true) }
+        try await waitUntil { MockURLProtocol.recordedRequests.count == 1 }
+
+        await fileSystem.setFailNextWrite(SettingsFileSystemError.other("disk full"))
+        await fileSystem.resumeSuspension("writeFileAndSynchronize")
+        do {
+            _ = try await switchTask.value
+            XCTFail("expected the stream switch persistence to fail")
+        } catch let error as SetIncludePrereleasePersistError {
+            XCTAssertEqual(error.underlying, .writeFailed)
+        }
+
+        stableGate.open()
+        let stableState = try await stableTask.value
+        XCTAssertEqual(stableState.availableVersion, "v1.1.0")
+
+        let finalSettings = await settingsStore.current
+        XCTAssertFalse(finalSettings.includePrereleaseUpdates)
+        XCTAssertEqual(finalSettings.updateETag, "\"stable-etag\"")
+        XCTAssertEqual(finalSettings.lastRelease?.version, "v1.1.0")
+        XCTAssertEqual(MockURLProtocol.recordedRequests.count, 1)
     }
 
     /// Regression test for a race `setIncludePrerelease(_:)`'s own
