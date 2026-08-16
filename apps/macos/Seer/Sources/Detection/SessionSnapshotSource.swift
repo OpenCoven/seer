@@ -53,6 +53,8 @@ private let sessionSkippedDirectoryNames: Set<String> = [".git", "node_modules",
 /// blobs are individually small, but the table can accumulate a very large
 /// history over time.
 private let cursorMaximumRows = 200
+/// Bounds composer identifiers before allocating Swift strings for untrusted keys.
+private let cursorMaximumKeyBytes = 4_096
 /// Bounds how large a single composer JSON blob this reader will parse,
 /// defending against a pathological/corrupted row forcing an unbounded
 /// `JSONSerialization` allocation.
@@ -512,19 +514,10 @@ enum SessionSnapshotSource {
             }
         }
 
-        let sinceMs = now - sessionCandidateWindowMs
         let sql = """
         SELECT key, value FROM cursorDiskKV
         WHERE key LIKE 'composerData:%'
-          AND value IS NOT NULL
-          AND (
-            json_extract(value, '$.status') = 'generating'
-            OR json_extract(value, '$.isContinuationInProgress') = 1
-            OR json_array_length(COALESCE(json_extract(value, '$.generatingBubbleIds'), '[]')) > 0
-            OR COALESCE(json_extract(value, '$.conversationCheckpointLastUpdatedAt'), 0) >= ?
-            OR COALESCE(json_extract(value, '$.lastUpdatedAt'), 0) >= ?
-            OR COALESCE(json_extract(value, '$.createdAt'), 0) >= ?
-          )
+        ORDER BY key
         LIMIT \(cursorMaximumRows)
         """
 
@@ -535,10 +528,6 @@ enum SessionSnapshotSource {
             throw CursorSessionScanError.databaseFailure(operation: "prepare composer query", code: prepareRC)
         }
         defer { sqlite3_finalize(statement) }
-
-        try checkCursorSQLite(sqlite3_bind_int64(statement, 1, sinceMs), operation: "bind composer query")
-        try checkCursorSQLite(sqlite3_bind_int64(statement, 2, sinceMs), operation: "bind composer query")
-        try checkCursorSQLite(sqlite3_bind_int64(statement, 3, sinceMs), operation: "bind composer query")
 
         var evidence: [SessionTurnEvidence] = []
         var rowCount = 0
@@ -553,18 +542,25 @@ enum SessionSnapshotSource {
             defer { stepRC = sqlite3_step(statement) }
             rowCount += 1
 
-            guard let keyCString = sqlite3_column_text(statement, 0) else { continue }
-            let key = String(cString: keyCString)
+            guard sqlite3_column_type(statement, 0) == SQLITE_TEXT else { continue }
+            let keyByteCount = Int(sqlite3_column_bytes(statement, 0))
+            guard keyByteCount > 0, keyByteCount <= cursorMaximumKeyBytes,
+                  let keyBytes = sqlite3_column_text(statement, 0),
+                  let key = String(
+                      data: Data(bytes: keyBytes, count: keyByteCount),
+                      encoding: .utf8
+                  ) else { continue }
 
-            guard let valueCString = sqlite3_column_text(statement, 1) else { continue }
+            guard sqlite3_column_type(statement, 1) == SQLITE_TEXT else { continue }
             let valueByteCount = Int(sqlite3_column_bytes(statement, 1))
             // Bounded blob processing: skip (never log) anything
             // implausibly large for a composer record.
-            guard valueByteCount > 0, valueByteCount <= cursorMaximumValueBytes else { continue }
-            let valueString = String(cString: valueCString)
+            guard valueByteCount > 0,
+                  valueByteCount <= cursorMaximumValueBytes,
+                  let valueBytes = sqlite3_column_text(statement, 1) else { continue }
+            let valueData = Data(bytes: valueBytes, count: valueByteCount)
 
-            guard let valueData = valueString.data(using: .utf8),
-                  let record = (try? JSONSerialization.jsonObject(with: valueData)) as? JSONObject else { continue }
+            guard let record = (try? JSONSerialization.jsonObject(with: valueData)) as? JSONObject else { continue }
 
             let assessment = assessCursorComposerRecord(record, now: now)
             guard assessment.active else { continue }

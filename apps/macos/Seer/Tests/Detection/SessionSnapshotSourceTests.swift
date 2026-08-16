@@ -529,6 +529,18 @@ final class SessionSnapshotSourceTests: XCTestCase {
         XCTAssertEqual(sqlite3_exec(db, "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)", nil, nil, nil), SQLITE_OK)
     }
 
+    private func insertCursorFixtureRecord(at url: URL, key: String, value: String) {
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &db), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        var statement: OpaquePointer?
+        XCTAssertEqual(sqlite3_prepare_v2(db, "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)", -1, &statement, nil), SQLITE_OK)
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, key, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        sqlite3_bind_text(statement, 2, value, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_DONE)
+    }
+
     private func openCursorWriter(at url: URL, wal: Bool) throws -> OpaquePointer {
         var db: OpaquePointer?
         let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI
@@ -562,6 +574,58 @@ final class SessionSnapshotSourceTests: XCTestCase {
         let cursorEvidence = evidence.filter { $0.family == .cursor }
         XCTAssertEqual(cursorEvidence.count, 1)
         XCTAssertEqual(cursorEvidence.first?.identity, "abc123")
+    }
+
+    func testCursorMalformedRowsAreSkippedWithoutHidingAValidActiveComposer() async throws {
+        let home = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let dbURL = home
+            .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+        makeEmptyCursorFixtureDatabase(at: dbURL)
+        insertCursorFixtureRecord(at: dbURL, key: "composerData:00-invalid", value: #"{"status":"#)
+        insertCursorFixtureRecord(at: dbURL, key: "composerData:01-array", value: #"["generating"]"#)
+        insertCursorFixtureRecord(at: dbURL, key: "composerData:02-valid", value: #"{"status":"generating"}"#)
+
+        let evidence = try await NativeSessionSnapshotSource(homeDirectory: home).snapshot(now: fixedNow)
+
+        XCTAssertEqual(evidence.filter { $0.family == .cursor }.map(\.identity), ["02-valid"])
+    }
+
+    func testCursorAllMalformedRowsProduceNoCandidatesInsteadOfFailingTheScan() async throws {
+        let home = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let dbURL = home
+            .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+        makeEmptyCursorFixtureDatabase(at: dbURL)
+        insertCursorFixtureRecord(at: dbURL, key: "composerData:invalid", value: "{")
+        insertCursorFixtureRecord(at: dbURL, key: "composerData:array", value: #"[]"#)
+        insertCursorFixtureRecord(at: dbURL, key: "composerData:scalar", value: #""generating""#)
+
+        let evidence = try await NativeSessionSnapshotSource(homeDirectory: home).snapshot(now: fixedNow)
+
+        XCTAssertTrue(evidence.filter { $0.family == .cursor }.isEmpty)
+    }
+
+    func testCursorOversizedRowsAreSkippedAndSQLLikeStringsRemainPlainData() async throws {
+        let home = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let dbURL = home
+            .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+        makeEmptyCursorFixtureDatabase(at: dbURL)
+        let oversized = #"{"status":"generating","padding":""#
+            + String(repeating: "x", count: 4_000_000)
+            + #""}"#
+        insertCursorFixtureRecord(at: dbURL, key: "composerData:00-oversized", value: oversized)
+        let injectionLikeIdentity = #"x' UNION SELECT key, value FROM cursorDiskKV --"#
+        insertCursorFixtureRecord(
+            at: dbURL,
+            key: "composerData:\(injectionLikeIdentity)",
+            value: #"{"status":"generating","name":"'); DROP TABLE cursorDiskKV; --"}"#
+        )
+
+        let evidence = try await NativeSessionSnapshotSource(homeDirectory: home).snapshot(now: fixedNow)
+
+        XCTAssertEqual(evidence.filter { $0.family == .cursor }.map(\.identity), [injectionLikeIdentity])
     }
 
     func testNativeSourceReadsActiveComposerCommittedOnlyToLiveWAL() async throws {
