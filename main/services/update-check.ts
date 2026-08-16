@@ -49,6 +49,16 @@ export type UpdateSettingsAccess = {
   setIncludePrereleaseUpdates(value: boolean): Promise<UpdateSettings>;
 };
 
+export type UpdateScheduledTimer = {
+  cancel(): void;
+  unref?(): void;
+};
+
+export type UpdateTimerScheduler = (
+  callback: () => void,
+  delayMs: number,
+) => UpdateScheduledTimer;
+
 type UpdateServiceOptions = {
   currentVersion: string;
   fetchImpl?: typeof fetch;
@@ -61,6 +71,7 @@ type UpdateServiceOptions = {
   // instead of waiting on a real timer.
   requestTimeoutMs?: number;
   createTimeoutSignal?: (timeoutMs: number) => AbortSignal;
+  scheduleTimer?: UpdateTimerScheduler;
 };
 
 type GitHubRelease = {
@@ -232,6 +243,7 @@ export class UpdateService {
   private readonly openExternal: (url: string) => Promise<void>;
   private readonly requestTimeoutMs: number;
   private readonly createTimeoutSignal: (timeoutMs: number) => AbortSignal;
+  private readonly scheduleTimer: UpdateTimerScheduler;
   private readonly listeners = new Set<(state: UpdateState) => void>();
   private state: UpdateState = {
     checking: false,
@@ -259,7 +271,7 @@ export class UpdateService {
   // Installed synchronously before settings persistence starts. While this is
   // present, no ordinary or scheduled check may select either release stream.
   private streamTransition: StreamTransition | null = null;
-  private timer: ReturnType<typeof setTimeout> | null = null;
+  private timer: UpdateScheduledTimer | null = null;
   private scheduleGeneration = 0;
   private started = false;
   private lastAttemptCompletedAt: number | null = null;
@@ -277,6 +289,13 @@ export class UpdateService {
     this.openExternal = options.openExternal;
     this.requestTimeoutMs = options.requestTimeoutMs ?? UPDATE_REQUEST_TIMEOUT_MS;
     this.createTimeoutSignal = options.createTimeoutSignal ?? ((timeoutMs) => AbortSignal.timeout(timeoutMs));
+    this.scheduleTimer = options.scheduleTimer ?? ((callback, delayMs) => {
+      const timer = setTimeout(callback, delayMs);
+      return {
+        cancel: () => clearTimeout(timer),
+        unref: () => timer.unref?.(),
+      };
+    });
   }
 
   getState(): UpdateState {
@@ -512,7 +531,7 @@ export class UpdateService {
 
   private cancelScheduledTimer(): void {
     this.scheduleGeneration += 1;
-    if (this.timer) clearTimeout(this.timer);
+    this.timer?.cancel();
     this.timer = null;
   }
 
@@ -524,7 +543,7 @@ export class UpdateService {
     const base = Math.max(this.state.lastCheckedAt ?? 0, this.lastAttemptCompletedAt ?? 0);
     const remaining = base > 0 ? base + CHECK_INTERVAL_MS - now : CHECK_INTERVAL_MS;
     const delay = remaining > 0 ? Math.min(remaining, CHECK_INTERVAL_MS) : CHECK_INTERVAL_MS;
-    this.timer = setTimeout(() => {
+    this.timer = this.scheduleTimer(() => {
       if (
         !this.started ||
         generation !== this.scheduleGeneration ||

@@ -50,7 +50,7 @@ async function withScratch(callback: (scratch: string) => Promise<void>) {
 }
 
 function sqlString(value: string) {
-  return `'${value.replaceAll("'", "''")}'`;
+  return `'${value.replace(/'/g, "''")}'`;
 }
 
 function insertRows(database: string, rows: Array<{ key: string; value: string }>) {

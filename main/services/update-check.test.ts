@@ -8,6 +8,7 @@ import {
   UpdateService,
   compareSemanticVersions,
   parseSemanticVersion,
+  type UpdateTimerScheduler,
   type UpdateSettings,
 } from "./update-check";
 
@@ -91,6 +92,7 @@ function makeHarness(options: {
 function makeDeferredHarness(options: {
   includePrereleaseUpdates?: boolean;
   suspendPersistence?: boolean;
+  scheduleTimer?: UpdateTimerScheduler;
 } = {}) {
   let now = 1_700_000_000_000;
   const calls: FetchCall[] = [];
@@ -133,6 +135,7 @@ function makeDeferredHarness(options: {
       },
     },
     openExternal: async () => undefined,
+    scheduleTimer: options.scheduleTimer,
   });
 
   return {
@@ -460,18 +463,29 @@ test("a failed suspended persistence restores the prior coherent stream and perm
 });
 
 test("stream transition cancels an expired scheduled callback and reschedules once after forced-check failure", async () => {
-  const harness = makeDeferredHarness({ suspendPersistence: true });
-  const originalSetTimeout = globalThis.setTimeout;
-  const originalClearTimeout = globalThis.clearTimeout;
-  const timers: Array<{ callback: () => void; delay: number; cleared: boolean }> = [];
-  globalThis.setTimeout = ((callback: (...args: never[]) => void, delay?: number) => {
-    const timer = { callback, delay: delay ?? 0, cleared: false, unref() {} };
-    timers.push(timer);
-    return timer as ReturnType<typeof setTimeout>;
-  }) as unknown as typeof setTimeout;
-  globalThis.clearTimeout = ((timer: ReturnType<typeof setTimeout>) => {
-    (timer as unknown as { cleared: boolean }).cleared = true;
-  }) as typeof clearTimeout;
+  const timers: Array<{
+    callback: () => void;
+    delay: number;
+    cleared: boolean;
+    cancel(): void;
+    unref(): void;
+  }> = [];
+  const harness = makeDeferredHarness({
+    suspendPersistence: true,
+    scheduleTimer: (callback, delay) => {
+      const timer = {
+        callback,
+        delay,
+        cleared: false,
+        cancel() {
+          this.cleared = true;
+        },
+        unref() {},
+      };
+      timers.push(timer);
+      return timer;
+    },
+  });
 
   try {
     const started = harness.service.start();
@@ -505,24 +519,31 @@ test("stream transition cancels an expired scheduled callback and reschedules on
     }, "failed forced check must not restore the stale stable-stream result");
   } finally {
     harness.service.stop();
-    globalThis.setTimeout = originalSetTimeout;
-    globalThis.clearTimeout = originalClearTimeout;
   }
 });
 
 test("successful stream transition replaces the cancelled schedule exactly once from forced-check completion", async () => {
-  const harness = makeDeferredHarness({ suspendPersistence: true });
-  const originalSetTimeout = globalThis.setTimeout;
-  const originalClearTimeout = globalThis.clearTimeout;
-  const timers: Array<{ delay: number; cleared: boolean }> = [];
-  globalThis.setTimeout = ((_callback: (...args: never[]) => void, delay?: number) => {
-    const timer = { delay: delay ?? 0, cleared: false, unref() {} };
-    timers.push(timer);
-    return timer as ReturnType<typeof setTimeout>;
-  }) as unknown as typeof setTimeout;
-  globalThis.clearTimeout = ((timer: ReturnType<typeof setTimeout>) => {
-    (timer as unknown as { cleared: boolean }).cleared = true;
-  }) as typeof clearTimeout;
+  const timers: Array<{
+    delay: number;
+    cleared: boolean;
+    cancel(): void;
+    unref(): void;
+  }> = [];
+  const harness = makeDeferredHarness({
+    suspendPersistence: true,
+    scheduleTimer: (_callback, delay) => {
+      const timer = {
+        delay,
+        cleared: false,
+        cancel() {
+          this.cleared = true;
+        },
+        unref() {},
+      };
+      timers.push(timer);
+      return timer;
+    },
+  });
 
   try {
     const started = harness.service.start();
@@ -542,8 +563,6 @@ test("successful stream transition replaces the cancelled schedule exactly once 
     assert.equal(timers[1]!.delay, CHECK_INTERVAL_MS);
   } finally {
     harness.service.stop();
-    globalThis.setTimeout = originalSetTimeout;
-    globalThis.clearTimeout = originalClearTimeout;
   }
 });
 
