@@ -260,6 +260,7 @@ export class UpdateService {
   // present, no ordinary or scheduled check may select either release stream.
   private streamTransition: StreamTransition | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
+  private scheduleGeneration = 0;
   private started = false;
   private lastAttemptCompletedAt: number | null = null;
 
@@ -410,6 +411,7 @@ export class UpdateService {
       previousPrereleaseEtag: this.prereleaseEtag,
       generation: ++this.generation,
     };
+    this.cancelScheduledTimer();
     this.streamTransition = transition;
     this.stableEtag = null;
     this.prereleaseEtag = null;
@@ -446,6 +448,7 @@ export class UpdateService {
           };
         }
         this.publish();
+        this.schedule();
       }
       throw error;
     }
@@ -468,6 +471,7 @@ export class UpdateService {
           lastCheckedAt: null,
         };
         this.publish();
+        this.schedule();
       }
       throw new UpdateCheckError("The selected update stream changed during persistence");
     }
@@ -478,7 +482,11 @@ export class UpdateService {
     // persisted stream.
     this.generation += 1;
     this.streamTransition = null;
-    return this.check({ force: true });
+    try {
+      return await this.check({ force: true });
+    } finally {
+      this.schedule();
+    }
   }
 
   async openCurrentRelease(): Promise<void> {
@@ -499,20 +507,38 @@ export class UpdateService {
 
   stop(): void {
     this.started = false;
+    this.cancelScheduledTimer();
+  }
+
+  private cancelScheduledTimer(): void {
+    this.scheduleGeneration += 1;
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
   }
 
   private schedule(): void {
-    if (!this.started) return;
-    if (this.timer) clearTimeout(this.timer);
-    const base = Math.max(this.state.lastCheckedAt ?? 0, this.lastAttemptCompletedAt ?? this.now());
-    const delay = Math.max(0, base + CHECK_INTERVAL_MS - this.now());
+    if (!this.started || this.streamTransition) return;
+    this.cancelScheduledTimer();
+    const generation = this.scheduleGeneration;
+    const now = this.now();
+    const base = Math.max(this.state.lastCheckedAt ?? 0, this.lastAttemptCompletedAt ?? 0);
+    const remaining = base > 0 ? base + CHECK_INTERVAL_MS - now : CHECK_INTERVAL_MS;
+    const delay = remaining > 0 ? Math.min(remaining, CHECK_INTERVAL_MS) : CHECK_INTERVAL_MS;
     this.timer = setTimeout(() => {
+      if (
+        !this.started ||
+        generation !== this.scheduleGeneration ||
+        this.streamTransition
+      ) {
+        return;
+      }
+      this.timer = null;
       void this.check()
         .catch(() => undefined)
-        .finally(() => this.schedule());
-    }, delay);
+        .finally(() => {
+          if (generation === this.scheduleGeneration) this.schedule();
+        });
+    }, Math.max(1, delay));
     this.timer.unref?.();
   }
 }

@@ -459,37 +459,87 @@ test("a failed suspended persistence restores the prior coherent stream and perm
   await recovery;
 });
 
-test("a scheduled check that fires during stream persistence is retried later without fetching the old stream", async () => {
+test("stream transition cancels an expired scheduled callback and reschedules once after forced-check failure", async () => {
   const harness = makeDeferredHarness({ suspendPersistence: true });
   const originalSetTimeout = globalThis.setTimeout;
   const originalClearTimeout = globalThis.clearTimeout;
-  let scheduled: (() => void) | null = null;
-  globalThis.setTimeout = ((callback: (...args: never[]) => void) => {
-    scheduled = callback;
-    return { unref() {} } as ReturnType<typeof setTimeout>;
+  const timers: Array<{ callback: () => void; delay: number; cleared: boolean }> = [];
+  globalThis.setTimeout = ((callback: (...args: never[]) => void, delay?: number) => {
+    const timer = { callback, delay: delay ?? 0, cleared: false, unref() {} };
+    timers.push(timer);
+    return timer as ReturnType<typeof setTimeout>;
   }) as unknown as typeof setTimeout;
-  globalThis.clearTimeout = (() => undefined) as typeof clearTimeout;
+  globalThis.clearTimeout = ((timer: ReturnType<typeof setTimeout>) => {
+    (timer as unknown as { cleared: boolean }).cleared = true;
+  }) as typeof clearTimeout;
 
   try {
     const started = harness.service.start();
     harness.resolve(0, Response.json(release("v1.2.0")));
     await started;
-    assert.ok(scheduled);
+    assert.equal(timers.length, 1);
+    assert.equal(timers[0]!.delay, CHECK_INTERVAL_MS);
+    harness.advance(CHECK_INTERVAL_MS);
 
     const toggle = harness.service.setIncludePrereleaseUpdates(true);
-    const fired = scheduled as () => void;
-    fired();
+    assert.equal(timers[0]!.cleared, true, "transition start must synchronously cancel the scheduled timer");
+    timers[0]!.callback();
     await Promise.resolve();
     assert.equal(harness.calls.length, 1, "the scheduled callback must not fetch while persistence is active");
+    assert.equal(timers.length, 1, "a cancelled callback must not re-arm itself during persistence");
 
     harness.resolvePersistence(0);
     await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(harness.calls.length, 2);
-    harness.resolve(1, Response.json([]));
-    await toggle;
-    await Promise.resolve();
+    harness.reject(1, new Error("forced check failed"));
+    await assert.rejects(toggle, /forced check failed/);
 
-    assert.ok(scheduled, "the scheduler must remain armed after the skipped transition-time check");
+    assert.equal(timers.length, 2, "transition completion must arm exactly one replacement timer");
+    assert.ok(timers[1]!.delay > 0, "replacement delay must be strictly positive");
+    assert.ok(timers[1]!.delay <= CHECK_INTERVAL_MS, "replacement delay must remain bounded");
+    assert.deepEqual(harness.service.getState(), {
+      checking: false,
+      availableVersion: null,
+      releaseURL: null,
+      lastCheckedAt: null,
+    }, "failed forced check must not restore the stale stable-stream result");
+  } finally {
+    harness.service.stop();
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
+  }
+});
+
+test("successful stream transition replaces the cancelled schedule exactly once from forced-check completion", async () => {
+  const harness = makeDeferredHarness({ suspendPersistence: true });
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  const timers: Array<{ delay: number; cleared: boolean }> = [];
+  globalThis.setTimeout = ((_callback: (...args: never[]) => void, delay?: number) => {
+    const timer = { delay: delay ?? 0, cleared: false, unref() {} };
+    timers.push(timer);
+    return timer as ReturnType<typeof setTimeout>;
+  }) as unknown as typeof setTimeout;
+  globalThis.clearTimeout = ((timer: ReturnType<typeof setTimeout>) => {
+    (timer as unknown as { cleared: boolean }).cleared = true;
+  }) as typeof clearTimeout;
+
+  try {
+    const started = harness.service.start();
+    harness.resolve(0, Response.json(release("v1.2.0")));
+    await started;
+    harness.advance(CHECK_INTERVAL_MS);
+
+    const toggle = harness.service.setIncludePrereleaseUpdates(true);
+    assert.equal(timers[0]!.cleared, true);
+    harness.resolvePersistence(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    harness.resolve(1, Response.json([release("v2.0.0-beta.1")]));
+    const state = await toggle;
+
+    assert.equal(state.availableVersion, "v2.0.0-beta.1");
+    assert.equal(timers.length, 2);
+    assert.equal(timers[1]!.delay, CHECK_INTERVAL_MS);
   } finally {
     harness.service.stop();
     globalThis.setTimeout = originalSetTimeout;
