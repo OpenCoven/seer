@@ -267,9 +267,10 @@ test("draft policy resumes only bound allowlisted drafts and publishes after fre
   assert.match(draftPolicySource, /git\/tags/);
   assert.match(draftPolicySource, /git\/refs/);
   assert.match(draftPolicySource, /seer-release-lock-/);
-  assert.match(draftPolicySource, /gh release create "\$\{SOURCE_TAG\}" --draft/);
+  assert.match(draftPolicySource, /gh release create "\$\{SOURCE_TAG\}" --draft --verify-tag/);
+  assert.match(draftPolicySource, /--target "\$\{DESTINATION_ANCHOR_COMMIT\}"/);
   assert.match(draftPolicySource, /gh release upload "\$\{SOURCE_TAG\}"[\s\S]*--clobber/);
-  assert.match(draftPolicyImplementation, /existing published release/);
+  assert.match(draftPolicyImplementation, /exact immutable published state/);
   assert.match(draftPolicyImplementation, /provenance marker does not match/);
   assert.match(draftPolicyImplementation, /foreign release asset/);
   assert.match(signing, /gh release download[\s\S]*--pattern "Seer-v\$\{VERSION\}-arm64\.dmg"[\s\S]*--pattern "SHA256SUMS"[\s\S]*--pattern "release-manifest\.json"/);
@@ -323,4 +324,29 @@ test("release lock is always relinquished and governance identity is protected-e
     /--method DELETE[\s\S]*git\/refs\/tags\/\$\{LOCK_REF_NAME\}/,
   );
   assert.match(draftPolicyImplementation, /post-publish release state/);
+});
+
+test("source and destination tags remain cryptographically bound at publication", () => {
+  const signing = jobBlock("sign-and-release");
+  const approval = signing.indexOf("Enforce protected release gates before any secret");
+  const sourceVerification = signing.indexOf("Verify source tag still resolves to the attested commit");
+  const signingStep = signing.indexOf("Sign and notarize attested input");
+  const publishStep = stepBlocks(signing).find((step) =>
+    step.includes("release-macos-draft.sh publish"),
+  );
+
+  assert.ok(approval !== -1 && approval < sourceVerification && sourceVerification < signingStep);
+  assert.match(
+    signing.slice(sourceVerification, signingStep),
+    /SOURCE_GITHUB_TOKEN: \$\{\{ github\.token \}\}/,
+  );
+  assert.match(
+    signing.slice(sourceVerification, signingStep),
+    /release-macos-draft\.sh verify-source-tag/,
+  );
+  assert.ok(publishStep);
+  assert.match(publishStep, /SOURCE_GITHUB_TOKEN: \$\{\{ github\.token \}\}/);
+  assert.match(draftPolicySource, /resolve_remote_tag_commit/);
+  assert.match(draftPolicySource, /destination tag collision/);
+  assert.match(draftStateHelperSource, /target_commitish/);
 });

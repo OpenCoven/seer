@@ -20,6 +20,7 @@ const workflowRun = required("WORKFLOW_RUN");
 const workflowAttempt = required("WORKFLOW_ATTEMPT");
 const version = required("VERSION");
 const destinationRepository = required("GH_REPO");
+const destinationAnchorCommit = process.env.DESTINATION_ANCHOR_COMMIT;
 const releaseWriter = {
   id: Number(required("RELEASE_WRITER_ID")),
   login: required("RELEASE_WRITER_LOGIN"),
@@ -94,6 +95,7 @@ function parseMetadata(value, { requireComplete, expectedDraft }) {
     tag_name: tagName,
     name: title,
     body,
+    target_commitish: targetCommitish,
     updated_at: updatedAt,
     author,
     assets,
@@ -107,6 +109,7 @@ function parseMetadata(value, { requireComplete, expectedDraft }) {
     typeof tagName !== "string" ||
     typeof title !== "string" ||
     typeof body !== "string" ||
+    typeof targetCommitish !== "string" ||
     typeof updatedAt !== "string" ||
     updatedAt.length === 0 ||
     !Array.isArray(assets)
@@ -119,6 +122,12 @@ function parseMetadata(value, { requireComplete, expectedDraft }) {
   if (prerelease !== false) fail("stable release workflow refuses prerelease metadata");
   if (!draft && !immutable) fail("published release is not protected by immutable releases");
   if (tagName !== sourceTag) fail(`draft release tag does not match ${sourceTag}`);
+  if (
+    !/^[0-9a-f]{40}$/.test(destinationAnchorCommit ?? "") ||
+    targetCommitish !== destinationAnchorCommit
+  ) {
+    fail("release target does not match the exact destination anchor commit");
+  }
   if (title !== expectedTitle) fail("release canonical title does not match");
   if (body.split("\n", 1)[0] !== expectedMarker) {
     fail("draft provenance marker does not match the source commit, tag, repository, and workflow");
@@ -174,6 +183,7 @@ function parseMetadata(value, { requireComplete, expectedDraft }) {
     tagName,
     title,
     body,
+    targetCommitish,
     updatedAt,
     author: normalizedAuthor,
     assets: normalizedAssets,
@@ -231,12 +241,13 @@ function validateLocal(metadata, localDir, localNotes, freshDownloads) {
 function validateStateShape(state) {
   if (
     !state ||
-    state.schema !== 3 ||
+    state.schema !== 4 ||
     state.repository !== destinationRepository ||
     !Number.isSafeInteger(state.releaseId) ||
     state.releaseId <= 0 ||
     typeof state.updatedAt !== "string" ||
     state.tagName !== sourceTag ||
+    state.destinationAnchorCommit !== destinationAnchorCommit ||
     state.title !== expectedTitle ||
     state.body !== expectedBody ||
     state.prerelease !== false ||
@@ -270,6 +281,7 @@ function compareCanonical(metadata, local, state, { compareUpdatedAt, context })
   if (metadata.id !== state.releaseId) fail(`${context} release ID changed after verification`);
   if (
     metadata.tagName !== state.tagName ||
+    metadata.targetCommitish !== state.destinationAnchorCommit ||
     metadata.title !== state.title ||
     metadata.body !== state.body ||
     metadata.prerelease !== state.prerelease ||
@@ -316,14 +328,15 @@ function runValidateNotes() {
 }
 
 function runCapture() {
-  const metadata = readMetadata(metadataPath, { requireComplete: true, expectedDraft: true });
+  const metadata = readMetadata(metadataPath, { requireComplete: true });
   const local = validateLocal(metadata, releaseDir, notesPath, downloadsDir);
   const state = {
-    schema: 3,
+    schema: 4,
     repository: destinationRepository,
     releaseId: metadata.id,
     updatedAt: metadata.updatedAt,
     tagName: metadata.tagName,
+    destinationAnchorCommit,
     title: metadata.title,
     body: metadata.body,
     prerelease: metadata.prerelease,
@@ -347,6 +360,11 @@ function runCompare({ published }) {
     context: published ? "post-publish release state" : "pre-publish release state",
   });
   process.stdout.write(`${state.releaseId}\n`);
+}
+
+function runVerifyPublishedLocal() {
+  const metadata = readMetadata(metadataPath, { requireComplete: true, expectedDraft: false });
+  validateLocal(metadata, releaseDir, notesPath, downloadsDir);
 }
 
 async function runIdentity() {
@@ -385,6 +403,20 @@ async function runRef() {
     fail("Git reference has an invalid shape");
   }
   process.stdout.write(`${ref.object.type}\n${ref.object.sha}\n`);
+}
+
+async function runTagTarget() {
+  const tag = await readStdinJSON("annotated Git tag");
+  if (
+    !tag ||
+    !/^[0-9a-f]{40}$/.test(tag.sha) ||
+    !tag.object ||
+    !["commit", "tag"].includes(tag.object.type) ||
+    !/^[0-9a-f]{40}$/.test(tag.object.sha)
+  ) {
+    fail("annotated Git tag has an invalid target");
+  }
+  process.stdout.write(`${tag.object.type}\n${tag.object.sha}\n`);
 }
 
 async function runLockTag() {
@@ -524,6 +556,9 @@ try {
     case "compare-published":
       runCompare({ published: true });
       break;
+    case "verify-published-local":
+      runVerifyPublishedLocal();
+      break;
     case "identity":
       await runIdentity();
       break;
@@ -535,6 +570,9 @@ try {
       break;
     case "ref":
       await runRef();
+      break;
+    case "tag-target":
+      await runTagTarget();
       break;
     case "lock-tag":
       await runLockTag();
@@ -551,7 +589,8 @@ try {
     default:
       fail(
         "usage: release-macos-draft-state.mjs inspect|downloads|validate-notes|capture|compare|" +
-          "compare-published|identity|repository|immutable|ref|lock-tag|lock-owner|run-status|commit",
+          "compare-published|verify-published-local|identity|repository|immutable|ref|tag-target|" +
+          "lock-tag|lock-owner|run-status|commit",
       );
   }
 } catch (error) {

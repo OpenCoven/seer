@@ -453,6 +453,21 @@ jobs:
           }
           printf 'signing-runner-id=%s\n' "${SIGNING_RUNNER_ID}" >> "${GITHUB_OUTPUT}"
 
+      - name: Verify source tag still resolves to the attested commit
+        env:
+          SOURCE_GITHUB_TOKEN: ${{ github.token }}
+          GH_REPO: OpenCoven/seer-releases
+          RELEASE_WRITER_LOGIN: ${{ vars.RELEASE_WRITER_LOGIN }}
+          RELEASE_WRITER_ID: ${{ vars.RELEASE_WRITER_ID }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          SOURCE_TAG: ${{ github.ref_name }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_RUN: ${{ github.run_id }}
+          WORKFLOW_ATTEMPT: ${{ github.run_attempt }}
+        run: bash scripts/release-macos-draft.sh verify-source-tag
+
       # No dependency install or build command runs in this job. The signing-only
       # script permits only fixed system tools while credentials exist, destroys
       # its temporary keychain and notarization material, and only then invokes
@@ -519,6 +534,16 @@ jobs:
           chmod 0644 "${notes_path}"
           printf 'path=%s\n' "${notes_path}" >> "${GITHUB_OUTPUT}"
 
+      - name: Create published-retry verification directory
+        id: published-retry-state
+        run: |
+          set -euo pipefail
+          state_dir="${RUNNER_TEMP}/seer-published-retry-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          [[ ! -e "${state_dir}" && ! -L "${state_dir}" ]]
+          umask 077
+          mkdir "${state_dir}"
+          printf 'directory=%s\n' "${state_dir}" >> "${GITHUB_OUTPUT}"
+
       - name: Create or resume draft and upload only public assets
         env:
           GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
@@ -534,6 +559,7 @@ jobs:
           WORKFLOW_ATTEMPT: ${{ github.run_attempt }}
           RELEASE_BODY: ${{ steps.release-notes.outputs.path }}
           RELEASE_DIR: build/macos/release
+          STATE_WORK_DIR: ${{ steps.published-retry-state.outputs.directory }}
         run: bash scripts/release-macos-draft.sh upload
 
       - name: Create fresh public-asset verification directory
@@ -652,6 +678,7 @@ jobs:
       - name: Publish only the verified draft
         env:
           GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          SOURCE_GITHUB_TOKEN: ${{ github.token }}
           GH_REPO: OpenCoven/seer-releases
           RELEASE_WRITER_LOGIN: ${{ vars.RELEASE_WRITER_LOGIN }}
           RELEASE_WRITER_ID: ${{ vars.RELEASE_WRITER_ID }}
