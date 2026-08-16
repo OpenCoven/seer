@@ -467,7 +467,7 @@ test("a scheduled check that fires during stream persistence is retried later wi
   globalThis.setTimeout = ((callback: (...args: never[]) => void) => {
     scheduled = callback;
     return { unref() {} } as ReturnType<typeof setTimeout>;
-  }) as typeof setTimeout;
+  }) as unknown as typeof setTimeout;
   globalThis.clearTimeout = (() => undefined) as typeof clearTimeout;
 
   try {
