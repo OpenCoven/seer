@@ -76,6 +76,15 @@ type ValidRelease = {
   version: SemanticVersion;
 };
 
+type StreamTransition = {
+  target: boolean;
+  previousSelection: boolean;
+  previousState: UpdateState;
+  previousStableEtag: string | null;
+  previousPrereleaseEtag: string | null;
+  generation: number;
+};
+
 export class UpdateCheckError extends Error {
   constructor(message: string) {
     super(message);
@@ -247,6 +256,9 @@ export class UpdateService {
   // prerelease updates are enabled) completes after a newer one and would
   // otherwise clobber its result with stale data.
   private generation = 0;
+  // Installed synchronously before settings persistence starts. While this is
+  // present, no ordinary or scheduled check may select either release stream.
+  private streamTransition: StreamTransition | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private started = false;
   private lastAttemptCompletedAt: number | null = null;
@@ -285,6 +297,8 @@ export class UpdateService {
   }
 
   async check(options: { force?: boolean } = {}): Promise<UpdateState> {
+    if (this.streamTransition) return this.getState();
+
     const startedAt = this.now();
     if (
       !options.force &&
@@ -303,9 +317,11 @@ export class UpdateService {
     // prematurely flipping `checking` back off on this newer call's
     // behalf.
     const myGeneration = ++this.generation;
-    const isCurrent = () => this.generation === myGeneration;
-
     const includePrerelease = this.settings.get().includePrereleaseUpdates;
+    const isCurrent = () =>
+      this.generation === myGeneration &&
+      this.streamTransition === null &&
+      this.settings.get().includePrereleaseUpdates === includePrerelease;
     const streamEtag = includePrerelease ? this.prereleaseEtag : this.stableEtag;
     const headers: Record<string, string> = {
       Accept: "application/vnd.github+json",
@@ -381,14 +397,20 @@ export class UpdateService {
   }
 
   async setIncludePrereleaseUpdates(value: boolean): Promise<UpdateState> {
-    // Bump the generation and invalidate the stream ETags/state *before* the
-    // first await, not after. This closes two related races: (1) any check()
-    // already in flight for the stream we're switching away from can never
-    // resolve into `isCurrent()` and clobber the state we're about to clear,
-    // and (2) if persistence below fails, the externally observable state is
-    // already the cleared/invalidated one rather than a stale, possibly
-    // stream-mismatched release held over from before the toggle.
-    this.generation += 1;
+    if (this.streamTransition) {
+      throw new UpdateCheckError("An update stream transition is already in progress");
+    }
+
+    const previousSelection = this.settings.get().includePrereleaseUpdates;
+    const transition: StreamTransition = {
+      target: value,
+      previousSelection,
+      previousState: { ...this.state, checking: false },
+      previousStableEtag: this.stableEtag,
+      previousPrereleaseEtag: this.prereleaseEtag,
+      generation: ++this.generation,
+    };
+    this.streamTransition = transition;
     this.stableEtag = null;
     this.prereleaseEtag = null;
     this.state = {
@@ -399,15 +421,63 @@ export class UpdateService {
     };
     this.publish();
 
-    // `settings.setIncludePrereleaseUpdates` (SettingsStore) only commits its
-    // own cache once the write to disk succeeds, so on failure `settings.get()`
-    // keeps reporting the *old* value. Propagating the rejection here (instead
-    // of swallowing it and calling `check()`) means a failed persist never
-    // starts a new check — the invalidated stream state above stays paired
-    // with that unchanged old setting, rather than presenting a
-    // half-toggled, self-contradictory snapshot.
-    await this.settings.setIncludePrereleaseUpdates(value);
+    try {
+      await this.settings.setIncludePrereleaseUpdates(value);
+    } catch (error) {
+      const authoritativeSelection = this.settings.get().includePrereleaseUpdates;
+      if (
+        this.streamTransition === transition &&
+        this.generation === transition.generation
+      ) {
+        this.generation += 1;
+        this.streamTransition = null;
+        if (authoritativeSelection === transition.previousSelection) {
+          this.stableEtag = transition.previousStableEtag;
+          this.prereleaseEtag = transition.previousPrereleaseEtag;
+          this.state = transition.previousState;
+        } else {
+          this.stableEtag = null;
+          this.prereleaseEtag = null;
+          this.state = {
+            checking: false,
+            availableVersion: null,
+            releaseURL: null,
+            lastCheckedAt: null,
+          };
+        }
+        this.publish();
+      }
+      throw error;
+    }
 
+    const authoritativeSelection = this.settings.get().includePrereleaseUpdates;
+    if (
+      this.streamTransition !== transition ||
+      this.generation !== transition.generation ||
+      authoritativeSelection !== transition.target
+    ) {
+      if (this.streamTransition === transition) {
+        this.generation += 1;
+        this.streamTransition = null;
+        this.stableEtag = null;
+        this.prereleaseEtag = null;
+        this.state = {
+          checking: false,
+          availableVersion: null,
+          releaseURL: null,
+          lastCheckedAt: null,
+        };
+        this.publish();
+      }
+      throw new UpdateCheckError("The selected update stream changed during persistence");
+    }
+
+    // Clearing the marker, advancing the generation, and retaining the
+    // already-cleared state are one synchronous transition. The forced check
+    // starts immediately afterward and therefore can only select the newly
+    // persisted stream.
+    this.generation += 1;
+    this.streamTransition = null;
     return this.check({ force: true });
   }
 

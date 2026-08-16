@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { setImmediate } from "node:timers";
 
 import {
   CHECK_INTERVAL_MS,
@@ -87,10 +88,18 @@ function makeHarness(options: {
 /// flight, with full control over which one's network response lands
 /// first, second, etc. — something `makeHarness`'s immediately-resolving
 /// `fetchImpl` cannot express.
-function makeDeferredHarness(options: { includePrereleaseUpdates?: boolean } = {}) {
+function makeDeferredHarness(options: {
+  includePrereleaseUpdates?: boolean;
+  suspendPersistence?: boolean;
+} = {}) {
   let now = 1_700_000_000_000;
   const calls: FetchCall[] = [];
   const deferred: Array<{ resolve: (response: Response) => void; reject: (error: unknown) => void }> = [];
+  const persistence: Array<{
+    value: boolean;
+    resolve: () => void;
+    reject: (error: unknown) => void;
+  }> = [];
   let settings: UpdateSettings = {
     includePrereleaseUpdates: options.includePrereleaseUpdates ?? false,
   };
@@ -106,6 +115,19 @@ function makeDeferredHarness(options: { includePrereleaseUpdates?: boolean } = {
     settings: {
       get: () => settings,
       setIncludePrereleaseUpdates: async (value) => {
+        if (options.suspendPersistence) {
+          await new Promise<void>((resolve, reject) => {
+            persistence.push({
+              value,
+              resolve: () => {
+                settings = { includePrereleaseUpdates: value };
+                resolve();
+              },
+              reject,
+            });
+          });
+          return settings;
+        }
         settings = { includePrereleaseUpdates: value };
         return settings;
       },
@@ -122,6 +144,16 @@ function makeDeferredHarness(options: { includePrereleaseUpdates?: boolean } = {
     },
     resolve(callIndex: number, response: Response) {
       deferred[callIndex]!.resolve(response);
+    },
+    reject(callIndex: number, error: unknown) {
+      deferred[callIndex]!.reject(error);
+    },
+    persistence,
+    resolvePersistence(callIndex: number) {
+      persistence[callIndex]!.resolve();
+    },
+    rejectPersistence(callIndex: number, error: unknown) {
+      persistence[callIndex]!.reject(error);
     },
     advance(milliseconds: number) {
       now += milliseconds;
@@ -305,7 +337,7 @@ test("toggling prereleases persists, clears stream cache, and forces one check",
   assert.equal(state.availableVersion, "v2.0.0-beta.1");
 });
 
-test("a failed settings persistence while toggling prereleases invalidates stream state without starting a new check, and a later successful toggle still works", async () => {
+test("a failed settings persistence restores stream state without starting a new check, and a later successful toggle still works", async () => {
   const harness = makeHarness({
     responses: [
       Response.json(release(), { headers: { ETag: '"stable"' } }),
@@ -326,23 +358,143 @@ test("a failed settings persistence while toggling prereleases invalidates strea
   assert.equal(harness.service.includesPrereleaseUpdates(), false);
   // A failed persist must never itself kick off a new check.
   assert.equal(harness.calls.length, 1);
-  // Stream state was invalidated rather than silently retaining the old
-  // stable release — paired with the still-unchanged old setting above,
-  // this is never a self-contradictory snapshot (e.g. a stale prerelease
-  // release surviving alongside `includePrereleaseUpdates: false`).
-  assert.deepEqual(harness.service.getState(), {
-    checking: false,
-    availableVersion: null,
-    releaseURL: null,
-    lastCheckedAt: null,
-  });
-  assert.notDeepEqual(harness.service.getState(), before);
+  // The old stable state remains coherent with the setting that survived the
+  // failed write, and its stream ETag is available to later stable checks.
+  assert.deepEqual(harness.service.getState(), before);
 
   harness.clearPersistFailure();
   const state = await harness.service.setIncludePrereleaseUpdates(true);
   assert.equal(harness.service.includesPrereleaseUpdates(), true);
   assert.equal(harness.calls.length, 2);
   assert.equal(state.availableVersion, "v2.0.0-beta.1");
+});
+
+test("a check started during suspended persistence cannot fetch the old stream or revive it after the forced new-stream check fails", async () => {
+  const harness = makeDeferredHarness({ suspendPersistence: true });
+
+  const oldStableCheck = harness.service.check({ force: true });
+  assert.equal(harness.calls.length, 1);
+
+  const toggle = harness.service.setIncludePrereleaseUpdates(true);
+  assert.equal(harness.persistence.length, 1, "the transition marker must be installed before persistence suspends");
+
+  const duringTransition = await harness.service.check({ force: true });
+  assert.equal(harness.calls.length, 1, "an external check must not fetch the old stream during persistence");
+  assert.deepEqual(duringTransition, {
+    checking: false,
+    availableVersion: null,
+    releaseURL: null,
+    lastCheckedAt: null,
+  });
+
+  harness.resolvePersistence(0);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(harness.settings().includePrereleaseUpdates, true);
+  assert.equal(harness.calls.length, 2, "successful persistence must force exactly one new-stream check");
+  assert.match(harness.calls[1]!.url, /releases\?per_page=20$/);
+  harness.reject(1, new Error("prerelease feed unavailable"));
+  await assert.rejects(() => toggle, /prerelease feed unavailable/);
+
+  harness.resolve(
+    0,
+    Response.json(release("v1.2.0"), { headers: { ETag: '"stable-must-not-survive"' } }),
+  );
+  await oldStableCheck;
+
+  assert.equal(harness.settings().includePrereleaseUpdates, true);
+  assert.deepEqual(harness.service.getState(), {
+    checking: false,
+    availableVersion: null,
+    releaseURL: null,
+    lastCheckedAt: null,
+  });
+
+  const recovery = harness.service.check({ force: true });
+  assert.equal(harness.calls.length, 3);
+  assert.match(harness.calls[2]!.url, /releases\?per_page=20$/);
+  assert.equal(
+    (harness.calls[2]!.init?.headers as Record<string, string>)["If-None-Match"],
+    undefined,
+    "neither the stale stable ETag nor a failed prerelease request may survive",
+  );
+  harness.resolve(
+    2,
+    Response.json([
+      release("v2.0.0-beta.2", "https://github.com/OpenCoven/seer/releases/tag/v2.0.0-beta.2", false, true),
+    ]),
+  );
+  assert.equal((await recovery).availableVersion, "v2.0.0-beta.2");
+});
+
+test("a failed suspended persistence restores the prior coherent stream and permits recovery checks", async () => {
+  const harness = makeDeferredHarness({ suspendPersistence: true });
+  const initial = harness.service.check({ force: true });
+  harness.resolve(
+    0,
+    Response.json(release("v1.2.0"), { headers: { ETag: '"stable-restored"' } }),
+  );
+  const priorState = await initial;
+
+  const toggle = harness.service.setIncludePrereleaseUpdates(true);
+  assert.deepEqual(harness.service.getState(), {
+    checking: false,
+    availableVersion: null,
+    releaseURL: null,
+    lastCheckedAt: null,
+  });
+  harness.rejectPersistence(0, new Error("disk full"));
+  await assert.rejects(() => toggle, /disk full/);
+
+  assert.equal(harness.settings().includePrereleaseUpdates, false);
+  assert.deepEqual(harness.service.getState(), priorState);
+
+  const recovery = harness.service.check({ force: true });
+  assert.equal(harness.calls.length, 2);
+  assert.match(harness.calls[1]!.url, /releases\/latest$/);
+  assert.equal(
+    (harness.calls[1]!.init?.headers as Record<string, string>)["If-None-Match"],
+    '"stable-restored"',
+  );
+  harness.resolve(1, new Response(null, { status: 304 }));
+  await recovery;
+});
+
+test("a scheduled check that fires during stream persistence is retried later without fetching the old stream", async () => {
+  const harness = makeDeferredHarness({ suspendPersistence: true });
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  let scheduled: (() => void) | null = null;
+  globalThis.setTimeout = ((callback: (...args: never[]) => void) => {
+    scheduled = callback;
+    return { unref() {} } as ReturnType<typeof setTimeout>;
+  }) as typeof setTimeout;
+  globalThis.clearTimeout = (() => undefined) as typeof clearTimeout;
+
+  try {
+    const started = harness.service.start();
+    harness.resolve(0, Response.json(release("v1.2.0")));
+    await started;
+    assert.ok(scheduled);
+
+    const toggle = harness.service.setIncludePrereleaseUpdates(true);
+    const fired = scheduled as () => void;
+    fired();
+    await Promise.resolve();
+    assert.equal(harness.calls.length, 1, "the scheduled callback must not fetch while persistence is active");
+
+    harness.resolvePersistence(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(harness.calls.length, 2);
+    harness.resolve(1, Response.json([]));
+    await toggle;
+    await Promise.resolve();
+
+    assert.ok(scheduled, "the scheduler must remain armed after the skipped transition-time check");
+  } finally {
+    harness.service.stop();
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
+  }
 });
 
 test("network failures are typed and retain the last valid state", async () => {
