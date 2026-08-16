@@ -1,7 +1,8 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 
 import { logger } from "@glaze/core/backend";
@@ -38,8 +39,15 @@ const execFileAsync = promisify(execFile);
  */
 const MAX_SESSION_WALK_DEPTH = 5;
 const MAX_SESSION_FILES_PER_ROOT = 400;
+export const MAX_SESSION_INSPECTED_ENTRIES_PER_ROOT = 2_048;
+export const MAX_SESSION_INSPECTED_DIRECTORIES_PER_ROOT = 128;
 const SESSION_TAIL_BYTES = 120_000;
 const CODEX_HEAD_SCAN_BYTES = 32_000;
+const CURSOR_MAX_ACTIVE_CANDIDATES = 200;
+const CURSOR_MAX_KEY_BYTES = 4_096;
+const CURSOR_MAX_VALUE_BYTES = 4_000_000;
+const CURSOR_MAX_ROW_BYTES = CURSOR_MAX_KEY_BYTES + CURSOR_MAX_VALUE_BYTES + 1_024;
+const CURSOR_QUERY_TIMEOUT_MS = 4_000;
 
 /**
  * EXPERIMENTAL Raycast AI log hack (not a supported API).
@@ -109,31 +117,63 @@ async function listProcesses(): Promise<ProcessHit[]> {
   }
 }
 
-async function walkRecentSessions(
+type SessionWalkResult = {
+  candidates: SessionCandidate[];
+  inspectedEntries: number;
+  inspectedDirectories: number;
+};
+
+export async function walkRecentSessionsWithStats(
   root: string,
   extensions: string[],
   now: number,
   fileNames?: string[],
-): Promise<SessionCandidate[]> {
+): Promise<SessionWalkResult> {
   const hits: SessionCandidate[] = [];
+  const budget = {
+    inspectedEntries: 0,
+    inspectedDirectories: 0,
+  };
+
+  function retainRecent(candidate: SessionCandidate): void {
+    if (hits.length < MAX_SESSION_FILES_PER_ROOT) {
+      hits.push(candidate);
+      return;
+    }
+    let oldestIndex = 0;
+    for (let index = 1; index < hits.length; index += 1) {
+      if (hits[index]!.mtimeMs < hits[oldestIndex]!.mtimeMs) oldestIndex = index;
+    }
+    if (candidate.mtimeMs > hits[oldestIndex]!.mtimeMs) hits[oldestIndex] = candidate;
+  }
 
   async function walk(dir: string, depth: number): Promise<void> {
-    if (hits.length >= MAX_SESSION_FILES_PER_ROOT) return;
     if (depth > MAX_SESSION_WALK_DEPTH) return;
+    if (budget.inspectedEntries >= MAX_SESSION_INSPECTED_ENTRIES_PER_ROOT) return;
+    if (budget.inspectedDirectories >= MAX_SESSION_INSPECTED_DIRECTORIES_PER_ROOT) return;
 
-    let entries;
+    let directory;
     try {
-      entries = await fs.readdir(dir, { withFileTypes: true });
+      directory = await fs.opendir(dir);
     } catch {
       return;
     }
+    budget.inspectedDirectories += 1;
 
-    for (const entry of entries) {
-      if (hits.length >= MAX_SESSION_FILES_PER_ROOT) break;
+    for await (const entry of directory) {
+      if (budget.inspectedEntries >= MAX_SESSION_INSPECTED_ENTRIES_PER_ROOT) break;
+      budget.inspectedEntries += 1;
 
       const fullPath = path.join(dir, entry.name);
+      let stat;
+      try {
+        stat = await fs.lstat(fullPath);
+      } catch {
+        continue;
+      }
+      if (stat.isSymbolicLink()) continue;
 
-      if (entry.isDirectory()) {
+      if (stat.isDirectory()) {
         if (entry.name === "node_modules" || entry.name === ".git" || entry.name === "cache") {
           continue;
         }
@@ -143,34 +183,36 @@ async function walkRecentSessions(
         continue;
       }
 
-      if (!entry.isFile()) continue;
+      if (!stat.isFile()) continue;
       if (fileNames && !fileNames.includes(entry.name)) continue;
       if (!extensions.some((ext) => entry.name.endsWith(ext))) continue;
 
-      try {
-        const stat = await fs.stat(fullPath);
-        if (isRecentTimestamp(stat.mtimeMs, now, SESSION_CANDIDATE_WINDOW_MS)) {
-          hits.push({
-            filePath: fullPath,
-            mtimeMs: stat.mtimeMs,
-            label: friendlySessionLabel(fullPath),
-          });
-        }
-      } catch {
-        // ignore
+      if (isRecentTimestamp(stat.mtimeMs, now, SESSION_CANDIDATE_WINDOW_MS)) {
+        retainRecent({
+          filePath: fullPath,
+          mtimeMs: stat.mtimeMs,
+          label: friendlySessionLabel(fullPath),
+        });
       }
     }
   }
 
-  try {
-    await fs.access(root);
-  } catch {
-    return hits;
-  }
-
   await walk(root, 0);
   hits.sort((a, b) => b.mtimeMs - a.mtimeMs);
-  return hits;
+  return {
+    candidates: hits,
+    inspectedEntries: budget.inspectedEntries,
+    inspectedDirectories: budget.inspectedDirectories,
+  };
+}
+
+async function walkRecentSessions(
+  root: string,
+  extensions: string[],
+  now: number,
+  fileNames?: string[],
+): Promise<SessionCandidate[]> {
+  return (await walkRecentSessionsWithStats(root, extensions, now, fileNames)).candidates;
 }
 
 async function readSessionTailLines(filePath: string): Promise<unknown[]> {
@@ -281,8 +323,9 @@ type ActiveTurnHit = TurnAssessment & {
  * also inspect conversation headers for open turns and running tools.
  * Returns every active composer so concurrent agents all appear in the menu.
  */
-async function detectCursorComposerActivity(now: number): Promise<ActiveTurnHit[]> {
-  const dbPath = path.join(
+export async function detectCursorComposerActivity(
+  now: number,
+  dbPath = path.join(
     os.homedir(),
     "Library",
     "Application Support",
@@ -290,7 +333,8 @@ async function detectCursorComposerActivity(now: number): Promise<ActiveTurnHit[
     "User",
     "globalStorage",
     "state.vscdb",
-  );
+  ),
+): Promise<ActiveTurnHit[]> {
 
   try {
     await fs.access(dbPath);
@@ -298,82 +342,143 @@ async function detectCursorComposerActivity(now: number): Promise<ActiveTurnHit[
     return [];
   }
 
-  try {
-    // Read-only URI so Cursor can keep the DB open while we poll.
+  return new Promise((resolve) => {
     const dbUri = `file:${dbPath}?mode=ro`;
-    // Recent composers only — full blobs are small but no need to scan ancient chats.
-    const sinceMs = now - SESSION_CANDIDATE_WINDOW_MS;
-    const { stdout } = await execFileAsync(
+    const child = spawn(
       "/usr/bin/sqlite3",
       [
         "-readonly",
         "-json",
         dbUri,
         `SELECT key, value FROM cursorDiskKV
-         WHERE key LIKE 'composerData:%'
-           AND value IS NOT NULL
-           AND (
-             json_extract(value, '$.status') = 'generating'
-             OR json_extract(value, '$.isContinuationInProgress') = 1
-             OR json_array_length(COALESCE(json_extract(value, '$.generatingBubbleIds'), '[]')) > 0
-             OR COALESCE(json_extract(value, '$.conversationCheckpointLastUpdatedAt'), 0) >= ${sinceMs}
-             OR COALESCE(json_extract(value, '$.lastUpdatedAt'), 0) >= ${sinceMs}
-             OR COALESCE(json_extract(value, '$.createdAt'), 0) >= ${sinceMs}
-           )`,
+         WHERE key LIKE 'composerData:%'`,
       ],
-      {
-        timeout: 4_000,
-        maxBuffer: 8 * 1024 * 1024,
-        encoding: "utf-8",
-      },
+      { stdio: ["ignore", "pipe", "pipe"] },
     );
-
-    const trimmed = stdout.trim();
-    if (!trimmed || trimmed === "[]") return [];
-
-    let rows: Array<{ key?: string; value?: string }> = [];
-    try {
-      rows = JSON.parse(trimmed) as Array<{ key?: string; value?: string }>;
-    } catch (error) {
-      logger.debug("detector", "Failed to parse Cursor composer rows", { error });
-      return [];
-    }
-
     const active: ActiveTurnHit[] = [];
+    const decoder = new StringDecoder("utf8");
+    let pending = "";
+    let pendingBytes = 0;
+    let discardingOversizedLine = false;
+    let intentionallyStopped = false;
+    let timedOut = false;
+    let childError: Error | null = null;
+    let stderr = "";
 
-    for (const row of rows) {
-      if (typeof row.value !== "string" || !row.value) continue;
+    const parseRow = (line: string) => {
+      let encoded = line.trim();
+      if (encoded.startsWith("[")) encoded = encoded.slice(1);
+      if (encoded.endsWith("]")) encoded = encoded.slice(0, -1);
+      if (encoded.endsWith(",")) encoded = encoded.slice(0, -1);
+      if (!encoded) return;
 
-      let record: CursorComposerRecord;
+      let row: unknown;
       try {
-        record = JSON.parse(row.value) as CursorComposerRecord;
+        row = JSON.parse(encoded);
       } catch {
-        continue;
+        return;
+      }
+      if (!row || typeof row !== "object" || Array.isArray(row)) return;
+      const { key, value } = row as { key?: unknown; value?: unknown };
+      if (
+        typeof key !== "string" ||
+        !key.startsWith("composerData:") ||
+        Buffer.byteLength(key, "utf8") > CURSOR_MAX_KEY_BYTES ||
+        typeof value !== "string" ||
+        value.length === 0 ||
+        Buffer.byteLength(value, "utf8") > CURSOR_MAX_VALUE_BYTES
+      ) {
+        return;
       }
 
-      const assessment = assessCursorComposerRecord(record, now);
-      if (!assessment.active) continue;
+      let record: unknown;
+      try {
+        record = JSON.parse(value);
+      } catch {
+        return;
+      }
+      if (!record || typeof record !== "object" || Array.isArray(record)) return;
 
-      const composerKey =
-        typeof row.key === "string" && row.key.startsWith("composerData:")
-          ? row.key.slice("composerData:".length)
-          : typeof row.key === "string"
-            ? row.key
-            : `composer-${assessment.lastActivityAt}`;
-
+      const assessment = assessCursorComposerRecord(record as CursorComposerRecord, now);
+      if (!assessment.active) return;
       active.push({
         ...assessment,
         filePath: dbPath,
-        identity: composerKey,
+        identity: key.slice("composerData:".length),
       });
-    }
+      if (active.length >= CURSOR_MAX_ACTIVE_CANDIDATES) {
+        intentionallyStopped = true;
+        child.kill("SIGTERM");
+      }
+    };
 
-    active.sort((a, b) => b.lastActivityAt - a.lastActivityAt);
-    return active;
-  } catch (error) {
-    logger.debug("detector", "Failed to read Cursor composer state", { error });
-    return [];
-  }
+    const appendLineFragment = (fragment: string, lineEnded: boolean) => {
+      if (discardingOversizedLine) {
+        if (lineEnded) discardingOversizedLine = false;
+        return;
+      }
+      const fragmentBytes = Buffer.byteLength(fragment, "utf8");
+      if (pendingBytes + fragmentBytes > CURSOR_MAX_ROW_BYTES) {
+        pending = "";
+        pendingBytes = 0;
+        discardingOversizedLine = !lineEnded;
+        return;
+      }
+      pending += fragment;
+      pendingBytes += fragmentBytes;
+      if (lineEnded) {
+        parseRow(pending);
+        pending = "";
+        pendingBytes = 0;
+      }
+    };
+
+    const consume = (text: string) => {
+      let offset = 0;
+      while (offset < text.length) {
+        const newline = text.indexOf("\n", offset);
+        if (newline === -1) {
+          appendLineFragment(text.slice(offset), false);
+          return;
+        }
+        appendLineFragment(text.slice(offset, newline), true);
+        offset = newline + 1;
+      }
+    };
+
+    child.stdout.on("data", (chunk: Buffer) => consume(decoder.write(chunk)));
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => {
+      if (stderr.length < 8_192) stderr += chunk.slice(0, 8_192 - stderr.length);
+    });
+    child.once("error", (error) => {
+      childError = error;
+    });
+
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, CURSOR_QUERY_TIMEOUT_MS);
+    timeout.unref?.();
+
+    child.once("close", (code, signal) => {
+      clearTimeout(timeout);
+      consume(decoder.end());
+      if (pendingBytes > 0 && !discardingOversizedLine) parseRow(pending);
+      if (childError || timedOut || (!intentionallyStopped && code !== 0)) {
+        logger.debug("detector", "Failed to read Cursor composer state", {
+          error: childError,
+          code,
+          signal,
+          stderr,
+        });
+        resolve([]);
+        return;
+      }
+      active.sort((a, b) => b.lastActivityAt - a.lastActivityAt);
+      resolve(active);
+    });
+  });
 }
 
 type RaycastChatEvent = {

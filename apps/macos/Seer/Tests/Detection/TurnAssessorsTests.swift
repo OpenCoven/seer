@@ -701,6 +701,29 @@ final class TurnAssessorsTests: XCTestCase {
         XCTAssertEqual(assessment.reason, "user prompt")
     }
 
+    func testCursorContinuationBooleanAcceptsOnlyActualCFBooleanValues() {
+        XCTAssertEqual(strictCursorBoolean(true), true)
+        XCTAssertEqual(strictCursorBoolean(false), false)
+        XCTAssertNil(strictCursorBoolean(NSNumber(value: 1)))
+        XCTAssertNil(strictCursorBoolean(NSNumber(value: 0)))
+    }
+
+    func testNumericContinuationFlagWithoutTimestampCannotBecomeRecentlyActive() {
+        let now: Int64 = 1_786_449_620_000
+        let assessment = assessCursorComposerRecord(
+            [
+                "status": "completed",
+                "isContinuationInProgress": NSNumber(value: 1),
+                "fullConversationHeadersOnly": [],
+            ],
+            now: now
+        )
+
+        XCTAssertFalse(assessment.active)
+        XCTAssertEqual(assessment.reason, "completed")
+        XCTAssertNotEqual(assessment.lastActivityAt, now)
+    }
+
     func testAssessCodexTurnDistinguishesApprovalFromCompletion() {
         let cwdPayload: JSONObject = ["cwd": "/tmp/seer-fixtures/codex-boundary-project"]
         let started: JSONObject = [

@@ -149,6 +149,54 @@ final class SessionSnapshotSourceTests: XCTestCase {
         XCTAssertEqual(sessionMaximumFilesPerRoot, 400)
     }
 
+    func testCollectCandidatesBoundsAllInspectedEntriesInAHugeSingleDirectory() throws {
+        let base = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: base) }
+
+        for index in 0..<600 {
+            let active = base.appendingPathComponent(String(format: "active-%05d.jsonl", index))
+            write("{}", to: active)
+            setModificationDate(Date(timeIntervalSince1970: Double(fixedNow) / 1000), at: active)
+        }
+        for index in 0..<(sessionMaximumInspectedEntriesPerRoot - 100) {
+            write("ignored", to: base.appendingPathComponent(String(format: "unrelated-%05d.txt", index)))
+        }
+
+        let result = SessionSnapshotSource.collectCandidatesWithStats(
+            root: base.path,
+            extensions: [".jsonl"],
+            fileNames: nil,
+            now: fixedNow
+        )
+
+        XCTAssertEqual(result.inspectedEntries, sessionMaximumInspectedEntriesPerRoot)
+        XCTAssertEqual(result.inspectedDirectories, 1)
+        XCTAssertFalse(result.candidates.isEmpty)
+        XCTAssertLessThanOrEqual(result.candidates.count, sessionMaximumFilesPerRoot)
+    }
+
+    func testCollectCandidatesBoundsInspectedDirectoriesIndependently() throws {
+        let base = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: base) }
+
+        for index in 0..<(sessionMaximumInspectedDirectoriesPerRoot + 50) {
+            try FileManager.default.createDirectory(
+                at: base.appendingPathComponent(String(format: "directory-%05d", index)),
+                withIntermediateDirectories: false
+            )
+        }
+
+        let result = SessionSnapshotSource.collectCandidatesWithStats(
+            root: base.path,
+            extensions: [".jsonl"],
+            fileNames: nil,
+            now: fixedNow
+        )
+
+        XCTAssertEqual(result.inspectedDirectories, sessionMaximumInspectedDirectoriesPerRoot)
+        XCTAssertLessThanOrEqual(result.inspectedEntries, sessionMaximumInspectedEntriesPerRoot)
+    }
+
     func testCollectCandidatesAllowsOnlyBoundedFutureMtimeSkew() throws {
         let base = makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: base) }
@@ -604,6 +652,34 @@ final class SessionSnapshotSourceTests: XCTestCase {
         let evidence = try await NativeSessionSnapshotSource(homeDirectory: home).snapshot(now: fixedNow)
 
         XCTAssertTrue(evidence.filter { $0.family == .cursor }.isEmpty)
+    }
+
+    func testCursorMalformedAndStalePrefixesBeyondFormerRawCapDoNotHideActiveComposer() async throws {
+        let home = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let dbURL = home
+            .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+        makeEmptyCursorFixtureDatabase(at: dbURL)
+
+        for index in 0..<205 {
+            let value = index.isMultiple(of: 2)
+                ? #"{"status":"#
+                : #"{"status":"completed","lastUpdatedAt":0}"#
+            insertCursorFixtureRecord(
+                at: dbURL,
+                key: String(format: "composerData:a-%03d", index),
+                value: value
+            )
+        }
+        insertCursorFixtureRecord(
+            at: dbURL,
+            key: "composerData:z-active",
+            value: #"{"status":"generating","lastUpdatedAt":1700000000000}"#
+        )
+
+        let evidence = try await NativeSessionSnapshotSource(homeDirectory: home).snapshot(now: fixedNow)
+
+        XCTAssertEqual(evidence.filter { $0.family == .cursor }.map(\.identity), ["z-active"])
     }
 
     func testCursorOversizedRowsAreSkippedAndSQLLikeStringsRemainPlainData() async throws {

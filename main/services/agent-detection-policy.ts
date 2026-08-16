@@ -807,10 +807,13 @@ export function assessCursorComposerRecord(
   const generatingIds = Array.isArray(record.generatingBubbleIds) ? record.generatingBubbleIds : [];
   const continuation = record.isContinuationInProgress === true;
   const label = cursorProjectLabel(record);
+  const malformedContinuation =
+    record.isContinuationInProgress !== undefined &&
+    typeof record.isContinuationInProgress !== "boolean";
 
   let lastActivityAt = parseTimestamp(
     record.conversationCheckpointLastUpdatedAt ?? record.lastUpdatedAt ?? record.createdAt,
-    now,
+    malformedContinuation ? 0 : now,
   );
 
   if (status === "generating" || continuation || generatingIds.length > 0) {

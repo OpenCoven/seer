@@ -23,7 +23,7 @@
     "type-check:standalone": "tsc -p tsconfig.standalone.json --noEmit",
     "format": "node glaze.ts format",
     "test": "node --test --test-concurrency=1 tests/*.test.mjs",
-    "test:renderer": "tsx --test renderer/**/*.test.ts main/services/update-check.test.ts"
+    "test:renderer": "tsx --test renderer/**/*.test.ts main/services/*.test.ts"
   },
   "dependencies": {
     "@radix-ui/colors": "^3.0.0",

@@ -36,8 +36,13 @@ public protocol SessionSnapshotProviding: Sendable {
 /// Maximum recursion depth walked beneath each configured session root.
 public let sessionMaximumWalkDepth = 5
 /// Maximum number of candidate files collected per configured root before
-/// traversal of that root stops early.
+/// older candidates are discarded.
 public let sessionMaximumFilesPerRoot = 400
+/// Maximum directory entries inspected per root, including stale, unrelated,
+/// malformed, and excluded entries.
+public let sessionMaximumInspectedEntriesPerRoot = 2_048
+/// Maximum directories opened per root, independently of the entry limit.
+public let sessionMaximumInspectedDirectoriesPerRoot = 128
 /// Maximum number of freshest candidates actually assessed (opened/read) per
 /// family, across all of that family's configured roots combined.
 public let sessionMaximumAssessedCandidates = 24
@@ -49,10 +54,9 @@ public let sessionTailReadBytes = 120_000
 public let codexHeadReadBytes = 32_000
 
 private let sessionSkippedDirectoryNames: Set<String> = [".git", "node_modules", "cache", "subagents"]
-/// Bounds how many Cursor composer rows are inspected per scan — composer
-/// blobs are individually small, but the table can accumulate a very large
-/// history over time.
-private let cursorMaximumRows = 200
+/// Bounds retained active Cursor composers after each row has independently
+/// passed key/value, JSON-shape, and activity validation.
+let cursorMaximumValidCandidates = 200
 /// Bounds composer identifiers before allocating Swift strings for untrusted keys.
 private let cursorMaximumKeyBytes = 4_096
 /// Bounds how large a single composer JSON blob this reader will parse,
@@ -61,6 +65,15 @@ private let cursorMaximumKeyBytes = 4_096
 private let cursorMaximumValueBytes = 4_000_000
 /// Keeps a locked live Cursor database from stalling the three-second scan loop.
 let cursorSQLiteBusyTimeoutMilliseconds: Int32 = 100
+let cursorSQLiteQueryDeadlineMilliseconds = 4_000
+
+private final class CursorSQLiteDeadline {
+    let uptime: TimeInterval
+
+    init(millisecondsFromNow: Int) {
+        uptime = ProcessInfo.processInfo.systemUptime + Double(millisecondsFromNow) / 1_000
+    }
+}
 
 /// Operational SQLite failures propagate through `AgentDetector` so
 /// `AgentMonitor` retains its last good state and publishes a scan diagnostic.
@@ -84,6 +97,17 @@ struct SessionCandidate: Equatable {
     let path: String
     let mtimeMs: Int64
     let label: String
+}
+
+struct SessionCandidateScanResult {
+    let candidates: [SessionCandidate]
+    let inspectedEntries: Int
+    let inspectedDirectories: Int
+}
+
+private struct SessionTraversalBudget {
+    var inspectedEntries = 0
+    var inspectedDirectories = 0
 }
 
 /// Native, bounded session/transcript source. Canonicalizes every
@@ -179,10 +203,38 @@ enum SessionSnapshotSource {
         fileNames: [String]?,
         now: Int64
     ) -> [SessionCandidate] {
+        collectCandidatesWithStats(
+            root: root,
+            extensions: extensions,
+            fileNames: fileNames,
+            now: now
+        ).candidates
+    }
+
+    static func collectCandidatesWithStats(
+        root: String,
+        extensions: [String],
+        fileNames: [String]?,
+        now: Int64
+    ) -> SessionCandidateScanResult {
         var hits: [SessionCandidate] = []
-        walk(directory: root, depth: 0, root: root, extensions: extensions, fileNames: fileNames, now: now, hits: &hits)
+        var budget = SessionTraversalBudget()
+        walk(
+            directory: root,
+            depth: 0,
+            root: root,
+            extensions: extensions,
+            fileNames: fileNames,
+            now: now,
+            hits: &hits,
+            budget: &budget
+        )
         hits.sort { $0.mtimeMs > $1.mtimeMs }
-        return hits
+        return SessionCandidateScanResult(
+            candidates: hits,
+            inspectedEntries: budget.inspectedEntries,
+            inspectedDirectories: budget.inspectedDirectories
+        )
     }
 
     private static func walk(
@@ -192,17 +244,33 @@ enum SessionSnapshotSource {
         extensions: [String],
         fileNames: [String]?,
         now: Int64,
-        hits: inout [SessionCandidate]
+        hits: inout [SessionCandidate],
+        budget: inout SessionTraversalBudget
     ) {
-        guard hits.count < sessionMaximumFilesPerRoot else { return }
         guard depth <= sessionMaximumWalkDepth else { return }
+        guard budget.inspectedEntries < sessionMaximumInspectedEntriesPerRoot else { return }
+        guard budget.inspectedDirectories < sessionMaximumInspectedDirectoriesPerRoot else { return }
 
-        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: directory) else { return }
+        let directoryFD = directory.withCString {
+            open($0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        }
+        guard directoryFD >= 0 else { return }
+        guard let stream = fdopendir(directoryFD) else {
+            close(directoryFD)
+            return
+        }
+        defer { closedir(stream) }
+        budget.inspectedDirectories += 1
 
-        // Deterministic traversal order regardless of the filesystem's own
-        // (unspecified) directory-entry ordering.
-        for name in entries.sorted() {
-            guard hits.count < sessionMaximumFilesPerRoot else { return }
+        while let entry = readdir(stream) {
+            let name = withUnsafePointer(to: entry.pointee.d_name) { pointer in
+                pointer.withMemoryRebound(to: CChar.self, capacity: Int(MAXNAMLEN) + 1) {
+                    String(cString: $0)
+                }
+            }
+            if name == "." || name == ".." { continue }
+            guard budget.inspectedEntries < sessionMaximumInspectedEntriesPerRoot else { return }
+            budget.inspectedEntries += 1
             let fullPath = directory + "/" + name
 
             var entryStat = stat()
@@ -211,7 +279,16 @@ enum SessionSnapshotSource {
 
             if mode == S_IFDIR {
                 guard !sessionSkippedDirectoryNames.contains(name) else { continue }
-                walk(directory: fullPath, depth: depth + 1, root: root, extensions: extensions, fileNames: fileNames, now: now, hits: &hits)
+                walk(
+                    directory: fullPath,
+                    depth: depth + 1,
+                    root: root,
+                    extensions: extensions,
+                    fileNames: fileNames,
+                    now: now,
+                    hits: &hits,
+                    budget: &budget
+                )
                 continue
             }
 
@@ -227,7 +304,23 @@ enum SessionSnapshotSource {
             let mtimeMs = mtimeMilliseconds(from: entryStat)
             guard isRecentTimestamp(mtimeMs, now: now, within: sessionCandidateWindowMs) else { continue }
 
-            hits.append(SessionCandidate(path: fullPath, mtimeMs: mtimeMs, label: friendlySessionLabel(fullPath)))
+            retainRecentCandidate(
+                SessionCandidate(path: fullPath, mtimeMs: mtimeMs, label: friendlySessionLabel(fullPath)),
+                in: &hits
+            )
+        }
+    }
+
+    private static func retainRecentCandidate(_ candidate: SessionCandidate, in hits: inout [SessionCandidate]) {
+        if hits.count < sessionMaximumFilesPerRoot {
+            hits.append(candidate)
+            return
+        }
+        guard let oldestIndex = hits.indices.min(by: { hits[$0].mtimeMs < hits[$1].mtimeMs }) else {
+            return
+        }
+        if candidate.mtimeMs > hits[oldestIndex].mtimeMs {
+            hits[oldestIndex] = candidate
         }
     }
 
@@ -514,11 +607,24 @@ enum SessionSnapshotSource {
             }
         }
 
+        let deadline = Unmanaged.passRetained(
+            CursorSQLiteDeadline(millisecondsFromNow: cursorSQLiteQueryDeadlineMilliseconds)
+        )
+        sqlite3_progress_handler(db, 1_000, { context in
+            guard let context else { return 1 }
+            let deadline = Unmanaged<CursorSQLiteDeadline>
+                .fromOpaque(context)
+                .takeUnretainedValue()
+            return ProcessInfo.processInfo.systemUptime >= deadline.uptime ? 1 : 0
+        }, deadline.toOpaque())
+        defer {
+            sqlite3_progress_handler(db, 0, nil, nil)
+            deadline.release()
+        }
+
         let sql = """
         SELECT key, value FROM cursorDiskKV
         WHERE key LIKE 'composerData:%'
-        ORDER BY key
-        LIMIT \(cursorMaximumRows)
         """
 
         var statement: OpaquePointer?
@@ -530,17 +636,15 @@ enum SessionSnapshotSource {
         defer { sqlite3_finalize(statement) }
 
         var evidence: [SessionTurnEvidence] = []
-        var rowCount = 0
         var stepRC = sqlite3_step(statement)
         if stepRC != SQLITE_DONE {
             try checkCursorSQLiteRow(stepRC, operation: "establish composer snapshot")
         }
         onSnapshotEstablished?()
-        while rowCount < cursorMaximumRows {
+        while evidence.count < cursorMaximumValidCandidates {
             if stepRC == SQLITE_DONE { break }
             try checkCursorSQLiteRow(stepRC, operation: "read composer query")
             defer { stepRC = sqlite3_step(statement) }
-            rowCount += 1
 
             guard sqlite3_column_type(statement, 0) == SQLITE_TEXT else { continue }
             let keyByteCount = Int(sqlite3_column_bytes(statement, 0))

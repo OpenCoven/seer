@@ -42,6 +42,12 @@ func isBooleanNumber(_ number: NSNumber) -> Bool {
     CFGetTypeID(number) == CFBooleanGetTypeID()
 }
 
+func strictCursorBoolean(_ value: Any?) -> Bool? {
+    guard let value else { return nil }
+    guard CFGetTypeID(value as CFTypeRef) == CFBooleanGetTypeID() else { return nil }
+    return (value as? NSNumber)?.boolValue
+}
+
 /// Extracts a finite `Double` from an `Any?`, rejecting JSON booleans and
 /// non-finite values, mirroring `typeof value === "number" &&
 /// Number.isFinite(value)` in the TS reference.
@@ -764,12 +770,14 @@ func cursorHeaderGrouping(_ header: JSONObject) -> JSONObject {
 public func assessCursorComposerRecord(_ record: JSONObject, now: Int64) -> TurnAssessment {
     let status = record["status"] as? String ?? "none"
     let generatingIds = record["generatingBubbleIds"] as? [Any] ?? []
-    let continuation = (record["isContinuationInProgress"] as? Bool) == true
+    let rawContinuation = record["isContinuationInProgress"]
+    let continuation = strictCursorBoolean(rawContinuation) == true
     let label = cursorProjectLabel(record)
+    let malformedContinuation = rawContinuation != nil && strictCursorBoolean(rawContinuation) == nil
 
     var lastActivityAt = parseTimestamp(
         firstNonNull(record["conversationCheckpointLastUpdatedAt"], record["lastUpdatedAt"], record["createdAt"]),
-        fallbackMs: now
+        fallbackMs: malformedContinuation ? 0 : now
     )
 
     if status == "generating" || continuation || !generatingIds.isEmpty {

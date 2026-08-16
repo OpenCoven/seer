@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   AGENT_KINDS,
   TIMESTAMP_FUTURE_SKEW_MS,
+  assessCursorComposerRecord,
   assessDetectionFixture,
   isRecentTimestamp,
   matchAgentKind,
@@ -42,6 +43,25 @@ function readJsonl(fileName) {
 const oracle = readJson("expected.json");
 const now = Date.parse(oracle.now);
 assert.ok(Number.isFinite(now), "expected.json 'now' must be a valid ISO timestamp");
+
+test("Cursor continuation flags use strict booleans without refreshing malformed records", () => {
+  for (const malformed of [1, 0]) {
+    const assessment = assessCursorComposerRecord({
+      status: "completed",
+      isContinuationInProgress: malformed,
+      fullConversationHeadersOnly: [],
+    }, now);
+    assert.equal(assessment.active, false);
+    assert.equal(assessment.lastActivityAt, 0);
+  }
+
+  assert.equal(assessCursorComposerRecord({
+    isContinuationInProgress: true,
+  }, now).active, true);
+  assert.equal(assessCursorComposerRecord({
+    isContinuationInProgress: false,
+  }, now).active, false);
+});
 
 const APPROVED_FAMILIES = [
   "claude-code",
