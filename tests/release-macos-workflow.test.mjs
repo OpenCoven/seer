@@ -71,6 +71,22 @@ test("release workflow exists and has only the protected tag trigger and scoped 
 test("permission scanning rejects workflow-level and job-level id-token write grants after YAML parsing", () => {
   const cases = [
     {
+      name: "plain workflow-level grant",
+      source: `name: Example
+
+permissions:
+  actions: read
+  id-token: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - run: true
+`,
+      expected: ["workflow"],
+    },
+    {
       name: "quoted workflow-level grant",
       source: `name: Example
 
