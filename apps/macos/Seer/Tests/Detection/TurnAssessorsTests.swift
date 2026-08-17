@@ -460,6 +460,44 @@ final class TurnAssessorsTests: XCTestCase {
         XCTAssertFalse(assessment.active, "a huge ancient timestamp must saturate to stale, not trap")
     }
 
+    func testAssessClaudeTurnTreatsEmptyNestedStopReasonAsAbsent() {
+        let now: Int64 = 1_786_449_620_000
+        let timestamp = now - 120_000
+        let assessment = assessClaudeTurn(
+            [[
+                "type": "assistant",
+                "timestamp": timestamp,
+                "message": ["stop_reason": ""],
+                "stop_reason": "tool_use",
+            ]],
+            mtimeMs: now,
+            now: now
+        )
+
+        XCTAssertTrue(assessment.active, "empty nested stop_reason must fall back to the top-level tool_use grace window")
+        XCTAssertEqual(assessment.lastActivityAt, timestamp)
+        XCTAssertEqual(assessment.reason, "tool_use in progress")
+    }
+
+    func testAssessClaudeTurnPreservesNonEmptyNestedStopReasonPrecedence() {
+        let now: Int64 = 1_786_449_620_000
+        let timestamp = now - 1_000
+        let assessment = assessClaudeTurn(
+            [[
+                "type": "assistant",
+                "timestamp": timestamp,
+                "message": ["stop_reason": "end_turn"],
+                "stop_reason": "tool_use",
+            ]],
+            mtimeMs: now,
+            now: now
+        )
+
+        XCTAssertFalse(assessment.active)
+        XCTAssertEqual(assessment.lastActivityAt, timestamp)
+        XCTAssertEqual(assessment.reason, "end_turn")
+    }
+
     /// Same JSON-callable trap coverage for the Codex assessor: a huge future
     /// `timestamp` in an `event_msg`/`task_started` record must not trap, and
     /// must be rejected as implausibly future-dated.

@@ -383,7 +383,11 @@ public func assessClaudeTurn(_ events: [JSONObject], mtimeMs: Int64, now: Int64)
 
         if type == "assistant" {
             let message = asRecord(record["message"])
-            let stopReason = (message?["stop_reason"] as? String) ?? (record["stop_reason"] as? String) ?? ""
+            let nestedStopReason = message?["stop_reason"] as? String
+            let recordStopReason = record["stop_reason"] as? String
+            let stopReason = (nestedStopReason?.isEmpty == false ? nestedStopReason : nil)
+                ?? (recordStopReason?.isEmpty == false ? recordStopReason : nil)
+                ?? ""
 
             if stopReason == "end_turn" || stopReason == "stop_sequence" {
                 return TurnAssessment(active: false, lastActivityAt: timestamp, reason: "end_turn")
