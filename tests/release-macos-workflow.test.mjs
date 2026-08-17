@@ -13,6 +13,255 @@ const draftStateHelperPath = join(repoRoot, "scripts", "release-macos-draft-stat
 const draftStateHelperSource = existsSync(draftStateHelperPath) ? readFileSync(draftStateHelperPath, "utf8") : "";
 const draftPolicyImplementation = `${draftPolicySource}\n${draftStateHelperSource}`;
 
+function splitYamlKeyValue(sourceLine) {
+  let inSingleQuoted = false;
+  let inDoubleQuoted = false;
+
+  for (let index = 0; index < sourceLine.length; index += 1) {
+    const character = sourceLine[index];
+
+    if (character === "'" && !inDoubleQuoted) {
+      if (inSingleQuoted && sourceLine[index + 1] === "'") {
+        index += 1;
+        continue;
+      }
+      inSingleQuoted = !inSingleQuoted;
+      continue;
+    }
+
+    if (character === '"' && !inSingleQuoted) {
+      let backslashCount = 0;
+      for (let cursor = index - 1; cursor >= 0 && sourceLine[cursor] === "\\"; cursor -= 1) {
+        backslashCount += 1;
+      }
+      if (backslashCount % 2 === 0) {
+        inDoubleQuoted = !inDoubleQuoted;
+      }
+      continue;
+    }
+
+    if (character === ":" && !inSingleQuoted && !inDoubleQuoted) {
+      return {
+        key: sourceLine.slice(0, index).trim(),
+        value: sourceLine.slice(index + 1).trim(),
+      };
+    }
+  }
+
+  return null;
+}
+
+function stripYamlComment(sourceValue) {
+  let inSingleQuoted = false;
+  let inDoubleQuoted = false;
+
+  for (let index = 0; index < sourceValue.length; index += 1) {
+    const character = sourceValue[index];
+
+    if (character === "'" && !inDoubleQuoted) {
+      if (inSingleQuoted && sourceValue[index + 1] === "'") {
+        index += 1;
+        continue;
+      }
+      inSingleQuoted = !inSingleQuoted;
+      continue;
+    }
+
+    if (character === '"' && !inSingleQuoted) {
+      let backslashCount = 0;
+      for (let cursor = index - 1; cursor >= 0 && sourceValue[cursor] === "\\"; cursor -= 1) {
+        backslashCount += 1;
+      }
+      if (backslashCount % 2 === 0) {
+        inDoubleQuoted = !inDoubleQuoted;
+      }
+      continue;
+    }
+
+    if (character === "#" && !inSingleQuoted && !inDoubleQuoted) {
+      return sourceValue.slice(0, index);
+    }
+  }
+
+  return sourceValue;
+}
+
+function normalizeYamlScalar(sourceValue) {
+  const trimmedValue = stripYamlComment(sourceValue).trim();
+
+  if (
+    trimmedValue.length >= 2 &&
+    ((trimmedValue.startsWith('"') && trimmedValue.endsWith('"')) ||
+      (trimmedValue.startsWith("'") && trimmedValue.endsWith("'")))
+  ) {
+    return trimmedValue.slice(1, -1);
+  }
+
+  return trimmedValue;
+}
+
+function parseInlineYamlMap(rawValue) {
+  const normalizedValue = stripYamlComment(rawValue).trim();
+  if (!normalizedValue.startsWith("{") || !normalizedValue.endsWith("}")) {
+    return null;
+  }
+
+  const entries = [];
+  const mapBody = normalizedValue.slice(1, -1);
+  let currentEntry = "";
+  let inSingleQuoted = false;
+  let inDoubleQuoted = false;
+
+  for (let index = 0; index < mapBody.length; index += 1) {
+    const character = mapBody[index];
+
+    if (character === "'" && !inDoubleQuoted) {
+      if (inSingleQuoted && mapBody[index + 1] === "'") {
+        currentEntry += "''";
+        index += 1;
+        continue;
+      }
+      inSingleQuoted = !inSingleQuoted;
+      currentEntry += character;
+      continue;
+    }
+
+    if (character === '"' && !inSingleQuoted) {
+      let backslashCount = 0;
+      for (let cursor = index - 1; cursor >= 0 && mapBody[cursor] === "\\"; cursor -= 1) {
+        backslashCount += 1;
+      }
+      if (backslashCount % 2 === 0) {
+        inDoubleQuoted = !inDoubleQuoted;
+      }
+      currentEntry += character;
+      continue;
+    }
+
+    if (character === "," && !inSingleQuoted && !inDoubleQuoted) {
+      entries.push(currentEntry);
+      currentEntry = "";
+      continue;
+    }
+
+    currentEntry += character;
+  }
+
+  if (currentEntry.trim()) {
+    entries.push(currentEntry);
+  }
+
+  const permissions = new Map();
+  for (const entry of entries) {
+    const pair = splitYamlKeyValue(entry);
+    if (!pair) continue;
+    permissions.set(normalizeYamlScalar(pair.key), normalizeYamlScalar(pair.value));
+  }
+
+  return permissions;
+}
+
+function parseYamlPermissionMap(lines, startIndex, indent, rawValue) {
+  const inlinePermissions = parseInlineYamlMap(rawValue);
+  if (inlinePermissions) {
+    return { permissions: inlinePermissions, endIndex: startIndex };
+  }
+
+  if (normalizeYamlScalar(rawValue) !== "") {
+    return { permissions: new Map(), endIndex: startIndex };
+  }
+
+  const permissions = new Map();
+  const childIndent = indent + 2;
+  let endIndex = startIndex;
+
+  for (let index = startIndex + 1; index < lines.length; index += 1) {
+    const line = lines[index];
+    const trimmedLine = line.trim();
+
+    if (!trimmedLine || trimmedLine.startsWith("#")) {
+      endIndex = index;
+      continue;
+    }
+
+    const lineIndent = line.match(/^ */)[0].length;
+    if (lineIndent <= indent) {
+      endIndex = index - 1;
+      break;
+    }
+
+    if (lineIndent !== childIndent) {
+      endIndex = index;
+      continue;
+    }
+
+    const pair = splitYamlKeyValue(trimmedLine);
+    if (pair) {
+      permissions.set(normalizeYamlScalar(pair.key), normalizeYamlScalar(pair.value));
+    }
+
+    endIndex = index;
+  }
+
+  return { permissions, endIndex };
+}
+
+function permissionMaps(workflowSource) {
+  const lines = workflowSource.split(/\r?\n/);
+  const maps = [];
+  let inJobs = false;
+  let currentJob = null;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const trimmedLine = line.trim();
+
+    if (!trimmedLine || trimmedLine.startsWith("#")) continue;
+
+    const indent = line.match(/^ */)[0].length;
+
+    if (indent === 0) {
+      currentJob = null;
+
+      const pair = splitYamlKeyValue(trimmedLine);
+      if (pair?.key === "permissions") {
+        const parsed = parseYamlPermissionMap(lines, index, 0, pair.value);
+        maps.push({ scope: "workflow", permissions: parsed.permissions });
+        index = parsed.endIndex;
+        inJobs = false;
+        continue;
+      }
+
+      inJobs = trimmedLine === "jobs:";
+      continue;
+    }
+
+    if (!inJobs) continue;
+
+    if (indent === 2 && trimmedLine.endsWith(":")) {
+      currentJob = trimmedLine.slice(0, -1).trim();
+      continue;
+    }
+
+    if (!currentJob || indent !== 4) continue;
+
+    const pair = splitYamlKeyValue(trimmedLine);
+    if (pair?.key !== "permissions") continue;
+
+    const parsed = parseYamlPermissionMap(lines, index, 4, pair.value);
+    maps.push({ scope: `jobs.${currentJob}`, permissions: parsed.permissions });
+    index = parsed.endIndex;
+  }
+
+  return maps;
+}
+
+function idTokenWriteScopes(workflowSource) {
+  return permissionMaps(workflowSource)
+    .filter(({ permissions }) => permissions.get("id-token") === "write")
+    .map(({ scope }) => scope);
+}
+
 function jobBlock(name, nextName) {
   const start = source.indexOf(`  ${name}:\n`);
   if (start === -1) return "";
@@ -28,7 +277,7 @@ function stepBlocks(job) {
 test("release workflow exists and has only the protected tag trigger and scoped source-run read permission", () => {
   assert.ok(existsSync(workflowPath), ".github/workflows/release-macos.yml must exist");
   assert.match(source, /^on:\n {2}push:\n {4}tags:\n {6}- "v\*\.\*\.\*"\n\npermissions:\n {2}actions: read\n {2}contents: read$/m);
-  assert.doesNotMatch(source, /\bid-token:\s*write\b/);
+  assert.deepEqual(idTokenWriteScopes(source), [], "workflow must not grant id-token: write at workflow or job scope");
   assert.doesNotMatch(source, /\b(?:pull_request|workflow_dispatch|schedule):/);
   assert.match(
     source,
@@ -38,6 +287,51 @@ test("release workflow exists and has only the protected tag trigger and scoped 
     [...source.matchAll(/^ {2}([a-z][a-z0-9-]*):\n {4}(?:name|needs|runs-on):/gm)].map((match) => match[1]),
     ["prepare", "sign-and-release"],
   );
+});
+
+test("permission scanning rejects quoted workflow-level and job-level id-token write grants", () => {
+  const quotedWorkflowLevelGrant = `name: Example
+
+permissions:
+  actions: read
+  id-token: "write"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - run: true
+`;
+  const quotedJobLevelGrant = `name: Example
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: 'write'
+    steps:
+      - run: true
+`;
+  const inlineQuotedJobLevelGrant = `name: Example
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions: { contents: read, id-token: "write" }
+    steps:
+      - run: true
+`;
+
+  assert.deepEqual(idTokenWriteScopes(quotedWorkflowLevelGrant), ["workflow"]);
+  assert.deepEqual(idTokenWriteScopes(quotedJobLevelGrant), ["jobs.release"]);
+  assert.deepEqual(idTokenWriteScopes(inlineQuotedJobLevelGrant), ["jobs.release"]);
 });
 
 test("every external action is pinned to the resolved immutable SHA", () => {
