@@ -54,6 +54,7 @@
     "eslint": "^9.39.2",
     "eslint-plugin-import": "^2.31.0",
     "globals": "^17.3.0",
+    "js-yaml": "^4.3.1",
     "oxfmt": "^0.26.0",
     "tailwindcss": "^4.2.2",
     "tsx": "^4.20.5",
