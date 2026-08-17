@@ -20,8 +20,9 @@ Verified on 2026-08-12:
   scripts (`scripts/release-macos-draft.sh`,
   `scripts/release-macos-draft-state.mjs`, and related `scripts/*macos*`
   tooling) are implemented and tested on the `feat/seer-standalone-macos`
-  feature branch. They are not yet merged to the default branch, pushed to a
-  release tag, or deployed. Every remote resource and credential this packet
+  feature branch. That branch is local only: it is unpushed and absent from
+  `origin`, and is not yet merged to the default branch, pushed to a release
+  tag, or deployed. Every remote resource and credential this packet
   describes — `OpenCoven/seer-releases`, the `macos-release` environment, its
   secrets, and its variables — remains unconfigured.
 
@@ -312,12 +313,8 @@ an account with administrative (write) access to that repository:
   `RELEASES_REPO_TOKEN`):
 
   ```bash
-  gh api --method PUT repos/OpenCoven/seer-releases/immutable-releases \
-    -F enabled=true
+  gh api --method PUT repos/OpenCoven/seer-releases/immutable-releases
   ```
-
-  `-F` sends `enabled` as a typed JSON boolean; `-f` would send it as the
-  string `"true"`, which the endpoint does not accept as a boolean.
 
 Verify the setting with the same `Administration: read` access already
 granted to `RELEASES_REPO_TOKEN` for this purpose — read access is sufficient
