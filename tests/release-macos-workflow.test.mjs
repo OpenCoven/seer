@@ -18,13 +18,17 @@ function isYamlMap(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function hasOidcWriteGrant(permissions) {
+  return permissions === "write-all" || (isYamlMap(permissions) && permissions["id-token"] === "write");
+}
+
 function idTokenWriteScopes(workflowSource) {
   const workflow = yaml.load(workflowSource);
   if (!isYamlMap(workflow)) return [];
 
   const scopes = [];
 
-  if (isYamlMap(workflow.permissions) && workflow.permissions["id-token"] === "write") {
+  if (hasOidcWriteGrant(workflow.permissions)) {
     scopes.push("workflow");
   }
 
@@ -33,7 +37,7 @@ function idTokenWriteScopes(workflowSource) {
   }
 
   for (const [jobName, job] of Object.entries(workflow.jobs)) {
-    if (isYamlMap(job?.permissions) && job.permissions["id-token"] === "write") {
+    if (hasOidcWriteGrant(job?.permissions)) {
       scopes.push(`jobs.${jobName}`);
     }
   }
@@ -56,7 +60,7 @@ function stepBlocks(job) {
 test("release workflow exists and has only the protected tag trigger and scoped source-run read permission", () => {
   assert.ok(existsSync(workflowPath), ".github/workflows/release-macos.yml must exist");
   assert.match(source, /^on:\n {2}push:\n {4}tags:\n {6}- "v\*\.\*\.\*"\n\npermissions:\n {2}actions: read\n {2}contents: read$/m);
-  assert.deepEqual(idTokenWriteScopes(source), [], "workflow must not grant id-token: write at workflow or job scope");
+  assert.deepEqual(idTokenWriteScopes(source), [], "workflow must not grant OIDC-capable permissions at workflow or job scope");
   assert.doesNotMatch(source, /\b(?:pull_request|workflow_dispatch|schedule):/);
   assert.match(
     source,
@@ -68,8 +72,22 @@ test("release workflow exists and has only the protected tag trigger and scoped 
   );
 });
 
-test("permission scanning rejects workflow-level and job-level id-token write grants after YAML parsing", () => {
+test("permission scanning rejects workflow-level and job-level OIDC-capable grants after YAML parsing", () => {
   const cases = [
+    {
+      name: "workflow-level write-all grant",
+      source: `name: Example
+
+permissions: write-all
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - run: true
+`,
+      expected: ["workflow"],
+    },
     {
       name: "plain workflow-level grant",
       source: `name: Example
@@ -135,6 +153,22 @@ jobs:
       - run: true
 `,
       expected: ["workflow"],
+    },
+    {
+      name: "job-level write-all grant",
+      source: `name: Example
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions: write-all
+    steps:
+      - run: true
+`,
+      expected: ["jobs.release"],
     },
     {
       name: "quoted job-level grant",
