@@ -515,6 +515,29 @@ async function runInspect() {
   );
 }
 
+async function runListPage() {
+  const page = await readStdinJSON("release list page");
+  if (!Array.isArray(page)) fail("release list page has an invalid shape");
+  const matches = page.filter(
+    (item) => item && typeof item === "object" && !Array.isArray(item) && item.tag_name === sourceTag,
+  );
+  if (matches.length > 1) {
+    fail("multiple releases match the exact source tag; refusing to disambiguate");
+  }
+  const lines = [`pageCount=${page.length}`, `matchCount=${matches.length}`];
+  if (matches.length === 1) {
+    const metadata = parseMetadata(matches[0], { requireComplete: false });
+    lines.push(
+      `id=${metadata.id}`,
+      `draft=${metadata.draft}`,
+      `prerelease=${metadata.prerelease}`,
+      `assetCount=${metadata.assets.length}`,
+      `assetsComplete=${metadata.complete}`,
+    );
+  }
+  process.stdout.write(lines.join("\n") + "\n");
+}
+
 function runDownloads() {
   const metadata = readMetadata(metadataPath, { requireComplete: true });
   for (const item of metadata.assets) process.stdout.write(`${item.id}\t${item.name}\n`);
@@ -741,6 +764,9 @@ try {
     case "inspect":
       await runInspect();
       break;
+    case "list-page":
+      await runListPage();
+      break;
     case "downloads":
       runDownloads();
       break;
@@ -797,8 +823,8 @@ try {
       break;
     default:
       fail(
-        "usage: release-macos-draft-state.mjs inspect|downloads|validate-notes|capture|compare|" +
-          "compare-published|verify-published-local|materialize-published|" +
+        "usage: release-macos-draft-state.mjs inspect|list-page|downloads|validate-notes|capture|" +
+          "compare|compare-published|verify-published-local|materialize-published|" +
           "capture-existing-published|compare-existing-published|identity|repository|immutable|" +
           "ref|tag-target|lock-tag|lock-owner|run-status|commit",
       );

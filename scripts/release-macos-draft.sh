@@ -134,7 +134,20 @@ RELEASE_WRITER_ID="${RELEASE_WRITER_ID:-}"
 [[ "${RELEASE_WRITER_ID}" =~ ^[1-9][0-9]*$ ]] ||
   fail "protected release writer ID is invalid"
 EXPECTED_ASSETS=("Seer-v${VERSION}-arm64.dmg" "SHA256SUMS" "release-manifest.json")
-RELEASE_ENDPOINT="repos/${GH_REPO}/releases/tags/${SOURCE_TAG}"
+# GitHub's "get a release by tag name" endpoint only returns published releases;
+# it 404s for drafts even with push access. Release discovery must instead use the
+# authenticated release *listing* endpoint (which does include drafts) with exact
+# tag matching, then address the release by its numeric ID thereafter.
+RELEASE_LIST_PAGE_SIZE=100
+RELEASE_LIST_MAX_PAGES=50
+if [[ "${SEER_RELEASE_TEST_MODE:-0}" == "1" ]]; then
+  RELEASE_LIST_PAGE_SIZE="${SEER_RELEASE_TEST_LIST_PAGE_SIZE:-${RELEASE_LIST_PAGE_SIZE}}"
+  RELEASE_LIST_MAX_PAGES="${SEER_RELEASE_TEST_LIST_MAX_PAGES:-${RELEASE_LIST_MAX_PAGES}}"
+fi
+[[ "${RELEASE_LIST_PAGE_SIZE}" =~ ^[1-9][0-9]*$ && "${RELEASE_LIST_PAGE_SIZE}" -le 100 ]] ||
+  fail "release list page size must be a positive integer no greater than 100"
+[[ "${RELEASE_LIST_MAX_PAGES}" =~ ^[1-9][0-9]*$ ]] ||
+  fail "release list page bound must be a positive integer"
 LOCK_REF_NAME="seer-release-lock-${SOURCE_TAG}"
 LOCK_REF="refs/tags/${LOCK_REF_NAME}"
 LOCK_TAG_NAME="${LOCK_REF_NAME}-${SOURCE_COMMIT}-run-${WORKFLOW_RUN}-attempt-${WORKFLOW_ATTEMPT}"
@@ -358,48 +371,64 @@ release_remote_lock() {
 }
 
 query_release() {
-  local field_count
+  local page
   local response
   local status
   local summary
+  local page_count
+  local match_count
+  local field_count
 
-  set +e
-  response="$(api "${RELEASE_ENDPOINT}" 2>&1)"
-  status=$?
-  set -e
-  if [[ "${status}" -ne 0 ]]; then
-    if /usr/bin/grep -Eq '\(HTTP 404\)|^HTTP/[0-9.]+ 404 ' <<< "${response}"; then
-      RELEASE_EXISTS=0
-      RELEASE_ID=""
-      RELEASE_DRAFT=""
-      RELEASE_PRERELEASE=""
-      RELEASE_ASSET_COUNT=0
-      RELEASE_ASSETS_COMPLETE=""
+  RELEASE_EXISTS=0
+  RELEASE_ID=""
+  RELEASE_DRAFT=""
+  RELEASE_PRERELEASE=""
+  RELEASE_ASSET_COUNT=0
+  RELEASE_ASSETS_COMPLETE=""
+
+  page=1
+  while :; do
+    [[ "${page}" -le "${RELEASE_LIST_MAX_PAGES}" ]] ||
+      fail "release listing exceeded the maximum bounded page count without a definitive result"
+
+    response="$(api "repos/${GH_REPO}/releases?per_page=${RELEASE_LIST_PAGE_SIZE}&page=${page}")"
+
+    set +e
+    summary="$(printf '%s' "${response}" | node "${STATE_HELPER}" list-page 2>&1)"
+    status=$?
+    set -e
+    [[ "${status}" -eq 0 ]] || fail "${summary#error: }"
+
+    page_count="$(printf '%s\n' "${summary}" | /usr/bin/sed -n '1s/^pageCount=//p')"
+    match_count="$(printf '%s\n' "${summary}" | /usr/bin/sed -n '2s/^matchCount=//p')"
+    [[ "${page_count}" =~ ^[0-9]+$ && "${match_count}" =~ ^(0|1)$ ]] ||
+      fail "release listing page has an invalid shape"
+
+    if [[ "${match_count}" -eq 1 ]]; then
+      field_count="$(printf '%s\n' "${summary}" | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
+      [[ "${field_count}" -eq 7 ]] || fail "release metadata has an invalid shape"
+      RELEASE_ID="$(printf '%s\n' "${summary}" | /usr/bin/sed -n '3s/^id=//p')"
+      RELEASE_DRAFT="$(printf '%s\n' "${summary}" | /usr/bin/sed -n '4s/^draft=//p')"
+      RELEASE_PRERELEASE="$(printf '%s\n' "${summary}" | /usr/bin/sed -n '5s/^prerelease=//p')"
+      RELEASE_ASSET_COUNT="$(printf '%s\n' "${summary}" | /usr/bin/sed -n '6s/^assetCount=//p')"
+      RELEASE_ASSETS_COMPLETE="$(printf '%s\n' "${summary}" | /usr/bin/sed -n '7s/^assetsComplete=//p')"
+      [[ "${RELEASE_ID}" =~ ^[1-9][0-9]*$ &&
+        "${RELEASE_DRAFT}" =~ ^(true|false)$ &&
+        "${RELEASE_PRERELEASE}" == "false" &&
+        "${RELEASE_ASSET_COUNT}" =~ ^[0-9]+$ &&
+        "${RELEASE_ASSETS_COMPLETE}" =~ ^(true|false)$ ]] ||
+        fail "release metadata has an invalid shape"
+      RELEASE_EXISTS=1
       return
     fi
-    fail "unable to inspect release ${SOURCE_TAG}: ${response}"
-  fi
 
-  set +e
-  summary="$(printf '%s' "${response}" | node "${STATE_HELPER}" inspect 2>&1)"
-  status=$?
-  set -e
-  [[ "${status}" -eq 0 ]] || fail "${summary#error: }"
+    if [[ "${page_count}" -lt "${RELEASE_LIST_PAGE_SIZE}" ]]; then
+      RELEASE_EXISTS=0
+      return
+    fi
 
-  RELEASE_EXISTS=1
-  field_count="$(printf '%s\n' "${summary}" | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
-  [[ "${field_count}" -eq 5 ]] || fail "release metadata has an invalid shape"
-  RELEASE_ID="$(printf '%s\n' "${summary}" | /usr/bin/sed -n '1s/^id=//p')"
-  RELEASE_DRAFT="$(printf '%s\n' "${summary}" | /usr/bin/sed -n '2s/^draft=//p')"
-  RELEASE_PRERELEASE="$(printf '%s\n' "${summary}" | /usr/bin/sed -n '3s/^prerelease=//p')"
-  RELEASE_ASSET_COUNT="$(printf '%s\n' "${summary}" | /usr/bin/sed -n '4s/^assetCount=//p')"
-  RELEASE_ASSETS_COMPLETE="$(printf '%s\n' "${summary}" | /usr/bin/sed -n '5s/^assetsComplete=//p')"
-  [[ "${RELEASE_ID}" =~ ^[1-9][0-9]*$ &&
-    "${RELEASE_DRAFT}" =~ ^(true|false)$ &&
-    "${RELEASE_PRERELEASE}" == "false" &&
-    "${RELEASE_ASSET_COUNT}" =~ ^[0-9]+$ &&
-    "${RELEASE_ASSETS_COMPLETE}" =~ ^(true|false)$ ]] ||
-    fail "release metadata has an invalid shape"
+    page=$((page + 1))
+  done
 }
 
 inspect_release() {
@@ -490,7 +519,10 @@ validate_state_paths() {
 
 rest_get_release() {
   local prefix="$1"
+  local release_id="$2"
   local metadata="${prefix}.json"
+  [[ "${release_id}" =~ ^[1-9][0-9]*$ ]] ||
+    fail "a verified numeric release ID is required to retrieve release metadata"
   [[ ! -e "${metadata}" && ! -L "${metadata}" ]] ||
     fail "release state response path must not preexist"
   curl --fail-with-body --silent --show-error \
@@ -499,7 +531,7 @@ rest_get_release() {
     --header "Authorization: Bearer ${GH_TOKEN}" \
     --header "X-GitHub-Api-Version: ${GH_API_VERSION}" \
     --output "${metadata}" \
-    "${GITHUB_API_URL:-https://api.github.com}/repos/${GH_REPO}/releases/tags/${SOURCE_TAG}"
+    "${GITHUB_API_URL:-https://api.github.com}/repos/${GH_REPO}/releases/${release_id}"
   printf '%s\n' "${metadata}"
 }
 
@@ -614,7 +646,7 @@ reconcile_published() {
 
   local metadata
   local downloads
-  metadata="$(rest_get_release "${STATE_WORK_DIR}/existing-published-initial")"
+  metadata="$(rest_get_release "${STATE_WORK_DIR}/existing-published-initial" "${RELEASE_ID}")"
   downloads="$(download_assets "${metadata}" "${STATE_WORK_DIR}/existing-published-initial")"
   node "${STATE_HELPER}" materialize-published \
     "${metadata}" "" "" "" "" "${downloads}" "${published_dir}"
@@ -622,7 +654,7 @@ reconcile_published() {
 
   local final_metadata
   local final_downloads
-  final_metadata="$(rest_get_release "${STATE_WORK_DIR}/existing-published-final")"
+  final_metadata="$(rest_get_release "${STATE_WORK_DIR}/existing-published-final" "${RELEASE_ID}")"
   final_downloads="$(download_assets "${final_metadata}" "${STATE_WORK_DIR}/existing-published-final")"
   node "${STATE_HELPER}" capture-existing-published \
     "${final_metadata}" "" "${published_dir}" "" "${evidence}" "${final_downloads}"
@@ -693,7 +725,10 @@ case "${MODE}" in
     validate_state_paths
     [[ ! -e "${VERIFIED_STATE}" && ! -L "${VERIFIED_STATE}" ]] ||
       fail "verified release state path must not preexist"
-    response_metadata="$(rest_get_release "${STATE_WORK_DIR}/capture")"
+    inspect_release
+    [[ "${RELEASE_EXISTS}" -eq 1 ]] ||
+      fail "release must exist before its state can be captured"
+    response_metadata="$(rest_get_release "${STATE_WORK_DIR}/capture" "${RELEASE_ID}")"
     downloads_dir="$(download_assets "${response_metadata}" "${STATE_WORK_DIR}/capture")"
     node "${STATE_HELPER}" capture \
       "${response_metadata}" "" \
@@ -713,7 +748,10 @@ case "${MODE}" in
         "$(cd "$(dirname "${EXISTING_PUBLISHED_STATE}")" && pwd -P)" ]] ||
         fail "existing-published-state evidence must be inside the state work directory"
       verify_source_tag
-      response_metadata="$(rest_get_release "${STATE_WORK_DIR}/existing-published-compare")"
+      inspect_release
+      [[ "${RELEASE_EXISTS}" -eq 1 ]] ||
+        fail "release must exist to verify existing-published-state evidence"
+      response_metadata="$(rest_get_release "${STATE_WORK_DIR}/existing-published-compare" "${RELEASE_ID}")"
       downloads_dir="$(
         download_assets "${response_metadata}" "${STATE_WORK_DIR}/existing-published-compare"
       )"
@@ -734,13 +772,15 @@ case "${MODE}" in
     if [[ "${RELEASE_EXISTS}" -eq 1 && "${RELEASE_DRAFT}" == "false" ]]; then
       fail "existing-published-state evidence is required for an immutable published release"
     fi
+    [[ "${RELEASE_EXISTS}" -eq 1 ]] ||
+      fail "release must exist before it can be published"
     validate_local_release
     validate_state_paths
     [[ -f "${VERIFIED_STATE}" && ! -L "${VERIFIED_STATE}" ]] ||
       fail "verified release state is missing or unsafe"
 
     verify_remote_lock
-    response_metadata="$(rest_get_release "${STATE_WORK_DIR}/publish")"
+    response_metadata="$(rest_get_release "${STATE_WORK_DIR}/publish" "${RELEASE_ID}")"
     downloads_dir="$(download_assets "${response_metadata}" "${STATE_WORK_DIR}/publish")"
     set +e
     release_id="$(
@@ -772,7 +812,7 @@ case "${MODE}" in
     patch_status=$?
     set -e
 
-    post_metadata="$(rest_get_release "${STATE_WORK_DIR}/post-publish")"
+    post_metadata="$(rest_get_release "${STATE_WORK_DIR}/post-publish" "${release_id}")"
     post_downloads="$(download_assets "${post_metadata}" "${STATE_WORK_DIR}/post-publish")"
     set +e
     published_result="$(

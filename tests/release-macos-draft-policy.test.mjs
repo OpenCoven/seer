@@ -274,28 +274,34 @@ if (args[0] === "api" && args.includes("user")) {
       conclusion: state.sourceRunConclusion,
     },
   ));
-} else if (args[0] === "api" && endpoint?.includes("/releases/tags/")) {
-  if (!state.release) fail404();
-  save();
-  const jqIndex = args.indexOf("--jq");
-  if (jqIndex !== -1) {
-    const jq = args[jqIndex + 1];
-    if (jq.includes("draft=")) {
-      const firstLine = (state.release.body ?? "").split("\\n")[0];
-      const expected = ["Seer-v1.2.3-arm64.dmg", "SHA256SUMS", "release-manifest.json"];
-      const valid = state.release.assets.every((item) => expected.includes(item.name));
-      const complete =
-        JSON.stringify(state.release.assets.map((item) => item.name).sort()) === JSON.stringify([...expected].sort());
-      console.log(
-        \`draft=\${state.release.draft}\\ntag=\${state.release.tag}\\nmarker=\${firstLine}\` +
-          \`\\nassetCount=\${state.release.assets.length}\\nassetsValid=\${valid}\\nassetsComplete=\${complete}\`,
-      );
-    } else {
-      process.exit(2);
+} else if (args[0] === "api" && endpoint?.startsWith("repos/OpenCoven/seer-releases/releases?")) {
+  // Models GitHub's real "list releases" endpoint: authenticated push-access
+  // callers see drafts too, unlike the tag-lookup endpoint below.
+  const query = new URLSearchParams(endpoint.split("?")[1] ?? "");
+  const perPage = Number(query.get("per_page"));
+  const page = Number(query.get("page"));
+  state.releaseListRequests = state.releaseListRequests || [];
+  state.releaseListRequests.push({ perPage, page });
+  const targetPage = state.releaseListPage ?? 1;
+  const items = [];
+  if (page === targetPage) {
+    if (state.release) items.push(releaseJSON());
+    if (state.releaseListDuplicateOnMatchPage && state.release) {
+      items.push({ ...releaseJSON(), id: state.release.id + 1 });
     }
-  } else {
-    console.log(JSON.stringify(releaseJSON()));
+  } else if (page < targetPage) {
+    for (let i = 0; i < perPage; i++) {
+      items.push({ id: 500000 + page * 1000 + i, tag_name: \`other-tag-page-\${page}-\${i}\` });
+    }
   }
+  save();
+  console.log(JSON.stringify(items));
+} else if (args[0] === "api" && endpoint?.includes("/releases/tags/")) {
+  // Real GitHub only returns a *published* release from this endpoint; it 404s
+  // for drafts even for authenticated users with push access.
+  if (!state.release || state.release.draft) fail404();
+  save();
+  console.log(JSON.stringify(releaseJSON()));
 } else if (args[0] === "release" && args[1] === "create") {
   if (state.release) {
     save();
@@ -406,6 +412,23 @@ const assetBytes = (item) =>
   item.contentsEncoding === "base64" ? Buffer.from(item.contents, "base64") : Buffer.from(item.contents);
 
 if (method === "GET" && url?.includes("/releases/tags/")) {
+  // Real GitHub only returns a *published* release from this endpoint; it 404s
+  // for drafts even for authenticated users with push access.
+  if (!state.release || state.release.draft) {
+    writeResponse(404, JSON.stringify({ message: "Not Found" }));
+    save();
+    process.exit(22);
+  }
+  writeResponse(200, releaseJSON());
+  save();
+} else if (method === "GET" && /\\/releases\\/[0-9]+$/.test(url ?? "")) {
+  // Get-a-release-by-ID works for drafts and published releases alike.
+  const id = Number(url.match(/\\/releases\\/([0-9]+)$/)[1]);
+  if (!state.release || state.release.id !== id) {
+    writeResponse(404, JSON.stringify({ message: "Not Found" }));
+    save();
+    process.exit(22);
+  }
   writeResponse(200, releaseJSON());
   save();
 } else if (method === "GET" && url?.includes("/releases/assets/")) {
@@ -517,12 +540,15 @@ if (process.env.FAKE_PLATFORM_RESULT === "fail") {
           : options.destinationTagRef,
         destinationTagObjects: options.destinationTagObjects ?? {},
         release: options.release === undefined ? matchingRelease() : options.release,
+        releaseListPage: options.releaseListPage ?? 1,
+        releaseListDuplicateOnMatchPage: options.releaseListDuplicateOnMatchPage ?? false,
         etag: options.etag ?? '"draft-etag"',
         postPublishMutation: null,
         patchOutcome: options.patchOutcome ?? "normal",
         nextAssetID: 200,
         calls: [],
         authenticatedRequests: [],
+        releaseListRequests: [],
       }),
     );
 
@@ -581,6 +607,80 @@ if (process.env.FAKE_PLATFORM_RESULT === "fail") {
     rmSync(scratch, { recursive: true, force: true });
   }
 }
+
+test("newly-created and resumable draft releases are discovered via authenticated listing while the tag-lookup endpoint only exposes published releases", () => {
+  // Case 1: no release exists yet. `upload` must create the draft and then
+  // verify its own existence through the authenticated listing endpoint; the
+  // real GitHub tag-lookup endpoint 404s for drafts even with push access, so
+  // relying on it here would make the workflow abort on every new release.
+  withHarness(({ run, readState }) => {
+    const result = run("upload");
+    assert.equal(result.status, 0, result.stderr);
+    const state = readState();
+    assert.equal(state.release.draft, true);
+    assert.equal(state.release.tag, sourceTag);
+    assert.ok(
+      !state.calls.some(
+        (call) => call[0] === "gh" && call.some((arg) => typeof arg === "string" && arg.includes("/releases/tags/")),
+      ),
+      "the tag-lookup endpoint (which cannot see drafts) must never be relied on to discover a draft",
+    );
+    assert.ok(
+      state.releaseListRequests.length > 0,
+      "the authenticated release listing endpoint must be used to discover the draft",
+    );
+  }, { release: null, destinationTagRef: null });
+
+  // Case 2: an existing draft (for example from a prior, interrupted attempt)
+  // must be resumed by discovering it through the same listing endpoint.
+  withHarness(({ run, readState }) => {
+    const result = run("preflight");
+    assert.equal(result.status, 0, result.stderr);
+    const state = readState();
+    assert.equal(state.release.draft, true);
+    assert.ok(
+      state.releaseListRequests.length > 0,
+      "the authenticated release listing endpoint must be used to resume the existing draft",
+    );
+  });
+});
+
+test("release discovery traverses bounded pagination to find a draft beyond the first page", () => {
+  withHarness(({ run, readState }) => {
+    const result = run("preflight", {
+      SEER_RELEASE_TEST_LIST_PAGE_SIZE: "2",
+      SEER_RELEASE_TEST_LIST_MAX_PAGES: "5",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const state = readState();
+    assert.equal(state.release.draft, true);
+    assert.deepEqual(
+      state.releaseListRequests.map(({ page }) => page),
+      [1, 2, 3],
+    );
+  }, { releaseListPage: 3 });
+});
+
+test("release discovery fails closed when bounded pagination is exhausted without a definitive result", () => {
+  withHarness(({ run, readState }) => {
+    const result = run("preflight", {
+      SEER_RELEASE_TEST_LIST_PAGE_SIZE: "2",
+      SEER_RELEASE_TEST_LIST_MAX_PAGES: "3",
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /bounded page count/i);
+    assert.ok(!readState().calls.some((call) => call.includes("PATCH")));
+  }, { releaseListPage: 10 });
+});
+
+test("release discovery fails closed when multiple releases match the exact source tag", () => {
+  withHarness(({ run, readState }) => {
+    const result = run("preflight");
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /multiple releases match/i);
+    assert.ok(!readState().calls.some((call) => call.includes("PATCH")));
+  }, { releaseListDuplicateOnMatchPage: true });
+});
 
 test("exact immutable published releases are accepted without mutation", () => {
   withHarness(({ run, readState }) => {
@@ -696,7 +796,10 @@ test("capture authenticates release metadata and asset downloads with the inject
     const result = run("capture", { GH_TOKEN: "auth-test-token", FAKE_EXPECTED_TOKEN: "auth-test-token" });
     assert.equal(result.status, 0, result.stderr);
     const requests = readState().authenticatedRequests;
-    assert.equal(requests.filter(({ url }) => url.includes("/releases/tags/")).length, 1);
+    assert.equal(
+      requests.filter(({ url }) => /\/releases\/[0-9]+$/.test(url)).length,
+      1,
+    );
     assert.equal(requests.filter(({ url }) => url.includes("/releases/assets/")).length, expectedAssets.length);
     assert.doesNotMatch(`${result.stdout}\n${result.stderr}\n${JSON.stringify(readState())}`, /auth-test-token/);
   });
@@ -1002,7 +1105,7 @@ test("exact captured state publishes by release ID with supported REST PATCH and
     assert.equal(state.authenticatedRequests.filter(({ method }) => method === "PATCH").length, 1);
     assert.equal(
       state.authenticatedRequests.filter(
-        ({ method, url }) => method === "GET" && url.includes("/releases/tags/"),
+        ({ method, url }) => method === "GET" && /\/releases\/[0-9]+$/.test(url),
       ).length,
       3,
     );
