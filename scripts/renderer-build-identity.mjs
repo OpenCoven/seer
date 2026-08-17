@@ -15,19 +15,25 @@
 // byte-identical relevant source always produce the exact same digest;
 // changing even one byte of relevant source always changes it.
 import { Buffer } from "node:buffer";
+import { spawnSync } from "node:child_process";
 import console from "node:console";
 import { createHash } from "node:crypto";
 import {
   closeSync,
   constants,
+  existsSync,
   fstatSync,
   lstatSync,
+  mkdirSync,
   openSync,
   readFileSync,
+  renameSync,
+  rmSync,
   readdirSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join, relative, sep } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
@@ -197,71 +203,149 @@ export function computeRendererBuildDigest(repoRoot) {
   return sha256Hex(Buffer.from(manifestLines, "utf8"));
 }
 
-function collectRendererAssetFiles(rendererRoot, directory, out) {
-  const entries = readdirSync(directory, { withFileTypes: true }).sort((left, right) =>
-    left.name.localeCompare(right.name),
+// Node does not expose Darwin's openat(2), so this macOS-only helper retains
+// O_NOFOLLOW directory descriptors and walks each child from its pinned parent.
+const rendererAssetDigestHelperSource = join(
+  dirname(fileURLToPath(import.meta.url)),
+  "renderer-asset-digest.swift",
+);
+const rendererAssetDigestHelperCache = join(
+  dirname(dirname(rendererAssetDigestHelperSource)),
+  "build",
+  ".renderer-asset-digest-helper",
+);
+
+function compiledRendererAssetDigestHelper() {
+  if (process.platform !== "darwin") {
+    throw new Error("descriptor-anchored renderer asset hashing requires macOS");
+  }
+
+  const source = readFileSync(rendererAssetDigestHelperSource);
+  const helperPath = join(
+    rendererAssetDigestHelperCache,
+    `renderer-asset-digest-${sha256Hex(source)}`,
   );
-  for (const entry of entries) {
-    const absolutePath = join(directory, entry.name);
-    const relativePath = toPosixRelativePath(rendererRoot, absolutePath);
-    if (relativePath === "build-manifest.json") continue;
-    const info = lstatSync(absolutePath);
-    if (info.isSymbolicLink()) {
-      throw new Error(`renderer asset must not be a symlink: ${relativePath}`);
-    }
-    if (info.isDirectory()) {
-      collectRendererAssetFiles(rendererRoot, absolutePath, out);
-    } else if (info.isFile()) {
-      out.push({ absolutePath, info, relativePath });
-    } else {
-      throw new Error(`renderer asset must be a regular file or directory: ${relativePath}`);
+  if (existsSync(helperPath)) return helperPath;
+
+  mkdirSync(rendererAssetDigestHelperCache, { recursive: true });
+  const lockPath = `${helperPath}.lock`;
+  const deadline = Date.now() + 120_000;
+  let lockDescriptor;
+  while (lockDescriptor === undefined) {
+    try {
+      lockDescriptor = openSync(lockPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+      writeFileSync(lockDescriptor, `${process.pid}\n`, "utf8");
+    } catch (error) {
+      if (!error || error.code !== "EEXIST") throw error;
+      try {
+        const ownerPid = Number(readFileSync(lockPath, "utf8").trim());
+        if (Number.isSafeInteger(ownerPid) && ownerPid > 0) {
+          try {
+            process.kill(ownerPid, 0);
+          } catch (ownerError) {
+            if (ownerError && ownerError.code === "ESRCH") {
+              unlinkSync(lockPath);
+              continue;
+            }
+          }
+        }
+      } catch (ownerError) {
+        if (ownerError && ownerError.code === "ENOENT") continue;
+        throw ownerError;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error("timed out waiting to compile descriptor-anchored renderer asset digest helper");
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
     }
   }
-}
-
-function sameObservedFileIdentity(expected, actual) {
-  return (
-    expected.dev === actual.dev &&
-    expected.ino === actual.ino &&
-    expected.size === actual.size &&
-    expected.mtimeMs === actual.mtimeMs &&
-    expected.ctimeMs === actual.ctimeMs
-  );
-}
-
-function readRendererAssetNoFollow(asset) {
-  let descriptor;
   try {
-    descriptor = openSync(
-      asset.absolutePath,
-      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
-    );
-  } catch (error) {
-    if (error && error.code === "ELOOP") {
-      throw new Error(`renderer asset must not be a symlink: ${asset.relativePath}`, { cause: error });
+    if (existsSync(helperPath)) return helperPath;
+    const stagingPath = `${helperPath}.${process.pid}`;
+    const compilation = spawnSync("swiftc", [rendererAssetDigestHelperSource, "-o", stagingPath], {
+      encoding: "utf8",
+    });
+    if (compilation.error || compilation.status !== 0) {
+      rmSync(stagingPath, { force: true });
+      throw new Error(
+        `unable to compile descriptor-anchored renderer asset digest helper: ${
+          compilation.error?.message ?? compilation.stderr?.trim() ?? "swiftc failed"
+        }`,
+        { cause: compilation.error },
+      );
     }
-    throw new Error(
-      `unable to open renderer asset without following symlinks: ${asset.relativePath}`,
-      { cause: error },
-    );
-  }
-  try {
-    const opened = fstatSync(descriptor);
-    if (!opened.isFile()) {
-      throw new Error(`renderer asset must be a regular file after opening: ${asset.relativePath}`);
+    try {
+      renameSync(stagingPath, helperPath);
+    } finally {
+      rmSync(stagingPath, { force: true });
     }
-    if (!sameObservedFileIdentity(asset.info, opened)) {
-      throw new Error(`renderer asset changed identity while being opened: ${asset.relativePath}`);
-    }
-    const contents = readFileSync(descriptor);
-    const afterRead = fstatSync(descriptor);
-    if (!afterRead.isFile() || !sameObservedFileIdentity(opened, afterRead)) {
-      throw new Error(`renderer asset changed while hashing: ${asset.relativePath}`);
-    }
-    return contents;
   } finally {
-    closeSync(descriptor);
+    closeSync(lockDescriptor);
+    unlinkSync(lockPath);
   }
+  return helperPath;
+}
+
+function normalizeAfterCollectionHook(afterCollection) {
+  if (afterCollection === undefined) return null;
+  if (
+    !afterCollection ||
+    typeof afterCollection !== "object" ||
+    Array.isArray(afterCollection) ||
+    typeof afterCollection.executable !== "string" ||
+    !Array.isArray(afterCollection.args) ||
+    afterCollection.args.some((argument) => typeof argument !== "string")
+  ) {
+    throw new TypeError(
+      "afterCollection must be an object with an executable string and string args array",
+    );
+  }
+  return afterCollection;
+}
+
+function readDescriptorAnchoredRendererAssets(rendererRoot, afterCollection) {
+  const hook = normalizeAfterCollectionHook(afterCollection);
+  const args = [resolve(rendererRoot)];
+  if (hook) {
+    args.push(
+      "--after-collection-hook",
+      Buffer.from(JSON.stringify(hook), "utf8").toString("base64"),
+    );
+  }
+  const result = spawnSync(compiledRendererAssetDigestHelper(), args, {
+    encoding: "utf8",
+    maxBuffer: 32 * 1024 * 1024,
+  });
+  if (result.error || result.status !== 0) {
+    throw new Error(
+      result.stderr?.trim() ||
+        result.error?.message ||
+        "descriptor-anchored renderer asset digest helper failed",
+      { cause: result.error },
+    );
+  }
+  let assets;
+  try {
+    assets = JSON.parse(result.stdout);
+  } catch (error) {
+    throw new Error("descriptor-anchored renderer asset digest helper returned invalid JSON", {
+      cause: error,
+    });
+  }
+  if (
+    !Array.isArray(assets) ||
+    assets.some(
+      (asset) =>
+        !asset ||
+        typeof asset !== "object" ||
+        typeof asset.relativePath !== "string" ||
+        typeof asset.sha256 !== "string" ||
+        !/^[0-9a-f]{64}$/.test(asset.sha256),
+    )
+  ) {
+    throw new Error("descriptor-anchored renderer asset digest helper returned invalid assets");
+  }
+  return assets;
 }
 
 /**
@@ -270,15 +354,11 @@ function readRendererAssetNoFollow(asset) {
  * manifest to the complete immutable generation it accompanies.
  */
 export function computeRendererAssetDigest(rendererRoot, { afterCollection } = {}) {
-  const assets = [];
-  collectRendererAssetFiles(rendererRoot, rendererRoot, assets);
+  const assets = readDescriptorAnchoredRendererAssets(rendererRoot, afterCollection);
   assets.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
-  // Makes collection-to-hash race coverage deterministic without affecting
-  // production callers, which do not supply an options object.
-  afterCollection?.();
   let manifestLines = "";
   for (const asset of assets) {
-    manifestLines += `${asset.relativePath}:${sha256Hex(readRendererAssetNoFollow(asset))}\n`;
+    manifestLines += `${asset.relativePath}:${asset.sha256}\n`;
   }
   return sha256Hex(Buffer.from(manifestLines, "utf8"));
 }

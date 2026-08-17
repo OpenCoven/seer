@@ -216,6 +216,7 @@ function createRendererFixture(scratch) {
     "tsconfig.json",
     "scripts/build-standalone-renderer.mjs",
     "scripts/renderer-consumer-gate.mjs",
+    "scripts/renderer-asset-digest.swift",
     "scripts/renderer-build-identity.mjs",
   ]) {
     cpSync(join(repoRoot, relativePath), join(fixtureRepo, relativePath));

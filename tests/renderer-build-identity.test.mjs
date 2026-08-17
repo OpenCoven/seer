@@ -2,13 +2,11 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
   cpSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  renameSync,
   rmSync,
-  symlinkSync,
-  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
@@ -28,6 +26,14 @@ const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = dirname(here);
 
 const HEX_SHA256 = /^[0-9a-f]{64}$/;
+const assetDigestHook = join(here, "helpers", "renderer-asset-digest-test-hook.mjs");
+
+function afterCollectionHook(action, ...args) {
+  return {
+    executable: process.execPath,
+    args: [assetDigestHook, action, ...args],
+  };
+}
 
 /**
  * A disposable copy of `tests/fixtures/renderer-build-identity/repo`,
@@ -107,10 +113,11 @@ test("computeRendererAssetDigest rejects an asset replaced by a symlink after co
     assert.throws(
       () =>
         computeRendererAssetDigest(rendererRoot, {
-          afterCollection() {
-            unlinkSync(assetPath);
-            symlinkSync(symlinkTarget, assetPath);
-          },
+          afterCollection: afterCollectionHook(
+            "replace-file-with-symlink",
+            assetPath,
+            symlinkTarget,
+          ),
         }),
       /renderer asset must not be a symlink: index\.ts/i,
     );
@@ -127,9 +134,11 @@ test("computeRendererAssetDigest rejects an asset replaced by a different regula
     assert.throws(
       () =>
         computeRendererAssetDigest(rendererRoot, {
-          afterCollection() {
-            renameSync(replacementPath, assetPath);
-          },
+          afterCollection: afterCollectionHook(
+            "replace-file-with-file",
+            replacementPath,
+            assetPath,
+          ),
         }),
       /renderer asset changed identity while being opened: index\.ts/i,
     );
@@ -144,10 +153,7 @@ test("computeRendererAssetDigest rejects an asset replaced by a non-regular file
     assert.throws(
       () =>
         computeRendererAssetDigest(rendererRoot, {
-          afterCollection() {
-            unlinkSync(assetPath);
-            mkdirSync(assetPath);
-          },
+          afterCollection: afterCollectionHook("replace-file-with-directory", assetPath),
         }),
       /renderer asset must be a regular file after opening: index\.ts/i,
     );
@@ -162,11 +168,60 @@ test("computeRendererAssetDigest rejects an in-place asset mutation after collec
     assert.throws(
       () =>
         computeRendererAssetDigest(rendererRoot, {
-          afterCollection() {
-            writeFileSync(assetPath, "in-place mutation after asset collection\n");
-          },
+          afterCollection: afterCollectionHook("mutate-file", assetPath),
         }),
       /renderer asset changed identity while being opened: index\.ts/i,
+    );
+  });
+});
+
+test("computeRendererAssetDigest rejects a parent-directory symlink replacement even when hard-linked assets keep file identities", () => {
+  withFixtureCopy((fixtureRepo) => {
+    const rendererRoot = join(fixtureRepo, "renderer");
+    const parentPath = join(rendererRoot, "nested");
+    const originalAsset = join(parentPath, "util.ts");
+    const replacementParent = join(fixtureRepo, "outside-parent");
+    const replacementAsset = join(replacementParent, "util.ts");
+    const parkedParent = join(rendererRoot, "nested-before-replacement");
+    mkdirSync(replacementParent);
+    linkSync(originalAsset, replacementAsset);
+
+    assert.throws(
+      () =>
+        computeRendererAssetDigest(rendererRoot, {
+          afterCollection: afterCollectionHook(
+            "replace-directory-with-symlink",
+            parentPath,
+            parkedParent,
+            replacementParent,
+          ),
+        }),
+      /renderer asset directory must not be a symlink: nested/i,
+    );
+  });
+});
+
+test("computeRendererAssetDigest rejects a renderer-root symlink replacement even when every asset inode is preserved", () => {
+  withFixtureCopy((fixtureRepo) => {
+    const rendererRoot = join(fixtureRepo, "renderer");
+    const replacementRoot = join(fixtureRepo, "outside-renderer");
+    const parkedRoot = join(fixtureRepo, "renderer-before-replacement");
+    mkdirSync(join(replacementRoot, "nested"), { recursive: true });
+    for (const relativePath of [".DS_Store", ".hidden-source.ts", "index.ts", "nested/.DS_Store", "nested/util.ts"]) {
+      linkSync(join(rendererRoot, relativePath), join(replacementRoot, relativePath));
+    }
+
+    assert.throws(
+      () =>
+        computeRendererAssetDigest(rendererRoot, {
+          afterCollection: afterCollectionHook(
+            "replace-directory-with-symlink",
+            rendererRoot,
+            parkedRoot,
+            replacementRoot,
+          ),
+        }),
+      /renderer root must not contain a symlink/i,
     );
   });
 });
