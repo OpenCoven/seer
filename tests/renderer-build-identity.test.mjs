@@ -1,7 +1,16 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import {
+  cpSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -31,7 +40,8 @@ const HEX_SHA256 = /^[0-9a-f]{64}$/;
  */
 function withFixtureCopy(run) {
   const fixtureSource = join(here, "fixtures", "renderer-build-identity", "repo");
-  const tmpRoot = mkdtempSync(join(tmpdir(), "seer-renderer-build-identity-"));
+  mkdirSync(join(repoRoot, "build"), { recursive: true });
+  const tmpRoot = mkdtempSync(join(repoRoot, "build", "renderer-build-identity-"));
   const fixtureRepo = join(tmpRoot, "repo");
   cpSync(fixtureSource, fixtureRepo, { recursive: true });
   try {
@@ -84,6 +94,80 @@ test("computeRendererAssetDigest changes when an emitted asset changes and ignor
     assert.equal(computeRendererAssetDigest(rendererRoot), before);
     writeFileSync(join(rendererRoot, "index.ts"), `${readFileSync(join(rendererRoot, "index.ts"), "utf8")}changed\n`);
     assert.notEqual(computeRendererAssetDigest(rendererRoot), before);
+  });
+});
+
+test("computeRendererAssetDigest rejects an asset replaced by a symlink after collection", () => {
+  withFixtureCopy((fixtureRepo) => {
+    const rendererRoot = join(fixtureRepo, "renderer");
+    const assetPath = join(rendererRoot, "index.ts");
+    const symlinkTarget = join(fixtureRepo, "outside-renderer.txt");
+    writeFileSync(symlinkTarget, "must never be hashed through a renderer asset path\n");
+
+    assert.throws(
+      () =>
+        computeRendererAssetDigest(rendererRoot, {
+          afterCollection() {
+            unlinkSync(assetPath);
+            symlinkSync(symlinkTarget, assetPath);
+          },
+        }),
+      /renderer asset must not be a symlink: index\.ts/i,
+    );
+  });
+});
+
+test("computeRendererAssetDigest rejects an asset replaced by a different regular file after collection", () => {
+  withFixtureCopy((fixtureRepo) => {
+    const rendererRoot = join(fixtureRepo, "renderer");
+    const assetPath = join(rendererRoot, "index.ts");
+    const replacementPath = join(rendererRoot, "replacement.ts");
+    writeFileSync(replacementPath, "replacement asset\n");
+
+    assert.throws(
+      () =>
+        computeRendererAssetDigest(rendererRoot, {
+          afterCollection() {
+            renameSync(replacementPath, assetPath);
+          },
+        }),
+      /renderer asset changed identity while being opened: index\.ts/i,
+    );
+  });
+});
+
+test("computeRendererAssetDigest rejects an asset replaced by a non-regular file after collection", () => {
+  withFixtureCopy((fixtureRepo) => {
+    const rendererRoot = join(fixtureRepo, "renderer");
+    const assetPath = join(rendererRoot, "index.ts");
+
+    assert.throws(
+      () =>
+        computeRendererAssetDigest(rendererRoot, {
+          afterCollection() {
+            unlinkSync(assetPath);
+            mkdirSync(assetPath);
+          },
+        }),
+      /renderer asset must be a regular file after opening: index\.ts/i,
+    );
+  });
+});
+
+test("computeRendererAssetDigest rejects an in-place asset mutation after collection", () => {
+  withFixtureCopy((fixtureRepo) => {
+    const rendererRoot = join(fixtureRepo, "renderer");
+    const assetPath = join(rendererRoot, "index.ts");
+
+    assert.throws(
+      () =>
+        computeRendererAssetDigest(rendererRoot, {
+          afterCollection() {
+            writeFileSync(assetPath, "in-place mutation after asset collection\n");
+          },
+        }),
+      /renderer asset changed identity while being opened: index\.ts/i,
+    );
   });
 });
 

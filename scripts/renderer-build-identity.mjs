@@ -205,16 +205,62 @@ function collectRendererAssetFiles(rendererRoot, directory, out) {
     const absolutePath = join(directory, entry.name);
     const relativePath = toPosixRelativePath(rendererRoot, absolutePath);
     if (relativePath === "build-manifest.json") continue;
-    if (entry.isSymbolicLink()) {
+    const info = lstatSync(absolutePath);
+    if (info.isSymbolicLink()) {
       throw new Error(`renderer asset must not be a symlink: ${relativePath}`);
     }
-    if (entry.isDirectory()) {
+    if (info.isDirectory()) {
       collectRendererAssetFiles(rendererRoot, absolutePath, out);
-    } else if (entry.isFile()) {
-      out.push(relativePath);
+    } else if (info.isFile()) {
+      out.push({ absolutePath, info, relativePath });
     } else {
       throw new Error(`renderer asset must be a regular file or directory: ${relativePath}`);
     }
+  }
+}
+
+function sameObservedFileIdentity(expected, actual) {
+  return (
+    expected.dev === actual.dev &&
+    expected.ino === actual.ino &&
+    expected.size === actual.size &&
+    expected.mtimeMs === actual.mtimeMs &&
+    expected.ctimeMs === actual.ctimeMs
+  );
+}
+
+function readRendererAssetNoFollow(asset) {
+  let descriptor;
+  try {
+    descriptor = openSync(
+      asset.absolutePath,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+  } catch (error) {
+    if (error && error.code === "ELOOP") {
+      throw new Error(`renderer asset must not be a symlink: ${asset.relativePath}`, { cause: error });
+    }
+    throw new Error(
+      `unable to open renderer asset without following symlinks: ${asset.relativePath}`,
+      { cause: error },
+    );
+  }
+  try {
+    const opened = fstatSync(descriptor);
+    if (!opened.isFile()) {
+      throw new Error(`renderer asset must be a regular file after opening: ${asset.relativePath}`);
+    }
+    if (!sameObservedFileIdentity(asset.info, opened)) {
+      throw new Error(`renderer asset changed identity while being opened: ${asset.relativePath}`);
+    }
+    const contents = readFileSync(descriptor);
+    const afterRead = fstatSync(descriptor);
+    if (!afterRead.isFile() || !sameObservedFileIdentity(opened, afterRead)) {
+      throw new Error(`renderer asset changed while hashing: ${asset.relativePath}`);
+    }
+    return contents;
+  } finally {
+    closeSync(descriptor);
   }
 }
 
@@ -223,14 +269,16 @@ function collectRendererAssetFiles(rendererRoot, directory, out) {
  * Excluding the manifest avoids a self-referential digest while binding the
  * manifest to the complete immutable generation it accompanies.
  */
-export function computeRendererAssetDigest(rendererRoot) {
-  const relativePaths = [];
-  collectRendererAssetFiles(rendererRoot, rendererRoot, relativePaths);
-  relativePaths.sort();
+export function computeRendererAssetDigest(rendererRoot, { afterCollection } = {}) {
+  const assets = [];
+  collectRendererAssetFiles(rendererRoot, rendererRoot, assets);
+  assets.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+  // Makes collection-to-hash race coverage deterministic without affecting
+  // production callers, which do not supply an options object.
+  afterCollection?.();
   let manifestLines = "";
-  for (const relativePath of relativePaths) {
-    const absolutePath = join(rendererRoot, ...relativePath.split("/"));
-    manifestLines += `${relativePath}:${sha256Hex(readFileSync(absolutePath))}\n`;
+  for (const asset of assets) {
+    manifestLines += `${asset.relativePath}:${sha256Hex(readRendererAssetNoFollow(asset))}\n`;
   }
   return sha256Hex(Buffer.from(manifestLines, "utf8"));
 }
