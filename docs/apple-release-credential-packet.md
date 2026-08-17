@@ -16,9 +16,17 @@ Verified on 2026-08-12:
 - This Mac has a valid `Developer ID Application: Soul Protocol LLC
   (9LR8Z8UQ9X)` signing identity.
 - `OpenCoven/coven-cave` already uses the same Apple secret names successfully.
-- The standalone workflow and packaging scripts are planned but not implemented.
+- The release workflow (`.github/workflows/release-macos.yml`) and packaging
+  scripts (`scripts/release-macos-draft.sh`,
+  `scripts/release-macos-draft-state.mjs`, and related `scripts/*macos*`
+  tooling) are implemented and tested on the `feat/seer-standalone-macos`
+  feature branch. They are not yet merged to the default branch, pushed to a
+  release tag, or deployed. Every remote resource and credential this packet
+  describes — `OpenCoven/seer-releases`, the `macos-release` environment, its
+  secrets, and its variables — remains unconfigured.
 
-Do not add credentials until the release workflow exists and has been reviewed.
+Do not add credentials until the release workflow has merged and been reviewed
+on the repository's default branch.
 GitHub exposes existing secret names but never their values, so the working
 `coven-cave` secrets cannot be copied out of GitHub. Load Seer's secrets again
 from the approved original `.p12`, `.p8`, password, and account records.
@@ -70,6 +78,50 @@ explicitly approved and created. Grant access only to that repository, with:
 
 Do not grant organization administration, Actions administration, source-repo
 write access, or access to other repositories.
+
+### Required release-writer identity variables
+
+`.github/workflows/release-macos.yml` reads `vars.RELEASE_WRITER_LOGIN` and
+`vars.RELEASE_WRITER_ID` from the `macos-release` environment. These are
+GitHub Actions **environment variables**, not secrets — set them with
+`gh variable set`, not `gh secret set`. The workflow rejects the run before any
+credential is used if either is missing or malformed:
+
+| GitHub environment variable | Format | Purpose |
+| --- | --- | --- |
+| `RELEASE_WRITER_LOGIN` | Exact GitHub login of the `RELEASES_REPO_TOKEN` owner; must match `^[A-Za-z0-9]([A-Za-z0-9-]{0,38})$` | Pins the workflow to one specific token-owning account |
+| `RELEASE_WRITER_ID` | Exact numeric GitHub user ID of that same account; must match `^[1-9][0-9]*$` | Prevents a login rename or account substitution from silently changing the trusted release writer |
+
+`scripts/release-macos-draft.sh` and `scripts/release-macos-draft-state.mjs`
+independently verify, on every mutating call, that `RELEASES_REPO_TOKEN`
+authenticates as the GitHub user whose `id` and `login` exactly equal these
+two values, and that the release's `author` matches them too. A token that
+authenticates as any other account fails closed.
+
+Determine the two values from the account that will hold
+`RELEASES_REPO_TOKEN`, then set them once the `macos-release` environment
+exists:
+
+```bash
+gh api user --jq '{login, id}'
+```
+
+```bash
+gh variable set RELEASE_WRITER_LOGIN --repo OpenCoven/seer --env macos-release \
+  --body "the-account-login"
+gh variable set RELEASE_WRITER_ID --repo OpenCoven/seer --env macos-release \
+  --body "123456"
+```
+
+Environment variables are visible in plaintext (they identify an account, not
+a credential), so verify them by reading their values directly instead of
+only checking presence:
+
+```bash
+gh variable list --repo OpenCoven/seer --env macos-release
+gh variable get RELEASE_WRITER_LOGIN --repo OpenCoven/seer --env macos-release
+gh variable get RELEASE_WRITER_ID --repo OpenCoven/seer --env macos-release
+```
 
 ## Export the signing certificate
 
@@ -199,7 +251,7 @@ declare `environment: macos-release` before it can access these secrets.
 ## Configure the protected environment
 
 Create a GitHub environment named `macos-release` only after the release
-workflow has landed.
+workflow has merged to the default branch.
 
 Configure:
 
@@ -225,6 +277,44 @@ They become releasable only when:
 At that point set both approval variables to `true` and set
 `CLEAN_MACHINE_VERIFIED_COMMIT` to the exact lowercase 40-character source
 commit. The workflow must reject any other value.
+
+## Enable and verify immutable releases in `OpenCoven/seer-releases`
+
+`scripts/release-macos-draft.sh` and `scripts/release-macos-draft-state.mjs`
+require GitHub's immutable-releases protection to already be enabled on
+`OpenCoven/seer-releases` before they will draft, sign, or publish anything.
+`require_repository_governance` in the shell script fetches
+`GET repos/OpenCoven/seer-releases/immutable-releases`, and `runImmutable` in
+the Node helper fails the run outright unless the response is exactly
+`{"enabled": true}`. Neither script enables the setting; both only verify it.
+
+Enable it once, after `OpenCoven/seer-releases` is created and before any
+tagged release runs, from an account with administrative access to that
+repository. This is a repository setting change and is out of scope for
+`RELEASES_REPO_TOKEN`, which is deliberately not granted `Administration`
+access:
+
+- In the GitHub UI: open `OpenCoven/seer-releases` → **Settings** → scroll to
+  the **Releases** section → enable **Enable release immutability**.
+- Equivalently, using an admin's own elevated session (not
+  `RELEASES_REPO_TOKEN`):
+
+  ```bash
+  gh api --method PUT repos/OpenCoven/seer-releases/immutable-releases \
+    -f enabled=true
+  ```
+
+Verify the setting with the same read-only access already granted to
+`RELEASES_REPO_TOKEN` — this does not require elevated permissions:
+
+```bash
+gh api repos/OpenCoven/seer-releases/immutable-releases --jq '.enabled'
+```
+
+This must print `true` before the first tagged release run. Once enabled,
+immutability applies only to releases published from that point forward, and
+the workflow's own read of this endpoint fails the job closed if it is ever
+disabled or missing.
 
 ## Verify configuration without reading secrets
 
@@ -252,6 +342,17 @@ RELEASES_REPO_TOKEN
 
 `APPLE_ID` and `APPLE_PASSWORD` appear only when the fallback is configured.
 
+The expected environment variable names (not secrets — safe to display in
+full with `gh variable get`) are:
+
+```text
+BINARY_DISTRIBUTION_APPROVED
+CLEAN_MACHINE_VERIFIED_COMMIT
+PARITY_MATRIX_APPROVED
+RELEASE_WRITER_ID
+RELEASE_WRITER_LOGIN
+```
+
 Do not validate credentials by printing them, echoing them into logs, or
 running an unreviewed workflow. The first live validation happens in the
 protected release job after its credential-import and notarization steps have
@@ -270,14 +371,19 @@ been reviewed.
 
 ## Completion checklist
 
-- [ ] Release workflow implemented and reviewed
+- [ ] Release workflow implemented, reviewed, merged to the default branch,
+      and pushed
 - [ ] `OpenCoven/seer-releases` explicitly approved and created
+- [ ] Immutable releases enabled on `OpenCoven/seer-releases` and verified as
+      `{"enabled": true}`
 - [ ] Developer ID Application `.p12` exported with private key
 - [ ] `.p12` password stored separately
 - [ ] App Store Connect issuer ID, key ID, and `.p8` secured
 - [ ] Optional Apple ID fallback intentionally enabled or omitted
 - [ ] Fine-grained release token scoped only to `seer-releases`
 - [ ] Required `macos-release` environment secrets present by name
+- [ ] `RELEASE_WRITER_LOGIN` and `RELEASE_WRITER_ID` set to the exact login
+      and numeric ID of the `RELEASES_REPO_TOKEN` owner
 - [ ] `macos-release` environment protection configured
 - [ ] Approval variables remain false until parity and clean-machine gates pass
 - [ ] Original `.p12` and `.p8` retained only in approved secure storage
