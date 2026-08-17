@@ -75,9 +75,19 @@ explicitly approved and created. Grant access only to that repository, with:
 
 - **Contents:** Read and write
 - **Metadata:** Read-only, implicitly required by GitHub
+- **Administration:** Read-only
 
-Do not grant organization administration, Actions administration, source-repo
-write access, or access to other repositories.
+`require_repository_governance` in `scripts/release-macos-draft.sh` runs
+`GET repos/OpenCoven/seer-releases/immutable-releases` with this same token on
+every invocation (`acquire-lock`, `reconcile-published`, `preflight`, `upload`,
+`capture`, `publish`, and `release-lock`), because the GitHub REST API requires
+repository `Administration: read` to read that endpoint — `Contents` and
+`Metadata` access are not sufficient. Grant read-only, not read-and-write:
+read is enough to verify the setting, and write would let this token enable or
+disable repository-administration state that it must not control.
+
+Do not grant organization administration, Administration write, Actions
+administration, source-repo write access, or access to other repositories.
 
 ### Required release-writer identity variables
 
@@ -284,15 +294,17 @@ commit. The workflow must reject any other value.
 require GitHub's immutable-releases protection to already be enabled on
 `OpenCoven/seer-releases` before they will draft, sign, or publish anything.
 `require_repository_governance` in the shell script fetches
-`GET repos/OpenCoven/seer-releases/immutable-releases`, and `runImmutable` in
-the Node helper fails the run outright unless the response is exactly
-`{"enabled": true}`. Neither script enables the setting; both only verify it.
+`GET repos/OpenCoven/seer-releases/immutable-releases` using
+`RELEASES_REPO_TOKEN`, and `runImmutable` in the Node helper fails the run
+unless the parsed response has `enabled === true`; it does not require the
+response to contain only that field, so any additional fields GitHub returns
+alongside `enabled` are accepted. Neither script enables the setting; both
+only verify it.
 
-Enable it once, after `OpenCoven/seer-releases` is created and before any
-tagged release runs, from an account with administrative access to that
-repository. This is a repository setting change and is out of scope for
-`RELEASES_REPO_TOKEN`, which is deliberately not granted `Administration`
-access:
+Enabling the setting is a write, so it is out of scope for
+`RELEASES_REPO_TOKEN`'s `Administration: read` grant. Enable it once, after
+`OpenCoven/seer-releases` is created and before any tagged release runs, from
+an account with administrative (write) access to that repository:
 
 - In the GitHub UI: open `OpenCoven/seer-releases` → **Settings** → scroll to
   the **Releases** section → enable **Enable release immutability**.
@@ -301,11 +313,15 @@ access:
 
   ```bash
   gh api --method PUT repos/OpenCoven/seer-releases/immutable-releases \
-    -f enabled=true
+    -F enabled=true
   ```
 
-Verify the setting with the same read-only access already granted to
-`RELEASES_REPO_TOKEN` — this does not require elevated permissions:
+  `-F` sends `enabled` as a typed JSON boolean; `-f` would send it as the
+  string `"true"`, which the endpoint does not accept as a boolean.
+
+Verify the setting with the same `Administration: read` access already
+granted to `RELEASES_REPO_TOKEN` for this purpose — read access is sufficient
+and does not require the elevated write access needed to enable the setting:
 
 ```bash
 gh api repos/OpenCoven/seer-releases/immutable-releases --jq '.enabled'
@@ -374,8 +390,9 @@ been reviewed.
 - [ ] Release workflow implemented, reviewed, merged to the default branch,
       and pushed
 - [ ] `OpenCoven/seer-releases` explicitly approved and created
-- [ ] Immutable releases enabled on `OpenCoven/seer-releases` and verified as
-      `{"enabled": true}`
+- [ ] Immutable releases enabled on `OpenCoven/seer-releases` and verified by
+      confirming `.enabled` is `true` in the API response (additional
+      response fields are expected and do not affect the check)
 - [ ] Developer ID Application `.p12` exported with private key
 - [ ] `.p12` password stored separately
 - [ ] App Store Connect issuer ID, key ID, and `.p8` secured
