@@ -27,7 +27,8 @@ function stepBlocks(job) {
 
 test("release workflow exists and has only the protected tag trigger and scoped source-run read permission", () => {
   assert.ok(existsSync(workflowPath), ".github/workflows/release-macos.yml must exist");
-  assert.match(source, /^on:\n {2}push:\n {4}tags:\n {6}- "v\*\.\*\.\*"\n\npermissions:\n {2}actions: read\n {2}contents: read\n {2}id-token: write$/m);
+  assert.match(source, /^on:\n {2}push:\n {4}tags:\n {6}- "v\*\.\*\.\*"\n\npermissions:\n {2}actions: read\n {2}contents: read$/m);
+  assert.doesNotMatch(source, /\bid-token:\s*write\b/);
   assert.doesNotMatch(source, /\b(?:pull_request|workflow_dispatch|schedule):/);
   assert.match(
     source,

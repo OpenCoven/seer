@@ -17,7 +17,6 @@ on:
 permissions:
   actions: read
   contents: read
-  id-token: write
 
 concurrency:
   group: release-macos-OpenCoven-seer-releases-${{ github.ref_name }}
