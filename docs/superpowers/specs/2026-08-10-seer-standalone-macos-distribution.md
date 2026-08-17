@@ -26,7 +26,8 @@ pass the same parity matrix.
 - The app uses Hardened Runtime without App Sandbox.
 - Source remains private.
 - Public binaries are published through `OpenCoven/seer-releases`.
-- Signing and notarization credentials are repository-scoped GitHub secrets.
+- Signing, notarization, and release credentials are secrets scoped to the
+  protected `macos-release` GitHub environment.
 
 ## Goals
 
@@ -396,7 +397,8 @@ The release target uses Hardened Runtime and no App Sandbox entitlement. The
 entitlements file contains only capabilities demonstrated to be necessary.
 The app is signed with an OpenCoven Developer ID Application identity.
 
-Repository secrets follow the existing OpenCoven macOS convention:
+The protected `macos-release` environment uses secrets following the existing
+OpenCoven macOS naming convention:
 
 | Secret | Purpose |
 | --- | --- |

@@ -70,6 +70,18 @@ node --test tests/standalone-boundary.test.mjs
 The generated Xcode project and every native build/release product are ignored.
 Do not commit them.
 
+## Standalone macOS distribution
+
+The standalone Swift/AppKit application and signed release pipeline are
+implemented:
+
+- [Standalone distribution design](docs/superpowers/specs/2026-08-10-seer-standalone-macos-distribution.md)
+- [Standalone implementation plan](docs/superpowers/plans/2026-08-10-seer-standalone-macos-distribution.md)
+- [Apple release credential packet](docs/apple-release-credential-packet.md)
+
+Signing, notarization, and release credentials are secrets scoped to the
+protected `macos-release` GitHub environment, not repository-scoped secrets.
+
 ## Architecture
 
 - `main/` — retained Glaze lifecycle, detection, monitoring, storage, tray,
