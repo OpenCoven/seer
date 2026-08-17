@@ -166,6 +166,21 @@ function sha256Hex(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
+/**
+ * Canonical renderer-asset path ordering shared with
+ * `renderer-asset-digest.swift` and the bundled-renderer Swift verifier.
+ *
+ * A path is root-relative, uses `/` separators, and retains each filename's
+ * exact Unicode scalar sequence: no locale collation, case folding, or
+ * Unicode normalization is applied. Encode that path as UTF-8, compare the
+ * first differing byte as an unsigned octet, and treat a strict prefix as
+ * smaller. This preserves the manifest's existing bytes/hash construction
+ * while giving every host exactly one ordering contract.
+ */
+export function compareRendererAssetPaths(left, right) {
+  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
+}
+
 function readRegularFileNoFollow(path, label) {
   const before = lstatSync(path);
   if (before.isSymbolicLink() || !before.isFile()) {
@@ -349,13 +364,14 @@ function readDescriptorAnchoredRendererAssets(rendererRoot, afterCollection) {
 }
 
 /**
- * Lowercase SHA-256 over every emitted file except build-manifest.json.
- * Excluding the manifest avoids a self-referential digest while binding the
- * manifest to the complete immutable generation it accompanies.
+ * Lowercase SHA-256 over every emitted file except build-manifest.json,
+ * canonically ordered by {@link compareRendererAssetPaths}. Excluding the
+ * manifest avoids a self-referential digest while binding the manifest to the
+ * complete immutable generation it accompanies.
  */
 export function computeRendererAssetDigest(rendererRoot, { afterCollection } = {}) {
   const assets = readDescriptorAnchoredRendererAssets(rendererRoot, afterCollection);
-  assets.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+  assets.sort((left, right) => compareRendererAssetPaths(left.relativePath, right.relativePath));
   let manifestLines = "";
   for (const asset of assets) {
     manifestLines += `${asset.relativePath}:${asset.sha256}\n`;

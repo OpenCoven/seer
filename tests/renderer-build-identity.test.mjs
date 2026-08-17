@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   cpSync,
   linkSync,
@@ -10,13 +11,14 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 
 import {
   RENDERER_BUILD_MANIFEST_ALGORITHM,
   RENDERER_BUILD_MANIFEST_SCHEMA_VERSION,
   buildRendererBuildManifest,
+  compareRendererAssetPaths,
   computeRendererAssetDigest,
   computeRendererBuildDigest,
   rendererBuildInputFiles,
@@ -27,12 +29,72 @@ const repoRoot = dirname(here);
 
 const HEX_SHA256 = /^[0-9a-f]{64}$/;
 const assetDigestHook = join(here, "helpers", "renderer-asset-digest-test-hook.mjs");
+const assetDigestHelper = join(repoRoot, "scripts", "renderer-asset-digest.swift");
+const buildIdentityModuleURL = pathToFileURL(
+  join(repoRoot, "scripts", "renderer-build-identity.mjs"),
+).href;
 
 function afterCollectionHook(action, ...args) {
   return {
     executable: process.execPath,
     args: [assetDigestHook, action, ...args],
   };
+}
+
+function sha256Hex(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function expectedAssetDigest(assets) {
+  const manifestLines = [...assets]
+    .sort((left, right) => compareRendererAssetPaths(left.relativePath, right.relativePath))
+    .map((asset) => `${asset.relativePath}:${asset.sha256}\n`)
+    .join("");
+  return sha256Hex(Buffer.from(manifestLines, "utf8"));
+}
+
+function collectAssetsWithSwiftHelper(rendererRoot) {
+  return JSON.parse(
+    execFileSync("swift", [assetDigestHelper, rendererRoot], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }),
+  );
+}
+
+function twoAvailableLocales() {
+  const available = execFileSync("locale", ["-a"], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  })
+    .split(/\r?\n/)
+    .filter(Boolean);
+  const byLowercaseName = new Map(available.map((locale) => [locale.toLowerCase(), locale]));
+  const selected = [];
+  for (const preferred of ["C", "en_US.UTF-8", "sv_SE.UTF-8", "de_DE.UTF-8", "tr_TR.UTF-8"]) {
+    const locale = byLowercaseName.get(preferred.toLowerCase());
+    if (locale && !selected.includes(locale)) selected.push(locale);
+    if (selected.length === 2) return selected;
+  }
+  for (const locale of available) {
+    if (!selected.includes(locale)) selected.push(locale);
+    if (selected.length === 2) return selected;
+  }
+  assert.fail(`expected at least two available locales, found: ${available.join(", ") || "(none)"}`);
+}
+
+function assetDigestUnderLocale(rendererRoot, locale) {
+  const program = [
+    `import { computeRendererAssetDigest } from ${JSON.stringify(buildIdentityModuleURL)};`,
+    `process.stdout.write(computeRendererAssetDigest(${JSON.stringify(rendererRoot)}));`,
+  ].join("\n");
+  return execFileSync(process.execPath, ["--input-type=module", "--eval", program], {
+    cwd: repoRoot,
+    encoding: "utf8",
+    env: { ...process.env, LC_ALL: locale },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
 }
 
 /**
@@ -100,6 +162,51 @@ test("computeRendererAssetDigest changes when an emitted asset changes and ignor
     assert.equal(computeRendererAssetDigest(rendererRoot), before);
     writeFileSync(join(rendererRoot, "index.ts"), `${readFileSync(join(rendererRoot, "index.ts"), "utf8")}changed\n`);
     assert.notEqual(computeRendererAssetDigest(rendererRoot), before);
+  });
+});
+
+test("computeRendererAssetDigest uses shared UTF-8 byte ordering for non-ASCII paths under differing locales", () => {
+  withFixtureCopy((fixtureRepo) => {
+    const rendererRoot = join(fixtureRepo, "renderer");
+    mkdirSync(join(rendererRoot, "unicode", "中"), { recursive: true });
+    for (const relativePath of [
+      "unicode/B.txt",
+      "unicode/a.txt",
+      "unicode/z.txt",
+      "unicode/ä.txt",
+      "unicode/é.txt",
+      "unicode/Ω.txt",
+      "unicode/中/雪.txt",
+    ]) {
+      writeFileSync(join(rendererRoot, relativePath), `${relativePath}\n`);
+    }
+
+    const helperAssets = collectAssetsWithSwiftHelper(rendererRoot);
+    const helperPaths = helperAssets.map((asset) => asset.relativePath);
+    assert.ok(
+      helperPaths.some((relativePath) => /[^\0-\x7F]/.test(relativePath)),
+      "the Swift helper must collect the non-ASCII asset paths",
+    );
+    assert.deepEqual(
+      helperPaths,
+      [...helperPaths].sort(compareRendererAssetPaths),
+      "the Swift helper must emit the same UTF-8 byte order Node uses for asset manifests",
+    );
+
+    const expectedDigest = expectedAssetDigest(helperAssets);
+    assert.equal(
+      computeRendererAssetDigest(rendererRoot),
+      expectedDigest,
+      "Node must construct the same canonical UTF-8-byte-ordered manifest as the Swift helper",
+    );
+
+    const [firstLocale, secondLocale] = twoAvailableLocales();
+    assert.notEqual(firstLocale, secondLocale, "the locale-stability check requires distinct LC_ALL values");
+    const firstDigest = assetDigestUnderLocale(rendererRoot, firstLocale);
+    const secondDigest = assetDigestUnderLocale(rendererRoot, secondLocale);
+    assert.equal(firstDigest, expectedDigest, `LC_ALL=${firstLocale} must not change the asset digest`);
+    assert.equal(secondDigest, expectedDigest, `LC_ALL=${secondLocale} must not change the asset digest`);
+    assert.equal(firstDigest, secondDigest, "different LC_ALL values must produce the same asset digest");
   });
 });
 

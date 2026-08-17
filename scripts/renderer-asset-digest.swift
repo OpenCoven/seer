@@ -83,6 +83,20 @@ private func failure(_ message: String) -> RendererDigestFailure {
     RendererDigestFailure(message: message)
 }
 
+/// Compares root-relative POSIX paths by their exact UTF-8 byte sequences.
+/// This intentionally does not use locale collation, case folding, or Unicode
+/// normalization; it must match `compareRendererAssetPaths` in
+/// `renderer-build-identity.mjs`.
+private func canonicalPathPrecedes(_ left: String, _ right: String) -> Bool {
+    let leftBytes = Array(left.utf8)
+    let rightBytes = Array(right.utf8)
+    let commonCount = min(leftBytes.count, rightBytes.count)
+    for index in 0 ..< commonCount where leftBytes[index] != rightBytes[index] {
+        return leftBytes[index] < rightBytes[index]
+    }
+    return leftBytes.count < rightBytes.count
+}
+
 private func systemError(_ context: String, _ code: Int32 = errno) -> RendererDigestFailure {
     failure("\(context): \(String(cString: strerror(code)))")
 }
@@ -249,7 +263,7 @@ private func directoryEntryNames(_ directory: DirectoryRecord) throws -> [String
             names.append(name)
         }
     }
-    return names.sorted()
+    return names.sorted(by: canonicalPathPrecedes)
 }
 
 private func collectAssets(
@@ -564,7 +578,7 @@ private func computeAssetHashes(rootPath: String, hook: CollectionHook?) throws 
         )
     }
     try verifyPinnedDescriptors(directories, rootIndex: rendererRootIndex, assets: assets)
-    return hashes
+    return hashes.sorted { canonicalPathPrecedes($0.relativePath, $1.relativePath) }
 }
 
 do {

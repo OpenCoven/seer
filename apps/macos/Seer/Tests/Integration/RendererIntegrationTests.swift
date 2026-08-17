@@ -232,11 +232,24 @@ private enum BundledRenderer {
         }
 
         var manifestLines = ""
-        for relativePath in relativePaths.sorted() {
+        for relativePath in relativePaths.sorted(by: canonicalRendererAssetPathPrecedes) {
             let contents = try Data(contentsOf: rendererRoot.appendingPathComponent(relativePath))
             manifestLines += "\(relativePath):\(sha256Hex(contents))\n"
         }
         return sha256Hex(Data(manifestLines.utf8))
+    }
+
+    /// Canonical asset-path ordering shared with `renderer-build-identity.mjs`
+    /// and `renderer-asset-digest.swift`: compare exact UTF-8 bytes, with no
+    /// locale collation, case folding, or Unicode normalization.
+    private static func canonicalRendererAssetPathPrecedes(_ left: String, _ right: String) -> Bool {
+        let leftBytes = Array(left.utf8)
+        let rightBytes = Array(right.utf8)
+        let commonCount = min(leftBytes.count, rightBytes.count)
+        for index in 0 ..< commonCount where leftBytes[index] != rightBytes[index] {
+            return leftBytes[index] < rightBytes[index]
+        }
+        return leftBytes.count < rightBytes.count
     }
 
     /// Every path (relative to `repoRoot`, POSIX-style, sorted) this
