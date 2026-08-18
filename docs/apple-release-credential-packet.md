@@ -618,18 +618,25 @@ progress.
 #### 2. List and drain every queued, waiting, or in-progress release run
 
 ```bash
-# Read-only. --limit is set well above gh's default page size (20) so a
-# busy run history cannot push an old queued/waiting run out of view —
-# the same class of truncation risk --paginate addresses for org-secret
-# visibility above. Increase --limit further if the returned array's
-# length equals --limit, since that means older runs may be unseen.
-gh run list --repo OpenCoven/seer --workflow release-macos.yml \
-  --json databaseId,status,conclusion,event,headBranch,createdAt,url \
-  --limit 200 \
-  --jq '[.[] | select(.status != "completed")]'
+# Read-only, exhaustively paginated REST enumeration — walks every page via
+# the API's Link-header pagination, so (unlike a --limit-bounded `gh run
+# list`) no fixed page count can hide an older queued/waiting run, and this
+# keeps working once step 1 disables the workflow (a disabled workflow's
+# past runs remain listable via this endpoint; only new runs stop being
+# created). Fails closed: nonzero exit and a visible ID/status listing if
+# any non-completed run remains, silent zero exit only when none do.
+active_runs="$(gh api --paginate \
+  'repos/OpenCoven/seer/actions/workflows/release-macos.yml/runs?per_page=100' \
+  --jq '.workflow_runs[] | select(.status != "completed") | [.id, .status] | @tsv')"
+if [ -n "$active_runs" ]; then
+  echo "Active (non-completed) release-macos.yml runs found:" >&2
+  printf '%s\n' "$active_runs" >&2
+  exit 1
+fi
+echo "No active release-macos.yml runs (exhaustive paginated check)."
 ```
 
-If this prints anything other than `[]`, drain each listed run before
+If this exits nonzero and lists run IDs, drain each listed run before
 continuing:
 
 ```bash
@@ -638,8 +645,8 @@ continuing:
 gh run cancel <run-id> --repo OpenCoven/seer
 ```
 
-Re-run the read-only listing command and confirm it prints `[]` before
-proceeding to step 3.
+Re-run the read-only enumeration command and confirm it exits zero with no
+listed run IDs before proceeding to step 3.
 
 Draining first closes a fallback window that deleting-then-verifying alone
 does not: the release job's `environment: macos-release` secrets are
@@ -856,14 +863,22 @@ gh secret list --repo OpenCoven/seer
 gh secret list --org OpenCoven \
   --json name,visibility,numSelectedRepos,selectedReposURL
 
-# Read-only: confirm no release workflow run is queued, waiting, or
-# in-progress (see "Switching notarization methods safely" > step 2 above
-# for why this must be empty before, and stay empty during, any secret
-# change)
-gh run list --repo OpenCoven/seer --workflow release-macos.yml \
-  --json databaseId,status,conclusion,event,headBranch,createdAt,url \
-  --limit 200 \
-  --jq '[.[] | select(.status != "completed")]'
+# Read-only, exhaustively paginated REST enumeration: confirm no release
+# workflow run is queued, waiting, or in-progress (see "Switching
+# notarization methods safely" > step 2 above for why this must be empty
+# before, and stay empty during, any secret change). --paginate walks every
+# page, so no --limit value can hide an older non-completed run, and this
+# keeps working once the workflow is disabled. Fails closed: nonzero exit
+# and a visible ID/status listing if any non-completed run remains.
+active_runs="$(gh api --paginate \
+  'repos/OpenCoven/seer/actions/workflows/release-macos.yml/runs?per_page=100' \
+  --jq '.workflow_runs[] | select(.status != "completed") | [.id, .status] | @tsv')"
+if [ -n "$active_runs" ]; then
+  echo "Active (non-completed) release-macos.yml runs found:" >&2
+  printf '%s\n' "$active_runs" >&2
+  exit 1
+fi
+echo "No active release-macos.yml runs (exhaustive paginated check)."
 ```
 
 For Method A (App Store Connect API key, recommended), the expected
@@ -994,8 +1009,11 @@ been reviewed.
       `RELEASES_REPO_TOKEN`
 - [ ] Before any notarization-method switch: the release workflow disabled
       (`gh workflow disable release-macos.yml`), every queued, waiting, or
-      in-progress release run drained (`gh run list ... --jq '[.[] |
-      select(.status != "completed")]'` returns `[]`), and lower-scope
+      in-progress release run drained (confirmed by the exhaustively
+      paginated `gh api --paginate
+      repos/OpenCoven/seer/actions/workflows/release-macos.yml/runs` check
+      in "List and drain every queued, waiting, or in-progress release run"
+      exiting zero with no active runs listed), and lower-scope
       duplicates removed — all completed **before** deleting the unused
       method's environment secrets or loading the replacement set, and the
       workflow re-enabled only after the replacement set is loaded and
