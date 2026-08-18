@@ -72,6 +72,47 @@ test("release workflow exists and has only the protected tag trigger and scoped 
   );
 });
 
+test("prepare and sign-and-release are bound to the exact seer-macos-release runner group, not label-only scheduling", () => {
+  const workflow = yaml.load(source);
+  assert.ok(isYamlMap(workflow?.jobs), "workflow must parse to a map of jobs");
+
+  const expectedRunsOn = { group: "seer-macos-release", labels: "macos-14-xlarge" };
+
+  for (const jobName of ["prepare", "sign-and-release"]) {
+    const job = workflow.jobs[jobName];
+    assert.ok(isYamlMap(job), `${jobName} job must exist`);
+    // A bare string (label-only, e.g. "macos-14-xlarge") or an object bound
+    // to any group other than seer-macos-release must fail this check: both
+    // would let another runner in the org that merely carries the
+    // macos-14-xlarge label receive this job, defeating the credential
+    // packet's runner-group verification.
+    assert.ok(
+      isYamlMap(job["runs-on"]),
+      `${jobName}.runs-on must be the object form ({ group, labels }), not a bare label string`,
+    );
+    assert.deepEqual(
+      job["runs-on"],
+      expectedRunsOn,
+      `${jobName}.runs-on must bind exactly to group "seer-macos-release" and label "macos-14-xlarge"`,
+    );
+  }
+
+  // Guard the raw source too, so a reformatted-but-equivalent YAML can't
+  // silently drift the group name or reintroduce label-only scheduling
+  // undetected by the parsed check above.
+  const runsOnObjectForm = /runs-on:\n {6}group: seer-macos-release\n {6}labels: macos-14-xlarge\n/g;
+  assert.equal(
+    [...source.matchAll(runsOnObjectForm)].length,
+    2,
+    "both jobs must use the identical group+labels runs-on block",
+  );
+  assert.doesNotMatch(
+    source,
+    /runs-on: *macos-14-xlarge *\n/,
+    "no job may use label-only runs-on scheduling",
+  );
+});
+
 test("permission scanning rejects workflow-level and job-level OIDC-capable grants after YAML parsing", () => {
   const cases = [
     {
@@ -272,7 +313,7 @@ test("every external action is pinned to the resolved immutable SHA", () => {
 test("prepare pins XcodeGen and runs the complete standalone gate without credentials", () => {
   const prepare = jobBlock("prepare", "sign-and-release");
 
-  assert.match(prepare, /runs-on: macos-14-xlarge/);
+  assert.match(prepare, /runs-on:\n {6}group: seer-macos-release\n {6}labels: macos-14-xlarge/);
   assert.doesNotMatch(prepare, /\benvironment:|\$\{\{\s*secrets\./);
   assert.match(prepare, /\^v\[0-9\]\+\\\.\[0-9\]\+\\\.\[0-9\]\+\$/);
   assert.match(prepare, /SOURCE_REPOSITORY_PRIVATE/);
@@ -379,7 +420,7 @@ test("signing uses a protected fresh job and rejects gates and identity mismatch
   const firstSecret = signing.indexOf("${{ secrets.");
 
   assert.match(signing, /needs: prepare/);
-  assert.match(signing, /runs-on: macos-14-xlarge/);
+  assert.match(signing, /runs-on:\n {6}group: seer-macos-release\n {6}labels: macos-14-xlarge/);
   assert.match(signing, /environment: macos-release/);
   assert.match(signing, /BINARY_DISTRIBUTION_APPROVED: \$\{\{ vars\.BINARY_DISTRIBUTION_APPROVED \}\}/);
   assert.match(signing, /PARITY_MATRIX_APPROVED: \$\{\{ vars\.PARITY_MATRIX_APPROVED \}\}/);

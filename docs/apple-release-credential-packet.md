@@ -41,8 +41,10 @@ Verified with read-only `gh api` calls on 2026-08-17:
 - `repos/OpenCoven/seer/environments` lists only `copilot`; `macos-release`
   does not exist yet.
 - `.github/workflows/release-macos.yml` requires the protected `macos-release`
-  environment (with required-reviewer approval) and `runs-on: macos-14-xlarge`
-  for its signing/notarization job.
+  environment (with required-reviewer approval) and binds both the `prepare`
+  and `sign-and-release` jobs to the object-form
+  `runs-on: { group: seer-macos-release, labels: macos-14-xlarge }` for its
+  build and signing/notarization work.
 
 GitHub's required-reviewers environment protection is only available on
 private repositories under GitHub Enterprise Cloud — it is public-repository
@@ -56,9 +58,9 @@ depends on, for a repository that must stay private
 
 This is a hard blocker on the release path, independent of and prior to every
 other step in this packet. It does not change, weaken, or redesign the
-approved gate (required reviewers on `macos-release` plus `macos-14-xlarge`
-remain mandatory) — it only identifies that the current plan cannot host that
-gate.
+approved gate (required reviewers on `macos-release` plus the
+`seer-macos-release` runner group with the `macos-14-xlarge` runner remain
+mandatory) — it only identifies that the current plan cannot host that gate.
 
 **Required external action (Val/admin only, not performed by this packet):**
 
@@ -71,23 +73,60 @@ gate.
    arm64 macOS larger runner whose usable workflow label — the runner's
    `name`, which is what a GitHub-hosted larger runner is addressed by in
    `runs-on:` — is exactly `macos-14-xlarge`. This name must match the
-   workflow's fixed `runs-on: macos-14-xlarge` exactly; the workflow's
+   workflow's fixed `labels: macos-14-xlarge` exactly; the workflow's
    `runs-on` value and its `uname -m == arm64` assertion in
    `.github/workflows/release-macos.yml` are not changed by this packet and
    must not be changed to accommodate a differently named runner.
-3. The administrator must grant `OpenCoven/seer` access to that runner
-   through the runner group it belongs to (either by setting the group's
-   visibility to all repositories, or by adding `OpenCoven/seer` to the
-   group's selected-repositories list) and must confirm the runner's status
-   is `Ready` (not `Provisioning`, `Shutdown`, `Deleting`, or `Stuck`) before
-   it is relied on.
-4. The administrator must configure Actions billing for `OpenCoven` with a
-   nonzero budget/spending limit, since a runner that exists but has no
-   spending headroom will fail jobs once the included usage is exhausted.
-5. After the plan change, runner provisioning, access grant, and billing
-   configuration, verify all four before creating `macos-release` or running
-   the workflow. This packet only reads state; it never changes billing,
-   plan, runner, runner-group, or org settings.
+3. The administrator must create (or reuse) an organization runner group
+   named exactly `seer-macos-release` and add that runner to it. The
+   workflow's `runs-on` binds to this exact group name in addition to the
+   `macos-14-xlarge` label — see the "Runner group binding" note below for
+   why the label alone is not sufficient. The administrator must grant
+   `OpenCoven/seer` access to that group by adding `OpenCoven/seer` to the
+   group's **selected repositories** list; prefer this over setting the
+   group's visibility to all repositories, since all-repositories visibility
+   would let every other repository in the org — not just `OpenCoven/seer` —
+   schedule jobs onto this signing-capable runner. The administrator must
+   also confirm the runner's status is `Ready` (not `Provisioning`,
+   `Shutdown`, `Deleting`, or `Stuck`) before it is relied on.
+4. The administrator must configure Actions billing for `OpenCoven` in
+   **Organization settings > Billing & Licensing > Budgets and alerts**: add
+   a valid payment method, and confirm every budget that applies to Actions
+   usage or larger-runner usage (organization-wide, product-level, or
+   SKU-level) still has spending headroom and that none of them is an
+   exhausted **hard-stop** budget (a budget with "Stop usage when budget
+   limit is reached" enabled at 100% used blocks all further Actions runs,
+   including this workflow, until the next billing cycle or a raised limit).
+   A runner that exists but has no payment method or has exhausted a
+   hard-stop budget will fail jobs outright.
+5. After the plan change, runner provisioning, runner-group creation and
+   access grant, and billing configuration, verify all of the above before
+   creating `macos-release` or running the workflow. This packet only reads
+   state; it never changes billing, plan, runner, runner-group, or org
+   settings.
+
+### Runner group binding (why label alone is not enough)
+
+A label-only `runs-on: macos-14-xlarge` schedules the job onto **any** runner
+in the organization that carries that label, in any runner group the calling
+repository can reach — not necessarily the specific runner this packet
+verifies below. Anyone who can create or rename another organization runner
+with the same `macos-14-xlarge` label (in a group `OpenCoven/seer` also has
+access to) could have the `prepare` or credential-bearing `sign-and-release`
+job scheduled onto it instead. `.github/workflows/release-macos.yml` closes
+this gap by using GitHub Actions' object-form `runs-on`:
+
+```yaml
+runs-on:
+  group: seer-macos-release
+  labels: macos-14-xlarge
+```
+
+This binds the job to the exact `seer-macos-release` runner group **and**
+the exact `macos-14-xlarge` label; both must match. Do not weaken this back
+to a bare `runs-on: macos-14-xlarge` string, and do not repoint it at a
+different group — either change would reopen the runner-substitution gap
+this packet's verification below is designed to catch.
 
 Read-only verification (safe to run repeatedly; none of these mutate state):
 
@@ -96,11 +135,13 @@ gh api orgs/OpenCoven --jq '{plan: .plan.name, seats: .plan.filled_seats}'
 gh api repos/OpenCoven/seer --jq '{private, default_branch}'
 gh api repos/OpenCoven/seer/environments --jq '.environments[].name'
 # Organization hosted-runners list response uses `.runners[]`, not
-# `.hosted_runners[]`.
+# `.hosted_runners[]`. Print image_details and machine_size_details too —
+# the runner's `name` is administrator-chosen and provable trust must come
+# from these detail fields, not from the name matching `macos-14-xlarge`.
 gh api orgs/OpenCoven/actions/hosted-runners \
-  --jq '.total_count, (.runners[] | {name, status, runner_group_id, platform})'
-# Substitute the runner_group_id printed above, then confirm that group
-# grants OpenCoven/seer access.
+  --jq '.total_count, (.runners[] | {name, status, runner_group_id, platform, image_details, machine_size_details})'
+# Substitute the runner_group_id printed above, then confirm that group is
+# named exactly seer-macos-release and grants OpenCoven/seer access.
 RUNNER_GROUP_ID="paste-the-runner_group_id-from-above"
 gh api "orgs/OpenCoven/actions/runner-groups/${RUNNER_GROUP_ID}" \
   --jq '{name, visibility, allows_public_repositories}'
@@ -108,18 +149,33 @@ gh api "orgs/OpenCoven/actions/runner-groups/${RUNNER_GROUP_ID}/repositories" \
   --jq '.repositories[].full_name'
 ```
 
-The commands above confirm the runner exists, is named `macos-14-xlarge`, is
-`Ready`, and belongs to a group whose repository list (or `all`/`private`
-visibility) includes `OpenCoven/seer`. They do **not** prove Actions billing
-has a nonzero budget — GitHub's budgets API
+The commands above confirm the runner is named `macos-14-xlarge`, is
+`Ready`, and belongs to a runner group named exactly `seer-macos-release`
+whose repository list includes `OpenCoven/seer` (selected-repositories
+visibility is preferred over `all`; see requirement 3 above). Require —
+do not just print — that `image_details` and `machine_size_details` prove
+the runner is macOS 14 on arm64 at the XLarge size: `image_details` must
+show a macOS 14 image (its `display_name`/`id` identifying `macos-14` and
+`platform` reporting the arm64 architecture), and `machine_size_details`
+must report the CPU-core and memory figures GitHub documents for the macOS
+XLarge tier. Do not trust the runner's `name` field alone — a name is
+administrator-chosen text and proves nothing about the underlying image or
+machine size. The workflow's own `uname -m == arm64` runtime assertion stays
+in place as defense in depth in case a runner is ever misconfigured despite
+this check.
+
+These commands do **not** prove Actions billing has payment-method or budget
+headroom — GitHub's budgets API
 (`GET /organizations/{org}/settings/billing/budgets`) requires organization
 admin or billing-manager credentials this token may not carry, and its shape
-varies by billing configuration. Verify the spending limit directly in the
-GitHub UI instead: **Organization settings > Billing and licensing > Spending
-limits > Actions**, and confirm the configured limit is greater than zero (or
-that "Unlimited" is deliberately selected). Listing runners or runner-group
-membership above is not evidence of a nonzero budget; check both,
-separately.
+varies by billing configuration. Verify billing directly in the GitHub UI
+instead: **Organization settings > Billing & Licensing > Budgets and
+alerts**. Confirm a valid payment method is on file, and confirm every
+budget that applies to Actions or larger-runner usage still has remaining
+headroom and that no such budget is an exhausted hard-stop budget (a budget
+with "Stop usage when budget limit is reached" enabled and fully consumed).
+Listing runners or runner-group membership above is not evidence of billing
+headroom; check both, separately.
 
 Checklist for this prerequisite:
 
@@ -131,15 +187,24 @@ Checklist for this prerequisite:
       arm64 macOS larger runner named exactly `macos-14-xlarge` has been
       provisioned and shows `status: Ready` via
       `gh api orgs/OpenCoven/actions/hosted-runners`
-- [ ] `OpenCoven/seer` confirmed present in that runner's runner-group
-      access (via `.../runner-groups/<id>/repositories`, or the group's
-      visibility is `all`)
-- [ ] Actions billing spending limit confirmed nonzero for `OpenCoven` via
-      the Billing and licensing UI (not provable from the runner-list API
+- [ ] That runner's `image_details` and `machine_size_details` (not its name
+      alone) confirmed to prove macOS 14, arm64, and the XLarge machine size
+- [ ] That runner belongs to an organization runner group named exactly
+      `seer-macos-release`
+- [ ] `OpenCoven/seer` confirmed present in that runner group's
+      selected-repositories access list (via
+      `.../runner-groups/<id>/repositories`); all-repositories visibility is
+      used only if selected-repositories is not viable, and that choice is
+      recorded here
+- [ ] A valid payment method confirmed on file for `OpenCoven` via
+      **Billing & Licensing > Budgets and alerts**
+- [ ] Every budget applicable to Actions/larger-runner usage confirmed to
+      have remaining headroom, and no such budget confirmed to be an
+      exhausted hard-stop budget (not provable from the runner-list API
       alone)
-- [ ] All four controls verified again immediately before `macos-release` is
-      created (plan/billing/runner/access changes can be reverted
-      independently of this packet)
+- [ ] All controls above verified again immediately before `macos-release`
+      is created (plan/billing/runner/runner-group/access changes can be
+      reverted independently of this packet)
 
 ## Required packet
 
@@ -323,10 +388,11 @@ into a zsh prompt: start `bash` first, or save the block as a script and run
 `bash load-secrets.sh`. Create and protect the `macos-release` environment
 using the next section before running this.
 
-The block below is Bash-only (`set -euo pipefail`), reads every sensitive
-value with `IFS= read -r -s ... < /dev/tty` — directly from the controlling
-terminal (so it can't silently accept an empty value piped in from
-elsewhere) and with `IFS=` cleared (so leading/trailing whitespace in the
+The block below fails closed if shell xtrace is already enabled (checked
+first, before any other line runs), is Bash-only (`set -euo pipefail`), reads
+every sensitive value with `IFS= read -r -s ... < /dev/tty` — directly from
+the controlling terminal (so it can't silently accept an empty value piped in
+from elsewhere) and with `IFS=` cleared (so leading/trailing whitespace in the
 entered value is preserved instead of being stripped by `read`) — rejects
 blank input instead of setting an empty secret, validates that
 certificate/key files are readable, ordinary, non-symlink, non-empty files
@@ -336,6 +402,23 @@ sent to GitHub. It never prints a secret value or writes an encoded copy to
 disk.
 
 ```bash
+# Fail closed if shell xtrace is enabled, before any secret value or file is
+# touched. `set -x` (or an inherited PS4/BASH_XTRACEFD trace, or a wrapping
+# script/profile that turned tracing on) echoes every command this script
+# runs, with its expanded arguments, to stderr — which means a secret held
+# in a shell variable would be printed in cleartext to the terminal,
+# scrollback buffer, or a captured log the moment it was passed to `base64`,
+# `tr`, `gh`, or any other command. Checking `$-` (the flags of the running
+# shell) for an `x` catches this regardless of how tracing was turned on,
+# and exits before `set -euo pipefail` or any secret-handling function
+# below ever runs.
+case "$-" in
+  *x*)
+    echo "error: shell xtrace (set -x) is enabled; disable it before loading secrets" >&2
+    exit 1
+    ;;
+esac
+
 set -euo pipefail
 
 cd /path/to/seer
@@ -425,7 +508,8 @@ Create a GitHub environment named `macos-release` only after the release
 workflow has merged to the default branch **and** the plan and billing
 prerequisite above has been verified — required reviewers cannot be enabled on
 a private-repository environment, and this environment cannot be scheduled
-onto `macos-14-xlarge`, until that upgrade is confirmed.
+onto the `seer-macos-release` group's `macos-14-xlarge` runner, until that
+upgrade is confirmed.
 
 Configure:
 
@@ -549,7 +633,10 @@ been reviewed.
 
 - [ ] `OpenCoven` organization plan/billing upgraded from Free and verified to
       support required reviewers on private-repository environments plus
-      `macos-14-xlarge` larger-runner entitlement
+      `macos-14-xlarge` larger-runner entitlement in the `seer-macos-release`
+      runner group (verified via `image_details`/`machine_size_details`, not
+      the runner name alone), with a valid payment method and headroom on
+      every applicable Actions/larger-runner budget in **Budgets and alerts**
 - [ ] Release workflow implemented, reviewed, merged to the default branch,
       and pushed
 - [ ] `OpenCoven/seer-releases` explicitly approved and created
@@ -571,3 +658,5 @@ been reviewed.
 - [ ] `macos-release` environment protection configured
 - [ ] Approval variables remain false until parity and clean-machine gates pass
 - [ ] Original `.p12` and `.p8` retained only in approved secure storage
+- [ ] Secret-loading shell confirmed to run with xtrace (`set -x`) disabled
+      before any secret value or file is read or piped

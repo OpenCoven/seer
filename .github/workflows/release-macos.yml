@@ -25,7 +25,14 @@ concurrency:
 jobs:
   prepare:
     name: Prepare credential-free release input
-    runs-on: macos-14-xlarge
+    # Object-form runs-on pins both the exact organization runner group and
+    # the exact runner label/name. A label-only `runs-on: macos-14-xlarge`
+    # would schedule onto ANY runner in the org carrying that label, not just
+    # the one this credential packet verified via `image_details` and
+    # `machine_size_details`. Binding the group closes that substitution gap.
+    runs-on:
+      group: seer-macos-release
+      labels: macos-14-xlarge
     outputs:
       version: ${{ steps.release-version.outputs.version }}
       prepare-runner-id: ${{ steps.release-input.outputs.prepare-runner-id }}
@@ -251,7 +258,13 @@ jobs:
   sign-and-release:
     name: Sign, verify, and publish from a fresh runner
     needs: prepare
-    runs-on: macos-14-xlarge
+    # See the `prepare` job's runs-on comment: the group binding is required
+    # here too, since this job is the one that imports signing/notarization
+    # secrets and must not run on any label-matching runner outside the
+    # verified `seer-macos-release` group.
+    runs-on:
+      group: seer-macos-release
+      labels: macos-14-xlarge
     environment: macos-release
     steps:
       - name: Enforce protected release gates before any secret
