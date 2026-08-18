@@ -17,7 +17,7 @@
 import { Buffer } from "node:buffer";
 import { spawnSync } from "node:child_process";
 import console from "node:console";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   closeSync,
   constants,
@@ -30,7 +30,6 @@ import {
   renameSync,
   rmSync,
   readdirSync,
-  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
@@ -230,6 +229,335 @@ const rendererAssetDigestHelperCache = join(
   ".renderer-asset-digest-helper",
 );
 
+function nonNegativeIntegerFromEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${name} must be a non-negative integer`);
+  }
+  return value;
+}
+
+/**
+ * How long a waiter blocks for the digest-helper lock before giving up
+ * (bounds every wait loop below - this lock never spins forever).
+ */
+const rendererAssetDigestHelperLockDeadlineMs = nonNegativeIntegerFromEnv(
+  "SEER_RENDERER_ASSET_DIGEST_HELPER_LOCK_DEADLINE_MS",
+  120_000,
+);
+
+/**
+ * How long a lock directory is allowed to exist with no `owner.json` yet
+ * before a waiter may treat it as abandoned-mid-initialization rather than
+ * a live owner that simply hasn't finished its atomic metadata commit.
+ * Measured from the directory's own filesystem birth time (immutable and
+ * identical for every observer), never from any one waiter's first poll,
+ * so concurrent waiters never disagree about when the grace period ends.
+ */
+const rendererAssetDigestHelperLockInitGraceMs = nonNegativeIntegerFromEnv(
+  "SEER_RENDERER_ASSET_DIGEST_HELPER_LOCK_INIT_GRACE_MS",
+  2_000,
+);
+
+function sleepMs(durationMs) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, durationMs);
+}
+
+function lstatOrNull(path) {
+  try {
+    return lstatSync(path);
+  } catch (error) {
+    if (error && error.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+/**
+ * Two `fs.Stats` refer to the exact same on-disk file/directory instance
+ * only if `dev`+`ino` match *and* (whenever both sides report a finite
+ * birth time) `birthtimeMs` also matches. `dev`+`ino` alone is not enough:
+ * many filesystems recycle inode numbers essentially immediately after a
+ * remove, so a since-replaced directory at the same path can otherwise
+ * present the exact same `dev`+`ino` pair coincidentally.
+ */
+function sameFileSystemIdentity(left, right) {
+  return (
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    (!Number.isFinite(left.birthtimeMs) ||
+      !Number.isFinite(right.birthtimeMs) ||
+      left.birthtimeMs === right.birthtimeMs)
+  );
+}
+
+function isPidAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error && error.code === "EPERM") return true;
+    if (error && error.code === "ESRCH") return false;
+    throw error;
+  }
+}
+
+// The four functions below (owner-metadata reads, single-attempt reclaim,
+// acquire, release) implement the crash-safe digest-helper lock protocol
+// and are exported *only* so tests/renderer-asset-digest-helper-lock.test.mjs
+// can construct precise on-disk fixtures (abandoned mid-init directories,
+// dead-owner directories, concurrent reclaimers, successor locks) and
+// drive this exact logic deterministically, without needing a real
+// `swiftc` compile or timing-dependent process races. `compiledRendererAssetDigestHelper()`
+// below is the only production caller.
+
+/**
+ * Reads and verifies `<lockDirPath>/owner.json`, opened `O_NOFOLLOW` and
+ * re-checked by descriptor so it cannot be swapped out from under the
+ * read. Returns `null` only when the file is simply absent (the narrow,
+ * bounded, pre-commit window every fresh lock directory passes through).
+ * Anything else that isn't a well-formed `{ pid }` record - a symlink, a
+ * non-regular file, unparsable JSON, a missing/invalid `pid` - throws:
+ * malformed or tampered lock state must never be silently treated as
+ * either "live" or "reclaimable".
+ */
+export function readRendererAssetDigestHelperLockOwnerOrNull(lockDirPath) {
+  const ownerPath = join(lockDirPath, "owner.json");
+  const before = lstatOrNull(ownerPath);
+  if (!before) return null;
+  if (before.isSymbolicLink() || !before.isFile()) {
+    throw new Error(
+      `renderer asset digest helper lock owner metadata must be a regular non-symlink file: ${ownerPath}`,
+    );
+  }
+  const descriptor = openSync(ownerPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const after = fstatSync(descriptor);
+    if (!after.isFile() || !sameFileSystemIdentity(before, after)) {
+      throw new Error(
+        `renderer asset digest helper lock owner metadata changed identity while being opened: ${ownerPath}`,
+      );
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(readFileSync(descriptor, "utf8"));
+    } catch (error) {
+      throw new Error(`renderer asset digest helper lock owner metadata is malformed: ${ownerPath}`, {
+        cause: error,
+      });
+    }
+    if (!parsed || typeof parsed !== "object" || !Number.isSafeInteger(parsed.pid) || parsed.pid <= 0) {
+      throw new Error(`renderer asset digest helper lock owner metadata is malformed: ${ownerPath}`);
+    }
+    return { pid: parsed.pid, fileInfo: after };
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+/**
+ * Attempts exactly one identity-verified reclaim of a lock directory this
+ * caller has already decided *looks* abandoned (`expectedDirInfo` and
+ * `expectedOwnerInfo` - `null` for "no owner.json yet" - captured *before*
+ * calling this). This never checks-then-acts on a live path (which always
+ * leaves a race window between the check and the act): it acts first -
+ * `renameSync` the directory out of the way, an atomic, single-winner
+ * operation racing reclaimers naturally serialize on, since once one
+ * reclaimer's rename has moved the source away, every other reclaimer's
+ * rename of that same source path fails with `ENOENT` - and only then
+ * verifies that what actually got moved is still the exact same directory
+ * (and, when reclaiming a dead owner rather than a bare initialization
+ * timeout, the exact same owner file) it inspected. Any mismatch (a
+ * successor already replaced the lock in the meantime, or its owner
+ * changed) restores the directory immediately, completely untouched -
+ * this process must never delete a successor's lock.
+ *
+ * Returns `"reclaimed"` (the caller may now retry acquisition, which will
+ * `mkdirSync` a fresh lock directory), `"raced"` (another reclaimer already
+ * won; the caller should simply retry acquisition from scratch), or
+ * `"not-stale"` (what is at this path now is not the abandoned state the
+ * caller observed; retry acquisition from scratch).
+ */
+export function reclaimAbandonedRendererAssetDigestHelperLockDirectory(
+  lockDirPath,
+  expectedDirInfo,
+  expectedOwnerInfo,
+) {
+  const quarantinePath = `${lockDirPath}.stale-${process.pid}-${randomBytes(6).toString("hex")}`;
+  try {
+    renameSync(lockDirPath, quarantinePath);
+  } catch (error) {
+    if (error && error.code === "ENOENT") return "raced";
+    throw error;
+  }
+  let restore = true;
+  try {
+    const quarantineDirInfo = lstatSync(quarantinePath);
+    if (
+      quarantineDirInfo.isSymbolicLink() ||
+      !quarantineDirInfo.isDirectory() ||
+      !sameFileSystemIdentity(expectedDirInfo, quarantineDirInfo)
+    ) {
+      return "not-stale";
+    }
+    const quarantineOwner = readRendererAssetDigestHelperLockOwnerOrNull(quarantinePath);
+    if (expectedOwnerInfo) {
+      if (
+        !quarantineOwner ||
+        !sameFileSystemIdentity(expectedOwnerInfo.fileInfo, quarantineOwner.fileInfo)
+      ) {
+        return "not-stale";
+      }
+      if (isPidAlive(quarantineOwner.pid)) {
+        return "not-stale";
+      }
+    } else if (quarantineOwner) {
+      // Metadata now exists though it didn't when this looked like an
+      // abandoned initialization: the real owner finished its atomic
+      // commit just in time. Never delete a lock that turned out to be
+      // live.
+      return "not-stale";
+    }
+    restore = false;
+    rmSync(quarantinePath, { recursive: true, force: false });
+    return "reclaimed";
+  } finally {
+    if (restore) {
+      try {
+        renameSync(quarantinePath, lockDirPath);
+      } catch (restoreError) {
+        // Only reachable if a new owner's mkdirSync raced back into the
+        // now-empty path between this reclaimer's rename above and this
+        // restore attempt - astronomically unlikely, but never destroy
+        // the quarantined directory or the new owner's lock over it:
+        // leave the quarantined copy on disk for manual inspection.
+        console.error(
+          `unable to restore renderer asset digest helper lock ${lockDirPath} after determining it was not actually stale`,
+          restoreError,
+        );
+      }
+    }
+  }
+}
+
+/**
+ * Acquires `lockDirPath` as a crash-safe, cross-process mutual-exclusion
+ * lock directory. `mkdirSync` itself is the only exclusive primitive used
+ * to contend for ownership; owner identity (`owner.json`, containing this
+ * process's pid) is committed *after* that, via write-to-temp-then-rename
+ * so it is always either completely absent or completely present, never
+ * partially written. A crash between those two steps therefore leaves a
+ * well-defined "initializing" state (directory present, no owner.json)
+ * that other waiters recognize and, after `initGraceMs`, safely reclaim -
+ * rather than the previous single-lock-file design's empty/partially
+ * written file, which no waiter's stale-owner check could ever recognize
+ * as abandoned, wedging every future build indefinitely.
+ */
+export function acquireRendererAssetDigestHelperLock(lockDirPath, options = {}) {
+  const deadlineMs = options.deadlineMs ?? rendererAssetDigestHelperLockDeadlineMs;
+  const initGraceMs = options.initGraceMs ?? rendererAssetDigestHelperLockInitGraceMs;
+  const deadline = Date.now() + deadlineMs;
+  for (;;) {
+    try {
+      mkdirSync(lockDirPath, { mode: 0o700 });
+    } catch (error) {
+      if (!error || error.code !== "EEXIST") throw error;
+      const dirInfo = lstatOrNull(lockDirPath);
+      if (!dirInfo) continue; // vanished between the failed mkdir and this inspection; retry immediately.
+      if (dirInfo.isSymbolicLink() || !dirInfo.isDirectory()) {
+        throw new Error(
+          `renderer asset digest helper lock path must be a real directory, never a symlink: ${lockDirPath}`,
+        );
+      }
+      // Fails closed (throws) on malformed/symlink owner metadata instead
+      // of guessing whether it is safe to reclaim.
+      const owner = readRendererAssetDigestHelperLockOwnerOrNull(lockDirPath);
+      if (owner) {
+        if (isPidAlive(owner.pid)) {
+          if (Date.now() >= deadline) {
+            throw new Error(
+              `timed out waiting for the live renderer asset digest helper lock owner (pid ${owner.pid}) to finish: ${lockDirPath}`,
+            );
+          }
+          sleepMs(10);
+          continue;
+        }
+        reclaimAbandonedRendererAssetDigestHelperLockDirectory(lockDirPath, dirInfo, owner);
+        continue;
+      }
+      const ageMs = Number.isFinite(dirInfo.birthtimeMs) ? Date.now() - dirInfo.birthtimeMs : 0;
+      if (ageMs < initGraceMs) {
+        if (Date.now() >= deadline) {
+          throw new Error(
+            `timed out waiting for renderer asset digest helper lock initialization: ${lockDirPath}`,
+          );
+        }
+        sleepMs(10);
+        continue;
+      }
+      reclaimAbandonedRendererAssetDigestHelperLockDirectory(lockDirPath, dirInfo, null);
+      continue;
+    }
+    const ownerPath = join(lockDirPath, "owner.json");
+    const tempPath = join(lockDirPath, `.owner-${process.pid}-${randomBytes(6).toString("hex")}.tmp`);
+    writeFileSync(tempPath, `${JSON.stringify({ pid: process.pid })}\n`, { mode: 0o600 });
+    renameSync(tempPath, ownerPath);
+    return {
+      lockDirPath,
+      dirInfo: lstatSync(lockDirPath),
+      ownerInfo: readRendererAssetDigestHelperLockOwnerOrNull(lockDirPath),
+    };
+  }
+}
+
+/**
+ * Releases a lock acquired by {@link acquireRendererAssetDigestHelperLock}.
+ * Like reclaim, this acts first (`renameSync` the directory this process
+ * believes it owns out of the way) and only then verifies, by identity,
+ * that what actually got moved is the exact directory and owner file this
+ * process created - never a successor's lock that happens to occupy the
+ * same path. A mismatch restores the directory untouched and throws
+ * instead of deleting; this process must never remove a lock instance it
+ * did not itself acquire.
+ */
+export function releaseRendererAssetDigestHelperLock(lock) {
+  const { lockDirPath, dirInfo, ownerInfo } = lock;
+  const quarantinePath = `${lockDirPath}.release-${process.pid}-${randomBytes(6).toString("hex")}`;
+  renameSync(lockDirPath, quarantinePath);
+  let restore = true;
+  try {
+    const quarantineDirInfo = lstatSync(quarantinePath);
+    if (
+      quarantineDirInfo.isSymbolicLink() ||
+      !quarantineDirInfo.isDirectory() ||
+      !sameFileSystemIdentity(dirInfo, quarantineDirInfo)
+    ) {
+      throw new Error(`renderer asset digest helper lock changed identity before release: ${lockDirPath}`);
+    }
+    const quarantineOwner = readRendererAssetDigestHelperLockOwnerOrNull(quarantinePath);
+    if (!quarantineOwner || !sameFileSystemIdentity(ownerInfo.fileInfo, quarantineOwner.fileInfo)) {
+      throw new Error(
+        `renderer asset digest helper lock owner metadata changed identity before release: ${lockDirPath}`,
+      );
+    }
+    restore = false;
+    rmSync(quarantinePath, { recursive: true, force: false });
+  } finally {
+    if (restore) {
+      try {
+        renameSync(quarantinePath, lockDirPath);
+      } catch (restoreError) {
+        console.error(
+          `unable to restore renderer asset digest helper lock ${lockDirPath} after a failed release identity check`,
+          restoreError,
+        );
+      }
+    }
+  }
+}
+
 function compiledRendererAssetDigestHelper() {
   if (process.platform !== "darwin") {
     throw new Error("descriptor-anchored renderer asset hashing requires macOS");
@@ -243,37 +571,8 @@ function compiledRendererAssetDigestHelper() {
   if (existsSync(helperPath)) return helperPath;
 
   mkdirSync(rendererAssetDigestHelperCache, { recursive: true });
-  const lockPath = `${helperPath}.lock`;
-  const deadline = Date.now() + 120_000;
-  let lockDescriptor;
-  while (lockDescriptor === undefined) {
-    try {
-      lockDescriptor = openSync(lockPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
-      writeFileSync(lockDescriptor, `${process.pid}\n`, "utf8");
-    } catch (error) {
-      if (!error || error.code !== "EEXIST") throw error;
-      try {
-        const ownerPid = Number(readFileSync(lockPath, "utf8").trim());
-        if (Number.isSafeInteger(ownerPid) && ownerPid > 0) {
-          try {
-            process.kill(ownerPid, 0);
-          } catch (ownerError) {
-            if (ownerError && ownerError.code === "ESRCH") {
-              unlinkSync(lockPath);
-              continue;
-            }
-          }
-        }
-      } catch (ownerError) {
-        if (ownerError && ownerError.code === "ENOENT") continue;
-        throw ownerError;
-      }
-      if (Date.now() >= deadline) {
-        throw new Error("timed out waiting to compile descriptor-anchored renderer asset digest helper");
-      }
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
-    }
-  }
+  const lockDirPath = `${helperPath}.lock`;
+  const lock = acquireRendererAssetDigestHelperLock(lockDirPath);
   try {
     if (existsSync(helperPath)) return helperPath;
     const stagingPath = `${helperPath}.${process.pid}`;
@@ -295,8 +594,7 @@ function compiledRendererAssetDigestHelper() {
       rmSync(stagingPath, { force: true });
     }
   } finally {
-    closeSync(lockDescriptor);
-    unlinkSync(lockPath);
+    releaseRendererAssetDigestHelperLock(lock);
   }
   return helperPath;
 }
