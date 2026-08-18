@@ -2,8 +2,8 @@ import { execFile } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import { promisify } from "node:util";
+import { Worker } from "node:worker_threads";
 
 import { logger } from "@glaze/core/backend";
 
@@ -14,26 +14,43 @@ import {
   assessCursorComposerRecord,
   assessGenericMtime,
   assessGrokTurn,
+  assessValidatedCursorComposerRecord,
   buildFriendlyDetail,
   codexProjectLabelFromPath,
   CURSOR_MAX_ACTIVE_CANDIDATES,
   CURSOR_MAX_BUBBLE_LOOKUPS,
   CURSOR_MAX_INSPECTED_ROWS,
   CURSOR_MAX_KEY_BYTES,
+  CURSOR_MAX_RECENT_HEADERS_PER_COMPOSER,
   CURSOR_MAX_TOTAL_DECODED_VALUE_BYTES,
   CURSOR_MAX_VALUE_BYTES,
+  CURSOR_RUNNING_TOOL_STATUSES,
   CURSOR_SQLITE_BUSY_TIMEOUT_MS,
   CURSOR_SQLITE_QUERY_DEADLINE_MS,
+  cursorHeaderGrouping,
+  cursorProjectLabel,
+  cursorRecencySqlExpression,
   cursorRelevantBubbleIds,
   friendlySessionLabel,
+  humanizeProjectName,
+  isPlainCursorObject,
   isRecentTimestamp,
+  malformedCursorAssessment,
   matchAgentKind,
+  MAX_SUPPORTED_TIMESTAMP_MS,
+  parseCursorTimestamp,
+  parseTimestamp,
   PROCESS_ONLY_CPU_THRESHOLD,
   SESSION_CANDIDATE_WINDOW_MS,
+  titleCaseWords,
+  TIMESTAMP_FUTURE_SKEW_MS,
   TOOL_TURN_GRACE_MS,
+  TURN_ACTIVE_GRACE_MS,
+  utf8ByteLength,
+  validateCursorHeaders,
+  validateCursorRecordFields,
+  validateOptionalString,
   type AgentKind,
-  type CursorBubbleRecord,
-  type CursorComposerRecord,
   type TurnAssessment,
 } from "./agent-detection-policy.js";
 import type { ActiveAgent, AgentActivitySource } from "./types.js";
@@ -364,18 +381,527 @@ export class CursorSessionScanError extends Error {
  * call site, so none of this can affect real scans — only tests that
  * explicitly construct hooks can observe inspected-row/bubble-lookup counts
  * or force a near-immediate deadline.
+ *
+ * `onRowInspected`/`onBubbleLookup` are live callbacks, so they cannot cross
+ * into the scan Worker directly — `runCursorScanInWorker` relays them from
+ * `"rowInspected"`/`"bubbleLookup"` progress messages instead, and only asks
+ * the worker to post those messages at all when a hook is actually present
+ * (`buildCursorWorkerData`'s `reportRowProgress`/`reportBubbleProgress`), so
+ * a real (non-test) scan never pays for progress messaging it has no
+ * listener for. `simulateRowProcessingDelayMs` is plain data (not a
+ * function), so — unlike the callbacks — it crosses via `workerData`
+ * directly and can genuinely busy-wait *inside* the worker, letting a test
+ * force a deadline trip without a live cross-thread callback.
  */
 type CursorScanTestHooks = {
   onRowInspected?: () => void;
   onBubbleLookup?: () => void;
   deadlineMillisecondsOverride?: number;
+  simulateRowProcessingDelayMs?: number;
 };
 
-/** Outcome of one bounded, parameterized `bubbleId:<composerId>:<bubbleId>` point lookup. */
-type BubbleLookupOutcome =
-  | { kind: "found"; bubble: CursorBubbleRecord }
-  | { kind: "absentOrMalformed" }
-  | { kind: "limitExceeded" };
+/** Every message the Cursor scan Worker can post back to its parent. */
+type CursorWorkerMessage =
+  | { type: "rowInspected" }
+  | { type: "bubbleLookup" }
+  | { type: "malformedRow" }
+  | { type: "result"; evidence: ActiveTurnHit[] }
+  | { type: "error"; reason: CursorScanIncompleteReason | "databaseError"; message?: string };
+
+/**
+ * Every pure Cursor-assessment function the scan Worker's row/bubble loop
+ * needs, reconstructed via `Function.prototype.toString()` so the whole
+ * bounded SQLite scan can run inside a real, terminable
+ * `node:worker_threads` Worker (see `runCursorScanInWorker` below) without a
+ * second, fragile, hand-maintained copy of this logic living in an external
+ * runtime file. Every one of these is either free-variable-free, or (per
+ * its own comment in `agent-detection-policy.ts`) takes every module
+ * constant/bound it needs as an explicit trailing parameter instead of
+ * reading it as a free variable — so the reconstructed text below stays
+ * correct no matter how esbuild's bundler happens to rename a top-level
+ * binding in the *real*, bundled copy of this module (confirmed
+ * empirically: even unminified, esbuild renames colliding cross-module
+ * bindings — e.g. a second `import * as path from "node:path"` becomes
+ * `path2`). `CURSOR_WORKER_DRIVER_SOURCE` below always passes every bound
+ * explicitly from `workerData`, never relying on a function's own default
+ * parameter to resolve one.
+ */
+const CURSOR_WORKER_POLICY_FUNCTIONS = [
+  isPlainCursorObject,
+  parseCursorTimestamp,
+  validateOptionalString,
+  validateCursorRecordFields,
+  validateCursorHeaders,
+  malformedCursorAssessment,
+  utf8ByteLength,
+  titleCaseWords,
+  humanizeProjectName,
+  cursorProjectLabel,
+  cursorHeaderGrouping,
+  parseTimestamp,
+  isRecentTimestamp,
+  cursorRelevantBubbleIds,
+  assessValidatedCursorComposerRecord,
+  assessCursorComposerRecord,
+];
+
+/**
+ * Hand-written worker-side driver, joined with the `.toString()`-
+ * reconstructed policy functions above into one `eval: true` Worker source
+ * string (`buildCursorWorkerSource`). Plain runtime JS text, not real
+ * checked TypeScript — this only ever runs inside the Worker `eval`, never
+ * through the TypeScript compiler.
+ *
+ * Requires only `node:worker_threads` (destructuring `parentPort`/
+ * `workerData`, never `Worker` itself), `node:sqlite`, and `node:path`:
+ * this worker must never be able to spawn a descendant Worker of its own
+ * (`CURSOR_WORKER_SOURCE` is asserted free of the literal text
+ * `"new Worker("` — see `agent-detector.test.ts`).
+ *
+ * Opens the vault read-only and performs exactly two parameterized
+ * queries — composer rows (`key LIKE 'composerData:%'`) and exact
+ * `bubbleId:<composerId>:<bubbleId>` point lookups — both built with the
+ * same bounded-value pattern: `octet_length(value)` is checked *before*
+ * the value column is ever selected unbounded, so an oversized row's value
+ * is replaced with SQL `NULL` (never crossing into JS) while its true byte
+ * count still comes back for skip/limit accounting. Composer rows are
+ * ordered by `workerData.recencySql` (validated JSON recency, built by
+ * `cursorRecencySqlExpression` in the parent) DESC, with `rowid` only as a
+ * deterministic tiebreaker — never bare `rowid` alone, which is only ever
+ * insertion order and never moves when Cursor UPSERTs an existing composer
+ * row in place.
+ *
+ * Posts back exactly one final `"result"`/`"error"` message, plus,
+ * opportunistically, `"rowInspected"`/`"bubbleLookup"`/`"malformedRow"`
+ * progress messages along the way.
+ */
+const CURSOR_WORKER_DRIVER_SOURCE = `
+function postResult(evidence) {
+  parentPort.postMessage({ type: "result", evidence });
+}
+function postError(reason, message) {
+  parentPort.postMessage({
+    type: "error",
+    reason,
+    message: message === undefined ? undefined : String(message),
+  });
+}
+
+const runningToolStatuses = new Set(workerData.runningToolStatuses);
+const cursorAssessmentLimits = {
+  sessionCandidateWindowMs: workerData.sessionCandidateWindowMs,
+  toolTurnGraceMs: workerData.toolTurnGraceMs,
+  turnActiveGraceMs: workerData.turnActiveGraceMs,
+  timestampFutureSkewMs: workerData.timestampFutureSkewMs,
+  maxSupportedTimestampMs: workerData.maxSupportedTimestampMs,
+  runningToolStatuses,
+  basename: (input) => path.basename(input),
+};
+
+const deadlineAtMs = performance.now() + workerData.deadlineMs;
+const deadlineExpired = () => performance.now() >= deadlineAtMs;
+
+let db;
+try {
+  db = new DatabaseSync(workerData.dbPath, {
+    readOnly: true,
+    timeout: workerData.sqliteBusyTimeoutMs,
+  });
+} catch (error) {
+  postError("databaseError", error && error.message ? error.message : String(error));
+}
+
+if (db) {
+  let transactionOpen = false;
+  try {
+    db.exec("BEGIN");
+    transactionOpen = true;
+
+    // Bounded blob processing (issue: JS must never materialize an
+    // oversized value before it is size-checked): this CASE WHEN gate
+    // rejects an oversized value to SQL NULL *before* it ever crosses into
+    // JS, while octet_length(value) still reports the true byte count so
+    // the row/skip logic below can act on it without ever touching the
+    // value itself.
+    const boundedValueSql =
+      "CASE WHEN octet_length(value) <= " + workerData.maxValueBytes + " THEN value ELSE NULL END";
+    // ORDER BY validated JSON recency (see cursorRecencySqlExpression),
+    // newest first, rowid only as a deterministic tiebreaker — never bare
+    // rowid, which is only ever insertion order and does not move when
+    // Cursor UPSERTs an existing composer row in place.
+    const composerStatement = db.prepare(
+      "SELECT key, " +
+        boundedValueSql +
+        " AS boundedValue, octet_length(value) AS valueByteCount, (" +
+        workerData.recencySql +
+        ") AS recencyMs FROM cursorDiskKV WHERE key LIKE ? ORDER BY recencyMs DESC, rowid DESC LIMIT ?",
+    );
+    // Prepared once, reused (bound fresh per call) for every bubble
+    // lookup — an exact parameterized point lookup, never SQL
+    // concatenation.
+    const bubbleStatement = db.prepare(
+      "SELECT " +
+        boundedValueSql +
+        " AS boundedValue, octet_length(value) AS valueByteCount FROM cursorDiskKV WHERE key = ?",
+    );
+
+    const evidence = [];
+    let rowsInspected = 0;
+    let totalDecodedBytes = 0;
+    let totalBubbleLookups = 0;
+    const attemptedBubbleKeys = new Set();
+    const bubbleCache = new Map();
+    let stopReason = null;
+
+    // Every counter/flag here is charged identically whether the row or
+    // bubble turns out to be inactive, malformed, or a duplicate reference
+    // — limits count inspected work, not just active results.
+    const lookUpBubble = (bubbleKey) => {
+      if (attemptedBubbleKeys.has(bubbleKey)) {
+        // Duplicate reference (already attempted this scan): serve from
+        // cache without a second round trip or byte charge.
+        const cached = bubbleCache.get(bubbleKey);
+        return cached ? { kind: "found", bubble: cached } : { kind: "absentOrMalformed" };
+      }
+      if (deadlineExpired()) {
+        stopReason = stopReason || "deadline";
+        return { kind: "limitExceeded" };
+      }
+      if (totalBubbleLookups >= workerData.maxBubbleLookups) {
+        stopReason = stopReason || "bubbleLookupLimit";
+        return { kind: "limitExceeded" };
+      }
+      attemptedBubbleKeys.add(bubbleKey);
+      totalBubbleLookups += 1;
+      if (workerData.reportBubbleProgress) parentPort.postMessage({ type: "bubbleLookup" });
+
+      const row = bubbleStatement.get(bubbleKey);
+      if (!row || typeof row.boundedValue !== "string") return { kind: "absentOrMalformed" };
+      const valueByteCount = row.valueByteCount;
+      if (valueByteCount === 0 || valueByteCount > workerData.maxValueBytes) {
+        return { kind: "absentOrMalformed" };
+      }
+      if (totalDecodedBytes + valueByteCount > workerData.maxTotalDecodedValueBytes) {
+        stopReason = stopReason || "decodedByteLimit";
+        return { kind: "limitExceeded" };
+      }
+      totalDecodedBytes += valueByteCount;
+      let bubble;
+      try {
+        bubble = JSON.parse(row.boundedValue);
+      } catch {
+        return { kind: "absentOrMalformed" };
+      }
+      if (!bubble || typeof bubble !== "object" || Array.isArray(bubble)) {
+        return { kind: "absentOrMalformed" };
+      }
+      bubbleCache.set(bubbleKey, bubble);
+      return { kind: "found", bubble };
+    };
+
+    rowLoop: for (const row of composerStatement.iterate("composerData:%", workerData.maxInspectedRows + 1)) {
+      if (deadlineExpired()) {
+        stopReason = "deadline";
+        break;
+      }
+
+      if (rowsInspected >= workerData.maxInspectedRows) {
+        // Pure existence+recency sentinel, the (cap + 1)-th matching row:
+        // never assessed, returned, or counted as inspected. Rows are
+        // already ordered newest-first by validated JSON recency (rowid
+        // only breaks ties), so if even this cut-off candidate's own
+        // timestamp is too old (or absent/malformed) to plausibly still be
+        // active, every omitted row beyond it is provably no newer either
+        // — accept the newest maxInspectedRows instead of treating "more
+        // history exists" alone as a failure.
+        const sentinelRecencyMs = typeof row.recencyMs === "number" ? row.recencyMs : null;
+        if (
+          sentinelRecencyMs !== null &&
+          isRecentTimestamp(
+            sentinelRecencyMs,
+            workerData.now,
+            workerData.sessionCandidateWindowMs,
+            workerData.timestampFutureSkewMs,
+            workerData.maxSupportedTimestampMs,
+          )
+        ) {
+          stopReason = "rowLimit";
+        }
+        break;
+      }
+      rowsInspected += 1;
+      if (workerData.reportRowProgress) parentPort.postMessage({ type: "rowInspected" });
+
+      if (workerData.simulateRowProcessingDelayMs > 0) {
+        const until = performance.now() + workerData.simulateRowProcessingDelayMs;
+        while (performance.now() < until) {
+          // Test-only busy-wait simulating slow per-row processing, so a
+          // deadline test can force a trip without a live cross-thread
+          // callback (only plain data crosses via workerData).
+        }
+      }
+
+      if (typeof row.key !== "string") continue;
+      const keyByteCount = Buffer.byteLength(row.key, "utf8");
+      if (keyByteCount === 0 || keyByteCount > workerData.maxKeyBytes) continue;
+
+      if (typeof row.boundedValue !== "string") continue;
+      const valueByteCount = row.valueByteCount;
+      // Bounded blob processing: skip (never log) anything implausibly
+      // large for a composer record — already NULL from the SQL gate.
+      if (valueByteCount === 0 || valueByteCount > workerData.maxValueBytes) continue;
+
+      if (totalDecodedBytes + valueByteCount > workerData.maxTotalDecodedValueBytes) {
+        stopReason = "decodedByteLimit";
+        break;
+      }
+      totalDecodedBytes += valueByteCount;
+
+      let record;
+      try {
+        record = JSON.parse(row.boundedValue);
+      } catch {
+        continue;
+      }
+      if (!record || typeof record !== "object" || Array.isArray(record)) continue;
+
+      const key = row.key;
+      const identity = key.indexOf("composerData:") === 0 ? key.slice("composerData:".length) : key;
+
+      let finalAssessment;
+      try {
+        // First pass never touches bubbles; lastActivityAt is folded
+        // purely from already-decoded, trusted composer/header fields, so
+        // it is identical whether or not bubbles are ultimately consulted
+        // below.
+        const provisional = assessCursorComposerRecord(record, workerData.now, {}, cursorAssessmentLimits);
+        finalAssessment = provisional;
+
+        if (
+          !provisional.active &&
+          isRecentTimestamp(
+            provisional.lastActivityAt,
+            workerData.now,
+            workerData.toolTurnGraceMs,
+            workerData.timestampFutureSkewMs,
+            workerData.maxSupportedTimestampMs,
+          )
+        ) {
+          // Only a plausibly-recent composer's verdict can change once a
+          // hidden bubble tool status is known — this keeps bubble lookups
+          // bounded to the small fraction of composers where they could
+          // possibly matter, instead of spending budget on every
+          // long-completed conversation the scan steps over.
+          const bubbles = {};
+          let truncatedByBubbleLookup = false;
+          for (const bubbleId of cursorRelevantBubbleIds(
+            record,
+            workerData.maxRecentHeadersPerComposer,
+            workerData.maxKeyBytes,
+            workerData.maxSupportedTimestampMs,
+          )) {
+            const outcome = lookUpBubble("bubbleId:" + identity + ":" + bubbleId);
+            if (outcome.kind === "found") {
+              bubbles[bubbleId] = outcome.bubble;
+            } else if (outcome.kind === "limitExceeded") {
+              truncatedByBubbleLookup = true;
+              break;
+            }
+          }
+          if (truncatedByBubbleLookup) break rowLoop;
+          finalAssessment = assessCursorComposerRecord(record, workerData.now, bubbles, cursorAssessmentLimits);
+        }
+      } catch {
+        parentPort.postMessage({ type: "malformedRow" });
+        continue;
+      }
+
+      if (!finalAssessment.active) continue;
+      evidence.push(Object.assign({}, finalAssessment, { filePath: workerData.dbPath, identity }));
+      if (evidence.length >= workerData.maxActiveCandidates) break;
+    }
+
+    // Any stop reason other than natural LIMIT-bounded exhaustion, the
+    // intentional maxActiveCandidates early exit, or a row-limit sentinel
+    // that itself proves every omitted row is no newer, means an unseen
+    // row or bubble could have been active — never trust the partial
+    // evidence gathered so far in that case.
+    if (stopReason) {
+      postError(stopReason);
+    } else {
+      db.exec("COMMIT");
+      transactionOpen = false;
+      evidence.sort((a, b) => b.lastActivityAt - a.lastActivityAt);
+      postResult(evidence);
+    }
+  } catch (error) {
+    postError("databaseError", error && error.message ? error.message : String(error));
+  } finally {
+    if (transactionOpen) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        // Best-effort rollback only; the error/result already determined
+        // above takes precedence.
+      }
+    }
+    try {
+      db.close();
+    } catch {
+      // Best-effort close only.
+    }
+  }
+}
+`;
+
+function buildCursorWorkerSource(): string {
+  const policyFunctionsSource = CURSOR_WORKER_POLICY_FUNCTIONS.map((fn) => fn.toString()).join("\n\n");
+  return [
+    '"use strict";',
+    'const { parentPort, workerData } = require("node:worker_threads");',
+    'const { DatabaseSync } = require("node:sqlite");',
+    'const path = require("node:path");',
+    "",
+    policyFunctionsSource,
+    "",
+    CURSOR_WORKER_DRIVER_SOURCE,
+  ].join("\n");
+}
+
+/**
+ * Assembled once at module load (cheap: a handful of `.toString()` calls
+ * plus string concatenation) rather than once per scan. Exported so both
+ * `runCursorScanInWorker` and `agent-detector.test.ts` share exactly one
+ * assembled source string — the test asserts this text never contains the
+ * literal `"new Worker("`, so the scan Worker can never spawn a descendant
+ * of its own.
+ */
+export const CURSOR_WORKER_SOURCE = buildCursorWorkerSource();
+
+function buildCursorWorkerData(dbPath: string, now: number, testHooks: CursorScanTestHooks | undefined) {
+  return {
+    dbPath,
+    now,
+    deadlineMs: testHooks?.deadlineMillisecondsOverride ?? CURSOR_SQLITE_QUERY_DEADLINE_MS,
+    sqliteBusyTimeoutMs: CURSOR_SQLITE_BUSY_TIMEOUT_MS,
+    maxInspectedRows: CURSOR_MAX_INSPECTED_ROWS,
+    maxKeyBytes: CURSOR_MAX_KEY_BYTES,
+    maxValueBytes: CURSOR_MAX_VALUE_BYTES,
+    maxTotalDecodedValueBytes: CURSOR_MAX_TOTAL_DECODED_VALUE_BYTES,
+    maxBubbleLookups: CURSOR_MAX_BUBBLE_LOOKUPS,
+    maxActiveCandidates: CURSOR_MAX_ACTIVE_CANDIDATES,
+    maxRecentHeadersPerComposer: CURSOR_MAX_RECENT_HEADERS_PER_COMPOSER,
+    sessionCandidateWindowMs: SESSION_CANDIDATE_WINDOW_MS,
+    toolTurnGraceMs: TOOL_TURN_GRACE_MS,
+    turnActiveGraceMs: TURN_ACTIVE_GRACE_MS,
+    timestampFutureSkewMs: TIMESTAMP_FUTURE_SKEW_MS,
+    maxSupportedTimestampMs: MAX_SUPPORTED_TIMESTAMP_MS,
+    runningToolStatuses: [...CURSOR_RUNNING_TOOL_STATUSES],
+    recencySql: cursorRecencySqlExpression("value"),
+    reportRowProgress: testHooks?.onRowInspected !== undefined,
+    reportBubbleProgress: testHooks?.onBubbleLookup !== undefined,
+    simulateRowProcessingDelayMs: testHooks?.simulateRowProcessingDelayMs ?? 0,
+  };
+}
+
+/**
+ * Runs the whole Cursor SQLite scan inside a terminable
+ * `node:worker_threads` Worker so this process's main event loop stays
+ * responsive even while SQLite performs a large, synchronous scan:
+ * `node:sqlite`'s `DatabaseSync` has no interrupt/progress-handler API, so
+ * a deadline check between `iterate()` steps on the main thread could never
+ * actually preempt a single slow native call — moving the whole scan to a
+ * Worker makes `worker.terminate()` (awaited here before rejecting on
+ * timeout) the real, effective backstop instead.
+ *
+ * `deadlineMs` must be a positive, finite number of milliseconds; an
+ * invalid deadline rejects immediately rather than spawning a Worker that
+ * could then never time out.
+ */
+function runCursorScanInWorker(
+  dbPath: string,
+  now: number,
+  testHooks?: CursorScanTestHooks,
+): Promise<ActiveTurnHit[]> {
+  const deadlineMs = testHooks?.deadlineMillisecondsOverride ?? CURSOR_SQLITE_QUERY_DEADLINE_MS;
+  if (!Number.isFinite(deadlineMs) || deadlineMs <= 0) {
+    return Promise.reject(
+      new CursorSessionScanError("databaseError", {
+        cause: new Error("Cursor scan deadline must be a positive, finite number of milliseconds"),
+      }),
+    );
+  }
+
+  const worker = new Worker(CURSOR_WORKER_SOURCE, {
+    eval: true,
+    workerData: buildCursorWorkerData(dbPath, now, testHooks),
+  });
+
+  return new Promise<ActiveTurnHit[]>((resolve, reject) => {
+    let settled = false;
+
+    const hardDeadlineTimer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      // Await termination before rejecting: this is the real preemption
+      // backstop (see this function's own doc comment) — the caller must
+      // never observe "deadline" while the worker (and its DatabaseSync
+      // handle) might still be running.
+      void worker.terminate().finally(() => {
+        reject(new CursorSessionScanError("deadline"));
+      });
+    }, deadlineMs);
+
+    worker.on("message", (message: CursorWorkerMessage) => {
+      if (message.type === "rowInspected") {
+        testHooks?.onRowInspected?.();
+        return;
+      }
+      if (message.type === "bubbleLookup") {
+        testHooks?.onBubbleLookup?.();
+        return;
+      }
+      if (message.type === "malformedRow") {
+        logger.debug("detector", "Skipped malformed Cursor composer row", {
+          reason: "assessment exception",
+        });
+        return;
+      }
+      if (settled) return;
+      settled = true;
+      clearTimeout(hardDeadlineTimer);
+      if (message.type === "result") {
+        resolve(message.evidence);
+      } else {
+        reject(
+          new CursorSessionScanError(
+            message.reason,
+            message.message !== undefined ? { cause: new Error(message.message) } : undefined,
+          ),
+        );
+      }
+      void worker.terminate();
+    });
+
+    worker.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(hardDeadlineTimer);
+      reject(new CursorSessionScanError("databaseError", { cause: error }));
+    });
+
+    worker.on("exit", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(hardDeadlineTimer);
+      reject(
+        new CursorSessionScanError("databaseError", {
+          cause: new Error(`Cursor session scan worker exited unexpectedly (code ${code})`),
+        }),
+      );
+    });
+  });
+}
 
 /**
  * Cursor IDE stores composer/agent state in globalStorage state.vscdb
@@ -387,16 +913,23 @@ type BubbleLookupOutcome =
  * `cursorRelevantBubbleIds`). Returns every active composer so concurrent
  * agents all appear in the menu.
  *
+ * The whole SQLite scan runs inside a terminable Worker (see
+ * `runCursorScanInWorker`) so a large/pathological vault can never block
+ * this process's main event loop.
+ *
  * Every hard bound below (see `agent-detection-policy.ts`'s
  * `CURSOR_MAX_*`/`CURSOR_SQLITE_*` constants) counts inactive, malformed,
  * duplicate, and active rows/lookups alike. Reaching any of them — other
  * than the intentional `CURSOR_MAX_ACTIVE_CANDIDATES` early exit once
- * plenty of concurrent agents are already found, or natural exhaustion of
- * the `LIMIT`-bounded result set — throws `CursorSessionScanError` rather
- * than silently returning whatever partial evidence was gathered so far: an
- * unbounded/pathological Cursor vault must never be able to make this
- * function falsely report "no active Cursor agents" merely because a bound
- * was hit before the scan could look far enough.
+ * plenty of concurrent agents are already found, natural exhaustion of the
+ * `LIMIT`-bounded result set, or a row-limit cut-off whose own validated
+ * JSON recency proves every omitted row is provably no newer (see
+ * `CURSOR_WORKER_DRIVER_SOURCE`'s row-limit sentinel logic) — rejects with
+ * `CursorSessionScanError` rather than silently returning whatever partial
+ * evidence was gathered so far: an unbounded/pathological Cursor vault must
+ * never be able to make this function falsely report "no active Cursor
+ * agents" merely because a bound was hit before the scan could look far
+ * enough.
  */
 export async function detectCursorComposerActivity(
   now: number,
@@ -417,230 +950,7 @@ export async function detectCursorComposerActivity(
     return [];
   }
 
-  return queryCursorComposers(dbPath, now, testHooks);
-}
-
-function queryCursorComposers(
-  dbPath: string,
-  now: number,
-  testHooks?: CursorScanTestHooks,
-): ActiveTurnHit[] {
-  let db: DatabaseSync;
-  try {
-    db = new DatabaseSync(dbPath, { readOnly: true, timeout: CURSOR_SQLITE_BUSY_TIMEOUT_MS });
-  } catch (error) {
-    throw new CursorSessionScanError("databaseError", { cause: error });
-  }
-
-  try {
-    return runCursorScan(db, dbPath, now, testHooks);
-  } finally {
-    try {
-      db.close();
-    } catch {
-      // Best-effort close only: a result or a thrown error has already
-      // been determined by this point, and a close failure must not
-      // override either.
-    }
-  }
-}
-
-function runCursorScan(
-  db: DatabaseSync,
-  dbPath: string,
-  now: number,
-  testHooks?: CursorScanTestHooks,
-): ActiveTurnHit[] {
-  const deadlineAtMs =
-    performance.now() + (testHooks?.deadlineMillisecondsOverride ?? CURSOR_SQLITE_QUERY_DEADLINE_MS);
-  const deadlineExpired = () => performance.now() >= deadlineAtMs;
-
-  let transactionOpen = false;
-  try {
-    db.exec("BEGIN");
-    transactionOpen = true;
-
-    // `ORDER BY rowid DESC`: cursorDiskKV is a plain SQLite KV table with no
-    // timestamp column, so the implicit rowid — bumped on every
-    // insert/upsert — is the only available, trustworthy (schema-level,
-    // not attacker-controlled-JSON) recency proxy. Cursor rewrites a
-    // composer's row whenever it changes, so the freshest activity
-    // surfaces first, which keeps a bounded scan useful even if the
-    // row/byte/time budget runs out before reaching the end of the table.
-    // `LIMIT ?` is bound to the inspected-row cap **+ 1**: SQL fetches at
-    // most that many rows (never the whole table); if the `(cap + 1)`-th
-    // row is actually delivered, more matching rows exist beyond what this
-    // scan inspected, which is the truncation signal.
-    const composerStatement = db.prepare(
-      "SELECT key, value FROM cursorDiskKV WHERE key LIKE ? ORDER BY rowid DESC LIMIT ?",
-    );
-    // Prepared once, reused (bound fresh per call) for every bubble
-    // lookup — an exact parameterized point lookup, never SQL
-    // concatenation.
-    const bubbleStatement = db.prepare("SELECT value FROM cursorDiskKV WHERE key = ?");
-
-    const evidence: ActiveTurnHit[] = [];
-    let rowsInspected = 0;
-    let totalDecodedBytes = 0;
-    let totalBubbleLookups = 0;
-    const attemptedBubbleKeys = new Set<string>();
-    const bubbleCache = new Map<string, CursorBubbleRecord>();
-    let stopReason: CursorScanIncompleteReason | null = null;
-
-    // Every counter/flag here is charged identically whether the row or
-    // bubble turns out to be inactive, malformed, or a duplicate reference
-    // — limits count inspected work, not just active results.
-    const lookUpBubble = (bubbleKey: string): BubbleLookupOutcome => {
-      if (attemptedBubbleKeys.has(bubbleKey)) {
-        // Duplicate reference (already attempted this scan): serve from
-        // cache without a second round trip or byte charge.
-        const cached = bubbleCache.get(bubbleKey);
-        return cached ? { kind: "found", bubble: cached } : { kind: "absentOrMalformed" };
-      }
-      if (deadlineExpired()) {
-        stopReason ??= "deadline";
-        return { kind: "limitExceeded" };
-      }
-      if (totalBubbleLookups >= CURSOR_MAX_BUBBLE_LOOKUPS) {
-        stopReason ??= "bubbleLookupLimit";
-        return { kind: "limitExceeded" };
-      }
-      attemptedBubbleKeys.add(bubbleKey);
-      totalBubbleLookups += 1;
-      testHooks?.onBubbleLookup?.();
-
-      const row = bubbleStatement.get(bubbleKey) as { value?: unknown } | undefined;
-      if (!row || typeof row.value !== "string") return { kind: "absentOrMalformed" };
-      const valueByteCount = Buffer.byteLength(row.value, "utf8");
-      if (valueByteCount === 0 || valueByteCount > CURSOR_MAX_VALUE_BYTES) {
-        return { kind: "absentOrMalformed" };
-      }
-      if (totalDecodedBytes + valueByteCount > CURSOR_MAX_TOTAL_DECODED_VALUE_BYTES) {
-        stopReason ??= "decodedByteLimit";
-        return { kind: "limitExceeded" };
-      }
-      totalDecodedBytes += valueByteCount;
-      let bubble: unknown;
-      try {
-        bubble = JSON.parse(row.value);
-      } catch {
-        return { kind: "absentOrMalformed" };
-      }
-      if (!bubble || typeof bubble !== "object" || Array.isArray(bubble)) {
-        return { kind: "absentOrMalformed" };
-      }
-      bubbleCache.set(bubbleKey, bubble as CursorBubbleRecord);
-      return { kind: "found", bubble: bubble as CursorBubbleRecord };
-    };
-
-    rowLoop: for (const row of composerStatement.iterate("composerData:%", CURSOR_MAX_INSPECTED_ROWS + 1)) {
-      if (deadlineExpired()) {
-        stopReason = "deadline";
-        break;
-      }
-      if (rowsInspected >= CURSOR_MAX_INSPECTED_ROWS) {
-        stopReason = "rowLimit";
-        break;
-      }
-      rowsInspected += 1;
-      testHooks?.onRowInspected?.();
-
-      if (typeof row.key !== "string") continue;
-      const keyByteCount = Buffer.byteLength(row.key, "utf8");
-      if (keyByteCount === 0 || keyByteCount > CURSOR_MAX_KEY_BYTES) continue;
-
-      if (typeof row.value !== "string") continue;
-      const valueByteCount = Buffer.byteLength(row.value, "utf8");
-      // Bounded blob processing: skip (never log) anything implausibly
-      // large for a composer record.
-      if (valueByteCount === 0 || valueByteCount > CURSOR_MAX_VALUE_BYTES) continue;
-
-      if (totalDecodedBytes + valueByteCount > CURSOR_MAX_TOTAL_DECODED_VALUE_BYTES) {
-        stopReason = "decodedByteLimit";
-        break;
-      }
-      totalDecodedBytes += valueByteCount;
-
-      let record: unknown;
-      try {
-        record = JSON.parse(row.value);
-      } catch {
-        continue;
-      }
-      if (!record || typeof record !== "object" || Array.isArray(record)) continue;
-
-      const key = row.key;
-      const identity = key.startsWith("composerData:") ? key.slice("composerData:".length) : key;
-
-      let finalAssessment: TurnAssessment & { label?: string };
-      try {
-        // First pass never touches bubbles; `lastActivityAt` is folded
-        // purely from already-decoded, trusted composer/header fields, so
-        // it is identical whether or not bubbles are ultimately consulted
-        // below.
-        const provisional = assessCursorComposerRecord(record as CursorComposerRecord, now);
-        finalAssessment = provisional;
-
-        if (!provisional.active && isRecentTimestamp(provisional.lastActivityAt, now, TOOL_TURN_GRACE_MS)) {
-          // Only a plausibly-recent composer's verdict can change once a
-          // hidden bubble tool status is known — this keeps bubble lookups
-          // bounded to the small fraction of composers where they could
-          // possibly matter, instead of spending budget on every
-          // long-completed conversation the scan steps over.
-          const bubbles: Record<string, CursorBubbleRecord> = {};
-          let truncatedByBubbleLookup = false;
-          for (const bubbleId of cursorRelevantBubbleIds(record as CursorComposerRecord)) {
-            const outcome = lookUpBubble(`bubbleId:${identity}:${bubbleId}`);
-            if (outcome.kind === "found") {
-              bubbles[bubbleId] = outcome.bubble;
-            } else if (outcome.kind === "limitExceeded") {
-              truncatedByBubbleLookup = true;
-              break;
-            }
-          }
-          if (truncatedByBubbleLookup) break rowLoop;
-          finalAssessment = assessCursorComposerRecord(record as CursorComposerRecord, now, bubbles);
-        }
-      } catch {
-        logger.debug("detector", "Skipped malformed Cursor composer row", {
-          reason: "assessment exception",
-        });
-        continue;
-      }
-
-      if (!finalAssessment.active) continue;
-      evidence.push({
-        ...finalAssessment,
-        filePath: dbPath,
-        identity,
-      });
-      if (evidence.length >= CURSOR_MAX_ACTIVE_CANDIDATES) break;
-    }
-
-    // Any stop reason other than natural `LIMIT`-bounded exhaustion or the
-    // intentional `CURSOR_MAX_ACTIVE_CANDIDATES` early exit means an unseen
-    // row or bubble could have been active — never trust the partial
-    // evidence gathered so far in that case.
-    if (stopReason) {
-      throw new CursorSessionScanError(stopReason);
-    }
-
-    db.exec("COMMIT");
-    transactionOpen = false;
-    evidence.sort((a, b) => b.lastActivityAt - a.lastActivityAt);
-    return evidence;
-  } catch (error) {
-    if (transactionOpen) {
-      try {
-        db.exec("ROLLBACK");
-      } catch {
-        // Best-effort rollback only; the error/result already determined
-        // above takes precedence.
-      }
-    }
-    if (error instanceof CursorSessionScanError) throw error;
-    throw new CursorSessionScanError("databaseError", { cause: error });
-  }
+  return runCursorScanInWorker(dbPath, now, testHooks);
 }
 
 type RaycastChatEvent = {

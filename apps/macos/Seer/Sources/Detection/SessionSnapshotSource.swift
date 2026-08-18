@@ -87,6 +87,59 @@ let cursorMaximumTotalDecodedValueBytes = 64_000_000
 /// duplicate references never cost more than a single lookup.
 let cursorMaximumBubbleLookups = 400
 
+/// Mirrors `cursorRecencySqlExpression("value")` in
+/// `main/services/agent-detection-policy.ts` exactly: same field priority
+/// (`conversationCheckpointLastUpdatedAt`, `lastUpdatedAt`, `createdAt` —
+/// the same order `assessCursorComposerRecord` itself already reads for a
+/// composer's own `lastActivityAt`), same `1e12` seconds/milliseconds
+/// heuristic, same `maxSupportedTimestampMs` bound (`8_640_000_000_000_000`)
+/// — so both platforms rank composer recency identically and can share
+/// numeric-bound test fixtures. A dedicated Swift/TS parity test asserts
+/// this string equals the TS function's output byte-for-byte.
+///
+/// Computes a `cursorDiskKV` composer row's recency directly in SQLite, in
+/// epoch milliseconds (or `NULL` when unrankable), so a query can
+/// `ORDER BY` **actual last-activity time** instead of `rowid`. `rowid` is
+/// only ever insertion order: Cursor UPSERTs an existing composer row in
+/// place when a conversation updates, which never changes that row's
+/// `rowid`, so `ORDER BY rowid DESC` alone would treat a freshly-updated
+/// *old* conversation as permanently stale.
+///
+/// Evaluation order matters, matching the byte/JSON-validity guards this
+/// scan already enforces, now pushed into SQL so an oversized or malformed
+/// row can never reach `ORDER BY` as anything but a (naturally last-sorted)
+/// `NULL`:
+///  1. `octet_length(value) > cursorMaximumValueBytes` short-circuits to
+///     `NULL` before `json_valid`/`json_extract` ever run against it.
+///  2. `json_valid(value)` gates everything else — malformed JSON yields
+///     `NULL`.
+///  3. Each candidate field must itself be a JSON `integer`/`real` (a
+///     string/object/array/bool timestamp yields `NULL`, matching this
+///     scan's existing "malformed field" skip policy) and, once scaled to
+///     milliseconds, within `maxSupportedTimestampMs` of zero — otherwise
+///     `NULL`.
+///
+/// `NULL` always sorts last under `ORDER BY ... DESC` in SQLite, so rows
+/// this expression can't rank (oversized, malformed JSON, or no numeric
+/// timestamp in any candidate field) are naturally deprioritized without
+/// any extra branching in the query itself.
+let cursorRecencySqlExpression: String = {
+    func fieldExpression(_ field: String) -> String {
+        let jsonPath = "'$.\(field)'"
+        let raw = "json_extract(value, \(jsonPath))"
+        let scaledMs = "(CASE WHEN \(raw) > 1000000000000 THEN \(raw) ELSE \(raw) * 1000 END)"
+        return "CASE WHEN json_type(value, \(jsonPath)) IN ('integer', 'real') " +
+            "AND ABS(\(scaledMs)) <= 8640000000000000 THEN \(scaledMs) ELSE NULL END"
+    }
+    let coalesced = [
+        "conversationCheckpointLastUpdatedAt",
+        "lastUpdatedAt",
+        "createdAt",
+    ].map(fieldExpression).joined(separator: ", ")
+    return "CASE WHEN octet_length(value) > \(cursorMaximumValueBytes) THEN NULL " +
+        "WHEN json_valid(value) THEN COALESCE(\(coalesced)) ELSE NULL END"
+}()
+
 private final class CursorSQLiteDeadline {
     let uptime: TimeInterval
 
@@ -628,7 +681,16 @@ enum SessionSnapshotSource {
         onSnapshotEstablished: (() -> Void)? = nil,
         onRowInspected: (() -> Void)? = nil,
         onBubbleLookup: (() -> Void)? = nil,
-        deadlineMillisecondsOverride: Int? = nil
+        deadlineMillisecondsOverride: Int? = nil,
+        /// Test-only seam: when set, every fresh (non-cached) bubble lookup
+        /// treats this as `sqlite3_step(bubbleStatement)`'s result instead
+        /// of actually stepping — lets tests assert that BUSY/INTERRUPT/
+        /// IOERR/CORRUPT/etc. propagate as a typed `CursorSessionScanError`
+        /// rather than being silently swallowed as "bubble missing"
+        /// (that conflation was the confirmed defect), without needing to
+        /// reproduce those conditions against a real SQLite file. `nil` in
+        /// production and every other test: real `sqlite3_step` always runs.
+        simulatedBubbleStepResultCode: Int32? = nil
     ) throws -> [SessionTurnEvidence] {
         let uri = URL(fileURLWithPath: validatedPath).absoluteString + "?mode=ro"
         var db: OpaquePointer?
@@ -678,22 +740,28 @@ enum SessionSnapshotSource {
             sqlite3_progress_handler(db, 0, nil, nil)
         }
 
-        // `ORDER BY rowid DESC`: cursorDiskKV is a plain SQLite KV table with
-        // no timestamp column, so the implicit rowid — bumped on every
-        // insert/upsert — is the only available, trustworthy (schema-level,
-        // not attacker-controlled-JSON) recency proxy. Cursor rewrites a
-        // composer's row whenever it changes, so the freshest activity
-        // surfaces first, which keeps a bounded scan useful (requirement 5):
+        // `ORDER BY recencyMs DESC, rowid DESC`: `recencyMs` is
+        // `cursorRecencySqlExpression`, a validated JSON timestamp computed
+        // directly in SQL (see its doc comment) — the actual last-activity
+        // time, not `rowid`. `rowid` is only ever insertion order: Cursor
+        // UPSERTs an existing composer row in place when a conversation
+        // updates, which never changes that row's `rowid`, so ordering by
+        // `rowid` alone would treat a freshly-updated *old* conversation as
+        // permanently stale. `rowid` remains a deterministic tiebreaker
+        // only, for rows that tie (or both lack) a validated timestamp.
+        // Newest-first ordering keeps a bounded scan useful (requirement 5):
         // even if the row/byte/time budget runs out, it already covered the
         // composers most likely to be currently active.
         // `LIMIT ?` is bound to the inspected-row cap **+ 1**: SQL fetches at
         // most that many rows (never the whole table); if the
         // `(cap + 1)`-th row is actually delivered, more matching rows exist
-        // beyond what this scan inspected, which is the truncation signal.
+        // beyond what this scan inspected — that row is never assessed as a
+        // composer, only peeked at for its own `recencyMs` as a truncation
+        // sentinel (see the row-limit branch below).
         let sql = """
-        SELECT key, value FROM cursorDiskKV
+        SELECT key, value, (\(cursorRecencySqlExpression)) AS recencyMs FROM cursorDiskKV
         WHERE key LIKE ?
-        ORDER BY rowid DESC
+        ORDER BY recencyMs DESC, rowid DESC
         LIMIT ?
         """
 
@@ -706,8 +774,14 @@ enum SessionSnapshotSource {
         defer { sqlite3_finalize(statement) }
 
         let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-        sqlite3_bind_text(statement, 1, "composerData:%", -1, sqliteTransient)
-        sqlite3_bind_int64(statement, 2, Int64(cursorMaximumInspectedRows) + 1)
+        try checkCursorSQLite(
+            sqlite3_bind_text(statement, 1, "composerData:%", -1, sqliteTransient),
+            operation: "bind composer key prefix"
+        )
+        try checkCursorSQLite(
+            sqlite3_bind_int64(statement, 2, Int64(cursorMaximumInspectedRows) + 1),
+            operation: "bind composer row limit"
+        )
 
         // Prepared once, reused (bind/step/reset) for every bubble lookup —
         // an exact parameterized point lookup, never string concatenation.
@@ -732,7 +806,7 @@ enum SessionSnapshotSource {
         // Every counter/flag above is charged identically whether the row
         // or bubble turns out to be inactive, malformed, or a duplicate
         // reference — limits count inspected work, not just active results.
-        func lookUpBubble(_ bubbleKey: String) -> BubbleLookupOutcome {
+        func lookUpBubble(_ bubbleKey: String) throws -> BubbleLookupOutcome {
             if attemptedBubbleKeys.contains(bubbleKey) {
                 // Duplicate reference (already attempted this scan): serve
                 // from cache without a second round trip or byte charge.
@@ -751,11 +825,29 @@ enum SessionSnapshotSource {
             totalBubbleLookups += 1
             onBubbleLookup?()
 
-            sqlite3_reset(bubbleStatement)
-            sqlite3_clear_bindings(bubbleStatement)
-            sqlite3_bind_text(bubbleStatement, 1, bubbleKey, -1, sqliteTransient)
-            guard sqlite3_step(bubbleStatement) == SQLITE_ROW,
-                  sqlite3_column_type(bubbleStatement, 0) == SQLITE_TEXT else {
+            try checkCursorSQLite(sqlite3_reset(bubbleStatement), operation: "reset bubble lookup")
+            try checkCursorSQLite(
+                sqlite3_clear_bindings(bubbleStatement),
+                operation: "clear bubble lookup bindings"
+            )
+            try checkCursorSQLite(
+                sqlite3_bind_text(bubbleStatement, 1, bubbleKey, -1, sqliteTransient),
+                operation: "bind bubble lookup key"
+            )
+            let stepRC = simulatedBubbleStepResultCode ?? sqlite3_step(bubbleStatement)
+            guard stepRC != SQLITE_DONE else {
+                // Genuinely absent: not every referenced bubble id was ever
+                // written (older data, or a tool call that never produced a
+                // result row). This is the ONLY outcome allowed to mean
+                // "missing" — every other non-`SQLITE_ROW` code below is an
+                // operational failure (BUSY/LOCKED/INTERRUPT/IOERR/CORRUPT/
+                // ...) and must propagate as a typed, inconclusive scan
+                // error instead of silently being treated the same as "this
+                // bubble doesn't exist".
+                return .absentOrMalformed
+            }
+            try checkCursorSQLiteRow(stepRC, operation: "read bubble lookup")
+            guard sqlite3_column_type(bubbleStatement, 0) == SQLITE_TEXT else {
                 return .absentOrMalformed
             }
             let valueByteCount = Int(sqlite3_column_bytes(bubbleStatement, 0))
@@ -790,7 +882,27 @@ enum SessionSnapshotSource {
                 break
             }
             guard rowsInspected < cursorMaximumInspectedRows else {
-                stopReason = .rowLimit
+                // `stepRC` still points at the un-consumed (cap + 1)-th row
+                // (the truncation sentinel), already confirmed above to be
+                // neither `SQLITE_DONE` nor unread: peek at its own
+                // SQL-computed `recencyMs` without assessing it as a
+                // composer (never spends a row/byte/bubble budget on it).
+                // Rows are already ordered newest-first by validated JSON
+                // recency (rowid only breaks ties), so if even this
+                // cut-off candidate's own timestamp is too old — or
+                // absent/malformed, sorting last as SQL `NULL` — to
+                // plausibly still be active, every omitted row beyond it is
+                // provably no newer either: accept the newest
+                // `cursorMaximumInspectedRows` instead of permanently
+                // failing merely because more history exists.
+                try checkCursorSQLiteRow(stepRC, operation: "read composer row-limit sentinel")
+                let sentinelRecencyMs: Int64? = sqlite3_column_type(statement, 2) == SQLITE_NULL
+                    ? nil
+                    : saturatingInt64(sqlite3_column_double(statement, 2))
+                if let sentinelRecencyMs,
+                   isRecentTimestamp(sentinelRecencyMs, now: now, within: sessionCandidateWindowMs) {
+                    stopReason = .rowLimit
+                }
                 break
             }
             try checkCursorSQLiteRow(stepRC, operation: "read composer query")
@@ -846,7 +958,7 @@ enum SessionSnapshotSource {
                 var bubbles: [String: JSONObject] = [:]
                 var truncatedByBubbleLookup = false
                 for bubbleId in cursorRelevantBubbleIds(record) {
-                    switch lookUpBubble("bubbleId:\(identity):\(bubbleId)") {
+                    switch try lookUpBubble("bubbleId:\(identity):\(bubbleId)") {
                     case .found(let bubble):
                         bubbles[bubbleId] = bubble
                     case .absentOrMalformed:

@@ -30,7 +30,17 @@ export const PROCESS_ONLY_CPU_THRESHOLD = 25.0;
 export const GENERIC_MTIME_WINDOW_MS = 20_000;
 /** Tolerates small wall-clock/filesystem skew without trusting far-future evidence. */
 export const TIMESTAMP_FUTURE_SKEW_MS = 5_000;
-const MAX_SUPPORTED_TIMESTAMP_MS = 8_640_000_000_000_000;
+/**
+ * Exported (not just module-private) so the Cursor SQLite worker driver in
+ * `agent-detector.ts` — which reconstructs pure functions from this module
+ * via `Function.prototype.toString()` to run them inside a terminable
+ * `node:worker_threads` Worker — can pass this bound to every
+ * `toString()`-reconstructed function explicitly, rather than relying on a
+ * function's own default-parameter expression to resolve a free variable
+ * whose identifier a bundler is free to rename (see `isRecentTimestamp`,
+ * `parseCursorTimestamp`, etc. below).
+ */
+export const MAX_SUPPORTED_TIMESTAMP_MS = 8_640_000_000_000_000;
 
 /**
  * Grok CLI brackets every turn with turn_started … turn_ended in events.jsonl,
@@ -351,16 +361,29 @@ export function parseTimestamp(value: unknown, fallbackMs: number): number {
  * Shared recency predicate for transcript timestamps and filesystem mtimes.
  * The supported range matches ECMAScript Date's finite millisecond range, so
  * subtraction cannot overflow even when untrusted JSON supplies huge numbers.
+ *
+ * `timestampFutureSkewMs`/`maxSupportedTimestampMs` default to the module
+ * constants for every normal (bundled, in-process) call site, but are real
+ * trailing parameters — not read as free variables — so the Cursor SQLite
+ * worker driver's `toString()`-reconstructed call sites can always pass
+ * them explicitly and never depend on a default expression whose free
+ * variable a bundler could rename.
  */
-export function isRecentTimestamp(timestampMs: number, now: number, graceMs: number): boolean {
+export function isRecentTimestamp(
+  timestampMs: number,
+  now: number,
+  graceMs: number,
+  timestampFutureSkewMs: number = TIMESTAMP_FUTURE_SKEW_MS,
+  maxSupportedTimestampMs: number = MAX_SUPPORTED_TIMESTAMP_MS,
+): boolean {
   if (
     !Number.isFinite(timestampMs) ||
     !Number.isFinite(now) ||
     !Number.isFinite(graceMs) ||
-    Math.abs(timestampMs) > MAX_SUPPORTED_TIMESTAMP_MS ||
-    Math.abs(now) > MAX_SUPPORTED_TIMESTAMP_MS ||
+    Math.abs(timestampMs) > maxSupportedTimestampMs ||
+    Math.abs(now) > maxSupportedTimestampMs ||
     graceMs < 0 ||
-    graceMs > MAX_SUPPORTED_TIMESTAMP_MS
+    graceMs > maxSupportedTimestampMs
   ) {
     return false;
   }
@@ -368,7 +391,7 @@ export function isRecentTimestamp(timestampMs: number, now: number, graceMs: num
   const age = now - timestampMs;
   return (
     Number.isFinite(age) &&
-    age >= -TIMESTAMP_FUTURE_SKEW_MS &&
+    age >= -timestampFutureSkewMs &&
     age <= graceMs
   );
 }
@@ -833,8 +856,97 @@ export const CURSOR_MAX_BUBBLE_LOOKUPS = 400;
  * force an unbounded (or even just large) number of per-composer lookups.
  */
 export const CURSOR_MAX_RECENT_HEADERS_PER_COMPOSER = 8;
+/**
+ * Cursor's `conversationCheckpointLastUpdatedAt`/`lastUpdatedAt`/`createdAt`
+ * fields mix epoch-seconds and epoch-milliseconds; any raw numeric value
+ * bigger than this threshold is assumed to already be milliseconds. Mirrors
+ * `parseCursorTimestamp`/`parseTimestamp`'s own `> 1e12` heuristic exactly
+ * (this constant only needs to exist because the SQL recency expression
+ * below has to encode the same heuristic as literal SQL, not JS).
+ */
+export const CURSOR_TIMESTAMP_SECONDS_THRESHOLD_MS = 1e12;
+/**
+ * Priority order `assessValidatedCursorComposerRecord` already uses for a
+ * composer's own "current" timestamp
+ * (`record.conversationCheckpointLastUpdatedAt ?? record.lastUpdatedAt ??
+ * record.createdAt`). `cursorRecencySqlExpression` below mirrors this exact
+ * order in SQL so a composer's SQL-computed sort key and its JS-computed
+ * `lastActivityAt` seed never disagree about which field wins.
+ */
+export const CURSOR_TIMESTAMP_FIELDS_BY_PRIORITY = [
+  "conversationCheckpointLastUpdatedAt",
+  "lastUpdatedAt",
+  "createdAt",
+] as const;
 
-export function cursorProjectLabel(record: CursorComposerRecord): string | undefined {
+/**
+ * Builds a SQL expression that computes a Cursor `cursorDiskKV` composer
+ * row's recency directly in SQLite, in epoch milliseconds (or `NULL` when
+ * unrankable) — so a query can `ORDER BY` **actual last-activity time**
+ * instead of `rowid`. `rowid` is only ever insertion order: Cursor UPSERTs
+ * an existing composer row in place when a conversation updates, which
+ * never changes that row's `rowid`, so `ORDER BY rowid DESC` silently
+ * treats a freshly-updated *old* conversation as stale forever.
+ *
+ * Evaluation order matters and mirrors the byte/JSON-validity guards this
+ * scan already enforces in JS, now pushed into SQL so an oversized or
+ * malformed row can never reach `ORDER BY` as anything but a (naturally
+ * last-sorted) `NULL`:
+ *  1. `octet_length(valueColumn) > maxValueBytes` short-circuits to `NULL`
+ *     — an oversized value is rejected *before* `json_valid`/`json_extract`
+ *     ever runs against it, so SQLite never even attempts to parse JSON out
+ *     of a blob this scan would reject anyway.
+ *  2. `json_valid(valueColumn)` gates everything else — malformed JSON
+ *     yields `NULL`.
+ *  3. Each candidate field must itself be a JSON `integer`/`real` (a
+ *     string/object/array/bool timestamp yields `NULL` for that field,
+ *     matching this scan's existing "malformed field" skip policy) and,
+ *     once scaled to milliseconds, within `maxSupportedTimestampMs` of zero
+ *     (matching `parseCursorTimestamp`'s own guard) — otherwise `NULL`.
+ *
+ * `NULL` always sorts last under `ORDER BY ... DESC` in SQLite, so rows
+ * this expression can't rank (oversized, malformed JSON, or no numeric
+ * timestamp in any candidate field) are naturally deprioritized without
+ * any extra branching in the query itself.
+ */
+export function cursorRecencySqlExpression(
+  valueColumn: string,
+  maxValueBytes: number = CURSOR_MAX_VALUE_BYTES,
+  maxSupportedTimestampMs: number = MAX_SUPPORTED_TIMESTAMP_MS,
+  secondsThresholdMs: number = CURSOR_TIMESTAMP_SECONDS_THRESHOLD_MS,
+): string {
+  const fieldExpression = (field: string): string => {
+    const jsonPath = `'$.${field}'`;
+    const raw = `json_extract(${valueColumn}, ${jsonPath})`;
+    const scaledMs = `(CASE WHEN ${raw} > ${secondsThresholdMs} THEN ${raw} ELSE ${raw} * 1000 END)`;
+    return (
+      `CASE WHEN json_type(${valueColumn}, ${jsonPath}) IN ('integer', 'real') ` +
+      `AND ABS(${scaledMs}) <= ${maxSupportedTimestampMs} THEN ${scaledMs} ELSE NULL END`
+    );
+  };
+  const coalesced = CURSOR_TIMESTAMP_FIELDS_BY_PRIORITY.map(fieldExpression).join(", ");
+  return (
+    `CASE WHEN octet_length(${valueColumn}) > ${maxValueBytes} THEN NULL ` +
+    `WHEN json_valid(${valueColumn}) THEN COALESCE(${coalesced}) ELSE NULL END`
+  );
+}
+
+/**
+ * `basename` defaults to real `path.basename` for every normal call site.
+ * It is a real trailing parameter (not a free variable read directly)
+ * because `agent-detector.ts`'s Cursor SQLite worker driver bundles this
+ * function's `toString()`-reconstructed text into a Worker, and esbuild's
+ * bundler renames colliding top-level `import * as path from "node:path"`
+ * bindings across modules (confirmed empirically) — a hardcoded free
+ * reference to `path` inside reconstructed text could resolve to the wrong
+ * (or no) binding depending on unrelated files elsewhere in the bundle. The
+ * worker driver always passes its own `basename` explicitly (backed by its
+ * own `require("node:path")`), so this default is never evaluated there.
+ */
+export function cursorProjectLabel(
+  record: CursorComposerRecord,
+  basename: (input: string) => string = (input) => path.basename(input),
+): string | undefined {
   const workspace = record.workspaceIdentifier;
   if (workspace && typeof workspace === "object") {
     const ws = workspace as Record<string, unknown>;
@@ -844,7 +956,7 @@ export function cursorProjectLabel(record: CursorComposerRecord): string | undef
       (typeof uri?.path === "string" && uri.path) ||
       (typeof ws.id === "string" && !/^[a-f0-9]{16,}$/i.test(ws.id) ? ws.id : "");
     if (fsPath) {
-      const base = path.basename(fsPath.replace(/[/\\]+$/, ""));
+      const base = basename(fsPath.replace(/[/\\]+$/, ""));
       if (base) return humanizeProjectName(base);
     }
   }
@@ -861,13 +973,27 @@ export function cursorHeaderGrouping(header: CursorConversationHeader): Record<s
     : {};
 }
 
-function isPlainCursorObject(value: unknown): value is Record<string, unknown> {
+/**
+ * Exported so the Cursor SQLite worker driver in `agent-detector.ts` can
+ * reconstruct this function (via `.toString()`) inside its Worker.
+ */
+export function isPlainCursorObject(value: unknown): value is Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const prototype = Object.getPrototypeOf(value);
   return prototype === Object.prototype || prototype === null;
 }
 
-function parseCursorTimestamp(value: unknown): number | null {
+/**
+ * Exported (see `isRecentTimestamp`'s comment) so `agent-detector.ts`'s
+ * Cursor worker driver can both `.toString()`-reconstruct this function and
+ * pass `maxSupportedTimestampMs` explicitly at every internal call site
+ * inside the reconstructed text, rather than relying on the default to
+ * resolve a (possibly renamed) free variable.
+ */
+export function parseCursorTimestamp(
+  value: unknown,
+  maxSupportedTimestampMs: number = MAX_SUPPORTED_TIMESTAMP_MS,
+): number | null {
   let parsed: number;
   if (typeof value === "number" && Number.isFinite(value)) {
     parsed = value > 1e12 ? value : value * 1000;
@@ -876,14 +1002,17 @@ function parseCursorTimestamp(value: unknown): number | null {
   } else {
     return null;
   }
-  return Number.isFinite(parsed) && Math.abs(parsed) <= MAX_SUPPORTED_TIMESTAMP_MS ? parsed : null;
+  return Number.isFinite(parsed) && Math.abs(parsed) <= maxSupportedTimestampMs ? parsed : null;
 }
 
-function validateOptionalString(record: Record<string, unknown>, field: string): boolean {
+export function validateOptionalString(record: Record<string, unknown>, field: string): boolean {
   return record[field] === undefined || typeof record[field] === "string";
 }
 
-function validateCursorRecordFields(record: Record<string, unknown>): boolean {
+export function validateCursorRecordFields(
+  record: Record<string, unknown>,
+  maxSupportedTimestampMs: number = MAX_SUPPORTED_TIMESTAMP_MS,
+): boolean {
   for (const field of [
     "status",
     "name",
@@ -897,7 +1026,9 @@ function validateCursorRecordFields(record: Record<string, unknown>): boolean {
     "createdAt",
     "conversationCheckpointLastUpdatedAt",
   ]) {
-    if (record[field] !== undefined && parseCursorTimestamp(record[field]) === null) return false;
+    if (record[field] !== undefined && parseCursorTimestamp(record[field], maxSupportedTimestampMs) === null) {
+      return false;
+    }
   }
   if (
     record.isContinuationInProgress !== undefined &&
@@ -929,7 +1060,10 @@ function validateCursorRecordFields(record: Record<string, unknown>): boolean {
   return true;
 }
 
-function validateCursorHeaders(value: unknown): ValidatedCursorConversationHeader[] | null {
+export function validateCursorHeaders(
+  value: unknown,
+  maxSupportedTimestampMs: number = MAX_SUPPORTED_TIMESTAMP_MS,
+): ValidatedCursorConversationHeader[] | null {
   if (value === undefined) return [];
   if (!Array.isArray(value)) return null;
 
@@ -937,7 +1071,7 @@ function validateCursorHeaders(value: unknown): ValidatedCursorConversationHeade
   for (const candidate of value) {
     if (!isPlainCursorObject(candidate)) continue;
     if (candidate.type !== 1 && candidate.type !== 2) continue;
-    const createdAt = parseCursorTimestamp(candidate.createdAt);
+    const createdAt = parseCursorTimestamp(candidate.createdAt, maxSupportedTimestampMs);
     if (createdAt === null) continue;
     if (!validateOptionalString(candidate, "bubbleId")) continue;
 
@@ -975,7 +1109,7 @@ function validateCursorHeaders(value: unknown): ValidatedCursorConversationHeade
   return headers;
 }
 
-function malformedCursorAssessment(): TurnAssessment {
+export function malformedCursorAssessment(): TurnAssessment {
   return { active: false, lastActivityAt: 0, reason: "malformed cursor composer" };
 }
 
@@ -992,15 +1126,25 @@ function malformedCursorAssessment(): TurnAssessment {
  * useful. Used by `agent-detector.ts` (the IO layer) to decide which real
  * `bubbleId:<composerId>:<bubbleId>` rows are worth a bounded lookup,
  * before ever calling this pure module's assessor.
+ *
+ * `maxRecentHeadersPerComposer`/`maxKeyBytes`/`maxSupportedTimestampMs`
+ * default to the module constants for every normal call site (see
+ * `isRecentTimestamp`'s comment for why these are real trailing
+ * parameters rather than free variables).
  */
-export function cursorRelevantBubbleIds(record: CursorComposerRecord): string[] {
-  const headers = validateCursorHeaders(record.fullConversationHeadersOnly);
+export function cursorRelevantBubbleIds(
+  record: CursorComposerRecord,
+  maxRecentHeadersPerComposer: number = CURSOR_MAX_RECENT_HEADERS_PER_COMPOSER,
+  maxKeyBytes: number = CURSOR_MAX_KEY_BYTES,
+  maxSupportedTimestampMs: number = MAX_SUPPORTED_TIMESTAMP_MS,
+): string[] {
+  const headers = validateCursorHeaders(record.fullConversationHeadersOnly, maxSupportedTimestampMs);
   if (headers === null) return [];
   const seen = new Set<string>();
   const ids: string[] = [];
-  for (const header of headers.slice(-CURSOR_MAX_RECENT_HEADERS_PER_COMPOSER)) {
+  for (const header of headers.slice(-maxRecentHeadersPerComposer)) {
     if (header.type !== 2 || header.bubbleId === undefined) continue;
-    if (utf8ByteLength(header.bubbleId) > CURSOR_MAX_KEY_BYTES) continue;
+    if (utf8ByteLength(header.bubbleId) > maxKeyBytes) continue;
     if (seen.has(header.bubbleId)) continue;
     seen.add(header.bubbleId);
     ids.push(header.bubbleId);
@@ -1011,9 +1155,41 @@ export function cursorRelevantBubbleIds(record: CursorComposerRecord): string[] 
 // `Buffer` is Node-only; this module stays environment-agnostic (it may be
 // evaluated in a renderer/browser-ish context), so byte length is measured
 // with the standard `TextEncoder` Web API instead.
-function utf8ByteLength(value: string): number {
+export function utf8ByteLength(value: string): number {
   return new TextEncoder().encode(value).length;
 }
+
+/**
+ * Bundles every module-level constant `assessValidatedCursorComposerRecord`
+ * needs, plus the `basename` seam `cursorProjectLabel` needs, into a single
+ * trailing parameter. `agent-detector.ts`'s Cursor SQLite worker driver
+ * `.toString()`-reconstructs `assessCursorComposerRecord` /
+ * `assessValidatedCursorComposerRecord` to run inside a Worker and always
+ * passes its own `CursorAssessmentLimits` object explicitly (built from
+ * `workerData`, with a `basename` backed by the worker's own
+ * `require("node:path")`) — see `isRecentTimestamp`'s comment for why every
+ * one of these is threaded as a real parameter instead of read as a free
+ * variable.
+ */
+export type CursorAssessmentLimits = {
+  sessionCandidateWindowMs: number;
+  toolTurnGraceMs: number;
+  turnActiveGraceMs: number;
+  timestampFutureSkewMs: number;
+  maxSupportedTimestampMs: number;
+  runningToolStatuses: ReadonlySet<string>;
+  basename: (input: string) => string;
+};
+
+export const DEFAULT_CURSOR_ASSESSMENT_LIMITS: CursorAssessmentLimits = {
+  sessionCandidateWindowMs: SESSION_CANDIDATE_WINDOW_MS,
+  toolTurnGraceMs: TOOL_TURN_GRACE_MS,
+  turnActiveGraceMs: TURN_ACTIVE_GRACE_MS,
+  timestampFutureSkewMs: TIMESTAMP_FUTURE_SKEW_MS,
+  maxSupportedTimestampMs: MAX_SUPPORTED_TIMESTAMP_MS,
+  runningToolStatuses: CURSOR_RUNNING_TOOL_STATUSES,
+  basename: (input) => path.basename(input),
+};
 
 /**
  * Cursor often leaves composer status stuck at "completed" on disk while a turn
@@ -1037,32 +1213,34 @@ export function assessCursorComposerRecord(
   record: CursorComposerRecord,
   now: number,
   bubbles: Record<string, CursorBubbleRecord> = {},
+  limits: CursorAssessmentLimits = DEFAULT_CURSOR_ASSESSMENT_LIMITS,
 ): TurnAssessment & { label?: string } {
   try {
-    return assessValidatedCursorComposerRecord(record, now, bubbles);
+    return assessValidatedCursorComposerRecord(record, now, bubbles, limits);
   } catch {
     return malformedCursorAssessment();
   }
 }
 
-function assessValidatedCursorComposerRecord(
+export function assessValidatedCursorComposerRecord(
   record: CursorComposerRecord,
   now: number,
   bubbles: Record<string, CursorBubbleRecord>,
+  limits: CursorAssessmentLimits,
 ): TurnAssessment & { label?: string } {
-  if (!isPlainCursorObject(record) || !validateCursorRecordFields(record)) {
+  if (!isPlainCursorObject(record) || !validateCursorRecordFields(record, limits.maxSupportedTimestampMs)) {
     return malformedCursorAssessment();
   }
-  const headers = validateCursorHeaders(record.fullConversationHeadersOnly);
+  const headers = validateCursorHeaders(record.fullConversationHeadersOnly, limits.maxSupportedTimestampMs);
   if (headers === null) return malformedCursorAssessment();
 
   const status = typeof record.status === "string" ? record.status : "none";
   const generatingIds = Array.isArray(record.generatingBubbleIds) ? record.generatingBubbleIds : [];
   const continuation = record.isContinuationInProgress === true;
-  const label = cursorProjectLabel(record);
+  const label = cursorProjectLabel(record, limits.basename);
   const timestamp =
     record.conversationCheckpointLastUpdatedAt ?? record.lastUpdatedAt ?? record.createdAt;
-  let lastActivityAt = timestamp === undefined ? 0 : (parseCursorTimestamp(timestamp) ?? 0);
+  let lastActivityAt = timestamp === undefined ? 0 : (parseCursorTimestamp(timestamp, limits.maxSupportedTimestampMs) ?? 0);
 
   if (status === "generating" || continuation || generatingIds.length > 0) {
     if (timestamp === undefined) return malformedCursorAssessment();
@@ -1073,7 +1251,13 @@ function assessValidatedCursorComposerRecord(
       reason = "agent generating";
     }
     return {
-      active: isRecentTimestamp(lastActivityAt, now, SESSION_CANDIDATE_WINDOW_MS),
+      active: isRecentTimestamp(
+        lastActivityAt,
+        now,
+        limits.sessionCandidateWindowMs,
+        limits.timestampFutureSkewMs,
+        limits.maxSupportedTimestampMs,
+      ),
       lastActivityAt,
       reason,
       label,
@@ -1104,9 +1288,9 @@ function assessValidatedCursorComposerRecord(
       typeof bubbleToolFormerData?.status === "string" ? bubbleToolFormerData.status.toLowerCase() : "";
 
     if (
-      CURSOR_RUNNING_TOOL_STATUSES.has(toolStatus) ||
-      CURSOR_RUNNING_TOOL_STATUSES.has(shellStatus) ||
-      CURSOR_RUNNING_TOOL_STATUSES.has(bubbleStatus)
+      limits.runningToolStatuses.has(toolStatus) ||
+      limits.runningToolStatuses.has(shellStatus) ||
+      limits.runningToolStatuses.has(bubbleStatus)
     ) {
       runningTool = true;
       openTurnTouchesTools = true;
@@ -1153,7 +1337,13 @@ function assessValidatedCursorComposerRecord(
 
   if (runningTool) {
     return {
-      active: isRecentTimestamp(lastActivityAt, now, TOOL_TURN_GRACE_MS),
+      active: isRecentTimestamp(
+        lastActivityAt,
+        now,
+        limits.toolTurnGraceMs,
+        limits.timestampFutureSkewMs,
+        limits.maxSupportedTimestampMs,
+      ),
       lastActivityAt,
       reason: "tool_call in progress",
       label,
@@ -1161,8 +1351,10 @@ function assessValidatedCursorComposerRecord(
   }
 
   if (openUserTurnAt != null && !sawCompletedTurnAfterUser) {
-    const grace = openTurnTouchesTools ? TOOL_TURN_GRACE_MS : TURN_ACTIVE_GRACE_MS;
-    if (isRecentTimestamp(lastActivityAt, now, grace)) {
+    const grace = openTurnTouchesTools ? limits.toolTurnGraceMs : limits.turnActiveGraceMs;
+    if (
+      isRecentTimestamp(lastActivityAt, now, grace, limits.timestampFutureSkewMs, limits.maxSupportedTimestampMs)
+    ) {
       return {
         active: true,
         lastActivityAt,

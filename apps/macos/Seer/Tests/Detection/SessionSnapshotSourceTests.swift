@@ -589,6 +589,22 @@ final class SessionSnapshotSourceTests: XCTestCase {
         XCTAssertEqual(sqlite3_step(statement), SQLITE_DONE)
     }
 
+    /// Simulates Cursor's real UPSERT-in-place behavior: same `rowid`, new
+    /// value. Used to prove validated JSON recency (not insertion-order
+    /// `rowid`) drives ordering.
+    private func updateCursorFixtureRecord(at url: URL, key: String, value: String) {
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &db), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        var statement: OpaquePointer?
+        XCTAssertEqual(sqlite3_prepare_v2(db, "UPDATE cursorDiskKV SET value = ? WHERE key = ?", -1, &statement, nil), SQLITE_OK)
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, value, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        sqlite3_bind_text(statement, 2, key, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_DONE)
+        XCTAssertEqual(sqlite3_changes(db), 1)
+    }
+
     /// Inserts many rows through a single connection/prepared statement/
     /// transaction — the adversarial tests below need hundreds to thousands
     /// of rows, and `insertCursorFixtureRecord`'s per-call open/close would
@@ -611,6 +627,32 @@ final class SessionSnapshotSourceTests: XCTestCase {
         }
         XCTAssertEqual(sqlite3_exec(db, "COMMIT", nil, nil, nil), SQLITE_OK)
     }
+
+    /// Inserts `count` rows with keys that never match
+    /// `key LIKE 'composerData:%'`, without building an in-memory
+    /// `[(key, value)]` array first — the adversarial responsiveness test
+    /// below needs a row count large enough to make a regression to a full
+    /// (non-index-driven) table scan obvious, while staying fast under the
+    /// real, index-driven `WHERE key LIKE 'composerData:%'` prefix filter.
+    private func insertManyNonMatchingCursorFixtureRecords(at url: URL, count: Int) {
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &db), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        XCTAssertEqual(sqlite3_exec(db, "BEGIN", nil, nil, nil), SQLITE_OK)
+        var statement: OpaquePointer?
+        XCTAssertEqual(sqlite3_prepare_v2(db, "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)", -1, &statement, nil), SQLITE_OK)
+        defer { sqlite3_finalize(statement) }
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        for index in 0..<count {
+            sqlite3_reset(statement)
+            sqlite3_clear_bindings(statement)
+            sqlite3_bind_text(statement, 1, "otherKey:\(index)", -1, transient)
+            sqlite3_bind_text(statement, 2, "x", -1, transient)
+            XCTAssertEqual(sqlite3_step(statement), SQLITE_DONE)
+        }
+        XCTAssertEqual(sqlite3_exec(db, "COMMIT", nil, nil, nil), SQLITE_OK)
+    }
+
 
     private func openCursorWriter(at url: URL, wal: Bool) throws -> OpaquePointer {
         var db: OpaquePointer?
@@ -1059,14 +1101,80 @@ final class SessionSnapshotSourceTests: XCTestCase {
         XCTAssertEqual(bubbleLookups, 1, "three references to the same bubble id must cost exactly one lookup")
     }
 
+    /// Confirmed defect: the bubble lookup previously treated every
+    /// non-`SQLITE_ROW` step result as "this bubble is missing", hiding
+    /// genuine operational failures (BUSY/INTERRUPT/IOERR/CORRUPT/...)
+    /// behind the same silent "absent" outcome. Reproducing each of these
+    /// against a real SQLite connection is impractical (BUSY needs real
+    /// lock contention, INTERRUPT needs a concurrent `sqlite3_interrupt`
+    /// call, IOERR/CORRUPT need real disk-level faults) —
+    /// `simulatedBubbleStepResultCode` is a narrow, test-only seam that
+    /// substitutes exactly one C API return value, exercising the real
+    /// error-propagation code path (`SQLITE_DONE` is the ONLY step result
+    /// that may mean "missing" — see `testCursorComposerWithoutResolvableBubbleStaysInactive`
+    /// for that legitimate case) without needing to fabricate the
+    /// underlying condition.
+    func testCursorBubbleLookupOperationalErrorsPropagateInsteadOfBeingTreatedAsMissing() throws {
+        let simulatedFailures: [(code: Int32, expected: CursorSessionScanError)] = [
+            (SQLITE_BUSY, .databaseBusy(code: SQLITE_BUSY)),
+            (SQLITE_INTERRUPT, .databaseFailure(operation: "read bubble lookup", code: SQLITE_INTERRUPT)),
+            (SQLITE_IOERR, .databaseFailure(operation: "read bubble lookup", code: SQLITE_IOERR)),
+            (SQLITE_CORRUPT, .databaseFailure(operation: "read bubble lookup", code: SQLITE_CORRUPT)),
+        ]
+
+        for (code, expectedError) in simulatedFailures {
+            let home = makeTempDirectory()
+            defer { try? FileManager.default.removeItem(at: home) }
+            let dbURL = home
+                .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+            makeCursorFixtureDatabase(
+                at: dbURL,
+                key: "composerData:needs-bubble",
+                valueJSON: """
+                {
+                  "status": "completed",
+                  "lastUpdatedAt": \(fixedNow - 65_000),
+                  "fullConversationHeadersOnly": [
+                    {"type": 1, "createdAt": \(fixedNow - 65_000)},
+                    {"type": 2, "createdAt": \(fixedNow - 60_000), "bubbleId": "bubble-error"}
+                  ]
+                }
+                """
+            )
+            insertCursorFixtureRecord(
+                at: dbURL,
+                key: "bubbleId:needs-bubble:bubble-error",
+                value: #"{"toolFormerData":{"status":"inProgress"}}"#
+            )
+
+            let fd = try XCTUnwrap(SessionSnapshotSource.openVerifiedRegularFile(at: dbURL.path, root: canonicalRoot(home)))
+            defer { close(fd) }
+
+            do {
+                _ = try SessionSnapshotSource.queryCursorComposers(
+                    fd: fd,
+                    validatedPath: dbURL.path,
+                    now: fixedNow,
+                    simulatedBubbleStepResultCode: code
+                )
+                XCTFail("simulated SQLite code \(code) from the bubble lookup must propagate, not be treated as a missing bubble")
+            } catch let error as CursorSessionScanError {
+                XCTAssertEqual(error, expectedError, "unexpected error shape for simulated code \(code)")
+            } catch {
+                XCTFail("expected typed CursorSessionScanError for simulated code \(code), got \(error)")
+            }
+        }
+    }
+
     // MARK: - Cursor: bounded scan adversarial tests (issue A)
 
-    /// Exceeding `cursorMaximumInspectedRows` (all inactive/malformed, so the
-    /// intentional 200-active early exit never fires) must fail the scan
-    /// with a typed, conservative error — never silently report "no active
-    /// Cursor agents" from a truncated view — and the SQL/loop must never
-    /// step through anywhere near the full table.
-    func testCursorRowLimitExceededThrowsScanIncompleteAndBoundsInspectedRows() throws {
+    /// Comfortably more than `cursorMaximumInspectedRows`, all sharing the
+    /// same old (epoch-zero) recency, plus one genuinely active composer.
+    /// Every "old" row is provably no newer than the row-limit sentinel, so
+    /// hitting the row cap here must not permanently fail the scan (the
+    /// confirmed defect: "throwing whenever >2000 composers permanently
+    /// freezes retained state in persistent large DBs").
+    func testCursorRowLimitRecoversWhenThousandsOfOldRowsExistBeyondNewestCandidates() throws {
         let home = makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: home) }
         let dbURL = home
@@ -1079,6 +1187,50 @@ final class SessionSnapshotSourceTests: XCTestCase {
             records.append((
                 key: String(format: "composerData:row-%05d", index),
                 value: #"{"status":"completed","lastUpdatedAt":0}"#
+            ))
+        }
+        records.append((
+            key: "composerData:z-active",
+            value: #"{"status":"generating","lastUpdatedAt":\#(fixedNow)}"#
+        ))
+        insertManyCursorFixtureRecords(at: dbURL, records: records)
+
+        let fd = try XCTUnwrap(SessionSnapshotSource.openVerifiedRegularFile(at: dbURL.path, root: canonicalRoot(home)))
+        defer { close(fd) }
+        let evidence = try SessionSnapshotSource.queryCursorComposers(
+            fd: fd,
+            validatedPath: dbURL.path,
+            now: fixedNow
+        )
+
+        XCTAssertEqual(evidence.map(\.identity), ["z-active"])
+    }
+
+    /// `cursorMaximumInspectedRows + 50` rows, each with its OWN recent (but
+    /// non-active — "completed") timestamp a few seconds apart. Ordered
+    /// newest-first, the `(cap + 1)`-th row (the sentinel) is still only a
+    /// couple of seconds older than `fixedNow` — comfortably inside
+    /// `sessionCandidateWindowMs` — so the scan cannot prove every omitted
+    /// row is too old to matter, and must still reject rather than risk
+    /// silently dropping a real active composer.
+    func testCursorRowLimitStillThrowsWhenCutOffCandidateCouldPlausiblyStillBeActive() throws {
+        let home = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let dbURL = home
+            .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+        makeEmptyCursorFixtureDatabase(at: dbURL)
+
+        // The (cap + 1)-th row (0-indexed: cursorMaximumInspectedRows) is the
+        // sentinel; confirm it really is inside the candidate window so the
+        // scan's rejection below is a genuine truncation risk, not a fixture bug.
+        XCTAssertLessThan(Int64(cursorMaximumInspectedRows), sessionCandidateWindowMs)
+
+        let totalRows = cursorMaximumInspectedRows + 50
+        var records: [(key: String, value: String)] = []
+        for index in 0..<totalRows {
+            records.append((
+                key: String(format: "composerData:recent-%05d", index),
+                value: #"{"status":"completed","lastUpdatedAt":\#(fixedNow - Int64(index))}"#
             ))
         }
         insertManyCursorFixtureRecords(at: dbURL, records: records)
@@ -1094,7 +1246,7 @@ final class SessionSnapshotSourceTests: XCTestCase {
                 now: fixedNow,
                 onRowInspected: { inspectedRows += 1 }
             )
-            XCTFail("exceeding the inspected-row cap must fail the scan instead of silently reporting partial results")
+            XCTFail("a plausibly-active cut-off candidate must fail the scan instead of silently reporting partial results")
         } catch let error as CursorSessionScanError {
             XCTAssertEqual(error, .scanIncomplete(reason: .rowLimit))
         } catch {
@@ -1102,8 +1254,96 @@ final class SessionSnapshotSourceTests: XCTestCase {
         }
 
         XCTAssertGreaterThan(inspectedRows, 0)
-        XCTAssertLessThanOrEqual(inspectedRows, cursorMaximumInspectedRows + 1)
+        XCTAssertLessThanOrEqual(inspectedRows, cursorMaximumInspectedRows)
         XCTAssertLessThan(inspectedRows, totalRows, "must never step through the entire table once bounded")
+    }
+
+    /// "target" gets the lowest `rowid` (inserted first) with an old value,
+    /// then `cursorMaximumInspectedRows` filler rows are inserted after it
+    /// (all higher `rowid`s, equally old/non-active), then "target" is
+    /// UPDATEd in place — mirroring Cursor's real UPSERT behavior — to a
+    /// recent/active value while its `rowid` never changes. Under
+    /// `ORDER BY rowid DESC` alone, "target" (the lowest rowid) would sort
+    /// dead last, behind every filler row, and would never be reached within
+    /// the row cap. Validated JSON recency must rank it first instead, since
+    /// it is now the newest activity by actual timestamp.
+    func testCursorRecencyOrderingRanksUpdatedOldRowidComposerAboveStaleHighRowidComposers() throws {
+        let home = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let dbURL = home
+            .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+        makeCursorFixtureDatabase(
+            at: dbURL,
+            key: "composerData:target",
+            valueJSON: #"{"status":"completed","lastUpdatedAt":0}"#
+        )
+
+        var filler: [(key: String, value: String)] = []
+        for index in 0..<cursorMaximumInspectedRows {
+            filler.append((
+                key: String(format: "composerData:filler-%05d", index),
+                value: #"{"status":"completed","lastUpdatedAt":0}"#
+            ))
+        }
+        insertManyCursorFixtureRecords(at: dbURL, records: filler)
+
+        updateCursorFixtureRecord(
+            at: dbURL,
+            key: "composerData:target",
+            value: #"{"status":"generating","lastUpdatedAt":\#(fixedNow)}"#
+        )
+
+        let fd = try XCTUnwrap(SessionSnapshotSource.openVerifiedRegularFile(at: dbURL.path, root: canonicalRoot(home)))
+        defer { close(fd) }
+        let evidence = try SessionSnapshotSource.queryCursorComposers(
+            fd: fd,
+            validatedPath: dbURL.path,
+            now: fixedNow
+        )
+
+        XCTAssertEqual(evidence.map(\.identity), ["target"])
+        XCTAssertEqual(evidence.first?.reason, "generating")
+    }
+
+    /// Many rows that never match `key LIKE 'composerData:%'` must stay
+    /// cheap: `key` is the table's primary key, so the `WHERE` clause seeks
+    /// directly to the matching key range instead of forcing SQLite to
+    /// evaluate `cursorRecencySqlExpression`/`ORDER BY` against every
+    /// unrelated row in a much larger table. Guards against a regression
+    /// that would silently turn this into an O(table size) scan and
+    /// jeopardize the deadline's ability to keep the scan bounded.
+    func testCursorScanRemainsFastAndSucceedsWithManyNonMatchingRows() throws {
+        let home = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let dbURL = home
+            .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+        makeEmptyCursorFixtureDatabase(at: dbURL)
+
+        insertManyNonMatchingCursorFixtureRecords(at: dbURL, count: 300_000)
+        insertCursorFixtureRecord(
+            at: dbURL,
+            key: "composerData:needle",
+            value: #"{"status":"generating","lastUpdatedAt":\#(fixedNow)}"#
+        )
+
+        let fd = try XCTUnwrap(SessionSnapshotSource.openVerifiedRegularFile(at: dbURL.path, root: canonicalRoot(home)))
+        defer { close(fd) }
+
+        let started = Date()
+        let evidence = try SessionSnapshotSource.queryCursorComposers(
+            fd: fd,
+            validatedPath: dbURL.path,
+            now: fixedNow,
+            // Comfortably shorter than the real 4s production deadline, but
+            // generous enough to rule out flakes: an index-driven prefix
+            // scan over 300K unrelated rows must finish in well under a
+            // second, not merely "eventually" inside the full deadline.
+            deadlineMillisecondsOverride: 2_000
+        )
+        let elapsedSeconds = Date().timeIntervalSince(started)
+
+        XCTAssertEqual(evidence.map(\.identity), ["needle"])
+        XCTAssertLessThan(elapsedSeconds, 2, "300K non-matching rows must never approach the deadline")
     }
 
     /// Many medium composer rows whose sum exceeds
