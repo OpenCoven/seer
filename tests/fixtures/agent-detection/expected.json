@@ -477,6 +477,19 @@
       }
     },
     {
+      "id": "cursor-tool-inprogress-mixed-case",
+      "family": "cursor",
+      "kind": "session",
+      "format": "cursor",
+      "fixtureFile": "cursor-tool-inprogress.json",
+      "expected": {
+        "active": true,
+        "source": "session",
+        "detail": "Cursor Tool Inprogress Project · Running tools",
+        "id": "cursor:cursor-tool-inprogress-composer"
+      }
+    },
+    {
       "id": "aider-below-threshold",
       "family": "aider",
       "kind": "process",

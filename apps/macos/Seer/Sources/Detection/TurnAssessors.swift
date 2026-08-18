@@ -741,12 +741,10 @@ public func assessGenericMtime(mtimeMs: Int64, now: Int64) -> TurnAssessment {
 
 // MARK: - Cursor
 
-// NOTE: "inProgress" (mixed case) is preserved verbatim from
-// `CURSOR_RUNNING_TOOL_STATUSES` in the TS policy even though `toolStatus`/
-// `shellStatus` are always lowercased before this set is checked — meaning
-// that entry never actually matches in either implementation. This is a
-// faithful, intentional port of that quirk, not a fix.
-private let cursorRunningToolStatuses: Set<String> = ["loading", "running", "pending", "in_progress", "inProgress"]
+// `toolStatus`/`shellStatus` are always lowercased before this set is
+// checked, so every entry here must already be lowercase or it can never
+// match — a mixed-case "inProgress" entry previously never matched.
+private let cursorRunningToolStatuses: Set<String> = ["loading", "running", "pending", "in_progress", "inprogress"]
 
 private func isLongHexIdentifier(_ text: String) -> Bool {
     guard text.count >= 16 else { return false }

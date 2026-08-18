@@ -1,0 +1,13 @@
+{
+  "composerKey": "cursor-tool-inprogress-composer",
+  "record": {
+    "status": "completed",
+    "workspaceIdentifier": {
+      "uri": { "fsPath": "/tmp/seer-fixtures/agent-detection/cursor-tool-inprogress-project" }
+    },
+    "lastUpdatedAt": "2026-08-10T12:09:00.000Z",
+    "fullConversationHeadersOnly": [
+      { "type": 2, "createdAt": "2026-08-10T12:09:55.000Z", "grouping": { "toolFormerStatus": "inProgress" } }
+    ]
+  }
+}

@@ -6,6 +6,7 @@ import test from "node:test";
 
 import {
   AGENT_KINDS,
+  CURSOR_RUNNING_TOOL_STATUSES,
   TIMESTAMP_FUTURE_SKEW_MS,
   assessCursorComposerRecord,
   assessDetectionFixture,
@@ -172,6 +173,40 @@ test("Cursor mixed headers process valid entries without refreshing malformed en
   assert.equal(repeated.active, false);
   assert.equal(repeated.lastActivityAt, now - 1_000);
   assert.equal(repeated.reason, "stale user prompt");
+});
+
+test("CURSOR_RUNNING_TOOL_STATUSES stores the in-progress entry lowercase, matching the lowercased comparison", () => {
+  // `toolStatus`/`shellStatus` are always lowercased (see the header loop below)
+  // before being checked against this set, so a mixed-case entry like
+  // "inProgress" can never match and silently never classifies a tool as running.
+  assert.ok(CURSOR_RUNNING_TOOL_STATUSES.has("inprogress"));
+  assert.ok(!CURSOR_RUNNING_TOOL_STATUSES.has("inProgress"));
+});
+
+test("Cursor tool status 'inProgress' (and normalized case variants) classify the composer as active", () => {
+  for (const rawStatus of ["inProgress", "INPROGRESS", "InProgress", "inprogress", "in_progress"]) {
+    const record = {
+      status: "completed",
+      lastUpdatedAt: now,
+      fullConversationHeadersOnly: [
+        { type: 2, createdAt: now, grouping: { toolFormerStatus: rawStatus } },
+      ],
+    };
+    const assessment = assessCursorComposerRecord(record, now);
+    assert.equal(assessment.active, true, `toolFormerStatus "${rawStatus}" should be active`);
+    assert.equal(assessment.reason, "tool_call in progress", `toolFormerStatus "${rawStatus}" should report a running tool`);
+
+    const shellRecord = {
+      status: "completed",
+      lastUpdatedAt: now,
+      fullConversationHeadersOnly: [
+        { type: 2, createdAt: now, grouping: { shellStatus: rawStatus } },
+      ],
+    };
+    const shellAssessment = assessCursorComposerRecord(shellRecord, now);
+    assert.equal(shellAssessment.active, true, `shellStatus "${rawStatus}" should be active`);
+    assert.equal(shellAssessment.reason, "tool_call in progress", `shellStatus "${rawStatus}" should report a running tool`);
+  }
 });
 
 const APPROVED_FAMILIES = [

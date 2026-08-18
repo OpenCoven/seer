@@ -769,12 +769,15 @@ type ValidatedCursorConversationHeader = {
   };
 };
 
+// `toolStatus`/`shellStatus` are always lowercased before this set is
+// checked, so every entry here must already be lowercase or it can never
+// match — a mixed-case "inProgress" entry previously never matched.
 export const CURSOR_RUNNING_TOOL_STATUSES = new Set([
   "loading",
   "running",
   "pending",
   "in_progress",
-  "inProgress",
+  "inprogress",
 ]);
 
 export function cursorProjectLabel(record: CursorComposerRecord): string | undefined {

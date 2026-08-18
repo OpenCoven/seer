@@ -867,6 +867,54 @@ final class TurnAssessorsTests: XCTestCase {
         XCTAssertEqual(repeated.reason, "stale user prompt")
     }
 
+    /// `toolFormerStatus`/`shellStatus` are always lowercased before being
+    /// checked against the running-tool allowlist, so the allowlist must
+    /// store its "in progress" entry lowercase too. A mixed-case entry like
+    /// `"inProgress"` never matches the lowercased field and silently never
+    /// classifies a running Cursor tool call as active.
+    func testCursorToolStatusInProgressMixedCaseIsActive() {
+        let now: Int64 = 1_786_449_620_000
+        let record: JSONObject = [
+            "status": "completed",
+            "lastUpdatedAt": now - 5_000,
+            "fullConversationHeadersOnly": [
+                ["type": 2, "createdAt": now - 5_000, "grouping": ["toolFormerStatus": "inProgress"]] as JSONObject,
+            ],
+        ]
+        let assessment = assessCursorComposerRecord(record, now: now)
+        XCTAssertTrue(assessment.active, "toolFormerStatus \"inProgress\" must classify the tool call as active")
+        XCTAssertEqual(assessment.reason, "tool_call in progress")
+    }
+
+    /// The field is lowercased before the allowlist check, so every raw case
+    /// variant of "in progress" must be normalized to the same active result.
+    func testCursorToolStatusInProgressCaseVariantsAreActive() {
+        let now: Int64 = 1_786_449_620_000
+        for rawStatus in ["inProgress", "INPROGRESS", "InProgress", "inprogress", "in_progress"] {
+            let toolRecord: JSONObject = [
+                "status": "completed",
+                "lastUpdatedAt": now - 5_000,
+                "fullConversationHeadersOnly": [
+                    ["type": 2, "createdAt": now - 5_000, "grouping": ["toolFormerStatus": rawStatus]] as JSONObject,
+                ],
+            ]
+            let toolAssessment = assessCursorComposerRecord(toolRecord, now: now)
+            XCTAssertTrue(toolAssessment.active, "toolFormerStatus \"\(rawStatus)\" should be active")
+            XCTAssertEqual(toolAssessment.reason, "tool_call in progress", "toolFormerStatus \"\(rawStatus)\" should report a running tool")
+
+            let shellRecord: JSONObject = [
+                "status": "completed",
+                "lastUpdatedAt": now - 5_000,
+                "fullConversationHeadersOnly": [
+                    ["type": 2, "createdAt": now - 5_000, "grouping": ["shellStatus": rawStatus]] as JSONObject,
+                ],
+            ]
+            let shellAssessment = assessCursorComposerRecord(shellRecord, now: now)
+            XCTAssertTrue(shellAssessment.active, "shellStatus \"\(rawStatus)\" should be active")
+            XCTAssertEqual(shellAssessment.reason, "tool_call in progress", "shellStatus \"\(rawStatus)\" should report a running tool")
+        }
+    }
+
     func testAssessCodexTurnDistinguishesApprovalFromCompletion() {
         let cwdPayload: JSONObject = ["cwd": "/tmp/seer-fixtures/codex-boundary-project"]
         let started: JSONObject = [
