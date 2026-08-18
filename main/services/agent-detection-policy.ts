@@ -969,8 +969,21 @@ export const CURSOR_TIMESTAMP_FIELDS_BY_PRIORITY = [
  *       `COALESCE` over the same 3 fields in the same priority order (not
  *       a flat max — a lower-priority field holding a numerically larger
  *       value must never outrank a defined higher-priority field, exactly
- *       like JS's `??` chain), defaulting to `0` when none of the 3 are
- *       defined (matching `lastActivityAt`'s own `0` seed).
+ *       like JS's `??` chain), yielding SQL `NULL` — never a `0` default —
+ *       when none of the 3 are defined/rankable. A composer with no root
+ *       timestamp AND no valid header can still be genuinely active in the
+ *       assessor's own `lastActivityAt` (which separately seeds `0` as an
+ *       in-memory fallback, never surfaced here), so this SQL expression
+ *       must not silently assert "this row's real recency is exactly
+ *       epoch-zero" on its behalf: doing so would make the row-limit
+ *       sentinel treat it as `isDefinitelyOlderThanWindowLowerBound` and
+ *       wave truncation through as "safe" even though this SQL projection
+ *       genuinely cannot rank the row at all. `overallRecency`'s own
+ *       null-skipping aggregate `MAX` already lets a defined `headerRecency`
+ *       win over a `NULL` `rootRecency` (header-only recency keeps
+ *       working); only a composer with *neither* signal now correctly
+ *       surfaces as the unrankable `NULL` the row-limit sentinel already
+ *       treats as inconclusive.
  *     - `headerRecency` mirrors the unconditional
  *       `for (const header of headers) { if (createdAt > lastActivityAt)
  *       lastActivityAt = createdAt; }` loop: the `MAX` of every
@@ -1035,16 +1048,32 @@ export function cursorRecencySqlExpression(
   const numericOrIsoStringToMsExpression = (typeExpr: string, rawExpr: string): string => {
     const scaledNumeric = `(CASE WHEN ${rawExpr} > ${secondsThresholdMs} THEN ${rawExpr} ELSE ${rawExpr} * 1000 END)`;
     // `YYYY-MM-DDTHH:MM:SS` prefix (GLOB is case-sensitive, so a lower-case
-    // `t` never matches), then either `Z`, an optional `.` + fractional
-    // digits followed by `Z`, an explicit `±HH:MM` offset, or fractional
-    // digits followed by that offset. Anything else (zone-less, date-only,
-    // space-separated, lower-case, missing seconds) is intentionally left
-    // unmatched.
+    // `t` never matches), then either bare `Z`, an explicit `±HH:MM` offset,
+    // or a `.` + EXACTLY 1-3 fractional digits followed by `Z` or an
+    // offset. GLOB has no `{1,3}`-style repetition, so each digit count is
+    // spelled out as its own alternative rather than the unrestricted `.*`
+    // wildcard a naive port would reach for — `.*` would happily match a
+    // 4-or-more-digit fraction too, which `Date.parse`/`ROUND(julianday(...))`
+    // /Swift's `ISO8601FormatStyle` can each round to a *different* integer
+    // millisecond (sub-millisecond precision none of the three parsers
+    // agrees on), silently breaking cross-engine parity. Anything else
+    // (zone-less, date-only, space-separated, lower-case, missing seconds,
+    // or a 4+-digit fraction) is intentionally left unmatched.
+    const fractionalSecondsDigitCounts = [1, 2, 3];
+    const suffixAlternatives = [
+      `substr(${rawExpr}, 20) = 'Z'`,
+      `substr(${rawExpr}, 20) GLOB '[+-][0-9][0-9]:[0-9][0-9]'`,
+      ...fractionalSecondsDigitCounts.flatMap((digits) => {
+        const fraction = `.${"[0-9]".repeat(digits)}`;
+        return [
+          `substr(${rawExpr}, 20) GLOB '${fraction}Z'`,
+          `substr(${rawExpr}, 20) GLOB '${fraction}[+-][0-9][0-9]:[0-9][0-9]'`,
+        ];
+      }),
+    ];
     const isoShapeGuard =
       `${rawExpr} GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*' ` +
-      `AND (substr(${rawExpr}, 20) = 'Z' OR substr(${rawExpr}, 20) GLOB '.*Z' ` +
-      `OR substr(${rawExpr}, 20) GLOB '[+-][0-9][0-9]:[0-9][0-9]' ` +
-      `OR substr(${rawExpr}, 20) GLOB '.*[+-][0-9][0-9]:[0-9][0-9]')`;
+      `AND (${suffixAlternatives.join(" OR ")})`;
     const scaledIsoString = `ROUND((julianday(${rawExpr}) - 2440587.5) * 86400000.0)`;
     return (
       `CASE ` +
@@ -1061,7 +1090,7 @@ export function cursorRecencySqlExpression(
       `json_extract(${valueColumn}, ${jsonPath})`,
     );
   };
-  const rootRecency = `COALESCE(${CURSOR_TIMESTAMP_FIELDS_BY_PRIORITY.map(fieldExpression).join(", ")}, 0)`;
+  const rootRecency = `COALESCE(${CURSOR_TIMESTAMP_FIELDS_BY_PRIORITY.map(fieldExpression).join(", ")})`;
 
   const headerCreatedAtMs = numericOrIsoStringToMsExpression(
     `json_type(headerEntry.value, '$.createdAt')`,
@@ -1147,8 +1176,19 @@ export function isPlainCursorObject(value: unknown): value is Record<string, unk
  * The exact ISO-8601 string grammar `parseCursorTimestamp` accepts:
  * `YYYY-MM-DDTHH:MM:SS[.fraction](Z|±HH:MM)`, case-sensitive `T`/`Z`
  * (a lower-case `t` or `z` is rejected), seconds required (no date-only or
- * minute-only shape), and no other separator (no space in place of `T`, no
- * RFC-2822 mail-date form). This is the single canonical grammar this
+ * minute-only shape), no other separator (no space in place of `T`, no
+ * RFC-2822 mail-date form), and an optional fractional-seconds component
+ * restricted to exactly 1-3 digits (`.1`, `.12`, `.123` accepted; a
+ * 4-or-more-digit fraction like `.1234` is rejected). The 1-3 digit bound
+ * matters for more than grammar purity: `Date.parse` (this function),
+ * `julianday()` (the SQL shape guard below), and Swift's
+ * `Date.ISO8601FormatStyle` all only ever *emit* millisecond precision, but
+ * a 4+-digit fraction is sub-millisecond precision that each of those three
+ * parsers is free to round differently — confirmed empirically that without
+ * this bound, the three engines can compute different integer millisecond
+ * values for the exact same 4+-digit-fraction string, silently breaking the
+ * cross-platform recency parity this grammar exists to guarantee. This is
+ * the single canonical grammar this
  * codebase intentionally supports for a Cursor timestamp *string* — it is
  * deliberately narrower than what `Date.parse` alone would accept, because
  * it must agree with two other independent parsers of the exact same
@@ -1176,7 +1216,7 @@ export function isPlainCursorObject(value: unknown): value is Record<string, unk
  * `parseCursorTimestamp` below.
  */
 export function isCanonicalCursorIsoTimestamp(value: string): boolean {
-  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/.test(value);
+  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?(Z|[+-]\d{2}:\d{2})$/.test(value);
 }
 
 /**

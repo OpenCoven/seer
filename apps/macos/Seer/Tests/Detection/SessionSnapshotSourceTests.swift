@@ -1309,6 +1309,59 @@ final class SessionSnapshotSourceTests: XCTestCase {
         XCTAssertLessThan(inspectedRows, totalRows, "must never step through the entire table once bounded")
     }
 
+    /// Regression for the removed `COALESCE(..., 0)` default:
+    /// `cursorRecencySqlExpression`'s `rootRecency` used to default an
+    /// entirely absent/unrankable root-and-header timestamp set to a
+    /// definite, rankable `0`, which `isDefinitelyOlderThanWindowLowerBound`
+    /// happily reports as "definitely old" — so hitting the row cap on such
+    /// a composer would have been wrongly treated as "safe to truncate"
+    /// even though the row is genuinely unrankable, not provably old. Every
+    /// one of `cursorMaximumInspectedRows + 50` rows here carries no root
+    /// timestamp field AND no header at all (`{"status":"completed"}`
+    /// only), so every row's SQL recency is `NULL`. `NULL` must never be
+    /// treated as "definitely older than the window's lower bound" — the
+    /// scan must still fail closed with `.rowLimit` (inconclusive) rather
+    /// than silently reporting a partial/empty result.
+    func testCursorRowLimitStillThrowsWhenThousandsOfRowsHaveNoRootOrHeaderTimestampAtAll() throws {
+        let home = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let dbURL = home
+            .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+        makeEmptyCursorFixtureDatabase(at: dbURL)
+
+        let totalRows = cursorMaximumInspectedRows + 50
+        var records: [(key: String, value: String)] = []
+        for index in 0..<totalRows {
+            records.append((
+                key: String(format: "composerData:no-timestamp-%05d", index),
+                value: #"{"status":"completed"}"#
+            ))
+        }
+        insertManyCursorFixtureRecords(at: dbURL, records: records)
+
+        let fd = try XCTUnwrap(SessionSnapshotSource.openVerifiedRegularFile(at: dbURL.path, root: canonicalRoot(home)))
+        defer { close(fd) }
+
+        var inspectedRows = 0
+        do {
+            _ = try SessionSnapshotSource.queryCursorComposers(
+                fd: fd,
+                validatedPath: dbURL.path,
+                now: fixedNow,
+                onRowInspected: { inspectedRows += 1 }
+            )
+            XCTFail("hitting the row cap with every row's recency unrankable (NULL) must fail the scan, never silently succeed")
+        } catch let error as CursorSessionScanError {
+            XCTAssertEqual(error, .scanIncomplete(reason: .rowLimit))
+        } catch {
+            XCTFail("expected typed CursorSessionScanError, got \(error)")
+        }
+
+        XCTAssertGreaterThan(inspectedRows, 0)
+        XCTAssertLessThanOrEqual(inspectedRows, cursorMaximumInspectedRows)
+        XCTAssertLessThan(inspectedRows, totalRows, "must never step through the entire table once bounded")
+    }
+
     /// Regression for the "far-future sentinel treated as safe" defect:
     /// `isRecentTimestamp` reports a far-future timestamp as "not recent"
     /// (its future-skew tolerance rejects it), so the old sentinel check —

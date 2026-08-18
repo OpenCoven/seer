@@ -704,6 +704,45 @@ test("Cursor row limit: previously-lenient ISO string timestamps never surface a
   });
 });
 
+// MARK: - Cursor row limit + no-COALESCE-default recency sentinel (issue:
+// `cursorRecencySqlExpression`'s `rootRecency` used to default an entirely
+// absent set of root timestamp fields to `COALESCE(..., 0)`, so a composer
+// with no root timestamp AND no valid header timestamp got a definite,
+// rankable SQL recency of exactly `0` instead of the correct `NULL`
+// ("unrankable"). `isDefinitelyOlderThanWindowLowerBound(0, ...)` reports
+// literal epoch-zero as definitively old, so the row-limit sentinel wrongly
+// treated hitting the cap on such a row as "safe to truncate" — the same
+// class of false-safe verdict the far-future-sentinel regression test
+// above already guards against for the opposite (too-new) direction.
+
+test("Cursor row limit stays inconclusive, never definitively old, when the cut-off candidate has no root or header timestamp at all despite 2000+ such composers", async () => {
+  await withDatabase(async (database) => {
+    // Every row is valid JSON with a `status` field but NO root
+    // `lastUpdatedAt`/`createdAt`/`conversationCheckpointLastUpdatedAt` and
+    // no `fullConversationHeadersOnly` at all — the composer's SQL recency
+    // must be NULL (unrankable), never the old `COALESCE(..., 0)` default.
+    const totalRows = CURSOR_MAX_INSPECTED_ROWS + 50;
+    const rows = Array.from({ length: totalRows }, (_, index) => ({
+      key: `composerData:no-timestamp-${String(index).padStart(5, "0")}`,
+      value: '{"status":"completed"}',
+    }));
+    insertManyRowsFast(database, rows);
+
+    await assert.rejects(
+      () => detectCursorComposerActivity(now, database),
+      (error: unknown) => {
+        assert.ok(error instanceof CursorSessionScanError);
+        assert.equal(
+          error.reason,
+          "rowLimit",
+          "an unrankable (NULL) cut-off sentinel must stay inconclusive, never be treated as definitively old",
+        );
+        return true;
+      },
+    );
+  });
+});
+
 test("Cursor scan Worker byte-count thresholds are bound named parameters, never interpolated SQL", () => {
   // The composer/bubble CASE projections' byte threshold must be a bound
   // named parameter ($maxValueBytes) resolved at `.get`/`.iterate` call

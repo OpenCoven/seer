@@ -663,14 +663,27 @@ test("Cursor SQL recency matches the assessor's field priority order for an upda
   assert.equal(assessedLastActivityAt(prioritized), now, raw);
 });
 
-test("Cursor SQL recency matches the assessor's lastActivityAt of 0 for malformed/unparseable records", () => {
+test("Cursor SQL recency is unrankable (NULL) for malformed/unparseable records, while the assessor's own in-memory lastActivityAt still falls back to 0", () => {
+  // Each of these records is valid JSON, but every field that would
+  // otherwise contribute a root/header recency signal is either absent or
+  // fails the SQL shape guard (an unparseable string, non-object header
+  // entries, or a bare top-level array with no matching `$.field` paths at
+  // all). `cursorRecencySqlExpression`'s `rootRecency`/`headerRecency` no
+  // longer default an unrankable set of candidates to `COALESCE(..., 0)`,
+  // so SQL now correctly reports `NULL` ("cannot rank this row") instead of
+  // a numeric `0` for every one of these — even though the assessor's own
+  // `lastActivityAt` still separately falls back to its in-memory `0` seed
+  // (see `assessCursorComposerRecord`'s own comment on that seed; it is
+  // never surfaced through this SQL expression). This is the intentional
+  // divergence that lets the row-limit sentinel treat such a row as
+  // inconclusive rather than definitively old.
   for (const record of [
     { lastUpdatedAt: "not-a-timestamp" },
     { fullConversationHeadersOnly: [42, null, "x"] },
     [],
   ]) {
     const raw = JSON.stringify(record);
-    assert.equal(sqlRecencyFor(record), assessedLastActivityAt(record), raw);
+    assert.equal(sqlRecencyFor(record), null, raw);
     assert.equal(assessedLastActivityAt(record), 0, raw);
   }
 
@@ -683,7 +696,7 @@ test("Cursor SQL recency matches the assessor's lastActivityAt of 0 for malforme
   assert.equal(sqlRecencyForRawValue(""), null);
 });
 
-test("Cursor SQL recency matches the assessor for a future-skewed timestamp, and rejects one beyond the supported bound identically", () => {
+test("Cursor SQL recency matches the assessor for a future-skewed timestamp, and is unrankable (not a defaulted 0) for one beyond the supported bound", () => {
   for (const futureMs of [now + 60_000, now + 86_400_000, MAX_SUPPORTED_TIMESTAMP_MS - 1]) {
     // lastActivityAt itself is never clamped by "is this in the future" —
     // only the separate active/inactive boolean is. Recency ranking must
@@ -693,11 +706,17 @@ test("Cursor SQL recency matches the assessor for a future-skewed timestamp, and
     assert.equal(assessedLastActivityAt(record), futureMs);
   }
 
-  // Beyond maxSupportedTimestampMs: both sides reject the whole record
-  // identically (validateCursorRecordFields already rejects any defined
-  // priority field that fails parseCursorTimestamp's own bound check).
+  // Beyond maxSupportedTimestampMs: the assessor rejects the whole record
+  // as malformed (`validateCursorRecordFields` already rejects any defined
+  // priority field that fails `parseCursorTimestamp`'s own bound check),
+  // falling back to its in-memory `0` seed. SQL independently rejects the
+  // same out-of-range numeric value via its own `ABS(ms) <=
+  // maxSupportedTimestampMs` guard, yielding `NULL` (unrankable) rather
+  // than a `COALESCE(..., 0)`-defaulted `0` — an out-of-range value must
+  // never poison the row's rank with a nonsensical magnitude OR silently
+  // masquerade as "provably epoch-zero old".
   const outOfRange = { status: "generating", lastUpdatedAt: MAX_SUPPORTED_TIMESTAMP_MS + 1 };
-  assert.equal(sqlRecencyFor(outOfRange), assessedLastActivityAt(outOfRange));
+  assert.equal(sqlRecencyFor(outOfRange), null);
   assert.equal(assessedLastActivityAt(outOfRange), 0);
 });
 
@@ -705,14 +724,14 @@ test("parseCursorTimestamp accepts exactly the canonical ISO-8601 grammar and re
   // The one grammar `parseCursorTimestamp`, `cursorRecencySqlExpression`'s
   // SQL shape guard, and the Swift port's `Date.ISO8601FormatStyle` all
   // intentionally agree on: `YYYY-MM-DDTHH:MM:SS[.fraction](Z|±HH:MM)`,
-  // case-sensitive `T`/`Z`, seconds required. `isCanonicalCursorIsoTimestamp`
-  // is the single exported validator `parseCursorTimestamp` itself uses, so
-  // this test and the parser cannot silently drift apart.
+  // case-sensitive `T`/`Z`, seconds required, fraction restricted to
+  // EXACTLY 1-3 digits. `isCanonicalCursorIsoTimestamp` is the single
+  // exported validator `parseCursorTimestamp` itself uses, so this test
+  // and the parser cannot silently drift apart.
   for (const canonical of [
     "2024-01-15T10:20:30Z",
     "2024-01-15T10:20:30.123Z",
     "2024-01-15T10:20:30.1Z",
-    "2024-01-15T10:20:30.123456Z",
     "2024-01-15T10:20:30+00:00",
     "2024-01-15T10:20:30-05:30",
     "2024-01-15T10:20:30.123+05:30",
@@ -734,6 +753,7 @@ test("parseCursorTimestamp accepts exactly the canonical ISO-8601 grammar and re
     "Mon, 15 Jan 2024 10:20:30 GMT", // RFC-2822
     "2024-01-15T10:20Z", // minute-only, no seconds
     "2024-01-15T10:20:30", // zone-less
+    "2024-01-15T10:20:30.123456Z", // 6-digit (sub-millisecond) fraction — restricted to 1-3 digits
   ]) {
     assert.equal(isCanonicalCursorIsoTimestamp(lenient), false, lenient);
     assert.equal(parseCursorTimestamp(lenient), null, lenient);
@@ -744,15 +764,20 @@ test("parseCursorTimestamp accepts exactly the canonical ISO-8601 grammar and re
   }
 });
 
-test("Cursor SQL recency, parseCursorTimestamp, and the assessor now agree that every lenient string shape is unrankable — no blessed divergence", () => {
+test("Cursor SQL recency and the assessor now agree that every lenient string shape is unrankable — no blessed divergence in WHICH shapes are rejected", () => {
   // Previously "documented" as the one intentional assessor divergence:
   // `Date.parse` (and so the old, unrestricted `parseCursorTimestamp`)
   // happily accepted a bare date-only string, while Swift's
   // `Date.ISO8601FormatStyle` flatly rejected it. `parseCursorTimestamp` is
   // now gated by the same `isCanonicalCursorIsoTimestamp` grammar the SQL
-  // shape guard already enforced, so all three engines agree: a date-only
-  // (or lower-case/RFC/space/minute-only) header timestamp is unrankable
-  // and contributes nothing to the composer's `lastActivityAt`.
+  // shape guard already enforced, so all three engines agree on WHICH
+  // shapes are unrankable: a date-only (or lower-case/RFC/space/
+  // minute-only) header timestamp contributes nothing to the composer's
+  // `lastActivityAt` on any engine. SQL now represents "unrankable" as a
+  // real `NULL` (never a `COALESCE(..., 0)`-defaulted `0`) while the
+  // assessor represents it as its own in-memory `0` fallback — those two
+  // representations are allowed, and expected, to differ; what must never
+  // differ is which shapes each side calls unrankable in the first place.
   for (const createdAt of [
     "2024-01-15",
     "2024-01-15t10:20:30Z",
@@ -763,9 +788,88 @@ test("Cursor SQL recency, parseCursorTimestamp, and the assessor now agree that 
     "2024-01-15T10:20:30",
   ]) {
     const record = { fullConversationHeadersOnly: [{ type: 1, createdAt }] };
-    assert.equal(sqlRecencyFor(record), 0, createdAt);
+    assert.equal(sqlRecencyFor(record), null, createdAt);
     assert.equal(assessedLastActivityAt(record), 0, createdAt);
   }
+});
+
+// MARK: - Cursor canonical ISO grammar: fractional-second digit-count
+// boundary. GLOB has no `{1,3}`-style repetition operator, so
+// `cursorRecencySqlExpression`'s shape guard has to spell out each digit
+// count (1, 2, 3) as its own alternative rather than reach for an
+// unrestricted `.*` wildcard — `.*` would also match a 4-or-more-digit
+// (sub-millisecond) fraction, which `julianday()`, `Date.parse`, and
+// Swift's `Date.ISO8601FormatStyle` are each free to round to a DIFFERENT
+// integer millisecond, silently breaking the cross-engine recency parity
+// this whole grammar exists to guarantee. `isCanonicalCursorIsoTimestamp`
+// must reject the exact same 4+-digit shapes the SQL guard rejects, and
+// every value both accept must resolve to the identical millisecond value.
+
+test("Cursor canonical ISO grammar accepts exactly 1-3 fractional-second digits and rejects the 0- and 4-digit boundary cutoffs, in lockstep with the SQL shape guard and Date.parse", () => {
+  const acceptedFractionDigits = ["1", "12", "123", "000", "007", "999"];
+  for (const fraction of acceptedFractionDigits) {
+    for (const zone of ["Z", "+00:00", "-05:30"]) {
+      const value = `2024-01-15T10:20:30.${fraction}${zone}`;
+      assert.equal(isCanonicalCursorIsoTimestamp(value), true, value);
+      const parsedMs = Date.parse(value);
+      assert.ok(Number.isFinite(parsedMs), value);
+      const record = { status: "generating", lastUpdatedAt: value };
+      assert.equal(sqlRecencyFor(record), parsedMs, value);
+      assert.equal(assessedLastActivityAt(record), parsedMs, value);
+    }
+  }
+
+  // Lower-bound cutoff: a bare `.` with ZERO fractional digits (one digit
+  // short of the 1-3 range) must be rejected exactly like the upper-bound
+  // cutoff, a 4-(or-more)-digit fraction (one digit over). Since the field
+  // is DEFINED but fails the shape guard, SQL recency is now unrankable
+  // (`NULL`) rather than a `COALESCE(..., 0)`-defaulted `0`.
+  const rejectedFractionShapes = ["", "1234", "12345", "123456"];
+  for (const fraction of rejectedFractionShapes) {
+    const value = `2024-01-15T10:20:30.${fraction}Z`;
+    assert.equal(isCanonicalCursorIsoTimestamp(value), false, value);
+    assert.equal(parseCursorTimestamp(value), null, value);
+    const record = { status: "generating", lastUpdatedAt: value };
+    assert.equal(sqlRecencyFor(record), null, value);
+    assert.equal(assessedLastActivityAt(record), 0, value);
+  }
+});
+
+// MARK: - Cursor SQL recency: no COALESCE(..., 0) default for a composer
+// with no rankable root or header timestamp at all.
+//
+// `rootRecency` used to default an entirely absent/unrankable set of root
+// fields to `COALESCE(..., 0)`, so a composer with NEITHER a root
+// timestamp NOR a valid header timestamp got a definite, rankable SQL
+// recency of exactly `0` instead of the correct `NULL` ("unrankable").
+// `isDefinitelyOlderThanWindowLowerBound(0, ...)` reports literal
+// epoch-zero as definitively old, so the row-limit sentinel
+// (`agent-detector.test.ts`'s "no root or header timestamp at all" case)
+// would have wrongly treated hitting the cap on such a row as "safe to
+// truncate". A header-only composer must still rank correctly — only a
+// composer with no signal anywhere becomes unrankable.
+
+test("Cursor SQL recency is NULL, never 0, for a composer with no root timestamp and no valid header — while header-only recency keeps working", () => {
+  const noSignalAtAll = { status: "completed" };
+  assert.equal(sqlRecencyFor(noSignalAtAll), null, JSON.stringify(noSignalAtAll));
+  // The assessor's own in-memory `lastActivityAt` still separately seeds
+  // `0` as a JS fallback — that in-memory fallback is never surfaced by
+  // this SQL expression, which is exactly the point: the two are allowed
+  // to diverge (SQL NULL vs. assessor 0) so the row-limit sentinel treats
+  // this row as inconclusive rather than definitively old.
+  assert.equal(assessedLastActivityAt(noSignalAtAll), 0);
+  assert.equal(isDefinitelyOlderThanWindowLowerBound(0, now, SESSION_CANDIDATE_WINDOW_MS), true);
+
+  // A record with only malformed/unrankable headers (no root fields
+  // either) must likewise stay NULL, not fall back to a rankable 0.
+  const onlyMalformedHeaders = { fullConversationHeadersOnly: [42, null, "x"] };
+  assert.equal(sqlRecencyFor(onlyMalformedHeaders), null, JSON.stringify(onlyMalformedHeaders));
+
+  // Header-only recency must still work when a header genuinely IS valid,
+  // even though the root fields remain entirely absent.
+  const headerOnlyValid = { fullConversationHeadersOnly: [{ type: 2, createdAt: now }] };
+  assert.equal(sqlRecencyFor(headerOnlyValid), now, JSON.stringify(headerOnlyValid));
+  assert.equal(assessedLastActivityAt(headerOnlyValid), now);
 });
 
 // MARK: - Cursor row-limit truncation safety: overflow-safe lower-bound

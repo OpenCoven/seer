@@ -134,8 +134,21 @@ let cursorMaximumBubbleLookups = 400
 ///       `COALESCE` over the same 3 fields in the same priority order
 ///       (never a flat max across them, which would let a lower-priority
 ///       field's numerically larger value outrank a defined
-///       higher-priority field), defaulting to `0` when none of the 3 are
-///       defined, matching `lastActivityAt`'s own `0` seed.
+///       higher-priority field), yielding SQL `NULL` — never a `0`
+///       default — when none of the 3 are defined/rankable. A composer
+///       with no root timestamp AND no valid header can still be genuinely
+///       active in the assessor's own `lastActivityAt` (which separately
+///       seeds `0` as an in-memory fallback, never surfaced here), so this
+///       SQL expression must not silently assert "this row's real recency
+///       is exactly epoch-zero" on its behalf — doing so would let the
+///       row-limit sentinel treat it as `isDefinitelyOlderThanWindowLowerBound`
+///       and wave truncation through as "safe" even though this SQL
+///       projection genuinely cannot rank the row at all.
+///       `overallRecency`'s own null-skipping aggregate `MAX` already lets
+///       a defined `headerRecency` win over a `NULL` `rootRecency`
+///       (header-only recency keeps working); only a composer with
+///       *neither* signal now correctly surfaces as the unrankable `NULL`
+///       the row-limit sentinel already treats as inconclusive.
 ///     - `headerRecency` mirrors the unconditional
 ///       `for header in headers { if createdAt > lastActivityAt { ... } }`
 ///       loop: the null-skipping aggregate `MAX` of every
@@ -152,23 +165,30 @@ let cursorMaximumBubbleLookups = 400
 ///       `parseCursorTimestamp`/`parseISO8601ToMs` accepts that can make a
 ///       composer active: a JSON number (seconds when `<= 1e12`, else
 ///       already milliseconds) or a JSON string in strict
-///       `YYYY-MM-DDTHH:MM:SS[.fff...](Z|±HH:MM)` form — the one string
-///       shape confirmed empirically to parse to the exact same
+///       `YYYY-MM-DDTHH:MM:SS[.f|.ff|.fff](Z|±HH:MM)` form — EXACTLY 1-3
+///       fractional digits when a fraction is present (never 4+; a naive
+///       unbounded `.*` GLOB would match `.1234`-shaped sub-millisecond
+///       precision that `Date.parse`/`julianday()`/`ISO8601FormatStyle`
+///       can each round to a different integer millisecond) — the one
+///       string shape confirmed empirically to parse to the exact same
 ///       millisecond value under both this codebase's TS parser
-///       (`Date.parse`) and this Swift parser
-///       (`Date.ISO8601FormatStyle`). Any other string (zone-less,
-///       date-only, lower-case `t`/`z`, space-separated, no-seconds) is
+///       (`Date.parse`, itself gated ahead of time by the identical
+///       `isCanonicalCursorIsoTimestamp` grammar) and this Swift parser
+///       (`Date.ISO8601FormatStyle`, likewise gated ahead of time by
+///       `isCanonicalCursorIsoTimestamp(_:)` in `TurnAssessors.swift`). Any
+///       other string (zone-less, date-only, lower-case `t`/`z`,
+///       space-separated, no-seconds, or a 4+-digit fraction) is
 ///       deliberately left unrankable: real Cursor data only ever emits
-///       epoch-millisecond numbers on disk, and Swift's own
-///       `ISO8601FormatStyle` flatly rejects several of those shapes
-///       (confirmed empirically), so ranking on them could silently
-///       diverge from what this very assessor would compute. A value that
-///       reaches SQLite's own date parser is additionally shape-guarded by
-///       `GLOB`/`substr` *before* `julianday()` ever runs, and the
-///       millisecond conversion is `ROUND`ed — confirmed empirically
-///       required, since the raw `(julianday(x) - 2440587.5) * 86400000.0`
-///       formula alone can be off by a sub-millisecond floating-point
-///       epsilon that `ROUND` corrects to the exact integer millisecond
+///       epoch-millisecond numbers on disk, and both platforms' grammar
+///       gate now flatly rejects every one of those shapes identically, so
+///       ranking on them could never happen in the assessor either. A
+///       value that reaches SQLite's own date parser is additionally
+///       shape-guarded by `GLOB`/`substr` *before* `julianday()` ever runs,
+///       and the millisecond conversion is `ROUND`ed — confirmed
+///       empirically required, since the raw
+///       `(julianday(x) - 2440587.5) * 86400000.0` formula alone can be
+///       off by a sub-millisecond floating-point epsilon that `ROUND`
+///       corrects to the exact integer millisecond
 ///       `Date.parse`/`ISO8601FormatStyle` produce.
 ///     - Both also apply the same `ABS(ms) <= maxSupportedTimestampMs`
 ///       bound as before, so an out-of-range numeric string/number never
@@ -188,16 +208,31 @@ let cursorRecencySqlExpression: String = {
     func numericOrIsoStringToMsExpression(_ typeExpr: String, _ rawExpr: String) -> String {
         let scaledNumeric = "(CASE WHEN \(rawExpr) > 1000000000000 THEN \(rawExpr) ELSE \(rawExpr) * 1000 END)"
         // `YYYY-MM-DDTHH:MM:SS` prefix (GLOB is case-sensitive, so a
-        // lower-case `t` never matches), then either `Z`, an optional `.` +
-        // fractional digits followed by `Z`, an explicit `±HH:MM` offset,
-        // or fractional digits followed by that offset. Anything else
+        // lower-case `t` never matches), then either bare `Z`, an explicit
+        // `±HH:MM` offset, or a `.` + EXACTLY 1-3 fractional digits
+        // followed by `Z` or an offset. GLOB has no `{1,3}`-style
+        // repetition, so each digit count is spelled out as its own
+        // alternative rather than the unrestricted `.*` wildcard a naive
+        // port would reach for — `.*` would happily match a 4-or-more-digit
+        // fraction too, which `Date.parse`/`ROUND(julianday(...))`/Swift's
+        // `ISO8601FormatStyle` can each round to a *different* integer
+        // millisecond (sub-millisecond precision none of the three parsers
+        // agrees on), silently breaking cross-engine parity. Anything else
         // (zone-less, date-only, space-separated, lower-case, missing
-        // seconds) is intentionally left unmatched.
+        // seconds, or a 4+-digit fraction) is intentionally left unmatched.
+        let fractionalSecondsDigitCounts = [1, 2, 3]
+        var suffixAlternatives = [
+            "substr(\(rawExpr), 20) = 'Z'",
+            "substr(\(rawExpr), 20) GLOB '[+-][0-9][0-9]:[0-9][0-9]'",
+        ]
+        for digits in fractionalSecondsDigitCounts {
+            let fraction = "." + String(repeating: "[0-9]", count: digits)
+            suffixAlternatives.append("substr(\(rawExpr), 20) GLOB '\(fraction)Z'")
+            suffixAlternatives.append("substr(\(rawExpr), 20) GLOB '\(fraction)[+-][0-9][0-9]:[0-9][0-9]'")
+        }
         let isoShapeGuard =
             "\(rawExpr) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*' " +
-            "AND (substr(\(rawExpr), 20) = 'Z' OR substr(\(rawExpr), 20) GLOB '.*Z' " +
-            "OR substr(\(rawExpr), 20) GLOB '[+-][0-9][0-9]:[0-9][0-9]' " +
-            "OR substr(\(rawExpr), 20) GLOB '.*[+-][0-9][0-9]:[0-9][0-9]')"
+            "AND (" + suffixAlternatives.joined(separator: " OR ") + ")"
         let scaledIsoString = "ROUND((julianday(\(rawExpr)) - 2440587.5) * 86400000.0)"
         return "CASE " +
             "WHEN \(typeExpr) IN ('integer', 'real') AND ABS(\(scaledNumeric)) <= 8640000000000000 THEN \(scaledNumeric) " +
@@ -216,7 +251,7 @@ let cursorRecencySqlExpression: String = {
         "conversationCheckpointLastUpdatedAt",
         "lastUpdatedAt",
         "createdAt",
-    ].map(fieldExpression).joined(separator: ", ") + ", 0)"
+    ].map(fieldExpression).joined(separator: ", ") + ")"
 
     let headerCreatedAtMs = numericOrIsoStringToMsExpression(
         "json_type(headerEntry.value, '$.createdAt')",

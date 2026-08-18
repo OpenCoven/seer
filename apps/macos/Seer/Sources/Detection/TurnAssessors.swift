@@ -824,6 +824,42 @@ private struct ValidatedCursorConversationHeader {
     let bubbleId: String?
 }
 
+/// Swift port of `isCanonicalCursorIsoTimestamp` in
+/// `main/services/agent-detection-policy.ts`, and the canonical grammar
+/// `cursorRecencySqlExpression`'s SQL `GLOB`/`substr` shape guard also
+/// enforces: `YYYY-MM-DDTHH:MM:SS[.fraction](Z|±HH:MM)`, case-sensitive
+/// `T`/`Z` (a lower-case `t` OR `z` is rejected — Swift's own
+/// `Date.ISO8601FormatStyle` is confirmed empirically to tolerate a
+/// lower-case trailing `z` as an accidental Foundation leniency the TS/SQL
+/// grammar does not mirror), seconds required (no date-only or
+/// minute-only shape), no other separator (no space in place of `T`, no
+/// RFC-2822 mail-date form), and an optional fractional-seconds component
+/// restricted to EXACTLY 1-3 digits (`.1`/`.12`/`.123` accepted; a
+/// 4-or-more-digit fraction like `.1234` is rejected — confirmed
+/// empirically that `Date.ISO8601FormatStyle` itself happily parses a
+/// 4+-digit fraction to a *different* rounded millisecond value than
+/// `Date.parse`/`julianday()` compute for the identical text, which would
+/// silently break the cross-platform recency parity this grammar exists to
+/// guarantee).
+///
+/// Gating `parseCursorTimestamp` with this check BEFORE it ever reaches
+/// `Date.ISO8601FormatStyle` is what makes this Swift parser reject every
+/// shape `Date.ISO8601FormatStyle` alone would otherwise accept but the TS
+/// parser (`Date.parse`, itself gated by the identical
+/// `isCanonicalCursorIsoTimestamp` in the TS policy) and the SQL shape
+/// guard both reject — without this gate, a lower-case `z` or a 4+-digit
+/// fraction could make this Swift assessor call a composer "active" while
+/// the TS/SQL side disagrees.
+private func isCanonicalCursorIsoTimestamp(_ value: String) -> Bool {
+    guard let regex = try? NSRegularExpression(
+        pattern: #"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?(Z|[+-]\d{2}:\d{2})$"#
+    ) else {
+        return false
+    }
+    let range = NSRange(value.startIndex..<value.endIndex, in: value)
+    return regex.firstMatch(in: value, options: [], range: range) != nil
+}
+
 private func parseCursorTimestamp(_ value: Any?) -> Int64? {
     if let numeric = finiteNumber(value) {
         let milliseconds = numeric > 1e12 ? numeric : numeric * 1_000
@@ -834,6 +870,7 @@ private func parseCursorTimestamp(_ value: Any?) -> Int64? {
     }
     guard let text = value as? String,
           !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+          isCanonicalCursorIsoTimestamp(text),
           let milliseconds = parseISO8601ToMs(text),
           abs(Double(milliseconds)) <= maxSupportedTimestampMs else {
         return nil

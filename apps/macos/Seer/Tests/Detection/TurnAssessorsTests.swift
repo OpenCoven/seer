@@ -1207,16 +1207,23 @@ final class TurnAssessorsTests: XCTestCase {
         XCTAssertEqual(assessedPrioritized, now)
     }
 
-    /// Mirrors the TS parity suite's malformed/unparseable case: both an
-    /// assessable-but-unrankable `JSONObject` (which the assessor rejects to
-    /// `lastActivityAt: 0`) and genuinely invalid JSON syntax (which never
-    /// even reaches the assessor in production — the scan Worker's own parse
-    /// fails first and the row is skipped — so only SQL's `NULL` unrankable
-    /// verdict is asserted for those; a bare top-level JSON array, the TS
-    /// suite's third malformed case, has no Swift equivalent here since
-    /// `assessCursorComposerRecord` only ever accepts a `JSONObject`
-    /// argument, a distinction TS's structural typing doesn't enforce at
-    /// this boundary).
+    /// Mirrors the TS parity suite's malformed/unparseable case: each of
+    /// these records is assessable but every field that would otherwise
+    /// contribute a root/header recency signal is either absent or fails
+    /// the SQL shape guard (an unparseable string, or non-object header
+    /// entries). `cursorRecencySqlExpression`'s `rootRecency`/
+    /// `headerRecency` no longer default an unrankable set of candidates to
+    /// `COALESCE(..., 0)`, so SQL now correctly reports `NULL` ("cannot
+    /// rank this row") instead of a numeric `0` for every one of these —
+    /// even though the assessor's own `lastActivityAt` still separately
+    /// falls back to its in-memory `0` seed (see
+    /// `assessCursorComposerRecord`'s own comment on that seed; it is never
+    /// surfaced through this SQL expression). This is the intentional
+    /// divergence that lets the row-limit sentinel treat such a row as
+    /// inconclusive rather than definitively old. Genuinely invalid JSON
+    /// syntax never even reaches the assessor in production — the scan
+    /// Worker's own parse fails first and the row is skipped — so only
+    /// SQL's `NULL` unrankable verdict is asserted for those.
     func testCursorSQLRecencyMatchesAssessorForMalformedOrUnparseableRecords() throws {
         let now: Int64 = 1_786_449_620_000
         for valueJSON in [
@@ -1224,7 +1231,7 @@ final class TurnAssessorsTests: XCTestCase {
             #"{"fullConversationHeadersOnly":[42,null,"x"]}"#,
         ] {
             let assessed = try assessedLastActivityAt(forValueJSON: valueJSON, now: now)
-            XCTAssertEqual(sqlRecency(forValueJSON: valueJSON), assessed, valueJSON)
+            XCTAssertNil(sqlRecency(forValueJSON: valueJSON), valueJSON)
             XCTAssertEqual(assessed, 0, valueJSON)
         }
 
@@ -1251,13 +1258,19 @@ final class TurnAssessorsTests: XCTestCase {
             XCTAssertEqual(assessed, futureMs, valueJSON)
         }
 
-        // Beyond maxSupportedTimestampMs: both sides reject the whole record
-        // identically (validateCursorRecordFields already rejects any
-        // defined priority field that fails parseCursorTimestamp's own
-        // bound check).
+        // Beyond maxSupportedTimestampMs: the assessor rejects the whole
+        // record as malformed (`validateCursorRecordFields` already rejects
+        // any defined priority field that fails `parseCursorTimestamp`'s
+        // own bound check), falling back to its in-memory `0` seed. SQL
+        // independently rejects the same out-of-range numeric value via its
+        // own `ABS(ms) <= maxSupportedTimestampMs` guard, yielding `NULL`
+        // (unrankable) rather than a `COALESCE(..., 0)`-defaulted `0` — an
+        // out-of-range value must never poison the row's rank with a
+        // nonsensical magnitude OR silently masquerade as "provably
+        // epoch-zero old".
         let outOfRange = #"{"status":"generating","lastUpdatedAt":\#(maxSupportedTimestampMs + 1)}"#
         let assessedOutOfRange = try assessedLastActivityAt(forValueJSON: outOfRange, now: now)
-        XCTAssertEqual(sqlRecency(forValueJSON: outOfRange), assessedOutOfRange)
+        XCTAssertNil(sqlRecency(forValueJSON: outOfRange))
         XCTAssertEqual(assessedOutOfRange, 0)
     }
 
@@ -1269,13 +1282,127 @@ final class TurnAssessorsTests: XCTestCase {
     /// enforces the identical canonical-ISO-8601 grammar ahead of
     /// parseCursorTimestamp, so on both platforms SQL and the assessor agree
     /// with no exception needed: both treat a date-only string as
-    /// unrankable/non-activity-bearing.
+    /// unrankable/non-activity-bearing. SQL now represents "unrankable" as a
+    /// real `NULL` (never a `COALESCE(..., 0)`-defaulted `0`), while the
+    /// assessor represents it as its own in-memory `0` fallback.
     func testCursorSQLRecencyAndAssessorAgreeDateOnlyStringsAreUnrankable() throws {
         let now: Int64 = 1_786_449_620_000
         XCTAssertNil(parseISO8601ToMs("2024-01-15"), "Swift's ISO8601FormatStyle must reject a date-only string")
         let valueJSON = #"{"fullConversationHeadersOnly":[{"type":1,"createdAt":"2024-01-15"}]}"#
         let assessed = try assessedLastActivityAt(forValueJSON: valueJSON, now: now)
-        XCTAssertEqual(sqlRecency(forValueJSON: valueJSON), 0)
+        XCTAssertNil(sqlRecency(forValueJSON: valueJSON))
         XCTAssertEqual(assessed, 0)
+    }
+
+    /// Mirrors the TS parity suite's "no blessed divergence" test: every
+    /// lenient header `createdAt` string shape (lower-case `t`/`z`, a space
+    /// instead of `T`, RFC-2822, minute-only, zone-less) must be rejected
+    /// identically by SQL's shape guard and by `parseCursorTimestamp`'s new
+    /// `isCanonicalCursorIsoTimestamp` gate — the two representations of
+    /// "unrankable" (SQL `NULL` vs. the assessor's in-memory `0` fallback)
+    /// are allowed to differ, but WHICH shapes are unrankable must never
+    /// differ between engines.
+    func testCursorSQLRecencyAndAssessorAgreeEveryLenientHeaderShapeIsUnrankable() throws {
+        let now: Int64 = 1_786_449_620_000
+        for createdAt in [
+            "2024-01-15",
+            "2024-01-15t10:20:30Z",
+            "2024-01-15T10:20:30z",
+            "2024-01-15 10:20:30Z",
+            "Mon, 15 Jan 2024 10:20:30 GMT",
+            "2024-01-15T10:20Z",
+            "2024-01-15T10:20:30",
+        ] {
+            let valueJSON = #"{"fullConversationHeadersOnly":[{"type":1,"createdAt":"\#(createdAt)"}]}"#
+            let assessed = try assessedLastActivityAt(forValueJSON: valueJSON, now: now)
+            XCTAssertNil(sqlRecency(forValueJSON: valueJSON), createdAt)
+            XCTAssertEqual(assessed, 0, createdAt)
+        }
+    }
+
+    // MARK: - Cursor canonical ISO grammar: fractional-second digit-count
+    // boundary. GLOB has no `{1,3}`-style repetition operator, so
+    // `cursorRecencySqlExpression`'s shape guard has to spell out each digit
+    // count (1, 2, 3) as its own alternative rather than reach for an
+    // unrestricted `.*` wildcard — `.*` would also match a 4-or-more-digit
+    // (sub-millisecond) fraction, which `julianday()`, `Date.parse`, and
+    // Swift's `Date.ISO8601FormatStyle`/`parseCursorTimestamp`'s own gate are
+    // each free to treat differently, silently breaking the cross-engine
+    // recency parity this whole grammar exists to guarantee.
+
+    /// Mirrors the TS parity suite's fractional-second digit-count boundary
+    /// test: 1, 2, and 3-digit fractions must be accepted (and agree with
+    /// `parseISO8601ToMs`'s own millisecond value) across `Z` and numeric
+    /// offset zones, while the 0-digit (bare `.`) and 4+-digit boundary
+    /// cutoffs must both be rejected identically by SQL and the assessor.
+    func testCursorCanonicalIsoGrammarAcceptsExactlyOneToThreeFractionalDigits() throws {
+        let now: Int64 = 1_786_449_620_000
+        let acceptedFractionDigits = ["1", "12", "123", "000", "007", "999"]
+        for fraction in acceptedFractionDigits {
+            for zone in ["Z", "+00:00", "-05:30"] {
+                let value = "2024-01-15T10:20:30.\(fraction)\(zone)"
+                let parsedMs = try XCTUnwrap(parseISO8601ToMs(value), value)
+                let valueJSON = #"{"status":"generating","lastUpdatedAt":"\#(value)"}"#
+                let assessed = try assessedLastActivityAt(forValueJSON: valueJSON, now: now)
+                XCTAssertEqual(sqlRecency(forValueJSON: valueJSON), parsedMs, value)
+                XCTAssertEqual(assessed, parsedMs, value)
+            }
+        }
+
+        // Lower-bound cutoff: a bare `.` with ZERO fractional digits (one
+        // digit short of the 1-3 range) must be rejected exactly like the
+        // upper-bound cutoff, a 4-(or-more)-digit fraction (one digit over).
+        // Since the field is DEFINED but fails the shape guard, SQL
+        // recency is now unrankable (`NULL`) rather than a
+        // `COALESCE(..., 0)`-defaulted `0`.
+        for fraction in ["", "1234", "12345", "123456"] {
+            let value = "2024-01-15T10:20:30.\(fraction)Z"
+            let valueJSON = #"{"status":"generating","lastUpdatedAt":"\#(value)"}"#
+            let assessed = try assessedLastActivityAt(forValueJSON: valueJSON, now: now)
+            XCTAssertNil(sqlRecency(forValueJSON: valueJSON), value)
+            XCTAssertEqual(assessed, 0, value)
+        }
+    }
+
+    // MARK: - Cursor SQL recency: no COALESCE(..., 0) default for a
+    // composer with no rankable root or header timestamp at all.
+    //
+    // `rootRecency` used to default an entirely absent/unrankable set of
+    // root fields to `COALESCE(..., 0)`, so a composer with NEITHER a root
+    // timestamp NOR a valid header timestamp got a definite, rankable SQL
+    // recency of exactly `0` instead of the correct `NULL` ("unrankable").
+    // `isDefinitelyOlderThanWindowLowerBound(0, ...)` reports literal
+    // epoch-zero as definitively old, so the row-limit sentinel
+    // (`SessionSnapshotSourceTests.swift`'s "no root or header timestamp at
+    // all" case) would have wrongly treated hitting the cap on such a row
+    // as "safe to truncate". A header-only composer must still rank
+    // correctly — only a composer with no signal anywhere becomes
+    // unrankable.
+    func testCursorSQLRecencyIsNullNeverZeroForComposerWithNoRootOrHeaderTimestamp() throws {
+        let now: Int64 = 1_786_449_620_000
+
+        let noSignalAtAll = #"{"status":"completed"}"#
+        XCTAssertNil(sqlRecency(forValueJSON: noSignalAtAll))
+        // The assessor's own in-memory `lastActivityAt` still separately
+        // seeds `0` as a JS/Swift fallback — that in-memory fallback is
+        // never surfaced by this SQL expression, which is exactly the
+        // point: the two are allowed to diverge (SQL NULL vs. assessor 0)
+        // so the row-limit sentinel treats this row as inconclusive rather
+        // than definitively old.
+        let assessedNoSignal = try assessedLastActivityAt(forValueJSON: noSignalAtAll, now: now)
+        XCTAssertEqual(assessedNoSignal, 0)
+        XCTAssertTrue(isDefinitelyOlderThanWindowLowerBound(0, now: now, within: sessionCandidateWindowMs))
+
+        // A record with only malformed/unrankable headers (no root fields
+        // either) must likewise stay NULL, not fall back to a rankable 0.
+        let onlyMalformedHeaders = #"{"fullConversationHeadersOnly":[42,null,"x"]}"#
+        XCTAssertNil(sqlRecency(forValueJSON: onlyMalformedHeaders))
+
+        // Header-only recency must still work when a header genuinely IS
+        // valid, even though the root fields remain entirely absent.
+        let headerOnlyValid = #"{"fullConversationHeadersOnly":[{"type":2,"createdAt":\#(now)}]}"#
+        XCTAssertEqual(sqlRecency(forValueJSON: headerOnlyValid), now)
+        let assessedHeaderOnly = try assessedLastActivityAt(forValueJSON: headerOnlyValid, now: now)
+        XCTAssertEqual(assessedHeaderOnly, now)
     }
 }
