@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import {
   cpSync,
   existsSync,
@@ -19,7 +19,10 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import {
+  compilePrivateRendererAssetDigestHelper,
   computeRendererBuildDigest,
+  createPrivateRendererAssetDigestRunDir,
+  ensurePrivateDirectory,
   rendererBuildInputFiles,
 } from "../scripts/renderer-build-identity.mjs";
 
@@ -537,6 +540,53 @@ test("64 stale-lock waiters repeatedly hand off without overlap, failures, or le
   mkdirSync(join(repoRoot, "build"), { recursive: true });
   const scratch = mkdtempSync(join(repoRoot, "build", "renderer-stale-lock-stress-"));
   const fixture = createRendererFixture(scratch);
+
+  // This stress test alone launches 64 waiters * 5 repetitions = 320 real
+  // wrapper invocations, each of which would otherwise pay for its own
+  // real, synchronous `swiftc` compile of the digest helper (see
+  // prepareRendererAssetDigestHelperImage/loadOrCompileRendererAssetDigestHelperImageOnce
+  // in renderer-build-identity.mjs) - individually cheap, but 320 of them
+  // serialized behind one lock would blow this test's real liveness budget
+  // (each waiter must still acquire the lock within SEER_RENDERER_LOCK_WAIT_MS
+  // below). So this test compiles the helper for real exactly once up
+  // front, using the same real compilation path the security tests exercise
+  // directly, via the explicit test-only
+  // SEER_RENDERER_BUILD_TEST_PRECOMPILED_HELPER_PATH hook, which only ever
+  // activates alongside the existing, already-required
+  // SEER_RENDERER_BUILD_TEST_BUILDER flag (production sets neither, so this
+  // can never activate accidentally outside a test that has already
+  // deliberately opted into faking the entire build step).
+  //
+  // Compiling once is necessary but, empirically, not sufficient: macOS
+  // independently re-validates (Gatekeeper/code-signing style) *every
+  // distinct inode* the first time it is ever executed, a real cost of
+  // several hundred milliseconds - paid again for every fresh byte-for-byte
+  // copy a waiter would otherwise materialize, even though the bytes and
+  // the compile were already validated. So under this same test-only hook,
+  // materializeRendererAssetDigestHelper hard-links to this one compiled,
+  // already-validated file instead of copying its bytes (see the long
+  // comment on that function for why that is safe: mode/ownership are
+  // inode-level, cleanup only ever unlinks a run directory's own link and
+  // never touches the shared inode's contents, and every destination path
+  // is independently, atomically unique). The one warm-up spawn below pays
+  // that one-time per-inode validation cost itself, up front, so every one
+  // of the 320 real waiter/consumer spawns that follow - each still
+  // independently creating its own fresh, private, mode-0700 run directory,
+  // still independently chmod'ing 0500, stripping its ACL, and
+  // validating/spawning/revalidating/removing it exactly as it would a
+  // freshly compiled one - runs at ordinary (single-digit-millisecond)
+  // spawn speed. Only the swiftc invocation and the one-time OS validation
+  // are shared; the on-disk directory entry, its permissions, and its
+  // validation are independently exercised by every waiter.
+  const helperImageRunsRoot = join(scratch, "helper-image-runs");
+  ensurePrivateDirectory(helperImageRunsRoot, "test helper image runs root");
+  const helperImageRunDir = createPrivateRendererAssetDigestRunDir(helperImageRunsRoot);
+  const precompiledHelperPath = compilePrivateRendererAssetDigestHelper(
+    join(fixture.repo, "scripts", "renderer-asset-digest.swift"),
+    helperImageRunDir.path,
+  );
+  spawnSync(precompiledHelperPath, [fixture.repo], { encoding: "utf8" });
+
   const waiterCount = 64;
   const repetitions = 5;
   try {
@@ -559,6 +609,7 @@ test("64 stale-lock waiters repeatedly hand off without overlap, failures, or le
         return runWrapper({
           env: {
             SEER_RENDERER_BUILD_TEST_BUILDER: testBuilderPath,
+            SEER_RENDERER_BUILD_TEST_PRECOMPILED_HELPER_PATH: precompiledHelperPath,
             SEER_RENDERER_BUILD_TEST_MARKER: marker,
             SEER_RENDERER_BUILD_TEST_TRACE: tracePath,
             SEER_RENDERER_BUILD_TEST_CONSUMER_ROOT: fixture.repo,

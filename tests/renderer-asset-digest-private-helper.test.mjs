@@ -19,7 +19,7 @@
 // invocations can ever block, wedge, or interfere with any other,
 // independent call.
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   chmodSync,
   closeSync,
@@ -39,6 +39,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import {
+  assertNoDarwinAclOrThrow,
   compilePrivateRendererAssetDigestHelper,
   computeRendererAssetDigest,
   createPrivateRendererAssetDigestRunDir,
@@ -49,6 +50,7 @@ import {
   rendererAssetDigestHelperFileRejectionReason,
   rendererAssetDigestPrivateRunsRoot,
   spawnValidatedPrivateRendererAssetDigestHelperFile,
+  stripDarwinAclOrThrow,
   verifyPrivateDirectoryOrThrow,
   withPrivateRendererAssetDigestHelper,
 } from "../scripts/renderer-build-identity.mjs";
@@ -56,6 +58,7 @@ import {
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = dirname(here);
 const runDirWorkerPath = join(here, "helpers", "renderer-asset-digest-run-dir-worker.mjs");
+const coldStartRootWorkerPath = join(here, "helpers", "renderer-asset-digest-cold-start-root-worker.mjs");
 const fullPipelineWorkerPath = join(here, "helpers", "renderer-asset-digest-full-pipeline-worker.mjs");
 const swiftHelperSource = join(repoRoot, "scripts", "renderer-asset-digest.swift");
 const rendererFixtureRoot = join(repoRoot, "renderer");
@@ -79,6 +82,18 @@ function withScratchDir(run) {
     return run(scratch);
   } finally {
     rmSync(scratch, { recursive: true, force: true });
+  }
+}
+
+/** Sets `process.env[name]` to `value` for the duration of `run`, always restoring it afterward. */
+function withEnv(name, value, run) {
+  const previous = process.env[name];
+  process.env[name] = value;
+  try {
+    return run();
+  } finally {
+    if (previous === undefined) delete process.env[name];
+    else process.env[name] = previous;
   }
 }
 
@@ -143,6 +158,35 @@ function fakeFileStats(overrides = {}) {
     size: 42,
     ...overrides,
   };
+}
+
+/**
+ * Directly shells out to `ls -lde` (the same mechanism
+ * darwinAclEntryLines/assertNoDarwinAclOrThrow use internally) to count how
+ * many macOS ACL entries currently exist on `path`, independent of the
+ * module under test - so these tests can assert on ACL state without
+ * depending on that module having already validated it.
+ */
+function aclEntryCount(path) {
+  const result = spawnSync("/bin/ls", ["-lde", path], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  return result.stdout.split("\n").filter((line) => line.length > 0).slice(1).length;
+}
+
+/** Applies a real macOS ACL entry directly to `path` (no inheritance involved). */
+function applyDirectAcl(path) {
+  const result = spawnSync("/bin/chmod", ["+a", "everyone allow read", path], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+}
+
+/** Marks `path` so that fresh children created under it inherit an ACL entry automatically. */
+function makeAclInheritable(path) {
+  const result = spawnSync(
+    "/bin/chmod",
+    ["+a", "everyone allow read,file_inherit,directory_inherit", path],
+    { encoding: "utf8" },
+  );
+  assert.equal(result.status, 0, result.stderr);
 }
 
 // --- privateDirectoryRejectionReason: pure predicate ---
@@ -326,6 +370,100 @@ test("ensurePrivateDirectory fails closed on a preexisting wrong-mode parent ins
   });
 });
 
+// --- macOS ACLs: a permission layer entirely separate from POSIX mode bits ---
+
+test("assertNoDarwinAclOrThrow accepts a real ACL-free directory and rejects the same directory once an ACL is added", () => {
+  withScratchDir((scratch) => {
+    const target = join(scratch, "clean");
+    mkdirSync(target, { mode: 0o700 });
+    assert.doesNotThrow(() => assertNoDarwinAclOrThrow(target, "test path"));
+
+    applyDirectAcl(target);
+    assert.throws(() => assertNoDarwinAclOrThrow(target, "test path"), /test path must not have a macOS ACL/);
+  });
+});
+
+test("assertNoDarwinAclOrThrow fails closed with a clear error when the path does not exist", () => {
+  withScratchDir((scratch) => {
+    const missing = join(scratch, "does-not-exist");
+    assert.throws(
+      () => assertNoDarwinAclOrThrow(missing, "test path"),
+      /unable to inspect test path for a macOS ACL/,
+    );
+  });
+});
+
+test("stripDarwinAclOrThrow removes a real ACL and is a safe no-op when none exists", () => {
+  withScratchDir((scratch) => {
+    const target = join(scratch, "target");
+    mkdirSync(target, { mode: 0o700 });
+
+    assert.doesNotThrow(() => stripDarwinAclOrThrow(target, "test path")); // no-op: nothing to strip yet.
+    assert.equal(aclEntryCount(target), 0);
+
+    applyDirectAcl(target);
+    assert.equal(aclEntryCount(target), 1);
+    stripDarwinAclOrThrow(target, "test path");
+    assert.equal(aclEntryCount(target), 0);
+  });
+});
+
+test("stripDarwinAclOrThrow fails closed with a clear error when the path does not exist", () => {
+  withScratchDir((scratch) => {
+    const missing = join(scratch, "does-not-exist");
+    assert.throws(
+      () => stripDarwinAclOrThrow(missing, "test path"),
+      /unable to strip a macOS ACL from test path/,
+    );
+  });
+});
+
+test("ensurePrivateDirectory strips an ACL inherited from its parent off a freshly created directory", () => {
+  withScratchDir((scratch) => {
+    const inheritingParent = join(scratch, "acl-inheriting-parent");
+    mkdirSync(inheritingParent, { mode: 0o700 });
+    makeAclInheritable(inheritingParent);
+
+    const target = join(inheritingParent, "private");
+    ensurePrivateDirectory(target, "test private directory");
+
+    assert.equal(lstatSync(target).mode & 0o777, 0o700);
+    assert.equal(aclEntryCount(target), 0);
+  });
+});
+
+test("ensurePrivateDirectory fails closed on (never silently strips) a preexisting, otherwise-valid directory that already has a macOS ACL", () => {
+  withScratchDir((scratch) => {
+    const target = join(scratch, "private");
+    mkdirSync(target, { mode: 0o700 });
+    chmodSync(target, 0o700);
+    applyDirectAcl(target);
+
+    assert.throws(
+      () => ensurePrivateDirectory(target, "test private directory"),
+      /test private directory must not have a macOS ACL/,
+    );
+
+    // Never auto-repaired: the ACL this call did not itself create is left exactly as found.
+    assert.equal(aclEntryCount(target), 1);
+  });
+});
+
+test("verifyPrivateDirectoryOrThrow rejects a directory with a macOS ACL without repairing it", () => {
+  withScratchDir((scratch) => {
+    const target = join(scratch, "private");
+    mkdirSync(target, { mode: 0o700 });
+    chmodSync(target, 0o700);
+    applyDirectAcl(target);
+
+    assert.throws(
+      () => verifyPrivateDirectoryOrThrow(target, "test private directory"),
+      /test private directory must not have a macOS ACL/,
+    );
+    assert.equal(aclEntryCount(target), 1);
+  });
+});
+
 // --- createPrivateRendererAssetDigestRunDir: uniqueness ---
 
 test("createPrivateRendererAssetDigestRunDir produces a distinct, independently valid directory on every call", () => {
@@ -481,6 +619,32 @@ test("openValidatedPrivateRendererAssetDigestHelperFile rejects a preexisting em
   });
 });
 
+test("openValidatedPrivateRendererAssetDigestHelperFile rejects a preexisting helper file that has a macOS ACL", () => {
+  withScratchDir((scratch) => {
+    const target = join(scratch, "helper");
+    writeTrivialScript(target);
+    applyDirectAcl(target);
+
+    assert.throws(
+      () => openValidatedPrivateRendererAssetDigestHelperFile(target, "test helper file"),
+      /test helper file must not have a macOS ACL/,
+    );
+    assert.equal(aclEntryCount(target), 1); // never auto-repaired
+  });
+});
+
+test("compilePrivateRendererAssetDigestHelper's freshly compiled helper file has no macOS ACL", () => {
+  withScratchDir((scratch) => {
+    const root = join(scratch, "runs-root");
+    ensurePrivateDirectory(root, "test private runs root");
+    const runDir = createPrivateRendererAssetDigestRunDir(root);
+
+    const helperPath = compilePrivateRendererAssetDigestHelper(swiftHelperSource, runDir.path);
+
+    assert.equal(aclEntryCount(helperPath), 0);
+  });
+});
+
 // --- spawnValidatedPrivateRendererAssetDigestHelperFile: validate-then-spawn swap attempts ---
 //
 // These exercise the exact seam between validating the compiled helper and
@@ -571,7 +735,7 @@ test("spawnValidatedPrivateRendererAssetDigestHelperFile throws when the file is
           spawnValidatedPrivateRendererAssetDigestHelperFile(target, opened, "test helper file", [], {
             encoding: "utf8",
           }),
-        /test helper file is writable by a group or other user immediately after spawn/,
+        /test helper file is writable by a group or other user after the spawned child process exited/,
       );
     } finally {
       closeSync(opened.fd);
@@ -652,6 +816,28 @@ test("compilePrivateRendererAssetDigestHelper throws a clear error and leaves no
   });
 });
 
+test("compilePrivateRendererAssetDigestHelper throws a clear ETIMEDOUT-aware error and leaves no partial helper file when swiftc exceeds its configured timeout", () => {
+  withScratchDir((scratch) => {
+    const root = join(scratch, "runs-root");
+    ensurePrivateDirectory(root, "test private runs root");
+    const runDir = createPrivateRendererAssetDigestRunDir(root);
+
+    withEnv("SEER_RENDERER_ASSET_DIGEST_COMPILE_TIMEOUT_MS", "1", () => {
+      assert.throws(
+        () => compilePrivateRendererAssetDigestHelper(swiftHelperSource, runDir.path),
+        /descriptor-anchored renderer asset digest helper compilation did not finish within 1ms and was killed/,
+      );
+    });
+    assert.deepEqual(readdirSync(runDir.path), []);
+
+    // A completely independent, later, real (untimed) compile still works -
+    // one call's timeout can never wedge or poison a later, unrelated one.
+    const recoveredRunDir = createPrivateRendererAssetDigestRunDir(root);
+    const helperPath = compilePrivateRendererAssetDigestHelper(swiftHelperSource, recoveredRunDir.path);
+    assert.equal(existsSync(helperPath), true);
+  });
+});
+
 // --- withPrivateRendererAssetDigestHelper: full lifecycle, abandoned directories ---
 
 test("withPrivateRendererAssetDigestHelper creates a run directory that exists only while run() executes, and forwards its return value", () => {
@@ -696,6 +882,66 @@ test("an abandoned run directory left by a previously crashed call is never touc
   }
 });
 
+test("orphaned run directories of several different shapes coexist untouched alongside many real concurrent invocations", async () => {
+  ensurePrivateDirectory(rendererAssetDigestPrivateRunsRoot, "renderer asset digest private runs root");
+
+  // Three abandoned run directories, each shaped like a plausible different
+  // way a prior call could have crashed mid-flight: completely empty (died
+  // right after `mkdirSync`), holding a lone file (died mid-materialize),
+  // and holding a nested subdirectory (died mid something stranger still).
+  // None of this module's own logic ever enumerates, repairs, or requires
+  // the shared root be otherwise empty, so all three must simply persist,
+  // byte-for-byte, no matter how many unrelated real calls run around them.
+  const emptyOrphan = createPrivateRendererAssetDigestRunDir(rendererAssetDigestPrivateRunsRoot);
+
+  const fileOrphan = createPrivateRendererAssetDigestRunDir(rendererAssetDigestPrivateRunsRoot);
+  writeFileSync(join(fileOrphan.path, "helper"), "orphaned helper bytes");
+
+  const nestedOrphan = createPrivateRendererAssetDigestRunDir(rendererAssetDigestPrivateRunsRoot);
+  const nestedDir = join(nestedOrphan.path, "nested");
+  mkdirSync(nestedDir, { mode: 0o700 });
+  writeFileSync(join(nestedDir, "leftover.txt"), "nested orphaned content");
+
+  const orphans = [emptyOrphan, fileOrphan, nestedOrphan];
+
+  try {
+    const workerCount = 24;
+    const results = await Promise.all(
+      Array.from({ length: workerCount }, () => runChildAndCollect(runDirWorkerPath, [])),
+    );
+
+    for (const result of results) {
+      assert.equal(result.code, 0, result.stderr);
+    }
+    const runDirPaths = results.map((result) => result.stdout.trim());
+    assert.equal(new Set(runDirPaths).size, workerCount, "every concurrent call must use a distinct run directory");
+
+    // None of the real invocations' run directories may collide with any
+    // orphan's path, and every real invocation must still have cleaned up
+    // its own directory afterward.
+    const orphanPaths = new Set(orphans.map((orphan) => orphan.path));
+    for (const runDirPath of runDirPaths) {
+      assert.equal(orphanPaths.has(runDirPath), false, "a real run dir must never collide with an orphan's path");
+      assert.equal(existsSync(runDirPath), false, `expected ${runDirPath} to have been cleaned up`);
+    }
+
+    // Every orphan survives completely unchanged - neither deleted nor
+    // mistaken for a stale directory to repair or reclaim.
+    assert.equal(existsSync(emptyOrphan.path), true);
+    assert.deepEqual(readdirSync(emptyOrphan.path), []);
+
+    assert.equal(existsSync(fileOrphan.path), true);
+    assert.equal(readFileSync(join(fileOrphan.path, "helper"), "utf8"), "orphaned helper bytes");
+
+    assert.equal(existsSync(nestedDir), true);
+    assert.equal(readFileSync(join(nestedDir, "leftover.txt"), "utf8"), "nested orphaned content");
+  } finally {
+    for (const orphan of orphans) {
+      rmSync(orphan.path, { recursive: true, force: true }); // test hygiene only.
+    }
+  }
+});
+
 // --- Real concurrent OS processes: the design's core claim, end to end ---
 
 test("many concurrent invocations each create and clean up their own distinct run directory, with no interference between them", async () => {
@@ -711,12 +957,62 @@ test("many concurrent invocations each create and clean up their own distinct ru
   const runDirPaths = results.map((result) => result.stdout.trim());
   assert.equal(new Set(runDirPaths).size, workerCount, "every concurrent call must use a distinct run directory");
 
-  // No leftover run directories of any kind: every participant's own
-  // cleanup succeeded independently, with no cross-talk between them.
-  assert.deepEqual(readdirSync(rendererAssetDigestPrivateRunsRoot), []);
+  // Every participant's own run directory must be gone again - regardless
+  // of whatever *other* run directories (an unrelated abandoned leftover
+  // from a different crashed call, or another independent test in this
+  // same file) may still coexist under the shared root: this design never
+  // requires, or even checks, that the shared root is otherwise empty.
+  for (const runDirPath of runDirPaths) {
+    assert.equal(existsSync(runDirPath), false, `expected ${runDirPath} to have been cleaned up: ${runDirPath}`);
+  }
+});
+
+test("many concurrent invocations racing the very first creation of a private root that does not yet exist all succeed with distinct run directories", async () => {
+  // Deliberately does NOT create the root ahead of time (unlike every other
+  // test in this file, which always calls ensurePrivateDirectory once,
+  // sequentially, before spawning anything): the entire point is to race
+  // dozens of real, independent OS processes against the exact instant a
+  // shared root is first brought into existence, which is exactly where an
+  // check-then-mkdir implementation would intermittently throw EEXIST.
+  mkdirSync(join(repoRoot, "build"), { recursive: true });
+  const scratchParent = mkdtempSync(join(repoRoot, "build", "renderer-asset-digest-cold-start-"));
+  const root = join(scratchParent, "never-yet-created-root");
+  assert.equal(existsSync(root), false);
+
+  try {
+    const workerCount = 32;
+    const results = await Promise.all(
+      Array.from({ length: workerCount }, () => runChildAndCollect(coldStartRootWorkerPath, [root])),
+    );
+
+    for (const result of results) {
+      assert.equal(result.code, 0, result.stderr);
+    }
+
+    const runDirPaths = results.map((result) => result.stdout.trim());
+    assert.equal(new Set(runDirPaths).size, workerCount, "every concurrent call must use a distinct run directory");
+    for (const runDirPath of runDirPaths) {
+      assert.equal(existsSync(runDirPath), false, `expected ${runDirPath} to have been cleaned up: ${runDirPath}`);
+    }
+
+    // Exactly one directory ever actually won the cold-start race and now
+    // exists; it must be a fully valid, ACL-free 0700 private root no
+    // matter which of the 32 racing processes happened to create it.
+    assert.equal(existsSync(root), true);
+    assert.equal(lstatSync(root).isDirectory(), true);
+    assert.equal(lstatSync(root).uid, process.getuid());
+    assert.equal(lstatSync(root).mode & 0o777, 0o700);
+    assert.equal(aclEntryCount(root), 0);
+    assert.deepEqual(readdirSync(root), []); // every worker's own run dir was cleaned up.
+  } finally {
+    rmSync(scratchParent, { recursive: true, force: true });
+  }
 });
 
 test("several concurrent, real end-to-end computeRendererAssetDigest calls against the same renderer root all succeed and agree on the exact same digest", async () => {
+  ensurePrivateDirectory(rendererAssetDigestPrivateRunsRoot, "renderer asset digest private runs root");
+  const before = new Set(readdirSync(rendererAssetDigestPrivateRunsRoot));
+
   const workerCount = 4;
   const results = await Promise.all(
     Array.from({ length: workerCount }, () => runChildAndCollect(fullPipelineWorkerPath, [rendererFixtureRoot])),
@@ -733,6 +1029,47 @@ test("several concurrent, real end-to-end computeRendererAssetDigest calls again
     assert.equal(digest, expectedDigest);
   }
 
-  // No leftover run directories from any of the concurrent real compiles.
-  assert.deepEqual(readdirSync(rendererAssetDigestPrivateRunsRoot), []);
+  // No *new* leftover run directories from any of these concurrent real
+  // compiles (or from the direct computeRendererAssetDigest call just
+  // above) - never a requirement that the shared root was, or is now,
+  // otherwise completely empty: an unrelated abandoned directory from a
+  // different crashed call, or from another independent test in this same
+  // file, is a legitimate, harmless coexisting sibling this assertion must
+  // tolerate rather than reject.
+  const after = readdirSync(rendererAssetDigestPrivateRunsRoot);
+  const newEntries = after.filter((entry) => !before.has(entry));
+  assert.deepEqual(newEntries, []);
+});
+
+// --- Subprocess timeouts: the compiled helper itself, end to end ---
+
+test("computeRendererAssetDigest throws a clear ETIMEDOUT-aware error and leaves no run directory behind when the compiled helper (and its afterCollection hook) exceeds its configured timeout", () => {
+  ensurePrivateDirectory(rendererAssetDigestPrivateRunsRoot, "renderer asset digest private runs root");
+  const before = new Set(readdirSync(rendererAssetDigestPrivateRunsRoot));
+
+  withEnv("SEER_RENDERER_ASSET_DIGEST_HELPER_TIMEOUT_MS", "200", () => {
+    const startedAt = Date.now();
+    assert.throws(
+      () =>
+        computeRendererAssetDigest(rendererFixtureRoot, {
+          afterCollection: { executable: "/bin/sleep", args: ["5"] },
+        }),
+      /descriptor-anchored renderer asset digest helper did not finish within 200ms and was killed/,
+    );
+    // Genuinely killed near the configured 200ms bound, not merely
+    // eventually failing after the hook's full 5-second sleep completed:
+    // proves the timeout actually terminates the child rather than just
+    // being reported after the fact.
+    assert.ok(Date.now() - startedAt < 4000, "expected the helper to be killed well before the 5s hook would finish");
+  });
+
+  // No leftover run directory from the killed attempt, and a completely
+  // independent, later, untimed call still succeeds - one call's timeout
+  // can never wedge or poison a later, unrelated one.
+  const after = readdirSync(rendererAssetDigestPrivateRunsRoot);
+  const newEntries = after.filter((entry) => !before.has(entry));
+  assert.deepEqual(newEntries, []);
+
+  const digest = computeRendererAssetDigest(rendererFixtureRoot);
+  assert.match(digest, /^[0-9a-f]{64}$/);
 });

@@ -23,6 +23,7 @@ import {
   closeSync,
   constants,
   fstatSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   openSync,
@@ -254,6 +255,97 @@ function lstatOrNull(path) {
 }
 
 /**
+ * Read fresh on every call (never frozen into a module-load-time constant)
+ * so tests can override compile/spawn timeouts per invocation via
+ * `process.env` without needing to re-import this module in a fresh
+ * process.
+ */
+function positiveIntegerFromEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${name} must be a non-negative integer`);
+  }
+  return value;
+}
+
+// macOS ACLs (`chmod +a ...`, or silently inherited from a parent
+// directory's `file_inherit`/`directory_inherit` flags - confirmed real on
+// this platform: a freshly `mkdir`'d child of such a parent carries an
+// "inherited allow ..." entry the instant it is created, with no separate
+// step required) are a completely separate permission layer from the POSIX
+// mode bits every check above otherwise relies on exclusively. A single ACL
+// "allow" entry can grant a group or other user access that an 0700/0500
+// mode alone would deny, silently defeating every mode-based rejection this
+// module performs. `ls -lde` is the only reliable way to detect one: the
+// trailing `@` indicator plain `ls -l` prints is not sufficient evidence on
+// its own (observed empirically: it can appear on a path with zero ACL
+// entries at all, apparently from an unrelated extended attribute), so this
+// parses the actual listing instead of trusting that character alone. A
+// path with no ACL prints exactly one line from `ls -lde`; each ACL entry
+// (explicit or inherited) adds its own indented, number-prefixed line
+// beneath it.
+function darwinAclEntryLines(path, label) {
+  const result = spawnSync("/bin/ls", ["-lde", path], { encoding: "utf8" });
+  if (result.error || result.status !== 0) {
+    throw new Error(
+      `unable to inspect ${label} for a macOS ACL: ${
+        result.error?.message ?? result.stderr?.trim() ?? "ls -lde failed"
+      }`,
+      { cause: result.error },
+    );
+  }
+  return result.stdout.split("\n").filter((line) => line.length > 0).slice(1);
+}
+
+/**
+ * Throws unless `path` has no macOS ACL at all. Called for *every* path
+ * this module trusts - freshly created or preexisting alike - immediately
+ * after the existing mode/uid/symlink checks pass, because ACL inheritance
+ * from a `file_inherit`/`directory_inherit`-flagged parent can reintroduce
+ * an ACL on every single new creation under it: stripping once at creation
+ * time (see {@link stripDarwinAclOrThrow}) is necessary but not sufficient
+ * on its own to *guarantee* absence to a caller who never re-checks. Fails
+ * closed: unable to even determine ACL presence is treated the same as an
+ * ACL being present. Exported (like {@link privateDirectoryRejectionReason}
+ * and {@link rendererAssetDigestHelperFileRejectionReason}) purely as a
+ * direct, white-box unit-testing seam for this exact fail-closed contract;
+ * every real caller reaches it only indirectly, via
+ * {@link verifyPrivateDirectoryOrThrow} or
+ * {@link openValidatedPrivateRendererAssetDigestHelperFile}.
+ */
+export function assertNoDarwinAclOrThrow(path, label) {
+  if (darwinAclEntryLines(path, label).length > 0) {
+    throw new Error(`${label} must not have a macOS ACL: ${path}`);
+  }
+}
+
+/**
+ * Removes every ACL entry (explicit or inherited) from a path this module
+ * itself just created with `chmod -N`, then immediately verifies none
+ * remain. Only ever called immediately after this module's own creation of
+ * `path` - never on a preexisting path it did not just create, consistent
+ * with never repairing (only verifying-and-rejecting) anything this module
+ * did not itself just bring into existence. Fails closed: an inability to
+ * strip, or to confirm the strip actually took effect, is always an error.
+ * Exported purely as a direct unit-testing seam - see
+ * {@link assertNoDarwinAclOrThrow}.
+ */
+export function stripDarwinAclOrThrow(path, label) {
+  const result = spawnSync("/bin/chmod", ["-N", path], { encoding: "utf8" });
+  if (result.error || result.status !== 0) {
+    throw new Error(
+      `unable to strip a macOS ACL from ${label}: ${
+        result.error?.message ?? result.stderr?.trim() ?? "chmod -N failed"
+      }`,
+      { cause: result.error },
+    );
+  }
+  assertNoDarwinAclOrThrow(path, label);
+}
+
+/**
  * Two `fs.Stats` refer to the exact same on-disk file instance only if
  * `dev`+`ino` match *and* (whenever both sides report a finite birth
  * time) `birthtimeMs` also matches. `dev`+`ino` alone is not enough: many
@@ -271,55 +363,93 @@ function sameFileSystemIdentity(left, right) {
   );
 }
 
-// The helper below has no shared canonical name at all: nothing is ever
-// staged-then-published, locked, or reused across calls or processes. Every
-// single call that needs it (see readDescriptorAnchoredRendererAssets)
-// compiles its own fresh copy into its own unique, unpredictable, private
-// work directory - created fresh, used once, and removed again before that
-// call returns - so there is no shared state for a validation/publication/
-// execution TOCTOU to ever open a window in, and no canonical winner whose
-// identity a concurrent or later call could race, displace, or wedge.
+// The helper below has no shared canonical *file* at all: nothing is ever
+// staged-then-published, locked, or reused across calls or processes at the
+// filesystem level. Every single call that needs it (see
+// readDescriptorAnchoredRendererAssets) materializes its own fresh copy of
+// the compiled image into its own unique, unpredictable, private work
+// directory - created fresh, used once, and removed again before that call
+// returns - so there is no shared on-disk state for a validation/
+// publication/execution TOCTOU to ever open a window in, and no canonical
+// winner whose identity a concurrent or later call could race, displace, or
+// wedge. The compiled *bytes* backing those per-call files are, since a
+// single Node process may call this many times (see
+// loadOrCompileRendererAssetDigestHelperImageOnce), compiled at most once
+// per process and cached in memory - a pure performance optimization over
+// paying for `swiftc` again on every call, never a change to the
+// per-call-fresh-file-on-disk guarantee above: every call still writes its
+// own copy of those bytes into its own fresh file and independently
+// chmods/ACL-strips/validates/spawns/revalidates/removes it exactly as if
+// it had just compiled that copy itself. The one narrow exception is a
+// tightly gated test-only path (see cachedHelperImageHardLinkSourcePath and
+// materializeRendererAssetDigestHelper) used by exactly one high-contention
+// lock stress test: it hard-links to, rather than copies, one already
+// real-compiled, already-validated file, so no two hard links ever share a
+// *directory entry*, no cleanup ever touches another link's entry, and the
+// underlying inode's content/mode/ownership - and therefore every guarantee
+// this comment describes - are identical no matter which link is checked.
+// That path activates only alongside the same existing explicit
+// test-builder flag production never sets, so it can never appear outside
+// a test that has already deliberately opted out of the real build step.
 //
 // Exclusivity comes entirely from filesystem permissions, not from any
 // mutual-exclusion protocol: `ensurePrivateDirectory` requires the private
 // runs root and every run directory under it to be a real, non-symlink
-// directory, owned by the current uid, and mode *exactly* 0700 (rejecting
-// any group/world bit at all) - normalizing (`chmodSync`) newly created
-// directories rather than trusting the mode requested at creation, because
-// that request is itself subject to the ambient umask and can otherwise
-// come out *less* permissive than intended (observed directly: an unusual
-// umask can leave a freshly created "mode 0700" directory completely
-// inaccessible, though never more permissive than requested - umask only
-// ever clears bits). A preexisting parent that is not already exactly this
-// shape is never "fixed" (chmod'd, or deleted and recreated) - fixing a
-// symlink planted at that exact path could affect whatever it actually
-// points at - it is rejected outright, failing closed. Since no other OS
-// user can ever traverse, read, or write a 0700 directory owned by someone
-// else, nothing outside this process's own uid can pre-create, observe, or
-// tamper with anything inside its run directory, regardless of `build/`'s
-// own (unrelated, unchanged) permissions.
+// directory, owned by the current uid, mode *exactly* 0700 (rejecting any
+// group/world bit at all), and free of any macOS ACL (an entirely separate
+// permission layer from POSIX mode bits - `chmod +a`, or silently inherited
+// from a parent directory's `file_inherit`/`directory_inherit` flags, can
+// grant access mode bits alone cannot deny, so ACL absence is independently
+// verified on every check, not merely stripped once at creation). Creation
+// itself races safely: `mkdirSync` is always attempted directly (never
+// gated behind a separate existence check first, which would leave a
+// window a concurrent creator could win in between) and an `EEXIST` it
+// throws is treated as "this path already exists, created either by an
+// earlier call or a concurrent one" rather than an uncaught crash. Only a
+// `mkdirSync` that itself just succeeded normalizes the result - an
+// explicit `chmodSync` (rather than trusting the mode requested at
+// creation, which is itself subject to the ambient umask and can otherwise
+// come out *less* permissive than intended, though never more - umask only
+// ever clears bits) followed by an ACL strip. A path this call did *not*
+// itself just create - whether preexisting long before, or created a
+// moment ago by a concurrent caller - is never "fixed" (chmod'd,
+// ACL-stripped, or deleted and recreated): fixing a symlink planted at that
+// exact path could affect whatever it actually points at, so it is instead
+// always independently verified and, if not already exactly right, rejected
+// outright, failing closed. Since no other OS user can ever traverse, read,
+// or write a 0700 directory owned by someone else, nothing outside this
+// process's own uid can pre-create, observe, or tamper with anything inside
+// its run directory, regardless of `build/`'s own (unrelated, unchanged)
+// permissions. The shared runs root itself is never required to be empty -
+// an abandoned run directory from an earlier killed process (see cleanup,
+// below) is an expected, harmless, coexisting sibling, never something a
+// later, unrelated call's root verification waits on, blocks on, or deletes.
 //
-// The compiled file itself is chmod 0500 (owner read+execute, no write bit
-// at all) immediately after compilation, then independently validated -
-// `lstat`, then re-checked by an `O_NOFOLLOW`-opened descriptor's `fstat` -
-// to be a regular, non-symlink, current-uid-owned, non-empty,
-// owner-executable file that is not writable by any group or other user.
-// That descriptor is kept open through the spawn immediately below it
+// The materialized file itself is chmod 0500 (owner read+execute, no write
+// bit at all) and ACL-stripped immediately after being written, then
+// independently validated - `lstat`, then re-checked by an
+// `O_NOFOLLOW`-opened descriptor's `fstat` - to be a regular, non-symlink,
+// current-uid-owned, non-empty, owner-executable, ACL-free file that is not
+// writable by any group or other user. That descriptor is kept open through
+// the spawn immediately below it
 // (`spawnValidatedPrivateRendererAssetDigestHelperFile`), which spawns by
 // the private pathname - Node has no portable way to exec an already-open
-// descriptor directly - and then revalidates identity immediately
-// afterward: a fresh `lstat` of that same pathname (catching a full
-// unlink-and-replace, which the kept-open descriptor's own `fstat` cannot
-// see, since it still refers to the original, now-detached inode) and a
-// fresh `fstat` of the original descriptor re-checked against every
-// rejection rule (catching an in-place mutation of that same inode, e.g. a
-// chmod or truncate-and-overwrite that never unlinked the path at all).
-// This cannot *prevent* a same-uid actor from swapping the file between
-// validation and spawn - no pathname-based exec ever can - it only
-// guarantees such a swap is always detected and thrown, never silently
-// trusted. Under this design's threat model (a 0700, current-uid-owned
-// private run directory nothing else can traverse or write into), no other
-// OS user can ever perform that swap in the first place.
+// descriptor directly - bounded by a finite timeout (`SIGKILL`, never left
+// to hang forever), and then revalidates identity once that spawned child
+// has run to completion (`spawnSync` blocks until exit, so this can never
+// run concurrently with, or before, the child finishing): a fresh `lstat`
+// of that same pathname (catching a full unlink-and-replace, which the
+// kept-open descriptor's own `fstat` cannot see, since it still refers to
+// the original, now-detached inode) and a fresh `fstat` of the original
+// descriptor re-checked against every rejection rule (catching an in-place
+// mutation of that same inode, e.g. a chmod or truncate-and-overwrite that
+// never unlinked the path at all). This cannot *prevent* a same-uid actor
+// from swapping the file while the child runs - no pathname-based exec ever
+// can - it only guarantees such a swap is always detected and thrown once
+// the child exits, never silently trusted. Under this design's threat model
+// (a 0700, current-uid-owned private run directory nothing else can
+// traverse or write into), no other OS user can ever perform that swap in
+// the first place.
 //
 // Cleanup only ever removes the exact run directory this call itself just
 // created, and only after re-verifying (fresh `lstat` + identity check)
@@ -350,14 +480,20 @@ export function privateDirectoryRejectionReason(stats) {
 
 /**
  * Verifies that `path` is a real, non-symlink directory, owned by the
- * current user, mode *exactly* 0700 - opened `O_NOFOLLOW|O_DIRECTORY` and
- * re-checked by descriptor so it can never be swapped out from under the
- * check (never trusting the initial `lstat` alone, which a symlink
- * installed immediately afterward could invalidate). Throws on absolutely
- * any mismatch, including absence: unlike the removed publish design,
- * nothing here is ever a legitimate "not published yet" state - a missing
- * or malformed directory is always an error the caller must fail closed on,
- * never silently treated as safe to create-over or reuse.
+ * current user, mode *exactly* 0700, and carries no macOS ACL - opened
+ * `O_NOFOLLOW|O_DIRECTORY` and re-checked by descriptor so it can never be
+ * swapped out from under the check (never trusting the initial `lstat`
+ * alone, which a symlink installed immediately afterward could
+ * invalidate). Throws on absolutely any mismatch, including absence:
+ * unlike the removed publish design, nothing here is ever a legitimate
+ * "not published yet" state - a missing or malformed directory is always
+ * an error the caller must fail closed on, never silently treated as safe
+ * to create-over or reuse. The ACL check runs on every call, not only
+ * right after creation, because ACL inheritance from a
+ * `file_inherit`/`directory_inherit`-flagged parent can reintroduce one on
+ * every single new creation - so a preexisting directory this module never
+ * repairs must still be rejected if it carries one, exactly like any other
+ * rejection reason below.
  */
 export function verifyPrivateDirectoryOrThrow(path, label) {
   const before = lstatSync(path);
@@ -377,6 +513,7 @@ export function verifyPrivateDirectoryOrThrow(path, label) {
     if (rejection) {
       throw new Error(`${label} ${rejection}: ${path}`);
     }
+    assertNoDarwinAclOrThrow(path, label);
     return after;
   } finally {
     closeSync(descriptor);
@@ -385,23 +522,42 @@ export function verifyPrivateDirectoryOrThrow(path, label) {
 
 /**
  * Ensures `path` is a private (real, non-symlink, current-uid-owned, mode
- * 0700) directory, creating it fresh if nothing exists there yet, and
- * always independently verifying it (whether just created or preexisting)
- * before returning. Creation always normalizes the mode with an explicit
- * `chmodSync` immediately afterward rather than trusting `mkdirSync`'s own
- * `mode` option, which is itself subject to the ambient umask (umask can
- * only ever clear bits, so a freshly created directory here can come out
- * *less* permissive than 0700 - even fully inaccessible - but never more;
- * there is accordingly no window where it is briefly more open than
- * intended). A preexisting path that fails verification is never repaired
- * (chmod'd, or removed and recreated) - only ever rejected - so this
- * always fails closed on an unsafe preexisting parent instead of guessing
- * at whether it is safe to reuse or "fix".
+ * 0700, ACL-free) directory, creating it fresh if nothing exists there
+ * yet, and always independently verifying it (whether just created or
+ * preexisting) before returning.
+ *
+ * Creation itself is atomic-race-safe: `mkdirSync` is always attempted
+ * directly (never gated behind a separate existence check first, which
+ * would leave a check-then-act window a concurrent creator could win in
+ * between) and an `EEXIST` it throws is caught and treated as "someone -
+ * this process on an earlier call, or a concurrent one - already created
+ * it"; every other error still propagates unchanged. Only a `mkdirSync`
+ * that itself just succeeded here normalizes the result: an explicit
+ * `chmodSync` (rather than trusting `mkdirSync`'s own `mode` option, which
+ * is itself subject to the ambient umask - umask can only ever clear bits,
+ * so a freshly created directory can come out *less* permissive than
+ * 0700, even fully inaccessible, but never more; there is accordingly no
+ * window where it is briefly more open than intended) followed by
+ * {@link stripDarwinAclOrThrow}, since a freshly created path can never
+ * already be a symlink or belong to another uid and so is always safe to
+ * normalize in place. A path this call did *not* itself just create -
+ * whether preexisting before this call ever ran, or created a moment ago
+ * by a concurrent caller - is never repaired (chmod'd, ACL-stripped, or
+ * removed and recreated): it only ever falls through to
+ * {@link verifyPrivateDirectoryOrThrow}, which fails closed on anything
+ * unsafe rather than guessing at whether it is safe to reuse or "fix".
  */
 export function ensurePrivateDirectory(path, label) {
-  if (!lstatOrNull(path)) {
+  let justCreated = false;
+  try {
     mkdirSync(path, { mode: 0o700 });
+    justCreated = true;
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error;
+  }
+  if (justCreated) {
     chmodSync(path, 0o700);
+    stripDarwinAclOrThrow(path, label);
   }
   return verifyPrivateDirectoryOrThrow(path, label);
 }
@@ -504,12 +660,12 @@ export function rendererAssetDigestHelperFileRejectionReason(stats) {
 
 /**
  * Verifies that `path` is a regular, non-symlink, current-uid-owned,
- * non-empty, owner-executable, not-group-or-world-writable file - `lstat`,
- * then re-checked by an `O_NOFOLLOW`-opened descriptor's `fstat`, so it can
- * never be swapped out from under the check (never trusting the initial
- * `lstat` alone, which a symlink installed immediately afterward could
- * invalidate). Throws on any mismatch, including absence. Returns the open
- * descriptor and its stats; the caller must keep the descriptor open
+ * non-empty, owner-executable, not-group-or-world-writable, ACL-free file -
+ * `lstat`, then re-checked by an `O_NOFOLLOW`-opened descriptor's `fstat`,
+ * so it can never be swapped out from under the check (never trusting the
+ * initial `lstat` alone, which a symlink installed immediately afterward
+ * could invalidate). Throws on any mismatch, including absence. Returns the
+ * open descriptor and its stats; the caller must keep the descriptor open
  * through the spawn (see {@link spawnValidatedPrivateRendererAssetDigestHelperFile})
  * and is responsible for closing it afterward.
  */
@@ -531,6 +687,7 @@ export function openValidatedPrivateRendererAssetDigestHelperFile(path, label) {
     if (rejection) {
       throw new Error(`${label} ${rejection}: ${path}`);
     }
+    assertNoDarwinAclOrThrow(path, label);
     return { fd, stats: after };
   } catch (error) {
     closeSync(fd);
@@ -541,19 +698,24 @@ export function openValidatedPrivateRendererAssetDigestHelperFile(path, label) {
 /**
  * Spawns the already-validated `path` (see
  * {@link openValidatedPrivateRendererAssetDigestHelperFile}) by pathname -
- * Node has no portable way to exec an already-open descriptor directly -
- * then revalidates identity immediately afterward, before the caller may
- * trust `spawnSync`'s result: a fresh `lstat` of `path` compared against
- * the stats captured at validation time (catching a full unlink-and-replace
- * or a symlink swap - a scenario the kept-open descriptor's own `fstat`
- * cannot see, since it still refers to the original, now-detached inode),
- * and a fresh `fstat` of that original descriptor re-checked against every
- * rejection rule (catching an in-place mutation of that same inode, e.g. a
- * chmod or truncate-and-overwrite that never unlinked the path at all).
+ * Node has no portable way to exec an already-open descriptor directly.
+ * `spawnSync` blocks until that child process has run to completion (exit
+ * or signal), so the revalidation below always runs only *after* the
+ * spawned child has already exited, never concurrently with it and never
+ * before - it cannot detect or prevent anything the child itself did while
+ * running, only confirm the file `path` still refers to is the exact same,
+ * still-valid one once the child is done with it: a fresh `lstat` of `path`
+ * compared against the stats captured at validation time (catching a full
+ * unlink-and-replace or a symlink swap - a scenario the kept-open
+ * descriptor's own `fstat` cannot see, since it still refers to the
+ * original, now-detached inode), and a fresh `fstat` of that original
+ * descriptor re-checked against every rejection rule (catching an in-place
+ * mutation of that same inode, e.g. a chmod or truncate-and-overwrite that
+ * never unlinked the path at all).
  *
- * This cannot *prevent* a same-uid actor from swapping the file between
- * validation and this call - no pathname-based exec ever can - it only
- * guarantees such a swap is always detected and thrown, never silently
+ * This cannot *prevent* a same-uid actor from swapping the file while the
+ * child runs - no pathname-based exec ever can - it only guarantees such a
+ * swap is always detected and thrown once the child exits, never silently
  * trusted. Under this design's threat model (a 0700, current-uid-owned
  * private run directory nothing else can traverse or write into), no other
  * OS user can ever perform that swap in the first place.
@@ -568,7 +730,7 @@ export function spawnValidatedPrivateRendererAssetDigestHelperFile(path, opened,
   const afterDescriptor = fstatSync(opened.fd);
   const rejection = rendererAssetDigestHelperFileRejectionReason(afterDescriptor);
   if (rejection) {
-    throw new Error(`${label} ${rejection} immediately after spawn: ${path}`);
+    throw new Error(`${label} ${rejection} after the spawned child process exited: ${path}`);
   }
   return result;
 }
@@ -579,17 +741,35 @@ export function spawnValidatedPrivateRendererAssetDigestHelperFile(path, opened,
  * {@link withPrivateRendererAssetDigestHelper}) and chmods it 0500 (owner
  * read+execute, no write bit at all - not even for its own owner, so
  * nothing can trivially mutate it in place afterward without an explicit
- * chmod first) before returning its path. Never caches, reuses, or shares
- * this compiled output with any other call: every call compiles its own.
- * Compiler stdout/stderr are bounded (`maxBuffer`) so a runaway or
- * unexpectedly verbose `swiftc` invocation can never grow unbounded.
+ * chmod first), strips any macOS ACL (see {@link stripDarwinAclOrThrow}),
+ * before returning its path. Never caches, reuses, or shares this compiled
+ * output with any other call: every call compiles its own. Compiler
+ * stdout/stderr are bounded (`maxBuffer`) so a runaway or unexpectedly
+ * verbose `swiftc` invocation can never grow unbounded, and the compiler
+ * process itself is bounded by a finite timeout (`SIGKILL`, never left to
+ * hang forever) - default 120s, generous for a real `swiftc` invocation of
+ * this single small source file (observed well under 5s on typical
+ * hardware) while still always eventually failing closed instead of
+ * blocking a caller indefinitely if the toolchain itself ever wedges.
+ * Overridable via `SEER_RENDERER_ASSET_DIGEST_COMPILE_TIMEOUT_MS` for tests
+ * that need a deterministic, fast timeout instead of waiting the full
+ * default.
  */
 export function compilePrivateRendererAssetDigestHelper(sourcePath, runDir) {
   const helperPath = join(runDir, "digest-helper");
+  const timeoutMs = positiveIntegerFromEnv("SEER_RENDERER_ASSET_DIGEST_COMPILE_TIMEOUT_MS", 120_000);
   const compilation = spawnSync("swiftc", [sourcePath, "-o", helperPath], {
     encoding: "utf8",
     maxBuffer: 8 * 1024 * 1024,
+    timeout: timeoutMs,
+    killSignal: "SIGKILL",
   });
+  if (compilation.error?.code === "ETIMEDOUT") {
+    throw new Error(
+      `descriptor-anchored renderer asset digest helper compilation did not finish within ${timeoutMs}ms and was killed`,
+      { cause: compilation.error },
+    );
+  }
   if (compilation.error || compilation.status !== 0) {
     throw new Error(
       `unable to compile descriptor-anchored renderer asset digest helper: ${
@@ -599,6 +779,7 @@ export function compilePrivateRendererAssetDigestHelper(sourcePath, runDir) {
     );
   }
   chmodSync(helperPath, 0o500);
+  stripDarwinAclOrThrow(helperPath, "renderer asset digest helper");
   return helperPath;
 }
 
@@ -619,10 +800,152 @@ function normalizeAfterCollectionHook(afterCollection) {
   return afterCollection;
 }
 
-// This call compiles, validates, spawns, revalidates, and cleans up a
-// brand-new private helper instance every single time it runs (see
-// withPrivateRendererAssetDigestHelper above): there is no cache, no
-// canonical path, and nothing shared or reused across calls or processes.
+// Populated at most once per Node process by
+// loadOrCompileRendererAssetDigestHelperImageOnce below; every subsequent
+// digest call in this same process reuses these same validated bytes
+// instead of invoking swiftc again.
+let cachedHelperImageBytes = null;
+
+// Set alongside cachedHelperImageBytes, but *only* on the test-only
+// precompiled-bytes-from-file path below - never when this process compiled
+// the image itself. When set, materializeRendererAssetDigestHelper hard-links
+// to this exact validated path instead of writing a fresh copy of the bytes;
+// see the long comment on that function for why that distinction matters and
+// why it is safe.
+let cachedHelperImageHardLinkSourcePath = null;
+
+/**
+ * Compiles (or, in tests only - see below) loads the renderer asset digest
+ * helper's binary image *once* per Node process and caches its bytes in
+ * memory for the remainder of that process's lifetime. Every digest call
+ * within this process reuses these same bytes (see
+ * {@link materializeRendererAssetDigestHelper}) instead of invoking
+ * `swiftc` again: a synchronous compile is cheap enough to pay once per
+ * real build/consumer-wrapper process, but this process can call
+ * {@link computeRendererAssetDigest} many times (once to build a staged
+ * generation's manifest, again to validate a just-published generation,
+ * possibly again during crash recovery) - paying for a fresh compile on
+ * *every one* of those calls, including while a caller holds the renderer
+ * build lock, is both wasted work and (under enough concurrent lock
+ * contention) can starve that lock's own liveness budget. See
+ * {@link prepareRendererAssetDigestHelperImage}, which lets a wrapper pay
+ * this cost once, up front, before it ever acquires that lock.
+ *
+ * The test-only bytes-from-file path below is deliberately gated behind
+ * the *existing* `SEER_RENDERER_BUILD_TEST_BUILDER` test-builder flag
+ * (never a new, independently-settable gate of its own): production never
+ * sets that variable, so this path can never activate accidentally outside
+ * a test that has already deliberately opted into faking the entire build
+ * step. Every security-relevant helper test still exercises a real compile
+ * directly via {@link compilePrivateRendererAssetDigestHelper} - this cache
+ * is only ever a performance optimization layered on top of what that
+ * function verifies, never a replacement for it.
+ */
+function loadOrCompileRendererAssetDigestHelperImageOnce() {
+  if (cachedHelperImageBytes) return cachedHelperImageBytes;
+
+  const precompiledPath = process.env.SEER_RENDERER_BUILD_TEST_PRECOMPILED_HELPER_PATH;
+  if (precompiledPath && process.env.SEER_RENDERER_BUILD_TEST_BUILDER) {
+    cachedHelperImageBytes = readRegularFileNoFollow(
+      precompiledPath,
+      "test precompiled renderer asset digest helper",
+    );
+    cachedHelperImageHardLinkSourcePath = precompiledPath;
+    return cachedHelperImageBytes;
+  }
+
+  cachedHelperImageBytes = withPrivateRendererAssetDigestHelper((runDirPath) => {
+    const helperPath = compilePrivateRendererAssetDigestHelper(rendererAssetDigestHelperSource, runDirPath);
+    return readRegularFileNoFollow(helperPath, "freshly compiled renderer asset digest helper");
+  });
+  return cachedHelperImageBytes;
+}
+
+/**
+ * Writes this process's cached, already-validated helper image bytes (see
+ * {@link loadOrCompileRendererAssetDigestHelperImageOnce}) into a file
+ * named `digest-helper` inside the already-private `runDir`, chmods it
+ * 0500 (owner read+execute, no write bit at all), and strips any macOS ACL
+ * (see {@link stripDarwinAclOrThrow}) before returning its path - the same
+ * shape {@link compilePrivateRendererAssetDigestHelper} returns, but
+ * materializing already-compiled bytes instead of paying for a fresh
+ * `swiftc` invocation. `writeFileSync`'s own `mode` option is, like
+ * `mkdirSync`'s, subject to the ambient umask, so the mode is always
+ * independently normalized with an explicit `chmodSync` afterward rather
+ * than trusted as requested.
+ *
+ * Under the test-only precompiled-bytes path specifically (see
+ * cachedHelperImageHardLinkSourcePath), this hard-links to the exact
+ * validated source file instead of copying its bytes into a new one. That
+ * distinction matters for exactly one reason, discovered empirically while
+ * bringing the 64-waiter renderer lock stress test back within its liveness
+ * budget: macOS independently re-validates (Gatekeeper/code-signing
+ * style) *every distinct inode* the first time it is ever executed - a real,
+ * per-inode cost of several hundred milliseconds that is paid again for
+ * every fresh byte-for-byte copy, even though its content, and even the
+ * originating compile, were already validated. A hard link is, to that
+ * validation, the *same* already-executed inode - so once any one path
+ * pointing at it has been spawned once, every other hard link to it
+ * (including ones created later, in other processes) spawns at normal
+ * (single-digit millisecond) speed. This is safe to rely on here because:
+ * mode and ownership are inode-level, so every hard link is already exactly
+ * as executable/owned as the source, independent of which link is checked;
+ * cleanup (see removePrivateRendererAssetDigestRunDirIfSafe) only ever
+ * unlinks *this run directory's own* directory entry, which merely drops
+ * that one link - it never truncates or rewrites the inode's contents, so
+ * concurrently running processes holding other links (or open descriptors)
+ * to the same inode are completely unaffected; and every run directory
+ * (and therefore every hard link's destination path) is independently,
+ * atomically created with a fresh unique name, so no two calls ever race to
+ * link the same destination. This can only ever happen behind the same
+ * dual-gated test-only flag combination described above - production, and
+ * every direct helper-security test, always takes the real
+ * compile-and-copy path below and a distinct inode every time.
+ */
+function materializeRendererAssetDigestHelper(runDir) {
+  const helperPath = join(runDir, "digest-helper");
+  if (cachedHelperImageHardLinkSourcePath) {
+    try {
+      linkSync(cachedHelperImageHardLinkSourcePath, helperPath);
+    } catch (error) {
+      if (error.code !== "EXDEV") throw error;
+      writeFileSync(helperPath, loadOrCompileRendererAssetDigestHelperImageOnce(), { mode: 0o500 });
+    }
+  } else {
+    writeFileSync(helperPath, loadOrCompileRendererAssetDigestHelperImageOnce(), { mode: 0o500 });
+  }
+  chmodSync(helperPath, 0o500);
+  stripDarwinAclOrThrow(helperPath, "renderer asset digest helper");
+  return helperPath;
+}
+
+/**
+ * Populates this process's cached helper image (see
+ * {@link loadOrCompileRendererAssetDigestHelperImageOnce}) if it is not
+ * already populated. Intended to be called once, by the renderer build
+ * wrapper's `main()`, *before* it ever acquires the renderer build lock -
+ * so the one real `swiftc` compile this process will ever pay for never
+ * consumes any lock-hold time, and every call to
+ * {@link computeRendererAssetDigest} afterward (including ones made while
+ * the lock is held) reuses the same already-validated cached bytes. A
+ * no-op on non-macOS platforms, where the whole descriptor-anchored digest
+ * feature is unavailable anyway (see {@link readDescriptorAnchoredRendererAssets}).
+ */
+export function prepareRendererAssetDigestHelperImage() {
+  if (process.platform !== "darwin") return;
+  loadOrCompileRendererAssetDigestHelperImageOnce();
+}
+
+// Every call still validates, spawns, revalidates, and cleans up a
+// brand-new private helper *file* instance every single time it runs (see
+// withPrivateRendererAssetDigestHelper above): there is no shared canonical
+// path, and the on-disk file itself is never reused or reopened across
+// calls or processes. What *is* shared across calls within one process is
+// the compiled image's validated bytes (see
+// loadOrCompileRendererAssetDigestHelperImageOnce) - each call still
+// materializes its own fresh, independently chmod'd/ACL-stripped copy of
+// those bytes into its own unique private run directory before validating
+// and spawning it exactly as before.
 function readDescriptorAnchoredRendererAssets(rendererRoot, afterCollection) {
   if (process.platform !== "darwin") {
     throw new Error("descriptor-anchored renderer asset hashing requires macOS");
@@ -635,9 +958,10 @@ function readDescriptorAnchoredRendererAssets(rendererRoot, afterCollection) {
       Buffer.from(JSON.stringify(hook), "utf8").toString("base64"),
     );
   }
+  const timeoutMs = positiveIntegerFromEnv("SEER_RENDERER_ASSET_DIGEST_HELPER_TIMEOUT_MS", 60_000);
 
   return withPrivateRendererAssetDigestHelper((runDirPath) => {
-    const helperPath = compilePrivateRendererAssetDigestHelper(rendererAssetDigestHelperSource, runDirPath);
+    const helperPath = materializeRendererAssetDigestHelper(runDirPath);
     const opened = openValidatedPrivateRendererAssetDigestHelperFile(helperPath, "renderer asset digest helper");
     try {
       const result = spawnValidatedPrivateRendererAssetDigestHelperFile(
@@ -645,8 +969,14 @@ function readDescriptorAnchoredRendererAssets(rendererRoot, afterCollection) {
         opened,
         "renderer asset digest helper",
         args,
-        { encoding: "utf8", maxBuffer: 32 * 1024 * 1024 },
+        { encoding: "utf8", maxBuffer: 32 * 1024 * 1024, timeout: timeoutMs, killSignal: "SIGKILL" },
       );
+      if (result.error?.code === "ETIMEDOUT") {
+        throw new Error(
+          `descriptor-anchored renderer asset digest helper did not finish within ${timeoutMs}ms and was killed`,
+          { cause: result.error },
+        );
+      }
       if (result.error || result.status !== 0) {
         throw new Error(
           result.stderr?.trim() ||
