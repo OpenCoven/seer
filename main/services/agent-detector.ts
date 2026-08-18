@@ -522,9 +522,11 @@ if (db) {
     // rejects an oversized value to SQL NULL *before* it ever crosses into
     // JS, while octet_length(value) still reports the true byte count so
     // the row/skip logic below can act on it without ever touching the
-    // value itself.
+    // value itself. The threshold is a bound named parameter
+    // ($maxValueBytes), never interpolated into the SQL text, so the byte
+    // bound can never be mistaken for (or corrupted by) untrusted SQL.
     const boundedValueSql =
-      "CASE WHEN octet_length(value) <= " + workerData.maxValueBytes + " THEN value ELSE NULL END";
+      "CASE WHEN octet_length(value) <= $maxValueBytes THEN value ELSE NULL END";
     // ORDER BY validated JSON recency (see cursorRecencySqlExpression),
     // newest first, rowid only as a deterministic tiebreaker — never bare
     // rowid, which is only ever insertion order and does not move when
@@ -534,7 +536,7 @@ if (db) {
         boundedValueSql +
         " AS boundedValue, octet_length(value) AS valueByteCount, (" +
         workerData.recencySql +
-        ") AS recencyMs FROM cursorDiskKV WHERE key LIKE ? ORDER BY recencyMs DESC, rowid DESC LIMIT ?",
+        ") AS recencyMs FROM cursorDiskKV WHERE key LIKE $keyPattern ORDER BY recencyMs DESC, rowid DESC LIMIT $rowLimit",
     );
     // Prepared once, reused (bound fresh per call) for every bubble
     // lookup — an exact parameterized point lookup, never SQL
@@ -542,7 +544,7 @@ if (db) {
     const bubbleStatement = db.prepare(
       "SELECT " +
         boundedValueSql +
-        " AS boundedValue, octet_length(value) AS valueByteCount FROM cursorDiskKV WHERE key = ?",
+        " AS boundedValue, octet_length(value) AS valueByteCount FROM cursorDiskKV WHERE key = $bubbleKey",
     );
 
     const evidence = [];
@@ -575,7 +577,7 @@ if (db) {
       totalBubbleLookups += 1;
       if (workerData.reportBubbleProgress) parentPort.postMessage({ type: "bubbleLookup" });
 
-      const row = bubbleStatement.get(bubbleKey);
+      const row = bubbleStatement.get({ maxValueBytes: workerData.maxValueBytes, bubbleKey });
       if (!row || typeof row.boundedValue !== "string") return { kind: "absentOrMalformed" };
       const valueByteCount = row.valueByteCount;
       if (valueByteCount === 0 || valueByteCount > workerData.maxValueBytes) {
@@ -599,7 +601,11 @@ if (db) {
       return { kind: "found", bubble };
     };
 
-    rowLoop: for (const row of composerStatement.iterate("composerData:%", workerData.maxInspectedRows + 1)) {
+    rowLoop: for (const row of composerStatement.iterate({
+      maxValueBytes: workerData.maxValueBytes,
+      keyPattern: "composerData:%",
+      rowLimit: workerData.maxInspectedRows + 1,
+    })) {
       if (deadlineExpired()) {
         stopReason = "deadline";
         break;
@@ -797,7 +803,13 @@ function buildCursorWorkerData(dbPath: string, now: number, testHooks: CursorSca
     timestampFutureSkewMs: TIMESTAMP_FUTURE_SKEW_MS,
     maxSupportedTimestampMs: MAX_SUPPORTED_TIMESTAMP_MS,
     runningToolStatuses: [...CURSOR_RUNNING_TOOL_STATUSES],
-    recencySql: cursorRecencySqlExpression("value"),
+    // Table-qualified, not bare "value": cursorRecencySqlExpression's own
+    // header subquery aliases a `json_each(...)` call in the same query,
+    // and json_each declares its own `value` output column — a bare
+    // "value" reference would silently self-collide with that alias
+    // instead of correlating to this row's real value column (see that
+    // function's doc comment).
+    recencySql: cursorRecencySqlExpression("cursorDiskKV.value"),
     reportRowProgress: testHooks?.onRowInspected !== undefined,
     reportBubbleProgress: testHooks?.onBubbleLookup !== undefined,
     simulateRowProcessingDelayMs: testHooks?.simulateRowProcessingDelayMs ?? 0,

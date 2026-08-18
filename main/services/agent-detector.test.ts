@@ -442,6 +442,174 @@ test("Cursor recency ordering ranks an updated old-rowid composer above stale hi
   });
 });
 
+// MARK: - Cursor row limit + extended recency shapes (header-only / string
+// timestamps): proves `cursorRecencySqlExpression` covering every
+// assessor-active timestamp shape (not just numeric root fields) is load
+// bearing for the row-limit sentinel's safety, not merely cosmetic.
+
+test("Cursor row limit recovers and detects a lower-rowid active composer whose only recency signal is a conversation header timestamp, despite 2000+ older numeric rows", async () => {
+  await withDatabase(async (database) => {
+    // No root-level lastUpdatedAt/createdAt/conversationCheckpointLastUpdatedAt
+    // at all — this composer's ONLY recency signal is a
+    // fullConversationHeadersOnly[*].createdAt. Before
+    // cursorRecencySqlExpression covered headers, this row's SQL recency
+    // was NULL (unrankable): it sorted dead last under
+    // `ORDER BY recencyMs DESC` no matter how recent its header actually
+    // was, so thousands of "old but numerically rankable" rows could push
+    // it beyond CURSOR_MAX_INSPECTED_ROWS and silently drop it. Inserted
+    // first so it also has the lowest rowid, ruling out the rowid
+    // tiebreaker from accidentally saving it.
+    insertRows(database, [
+      {
+        key: "composerData:header-only-active",
+        value: JSON.stringify({
+          fullConversationHeadersOnly: [{ type: 1, createdAt: now }],
+        }),
+      },
+    ]);
+
+    // Comfortably more than CURSOR_MAX_INSPECTED_ROWS, every one an old
+    // (epoch-zero), purely-numeric, inactive composer with a strictly
+    // higher rowid than the header-only composer above.
+    const totalRows = CURSOR_MAX_INSPECTED_ROWS + 50;
+    const filler = Array.from({ length: totalRows }, (_, index) => ({
+      key: `composerData:old-${String(index).padStart(5, "0")}`,
+      value: '{"status":"completed","lastUpdatedAt":0}',
+    }));
+    insertManyRowsFast(database, filler);
+
+    const active = await detectCursorComposerActivity(now, database);
+
+    assert.deepEqual(active.map(({ identity }) => identity), ["header-only-active"]);
+  });
+});
+
+test("Cursor row limit recovers and detects a lower-rowid active composer with an ISO-8601 string root timestamp, despite 2000+ older numeric rows", async () => {
+  await withDatabase(async (database) => {
+    // The only recency signal is lastUpdatedAt as an ISO-8601 string
+    // (Date.prototype.toISOString()'s own canonical shape) instead of a
+    // JSON number — before cursorRecencySqlExpression accepted string
+    // timestamps, `json_type(...) IN ('integer', 'real')` excluded it
+    // entirely, so this row's SQL recency was also NULL.
+    insertRows(database, [
+      {
+        key: "composerData:string-timestamp-active",
+        value: JSON.stringify({ status: "generating", lastUpdatedAt: new Date(now).toISOString() }),
+      },
+    ]);
+
+    const totalRows = CURSOR_MAX_INSPECTED_ROWS + 50;
+    const filler = Array.from({ length: totalRows }, (_, index) => ({
+      key: `composerData:old-${String(index).padStart(5, "0")}`,
+      value: '{"status":"completed","lastUpdatedAt":0}',
+    }));
+    insertManyRowsFast(database, filler);
+
+    const active = await detectCursorComposerActivity(now, database);
+
+    assert.deepEqual(active.map(({ identity }) => identity), ["string-timestamp-active"]);
+  });
+});
+
+test("Cursor row limit still throws when the cut-off candidate's header-derived timestamp could plausibly still be active", async () => {
+  await withDatabase(async (database) => {
+    // Mirrors "Cursor row limit still throws when the cut-off candidate
+    // could plausibly still be active" above, but every row's ONLY
+    // recency signal is a conversation header's createdAt rather than a
+    // root field — proving the new header-recency contribution
+    // participates in the exact same fail-safe "ambiguous sentinel" check
+    // instead of quietly bypassing it (e.g. by mis-ranking a genuinely
+    // recent header-only row as unrankable/old).
+    const totalRows = CURSOR_MAX_INSPECTED_ROWS + 50;
+    const rows = Array.from({ length: totalRows }, (_, index) => ({
+      key: `composerData:recent-header-${String(index).padStart(5, "0")}`,
+      value: JSON.stringify({
+        status: "completed",
+        fullConversationHeadersOnly: [{ type: 2, createdAt: now - index }],
+      }),
+    }));
+    // The (cap + 1)-th row (0-indexed: CURSOR_MAX_INSPECTED_ROWS) is the
+    // sentinel; confirm it really is inside the candidate window so the
+    // scan's rejection below is a genuine truncation risk, not a fixture bug.
+    assert.ok(CURSOR_MAX_INSPECTED_ROWS < SESSION_CANDIDATE_WINDOW_MS);
+    insertManyRowsFast(database, rows);
+
+    await assert.rejects(
+      () => detectCursorComposerActivity(now, database),
+      (error: unknown) => {
+        assert.ok(error instanceof CursorSessionScanError);
+        assert.equal(error.reason, "rowLimit");
+        return true;
+      },
+    );
+  });
+});
+
+test("Cursor row limit recovers when thousands of old rows carry only header-derived or string recency", async () => {
+  await withDatabase(async (database) => {
+    // Same shape as "Cursor row limit recovers when thousands of old rows
+    // exist beyond the newest candidates" above, but exercising the new
+    // header/string recency paths for the *old* history itself: every
+    // filler row's own recency is unambiguously old (epoch-zero-ish) via a
+    // header createdAt or a string createdAt, not a numeric root field —
+    // proving old header/string-derived rows are correctly recognized as
+    // old (not accidentally left unrankable-NULL, which would still be
+    // "safe" but would defeat the point of ranking them at all) and so
+    // hitting the row cap here must not permanently fail the scan.
+    const totalRows = CURSOR_MAX_INSPECTED_ROWS + 50;
+    const rows: Array<{ key: string; value: string }> = [];
+    for (let index = 0; index < totalRows; index += 1) {
+      rows.push(
+        index % 2 === 0
+          ? {
+              key: `composerData:old-header-${String(index).padStart(5, "0")}`,
+              value: JSON.stringify({
+                status: "completed",
+                fullConversationHeadersOnly: [{ type: 2, createdAt: 0 }],
+              }),
+            }
+          : {
+              key: `composerData:old-string-${String(index).padStart(5, "0")}`,
+              value: JSON.stringify({
+                status: "completed",
+                lastUpdatedAt: new Date(0).toISOString(),
+              }),
+            },
+      );
+    }
+    rows.push({
+      key: "composerData:z-active",
+      value: `{"status":"generating","lastUpdatedAt":${now}}`,
+    });
+    insertManyRowsFast(database, rows);
+
+    const active = await detectCursorComposerActivity(now, database);
+
+    assert.deepEqual(active.map(({ identity }) => identity), ["z-active"]);
+  });
+});
+
+test("Cursor scan Worker byte-count thresholds are bound named parameters, never interpolated SQL", () => {
+  // The composer/bubble CASE projections' byte threshold must be a bound
+  // named parameter ($maxValueBytes) resolved at `.get`/`.iterate` call
+  // time, never a string-interpolated numeric literal baked into the SQL
+  // text — otherwise the "threshold" reads as an untrusted-SQL-injection
+  // shape during review, even though today's value happens to be a fixed
+  // constant. Same for the composer key-prefix filter, row limit, and the
+  // bubble lookup's key equality: every value that varies per call is a
+  // named parameter, never string concatenation into SQL.
+  assert.match(detectorSource, /octet_length\(value\) <= \$maxValueBytes/);
+  assert.match(detectorSource, /maxValueBytes: workerData\.maxValueBytes/);
+  assert.match(detectorSource, /key LIKE \$keyPattern/);
+  assert.match(detectorSource, /LIMIT \$rowLimit/);
+  assert.match(detectorSource, /key = \$bubbleKey/);
+  assert.doesNotMatch(detectorSource, /octet_length\(value\) <= "\s*\+/);
+  assert.doesNotMatch(detectorSource, /<=\s*\$\{/);
+  // Selects a bounded projection plus its own byte-count column — never
+  // raw `value` — for both the composer and bubble queries.
+  assert.match(detectorSource, /AS boundedValue, octet_length\(value\) AS valueByteCount/);
+});
+
 test("Cursor cumulative decoded byte limit exceeded throws scanIncomplete", async () => {
   await withDatabase(async (database) => {
     const padding = "x".repeat(3_500_000);

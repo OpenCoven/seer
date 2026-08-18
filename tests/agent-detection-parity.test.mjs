@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
@@ -16,9 +17,11 @@ import {
   CURSOR_RUNNING_TOOL_STATUSES,
   CURSOR_SQLITE_BUSY_TIMEOUT_MS,
   CURSOR_SQLITE_QUERY_DEADLINE_MS,
+  MAX_SUPPORTED_TIMESTAMP_MS,
   TIMESTAMP_FUTURE_SKEW_MS,
   assessCursorComposerRecord,
   assessDetectionFixture,
+  cursorRecencySqlExpression,
   cursorRelevantBubbleIds,
   isRecentTimestamp,
   matchAgentKind,
@@ -549,4 +552,163 @@ test("exactly five scoped-package process matchers are case-sensitive", () => {
       "@continuedev\\/cli",
     ]),
   );
+});
+
+// MARK: - Cursor SQL recency vs. assessor-derived recency parity
+//
+// `cursorRecencySqlExpression` computes a `cursorDiskKV` composer row's
+// recency directly in SQLite so a bounded query can `ORDER BY` real
+// last-activity time instead of `rowid` (see its doc comment in
+// `agent-detection-policy.ts`). These cases execute that *exact* SQL
+// expression through a real SQLite connection (`node:sqlite`, the same
+// engine `agent-detector.ts`'s scan Worker uses) — via a bound `$value`
+// parameter standing in for the table column, never a table — and assert
+// it agrees with `assessCursorComposerRecord`'s own `lastActivityAt` for
+// every timestamp shape the assessor can turn into an *active* composer.
+// That agreement is exactly what lets the row-limit sentinel (see
+// `agent-detector.test.ts`'s "row limit recovers"/"still throws" tests)
+// safely treat an unrankable (SQL `NULL`) row as provably never a lost
+// active composer: a row can only be unrankable here if it is also
+// unassessable (malformed JSON/oversized), and this suite is the proof
+// that every *other*, assessable shape always gets a real, matching rank.
+function sqlRecencyForRawValue(rawValue) {
+  const db = new DatabaseSync(":memory:");
+  try {
+    const expression = cursorRecencySqlExpression("$value");
+    const row = db.prepare(`SELECT (${expression}) AS recencyMs`).get({ value: rawValue });
+    return row.recencyMs === null ? null : Number(row.recencyMs);
+  } finally {
+    db.close();
+  }
+}
+
+function sqlRecencyFor(record) {
+  return sqlRecencyForRawValue(JSON.stringify(record));
+}
+
+function assessedLastActivityAt(record) {
+  return assessCursorComposerRecord(record, now).lastActivityAt;
+}
+
+test("Cursor SQL recency matches the assessor for a numeric root timestamp (milliseconds and seconds)", () => {
+  for (const record of [
+    { status: "generating", lastUpdatedAt: now },
+    { status: "generating", lastUpdatedAt: Math.round(now / 1000) },
+  ]) {
+    const raw = JSON.stringify(record);
+    assert.equal(sqlRecencyFor(record), assessedLastActivityAt(record), raw);
+    assert.equal(assessedLastActivityAt(record), now, raw);
+  }
+});
+
+test("Cursor SQL recency matches the assessor for an ISO-8601 string root timestamp", () => {
+  const isoNow = new Date(now).toISOString();
+  // toISOString() always emits this exact shape (milliseconds + trailing
+  // "Z") — precisely what cursorRecencySqlExpression's GLOB guard requires
+  // and what real Cursor data would use if it ever emitted string
+  // timestamps at all.
+  assert.match(isoNow, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+  const record = { status: "generating", lastUpdatedAt: isoNow };
+  assert.equal(sqlRecencyFor(record), assessedLastActivityAt(record), isoNow);
+  assert.equal(assessedLastActivityAt(record), now);
+});
+
+test("Cursor SQL recency matches the assessor for a header-only composer (numeric and string createdAt)", () => {
+  const isoNow = new Date(now).toISOString();
+  for (const createdAt of [now, isoNow]) {
+    // No root-level lastUpdatedAt/createdAt/conversationCheckpointLastUpdatedAt
+    // at all: this composer's only recency signal is a conversation
+    // header's own createdAt.
+    const record = { fullConversationHeadersOnly: [{ type: 1, createdAt }] };
+    const raw = JSON.stringify(record);
+    assert.equal(sqlRecencyFor(record), assessedLastActivityAt(record), raw);
+    assert.equal(assessedLastActivityAt(record), now, raw);
+  }
+});
+
+test("Cursor SQL recency matches the assessor's field priority order for an updated-old row", () => {
+  const oldCreatedAt = now - 86_400_000;
+  for (const record of [
+    // createdAt is a day old, but lastUpdatedAt reflects a recent update:
+    // the higher-priority defined field must win over the older createdAt.
+    { status: "completed", createdAt: oldCreatedAt, lastUpdatedAt: now },
+    // conversationCheckpointLastUpdatedAt outranks both lastUpdatedAt and
+    // createdAt even though all three are defined.
+    {
+      status: "completed",
+      createdAt: oldCreatedAt,
+      lastUpdatedAt: oldCreatedAt,
+      conversationCheckpointLastUpdatedAt: now,
+    },
+  ]) {
+    const raw = JSON.stringify(record);
+    assert.equal(sqlRecencyFor(record), assessedLastActivityAt(record), raw);
+    assert.equal(assessedLastActivityAt(record), now, raw);
+  }
+
+  // Priority order is a COALESCE, not a flat MAX: a lower-priority field's
+  // numerically *larger* raw value must never outrank a defined
+  // higher-priority field, in SQL exactly as in the `??` chain.
+  const prioritized = {
+    status: "completed",
+    conversationCheckpointLastUpdatedAt: Math.round(now / 1000),
+    lastUpdatedAt: now + 999_000_000,
+  };
+  const raw = JSON.stringify(prioritized);
+  assert.equal(sqlRecencyFor(prioritized), assessedLastActivityAt(prioritized), raw);
+  assert.equal(assessedLastActivityAt(prioritized), now, raw);
+});
+
+test("Cursor SQL recency matches the assessor's lastActivityAt of 0 for malformed/unparseable records", () => {
+  for (const record of [
+    { lastUpdatedAt: "not-a-timestamp" },
+    { fullConversationHeadersOnly: [42, null, "x"] },
+    [],
+  ]) {
+    const raw = JSON.stringify(record);
+    assert.equal(sqlRecencyFor(record), assessedLastActivityAt(record), raw);
+    assert.equal(assessedLastActivityAt(record), 0, raw);
+  }
+
+  // Genuinely invalid JSON syntax never even reaches the assessor: the
+  // scan Worker's own JSON.parse throws first and the row is skipped
+  // before assessment. SQL correctly reports this shape as unrankable
+  // (NULL, sorts last) rather than a numeric 0 — the only "parity" claim
+  // meaningful for a row nothing ever assesses.
+  assert.equal(sqlRecencyForRawValue('{"status":'), null);
+  assert.equal(sqlRecencyForRawValue(""), null);
+});
+
+test("Cursor SQL recency matches the assessor for a future-skewed timestamp, and rejects one beyond the supported bound identically", () => {
+  for (const futureMs of [now + 60_000, now + 86_400_000, MAX_SUPPORTED_TIMESTAMP_MS - 1]) {
+    // lastActivityAt itself is never clamped by "is this in the future" —
+    // only the separate active/inactive boolean is. Recency ranking must
+    // track the assessor's raw value exactly, future or not.
+    const record = { status: "generating", lastUpdatedAt: futureMs };
+    assert.equal(sqlRecencyFor(record), assessedLastActivityAt(record), String(futureMs));
+    assert.equal(assessedLastActivityAt(record), futureMs);
+  }
+
+  // Beyond maxSupportedTimestampMs: both sides reject the whole record
+  // identically (validateCursorRecordFields already rejects any defined
+  // priority field that fails parseCursorTimestamp's own bound check).
+  const outOfRange = { status: "generating", lastUpdatedAt: MAX_SUPPORTED_TIMESTAMP_MS + 1 };
+  assert.equal(sqlRecencyFor(outOfRange), assessedLastActivityAt(outOfRange));
+  assert.equal(assessedLastActivityAt(outOfRange), 0);
+});
+
+test("Cursor SQL recency documents its one intentional assessor divergence: date-only strings", () => {
+  // "2024-01-15" is a string shape Date.parse (and so this TS assessor)
+  // happily accepts, but Swift's Date.ISO8601FormatStyle flatly rejects —
+  // confirmed empirically (see cursorRecencySqlExpression's doc comment).
+  // Supporting it here would only ever benefit the TS side of a supposedly
+  // shared expression, trading a narrow, unobserved-in-real-data gap for a
+  // *new*, permanent TS/Swift ranking disagreement. This is the one
+  // deliberately-excluded shape where SQL and the assessor do NOT agree —
+  // documented here as a locked-in, intentional exception, not an
+  // oversight, and bounded because real Cursor data only ever emits
+  // numeric epoch-millisecond timestamps on disk.
+  const record = { fullConversationHeadersOnly: [{ type: 1, createdAt: "2024-01-15" }] };
+  assert.equal(sqlRecencyFor(record), 0);
+  assert.notEqual(assessedLastActivityAt(record), 0);
 });

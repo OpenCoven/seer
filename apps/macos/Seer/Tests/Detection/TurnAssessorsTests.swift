@@ -1,4 +1,5 @@
 import XCTest
+import SQLite3
 @testable import Seer
 
 /// Table-driven parity tests: every case in the shared fixture oracle
@@ -1076,5 +1077,203 @@ final class TurnAssessorsTests: XCTestCase {
         XCTAssertFalse(assessment.active)
         XCTAssertEqual(assessment.reason, "waiting for approval")
         XCTAssertEqual(assessment.label, "Codex Boundary Project")
+    }
+
+    // MARK: - Cursor SQL recency vs. assessor-derived recency parity (mirrors
+    // tests/agent-detection-parity.test.mjs's "Cursor SQL recency vs.
+    // assessor-derived recency parity" section)
+    //
+    // `cursorRecencySqlExpression` (in `SessionSnapshotSource.swift`) computes
+    // a `cursorDiskKV` composer row's recency directly in SQLite so a bounded
+    // query can `ORDER BY` real last-activity time instead of `rowid`. These
+    // cases execute that *exact* SQL expression through a real SQLite
+    // connection and assert it agrees with `assessCursorComposerRecord`'s own
+    // `lastActivityAt` for every timestamp shape the assessor can turn into
+    // an *active* composer. That agreement is exactly what lets the row-limit
+    // sentinel (see `SessionSnapshotSourceTests.swift`'s "row limit
+    // recovers"/"still throws" tests) safely treat an unrankable (SQL `NULL`)
+    // row as provably never a lost active composer.
+
+    /// Computes `cursorRecencySqlExpression` against a single real, in-memory
+    /// SQLite row holding `valueJSON` as `cursorDiskKV.value`. `:memory:` is
+    /// enough: this proves a pure SQL-evaluation property, independent of the
+    /// filesystem/WAL/symlink hardening `SessionSnapshotSourceTests.swift`
+    /// already covers.
+    private func sqlRecency(forValueJSON valueJSON: String) -> Int64? {
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(":memory:", &db), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        XCTAssertEqual(
+            sqlite3_exec(db, "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)", nil, nil, nil),
+            SQLITE_OK
+        )
+        var insert: OpaquePointer?
+        XCTAssertEqual(
+            sqlite3_prepare_v2(db, "INSERT INTO cursorDiskKV (key, value) VALUES ('row', ?)", -1, &insert, nil),
+            SQLITE_OK
+        )
+        sqlite3_bind_text(insert, 1, valueJSON, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        XCTAssertEqual(sqlite3_step(insert), SQLITE_DONE)
+        sqlite3_finalize(insert)
+
+        var query: OpaquePointer?
+        XCTAssertEqual(
+            sqlite3_prepare_v2(db, "SELECT (\(cursorRecencySqlExpression)) AS recencyMs FROM cursorDiskKV", -1, &query, nil),
+            SQLITE_OK
+        )
+        defer { sqlite3_finalize(query) }
+        XCTAssertEqual(sqlite3_step(query), SQLITE_ROW)
+        guard sqlite3_column_type(query, 0) != SQLITE_NULL else { return nil }
+        return sqlite3_column_int64(query, 0)
+    }
+
+    /// `assessCursorComposerRecord`'s own `lastActivityAt`, parsed from the
+    /// *exact same* JSON text `sqlRecency(forValueJSON:)` receives — parsing
+    /// once from text (rather than authoring a Swift dictionary literal and a
+    /// JSON string separately) guarantees both sides see byte-identical
+    /// input.
+    private func assessedLastActivityAt(forValueJSON valueJSON: String, now: Int64) throws -> Int64 {
+        let record = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(valueJSON.utf8), options: [.fragmentsAllowed]) as? JSONObject
+        )
+        return assessCursorComposerRecord(record, now: now).lastActivityAt
+    }
+
+    /// Mirrors the TS parity suite's "numeric root timestamp (milliseconds
+    /// and seconds)" case.
+    func testCursorSQLRecencyMatchesAssessorForNumericRootTimestamp() throws {
+        let now: Int64 = 1_786_449_620_000
+        for valueJSON in [
+            #"{"status":"generating","lastUpdatedAt":\#(now)}"#,
+            #"{"status":"generating","lastUpdatedAt":\#(now / 1_000)}"#,
+        ] {
+            let assessed = try assessedLastActivityAt(forValueJSON: valueJSON, now: now)
+            XCTAssertEqual(sqlRecency(forValueJSON: valueJSON), assessed, valueJSON)
+            XCTAssertEqual(assessed, now, valueJSON)
+        }
+    }
+
+    /// Mirrors the TS parity suite's ISO-8601 string root timestamp case:
+    /// `toISOString()`'s exact millisecond+`Z` shape is what
+    /// `cursorRecencySqlExpression`'s `GLOB` guard requires and what Swift's
+    /// `ISO8601FormatStyle` parses to the identical millisecond value.
+    func testCursorSQLRecencyMatchesAssessorForISOStringRootTimestamp() throws {
+        let now: Int64 = 1_786_449_620_000
+        let isoNow = "2026-08-11T12:00:20.000Z"
+        XCTAssertEqual(parseISO8601ToMs(isoNow), now, "fixture ISO string must itself parse to `now`")
+        let valueJSON = #"{"status":"generating","lastUpdatedAt":"\#(isoNow)"}"#
+        let assessed = try assessedLastActivityAt(forValueJSON: valueJSON, now: now)
+        XCTAssertEqual(sqlRecency(forValueJSON: valueJSON), assessed)
+        XCTAssertEqual(assessed, now)
+    }
+
+    /// Mirrors the TS parity suite's "header-only composer" case: no root
+    /// `lastUpdatedAt`/`createdAt`/`conversationCheckpointLastUpdatedAt`
+    /// field at all — the composer's only recency signal is a conversation
+    /// header's own `createdAt`, in both the numeric and ISO-string shapes.
+    func testCursorSQLRecencyMatchesAssessorForHeaderOnlyComposer() throws {
+        let now: Int64 = 1_786_449_620_000
+        let isoNow = "2026-08-11T12:00:20.000Z"
+        for createdAtJSON in ["\(now)", "\"\(isoNow)\""] {
+            let valueJSON = #"{"fullConversationHeadersOnly":[{"type":1,"createdAt":\#(createdAtJSON)}]}"#
+            let assessed = try assessedLastActivityAt(forValueJSON: valueJSON, now: now)
+            XCTAssertEqual(sqlRecency(forValueJSON: valueJSON), assessed, valueJSON)
+            XCTAssertEqual(assessed, now, valueJSON)
+        }
+    }
+
+    /// Mirrors the TS parity suite's field-priority-order case: a
+    /// higher-priority defined field must win over a numerically-later but
+    /// lower-priority one, in SQL exactly as in the assessor's own
+    /// `firstNonNull` chain — a `COALESCE`, never a flat `MAX` across all
+    /// three fields.
+    func testCursorSQLRecencyMatchesAssessorFieldPriorityOrderForUpdatedOldRow() throws {
+        let now: Int64 = 1_786_449_620_000
+        let oldCreatedAt = now - 86_400_000
+        for valueJSON in [
+            #"{"status":"completed","createdAt":\#(oldCreatedAt),"lastUpdatedAt":\#(now)}"#,
+            #"{"status":"completed","createdAt":\#(oldCreatedAt),"lastUpdatedAt":\#(oldCreatedAt),"conversationCheckpointLastUpdatedAt":\#(now)}"#,
+        ] {
+            let assessed = try assessedLastActivityAt(forValueJSON: valueJSON, now: now)
+            XCTAssertEqual(sqlRecency(forValueJSON: valueJSON), assessed, valueJSON)
+            XCTAssertEqual(assessed, now, valueJSON)
+        }
+
+        // A lower-priority field's numerically *larger* raw value must never
+        // outrank a defined higher-priority field.
+        let prioritized = #"{"status":"completed","conversationCheckpointLastUpdatedAt":\#(now / 1_000),"lastUpdatedAt":\#(now + 999_000_000)}"#
+        let assessedPrioritized = try assessedLastActivityAt(forValueJSON: prioritized, now: now)
+        XCTAssertEqual(sqlRecency(forValueJSON: prioritized), assessedPrioritized)
+        XCTAssertEqual(assessedPrioritized, now)
+    }
+
+    /// Mirrors the TS parity suite's malformed/unparseable case: both an
+    /// assessable-but-unrankable `JSONObject` (which the assessor rejects to
+    /// `lastActivityAt: 0`) and genuinely invalid JSON syntax (which never
+    /// even reaches the assessor in production — the scan Worker's own parse
+    /// fails first and the row is skipped — so only SQL's `NULL` unrankable
+    /// verdict is asserted for those; a bare top-level JSON array, the TS
+    /// suite's third malformed case, has no Swift equivalent here since
+    /// `assessCursorComposerRecord` only ever accepts a `JSONObject`
+    /// argument, a distinction TS's structural typing doesn't enforce at
+    /// this boundary).
+    func testCursorSQLRecencyMatchesAssessorForMalformedOrUnparseableRecords() throws {
+        let now: Int64 = 1_786_449_620_000
+        for valueJSON in [
+            #"{"lastUpdatedAt":"not-a-timestamp"}"#,
+            #"{"fullConversationHeadersOnly":[42,null,"x"]}"#,
+        ] {
+            let assessed = try assessedLastActivityAt(forValueJSON: valueJSON, now: now)
+            XCTAssertEqual(sqlRecency(forValueJSON: valueJSON), assessed, valueJSON)
+            XCTAssertEqual(assessed, 0, valueJSON)
+        }
+
+        XCTAssertNil(sqlRecency(forValueJSON: #"{"status":"#))
+        XCTAssertNil(sqlRecency(forValueJSON: ""))
+    }
+
+    /// Mirrors the TS parity suite's future-skew case: `lastActivityAt`
+    /// itself is never clamped by "is this in the future" — only the
+    /// separate active/inactive boolean is — so recency ranking must track
+    /// the assessor's raw value exactly, future or not, up to (and rejecting
+    /// identically beyond) `maxSupportedTimestampMs`.
+    func testCursorSQLRecencyMatchesAssessorForFutureSkewedAndOutOfRangeTimestamps() throws {
+        let now: Int64 = 1_786_449_620_000
+        // `TurnAssessors.swift`'s own `maxSupportedTimestampMs` is
+        // file-private, so this mirrors it verbatim — exactly as
+        // `cursorRecencySqlExpression` itself already must, for the same
+        // reason (see its doc comment in `SessionSnapshotSource.swift`).
+        let maxSupportedTimestampMs: Int64 = 8_640_000_000_000_000
+        for futureMs in [now + 60_000, now + 86_400_000, maxSupportedTimestampMs - 1] {
+            let valueJSON = #"{"status":"generating","lastUpdatedAt":\#(futureMs)}"#
+            let assessed = try assessedLastActivityAt(forValueJSON: valueJSON, now: now)
+            XCTAssertEqual(sqlRecency(forValueJSON: valueJSON), assessed, valueJSON)
+            XCTAssertEqual(assessed, futureMs, valueJSON)
+        }
+
+        // Beyond maxSupportedTimestampMs: both sides reject the whole record
+        // identically (validateCursorRecordFields already rejects any
+        // defined priority field that fails parseCursorTimestamp's own
+        // bound check).
+        let outOfRange = #"{"status":"generating","lastUpdatedAt":\#(maxSupportedTimestampMs + 1)}"#
+        let assessedOutOfRange = try assessedLastActivityAt(forValueJSON: outOfRange, now: now)
+        XCTAssertEqual(sqlRecency(forValueJSON: outOfRange), assessedOutOfRange)
+        XCTAssertEqual(assessedOutOfRange, 0)
+    }
+
+    /// Unlike TS (`Date.parse` happily accepts a bare date-only string — see
+    /// `agent-detection-parity.test.mjs`'s documented divergence test),
+    /// Swift's `Date.ISO8601FormatStyle` flatly rejects `"2024-01-15"`
+    /// (confirmed empirically: both the fractional- and
+    /// non-fractional-seconds style variants fail to parse it), so on this
+    /// platform SQL and the assessor already agree with no exception needed:
+    /// both treat a date-only string as unrankable/non-activity-bearing.
+    func testCursorSQLRecencyAndAssessorAgreeDateOnlyStringsAreUnrankable() throws {
+        let now: Int64 = 1_786_449_620_000
+        XCTAssertNil(parseISO8601ToMs("2024-01-15"), "Swift's ISO8601FormatStyle must reject a date-only string")
+        let valueJSON = #"{"fullConversationHeadersOnly":[{"type":1,"createdAt":"2024-01-15"}]}"#
+        let assessed = try assessedLastActivityAt(forValueJSON: valueJSON, now: now)
+        XCTAssertEqual(sqlRecency(forValueJSON: valueJSON), 0)
+        XCTAssertEqual(assessed, 0)
     }
 }

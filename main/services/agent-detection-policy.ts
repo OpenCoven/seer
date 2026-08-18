@@ -888,6 +888,19 @@ export const CURSOR_TIMESTAMP_FIELDS_BY_PRIORITY = [
  * never changes that row's `rowid`, so `ORDER BY rowid DESC` silently
  * treats a freshly-updated *old* conversation as stale forever.
  *
+ * `valueColumn` must be a reference that resolves correctly even from
+ * *inside* a correlated `json_each(...)` subquery aliased in the same
+ * query — e.g. `"cursorDiskKV.value"`, not a bare `"value"`. SQLite's
+ * table-valued-function binder resolves an unqualified column name that
+ * collides with one of `json_each`'s own output columns (`key`, `value`,
+ * `type`, `atom`, `id`, `parent`, `fullkey`, `path`) against that
+ * function's *own* alias, even while still evaluating that alias's own
+ * input argument — confirmed empirically: `json_each(value, ...)` inside a
+ * query that also does `json_each(...) AS headerEntry` silently yields
+ * zero rows instead of correlating to the outer row's `value` column,
+ * because `value` also happens to be one of `json_each`'s declared output
+ * columns. A table-qualified reference sidesteps the collision entirely.
+ *
  * Evaluation order matters and mirrors the byte/JSON-validity guards this
  * scan already enforces in JS, now pushed into SQL so an oversized or
  * malformed row can never reach `ORDER BY` as anything but a (naturally
@@ -898,16 +911,62 @@ export const CURSOR_TIMESTAMP_FIELDS_BY_PRIORITY = [
  *     of a blob this scan would reject anyway.
  *  2. `json_valid(valueColumn)` gates everything else — malformed JSON
  *     yields `NULL`.
- *  3. Each candidate field must itself be a JSON `integer`/`real` (a
- *     string/object/array/bool timestamp yields `NULL` for that field,
- *     matching this scan's existing "malformed field" skip policy) and,
- *     once scaled to milliseconds, within `maxSupportedTimestampMs` of zero
- *     (matching `parseCursorTimestamp`'s own guard) — otherwise `NULL`.
+ *  3. The composer's own recency is `MAX(rootRecency, headerRecency)`,
+ *     covering every timestamp shape `assessValidatedCursorComposerRecord`
+ *     can turn into an active composer:
+ *     - `rootRecency` mirrors `record.conversationCheckpointLastUpdatedAt
+ *       ?? record.lastUpdatedAt ?? record.createdAt` exactly: a
+ *       `COALESCE` over the same 3 fields in the same priority order (not
+ *       a flat max — a lower-priority field holding a numerically larger
+ *       value must never outrank a defined higher-priority field, exactly
+ *       like JS's `??` chain), defaulting to `0` when none of the 3 are
+ *       defined (matching `lastActivityAt`'s own `0` seed).
+ *     - `headerRecency` mirrors the unconditional
+ *       `for (const header of headers) { if (createdAt > lastActivityAt)
+ *       lastActivityAt = createdAt; }` loop: the `MAX` of every
+ *       `fullConversationHeadersOnly[*].createdAt` whose sibling `type` is
+ *       `1` or `2` (`validateCursorHeaders`'s own filter), aggregated with
+ *       SQL's null-skipping `MAX` (not the 2+-arg `max()` scalar function,
+ *       which returns `NULL` if *any* argument is `NULL` — the opposite of
+ *       what's needed here) so a composer with zero valid headers
+ *       contributes nothing rather than poisoning the whole expression.
+ *       Each `json_each` row is guarded with `type = 'object'` before any
+ *       `json_extract`/`json_type` call touches its `value`, because
+ *       `json_each`'s per-row `value` column holds a non-object scalar
+ *       entry's *already-decoded* form (e.g. an unquoted bare word), which
+ *       is not valid JSON syntax to re-parse — confirmed empirically that
+ *       an unguarded call throws `"malformed JSON"` for a plain
+ *       string/number/bool/null/array entry in the headers array.
+ *     - Both root and header candidates accept either shape
+ *       `parseCursorTimestamp` accepts that can make a composer active:
+ *       a JSON number (seconds when `<= secondsThresholdMs`, else already
+ *       milliseconds — mirroring the `> 1e12` heuristic exactly) or a JSON
+ *       string in strict `YYYY-MM-DDTHH:MM:SS[.fff...](Z|±HH:MM)` form —
+ *       the one string shape empirically confirmed to parse to the exact
+ *       same millisecond value under both this codebase's TS parser
+ *       (`Date.parse`) and its Swift parser (`Date.ISO8601FormatStyle`).
+ *       Any other string (zone-less, date-only, lower-case `t`/`z`,
+ *       space-separated, no-seconds, or otherwise lenient-but-ambiguous
+ *       `Date.parse` shapes) is deliberately left unrankable here: real
+ *       Cursor data only ever emits epoch-millisecond numbers on disk, so
+ *       this restriction never under-ranks genuine data, and Swift's
+ *       stricter ISO 8601 parser flatly rejects several of those shapes
+ *       anyway, so ranking on them could silently diverge between engines.
+ *       A value that reaches SQLite's own date parser is additionally
+ *       shape-guarded by `GLOB`/`substr` *before* `julianday()` ever runs,
+ *       and the millisecond conversion is `ROUND`ed — confirmed empirically
+ *       required, since the raw `(julianday(x) - 2440587.5) * 86400000.0`
+ *       formula alone can be off by a sub-millisecond floating-point
+ *       epsilon (e.g. `...123` computed as `...122.9927`) that `ROUND`
+ *       corrects to the exact integer millisecond `Date.parse` produces.
+ *     - Both also apply the same `ABS(ms) <= maxSupportedTimestampMs`
+ *       bound as before, so an out-of-range numeric string/number never
+ *       poisons the `MAX` with a nonsensical magnitude.
  *
  * `NULL` always sorts last under `ORDER BY ... DESC` in SQLite, so rows
- * this expression can't rank (oversized, malformed JSON, or no numeric
- * timestamp in any candidate field) are naturally deprioritized without
- * any extra branching in the query itself.
+ * this expression can't rank (oversized, malformed JSON, or no timestamp
+ * in any root/header candidate) are naturally deprioritized without any
+ * extra branching in the query itself.
  */
 export function cursorRecencySqlExpression(
   valueColumn: string,
@@ -915,19 +974,68 @@ export function cursorRecencySqlExpression(
   maxSupportedTimestampMs: number = MAX_SUPPORTED_TIMESTAMP_MS,
   secondsThresholdMs: number = CURSOR_TIMESTAMP_SECONDS_THRESHOLD_MS,
 ): string {
-  const fieldExpression = (field: string): string => {
-    const jsonPath = `'$.${field}'`;
-    const raw = `json_extract(${valueColumn}, ${jsonPath})`;
-    const scaledMs = `(CASE WHEN ${raw} > ${secondsThresholdMs} THEN ${raw} ELSE ${raw} * 1000 END)`;
+  // Converts one already-`json_extract`-ed candidate (`typeExpr` its
+  // `json_type(...)`, `rawExpr` its `json_extract(...)`) to epoch
+  // milliseconds, or `NULL` if it is neither a supported number nor a
+  // supported ISO-8601 string shape. Shared verbatim by every root field
+  // and the header `createdAt` so numeric/string support never drifts
+  // between the two.
+  const numericOrIsoStringToMsExpression = (typeExpr: string, rawExpr: string): string => {
+    const scaledNumeric = `(CASE WHEN ${rawExpr} > ${secondsThresholdMs} THEN ${rawExpr} ELSE ${rawExpr} * 1000 END)`;
+    // `YYYY-MM-DDTHH:MM:SS` prefix (GLOB is case-sensitive, so a lower-case
+    // `t` never matches), then either `Z`, an optional `.` + fractional
+    // digits followed by `Z`, an explicit `±HH:MM` offset, or fractional
+    // digits followed by that offset. Anything else (zone-less, date-only,
+    // space-separated, lower-case, missing seconds) is intentionally left
+    // unmatched.
+    const isoShapeGuard =
+      `${rawExpr} GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*' ` +
+      `AND (substr(${rawExpr}, 20) = 'Z' OR substr(${rawExpr}, 20) GLOB '.*Z' ` +
+      `OR substr(${rawExpr}, 20) GLOB '[+-][0-9][0-9]:[0-9][0-9]' ` +
+      `OR substr(${rawExpr}, 20) GLOB '.*[+-][0-9][0-9]:[0-9][0-9]')`;
+    const scaledIsoString = `ROUND((julianday(${rawExpr}) - 2440587.5) * 86400000.0)`;
     return (
-      `CASE WHEN json_type(${valueColumn}, ${jsonPath}) IN ('integer', 'real') ` +
-      `AND ABS(${scaledMs}) <= ${maxSupportedTimestampMs} THEN ${scaledMs} ELSE NULL END`
+      `CASE ` +
+      `WHEN ${typeExpr} IN ('integer', 'real') AND ABS(${scaledNumeric}) <= ${maxSupportedTimestampMs} THEN ${scaledNumeric} ` +
+      `WHEN ${typeExpr} = 'text' AND ${isoShapeGuard} AND ABS(${scaledIsoString}) <= ${maxSupportedTimestampMs} THEN ${scaledIsoString} ` +
+      `ELSE NULL END`
     );
   };
-  const coalesced = CURSOR_TIMESTAMP_FIELDS_BY_PRIORITY.map(fieldExpression).join(", ");
+
+  const fieldExpression = (field: string): string => {
+    const jsonPath = `'$.${field}'`;
+    return numericOrIsoStringToMsExpression(
+      `json_type(${valueColumn}, ${jsonPath})`,
+      `json_extract(${valueColumn}, ${jsonPath})`,
+    );
+  };
+  const rootRecency = `COALESCE(${CURSOR_TIMESTAMP_FIELDS_BY_PRIORITY.map(fieldExpression).join(", ")}, 0)`;
+
+  const headerCreatedAtMs = numericOrIsoStringToMsExpression(
+    `json_type(headerEntry.value, '$.createdAt')`,
+    `json_extract(headerEntry.value, '$.createdAt')`,
+  );
+  // `headerEntry.type = 'object'` is `json_each`'s own per-row type marker
+  // (guards every subsequent `json_extract`/`json_type` call against the
+  // "malformed JSON" throw on non-object entries); the `json_extract(...,
+  // '$.type') IN (1, 2)` filter is the *header's own* `type` field,
+  // matching `validateCursorHeaders`'s `candidate.type !== 1 && !== 2`
+  // rejection exactly (Cursor bubble types: 1 = user, 2 = assistant/tool).
+  const headerRecency =
+    `(SELECT MAX(${headerCreatedAtMs}) FROM json_each(${valueColumn}, '$.fullConversationHeadersOnly') AS headerEntry ` +
+    `WHERE headerEntry.type = 'object' AND json_extract(headerEntry.value, '$.type') IN (1, 2))`;
+
+  // A 2-row `UNION ALL` + aggregate `MAX` rather than the 2+-arg `max()`
+  // scalar function: `max(a, b)` returns `NULL` if *either* is `NULL`,
+  // while the aggregate `MAX(v)` over a derived table correctly skips
+  // `NULL` rows (a composer with no valid headers still ranks by
+  // `rootRecency` alone).
+  const overallRecency =
+    `(SELECT MAX(v) FROM (SELECT ${rootRecency} AS v UNION ALL SELECT ${headerRecency} AS v))`;
+
   return (
     `CASE WHEN octet_length(${valueColumn}) > ${maxValueBytes} THEN NULL ` +
-    `WHEN json_valid(${valueColumn}) THEN COALESCE(${coalesced}) ELSE NULL END`
+    `WHEN json_valid(${valueColumn}) THEN ${overallRecency} ELSE NULL END`
   );
 }
 

@@ -87,15 +87,19 @@ let cursorMaximumTotalDecodedValueBytes = 64_000_000
 /// duplicate references never cost more than a single lookup.
 let cursorMaximumBubbleLookups = 400
 
-/// Mirrors `cursorRecencySqlExpression("value")` in
-/// `main/services/agent-detection-policy.ts` exactly: same field priority
+/// Mirrors `cursorRecencySqlExpression("cursorDiskKV.value")` in
+/// `main/services/agent-detection-policy.ts`: same field priority
 /// (`conversationCheckpointLastUpdatedAt`, `lastUpdatedAt`, `createdAt` —
 /// the same order `assessCursorComposerRecord` itself already reads for a
 /// composer's own `lastActivityAt`), same `1e12` seconds/milliseconds
-/// heuristic, same `maxSupportedTimestampMs` bound (`8_640_000_000_000_000`)
-/// — so both platforms rank composer recency identically and can share
-/// numeric-bound test fixtures. A dedicated Swift/TS parity test asserts
-/// this string equals the TS function's output byte-for-byte.
+/// heuristic, same `maxSupportedTimestampMs` bound (`8_640_000_000_000_000`),
+/// and the same `fullConversationHeadersOnly[*].createdAt` header-max
+/// contribution — so both platforms rank composer recency identically and
+/// can share numeric-bound test fixtures. `SessionSnapshotSourceTests.swift`
+/// asserts this SQL, executed against real SQLite, agrees with
+/// `assessCursorComposerRecord`'s own computed `lastActivityAt` for the
+/// same numeric/ISO-string/header-only/malformed/future-skew fixtures the
+/// TS parity suite uses.
 ///
 /// Computes a `cursorDiskKV` composer row's recency directly in SQLite, in
 /// epoch milliseconds (or `NULL` when unrankable), so a query can
@@ -105,39 +109,139 @@ let cursorMaximumBubbleLookups = 400
 /// `rowid`, so `ORDER BY rowid DESC` alone would treat a freshly-updated
 /// *old* conversation as permanently stale.
 ///
+/// References the composer row's value as `cursorDiskKV.value` (table-
+/// qualified), never a bare `value` — the header-max subquery below
+/// aliases a `json_each(...)` call as `headerEntry` in the very same
+/// query, and `json_each` itself declares an output column named `value`;
+/// confirmed empirically that SQLite's table-valued-function binder
+/// resolves an unqualified `value` reference against that colliding alias
+/// instead of correlating to the outer row, silently yielding zero header
+/// rows rather than an error. A table-qualified reference sidesteps the
+/// collision entirely.
+///
 /// Evaluation order matters, matching the byte/JSON-validity guards this
 /// scan already enforces, now pushed into SQL so an oversized or malformed
 /// row can never reach `ORDER BY` as anything but a (naturally last-sorted)
 /// `NULL`:
-///  1. `octet_length(value) > cursorMaximumValueBytes` short-circuits to
-///     `NULL` before `json_valid`/`json_extract` ever run against it.
-///  2. `json_valid(value)` gates everything else — malformed JSON yields
-///     `NULL`.
-///  3. Each candidate field must itself be a JSON `integer`/`real` (a
-///     string/object/array/bool timestamp yields `NULL`, matching this
-///     scan's existing "malformed field" skip policy) and, once scaled to
-///     milliseconds, within `maxSupportedTimestampMs` of zero — otherwise
-///     `NULL`.
+///  1. `octet_length(cursorDiskKV.value) > cursorMaximumValueBytes`
+///     short-circuits to `NULL` before `json_valid`/`json_extract` ever
+///     run against it.
+///  2. `json_valid(cursorDiskKV.value)` gates everything else — malformed
+///     JSON yields `NULL`.
+///  3. The composer's recency is `MAX(rootRecency, headerRecency)`:
+///     - `rootRecency` mirrors `record.conversationCheckpointLastUpdatedAt
+///       ?? record.lastUpdatedAt ?? record.createdAt` exactly — a
+///       `COALESCE` over the same 3 fields in the same priority order
+///       (never a flat max across them, which would let a lower-priority
+///       field's numerically larger value outrank a defined
+///       higher-priority field), defaulting to `0` when none of the 3 are
+///       defined, matching `lastActivityAt`'s own `0` seed.
+///     - `headerRecency` mirrors the unconditional
+///       `for header in headers { if createdAt > lastActivityAt { ... } }`
+///       loop: the null-skipping aggregate `MAX` of every
+///       `fullConversationHeadersOnly[*].createdAt` whose sibling `type`
+///       is `1` or `2`. Each `json_each` row is guarded with
+///       `headerEntry.type = 'object'` before any `json_extract`/
+///       `json_type` call touches its `value` — `json_each`'s per-row
+///       `value` column holds a non-object scalar entry's already-decoded
+///       form (e.g. an unquoted bare word), which is not valid JSON syntax
+///       to re-parse; confirmed empirically that an unguarded call throws
+///       `"malformed JSON"` for a plain string/number/bool/null/array
+///       entry in the headers array.
+///     - Both root and header candidates accept either shape
+///       `parseCursorTimestamp`/`parseISO8601ToMs` accepts that can make a
+///       composer active: a JSON number (seconds when `<= 1e12`, else
+///       already milliseconds) or a JSON string in strict
+///       `YYYY-MM-DDTHH:MM:SS[.fff...](Z|±HH:MM)` form — the one string
+///       shape confirmed empirically to parse to the exact same
+///       millisecond value under both this codebase's TS parser
+///       (`Date.parse`) and this Swift parser
+///       (`Date.ISO8601FormatStyle`). Any other string (zone-less,
+///       date-only, lower-case `t`/`z`, space-separated, no-seconds) is
+///       deliberately left unrankable: real Cursor data only ever emits
+///       epoch-millisecond numbers on disk, and Swift's own
+///       `ISO8601FormatStyle` flatly rejects several of those shapes
+///       (confirmed empirically), so ranking on them could silently
+///       diverge from what this very assessor would compute. A value that
+///       reaches SQLite's own date parser is additionally shape-guarded by
+///       `GLOB`/`substr` *before* `julianday()` ever runs, and the
+///       millisecond conversion is `ROUND`ed — confirmed empirically
+///       required, since the raw `(julianday(x) - 2440587.5) * 86400000.0`
+///       formula alone can be off by a sub-millisecond floating-point
+///       epsilon that `ROUND` corrects to the exact integer millisecond
+///       `Date.parse`/`ISO8601FormatStyle` produce.
+///     - Both also apply the same `ABS(ms) <= maxSupportedTimestampMs`
+///       bound as before, so an out-of-range numeric string/number never
+///       poisons the `MAX` with a nonsensical magnitude.
 ///
 /// `NULL` always sorts last under `ORDER BY ... DESC` in SQLite, so rows
-/// this expression can't rank (oversized, malformed JSON, or no numeric
-/// timestamp in any candidate field) are naturally deprioritized without
-/// any extra branching in the query itself.
+/// this expression can't rank (oversized, malformed JSON, or no timestamp
+/// in any root/header candidate) are naturally deprioritized without any
+/// extra branching in the query itself.
 let cursorRecencySqlExpression: String = {
+    // Converts one already-`json_extract`-ed candidate (`typeExpr` its
+    // `json_type(...)`, `rawExpr` its `json_extract(...)`) to epoch
+    // milliseconds, or `NULL` if it is neither a supported number nor a
+    // supported ISO-8601 string shape. Shared verbatim by every root field
+    // and the header `createdAt` so numeric/string support never drifts
+    // between the two.
+    func numericOrIsoStringToMsExpression(_ typeExpr: String, _ rawExpr: String) -> String {
+        let scaledNumeric = "(CASE WHEN \(rawExpr) > 1000000000000 THEN \(rawExpr) ELSE \(rawExpr) * 1000 END)"
+        // `YYYY-MM-DDTHH:MM:SS` prefix (GLOB is case-sensitive, so a
+        // lower-case `t` never matches), then either `Z`, an optional `.` +
+        // fractional digits followed by `Z`, an explicit `±HH:MM` offset,
+        // or fractional digits followed by that offset. Anything else
+        // (zone-less, date-only, space-separated, lower-case, missing
+        // seconds) is intentionally left unmatched.
+        let isoShapeGuard =
+            "\(rawExpr) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*' " +
+            "AND (substr(\(rawExpr), 20) = 'Z' OR substr(\(rawExpr), 20) GLOB '.*Z' " +
+            "OR substr(\(rawExpr), 20) GLOB '[+-][0-9][0-9]:[0-9][0-9]' " +
+            "OR substr(\(rawExpr), 20) GLOB '.*[+-][0-9][0-9]:[0-9][0-9]')"
+        let scaledIsoString = "ROUND((julianday(\(rawExpr)) - 2440587.5) * 86400000.0)"
+        return "CASE " +
+            "WHEN \(typeExpr) IN ('integer', 'real') AND ABS(\(scaledNumeric)) <= 8640000000000000 THEN \(scaledNumeric) " +
+            "WHEN \(typeExpr) = 'text' AND \(isoShapeGuard) AND ABS(\(scaledIsoString)) <= 8640000000000000 THEN \(scaledIsoString) " +
+            "ELSE NULL END"
+    }
+
     func fieldExpression(_ field: String) -> String {
         let jsonPath = "'$.\(field)'"
-        let raw = "json_extract(value, \(jsonPath))"
-        let scaledMs = "(CASE WHEN \(raw) > 1000000000000 THEN \(raw) ELSE \(raw) * 1000 END)"
-        return "CASE WHEN json_type(value, \(jsonPath)) IN ('integer', 'real') " +
-            "AND ABS(\(scaledMs)) <= 8640000000000000 THEN \(scaledMs) ELSE NULL END"
+        return numericOrIsoStringToMsExpression(
+            "json_type(cursorDiskKV.value, \(jsonPath))",
+            "json_extract(cursorDiskKV.value, \(jsonPath))"
+        )
     }
-    let coalesced = [
+    let rootRecency = "COALESCE(" + [
         "conversationCheckpointLastUpdatedAt",
         "lastUpdatedAt",
         "createdAt",
-    ].map(fieldExpression).joined(separator: ", ")
-    return "CASE WHEN octet_length(value) > \(cursorMaximumValueBytes) THEN NULL " +
-        "WHEN json_valid(value) THEN COALESCE(\(coalesced)) ELSE NULL END"
+    ].map(fieldExpression).joined(separator: ", ") + ", 0)"
+
+    let headerCreatedAtMs = numericOrIsoStringToMsExpression(
+        "json_type(headerEntry.value, '$.createdAt')",
+        "json_extract(headerEntry.value, '$.createdAt')"
+    )
+    // `headerEntry.type = 'object'` is `json_each`'s own per-row type
+    // marker (guards every subsequent `json_extract`/`json_type` call
+    // against the "malformed JSON" throw on non-object entries); the
+    // `json_extract(..., '$.type') IN (1, 2)` filter is the *header's own*
+    // `type` field, matching Swift's `validateCursorHeaders` rejection of
+    // any `type` other than `1`/`2` exactly (Cursor bubble types: 1 =
+    // user, 2 = assistant/tool).
+    let headerRecency =
+        "(SELECT MAX(\(headerCreatedAtMs)) FROM json_each(cursorDiskKV.value, '$.fullConversationHeadersOnly') AS headerEntry " +
+        "WHERE headerEntry.type = 'object' AND json_extract(headerEntry.value, '$.type') IN (1, 2))"
+
+    // A 2-row `UNION ALL` + aggregate `MAX` rather than the 2+-arg `max()`
+    // scalar function: `max(a, b)` returns `NULL` if *either* is `NULL`,
+    // while the aggregate `MAX(v)` over a derived table correctly skips
+    // `NULL` rows (a composer with no valid headers still ranks by
+    // `rootRecency` alone).
+    let overallRecency = "(SELECT MAX(v) FROM (SELECT \(rootRecency) AS v UNION ALL SELECT \(headerRecency) AS v))"
+
+    return "CASE WHEN octet_length(cursorDiskKV.value) > \(cursorMaximumValueBytes) THEN NULL " +
+        "WHEN json_valid(cursorDiskKV.value) THEN \(overallRecency) ELSE NULL END"
 }()
 
 private final class CursorSQLiteDeadline {
@@ -758,11 +862,24 @@ enum SessionSnapshotSource {
         // beyond what this scan inspected — that row is never assessed as a
         // composer, only peeked at for its own `recencyMs` as a truncation
         // sentinel (see the row-limit branch below).
+        //
+        // Selects a bounded `boundedValue` CASE projection plus a
+        // `valueByteCount` column — never raw `value` — so an oversized
+        // row's content never crosses into a `sqlite3_column_text`/`_blob`
+        // call: the byte count alone (always safe to read, `octet_length`
+        // never materializes the oversized text/blob itself) is enough to
+        // reject it below. The byte threshold is bound via
+        // `sqlite3_bind_int64` (`?1`), never interpolated into this SQL
+        // text.
         let sql = """
-        SELECT key, value, (\(cursorRecencySqlExpression)) AS recencyMs FROM cursorDiskKV
-        WHERE key LIKE ?
+        SELECT key,
+          CASE WHEN octet_length(value) <= ?1 THEN value ELSE NULL END AS boundedValue,
+          octet_length(value) AS valueByteCount,
+          (\(cursorRecencySqlExpression)) AS recencyMs
+        FROM cursorDiskKV
+        WHERE key LIKE ?2
         ORDER BY recencyMs DESC, rowid DESC
-        LIMIT ?
+        LIMIT ?3
         """
 
         var statement: OpaquePointer?
@@ -775,19 +892,34 @@ enum SessionSnapshotSource {
 
         let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
         try checkCursorSQLite(
-            sqlite3_bind_text(statement, 1, "composerData:%", -1, sqliteTransient),
+            sqlite3_bind_int64(statement, 1, Int64(cursorMaximumValueBytes)),
+            operation: "bind composer value byte bound"
+        )
+        try checkCursorSQLite(
+            sqlite3_bind_text(statement, 2, "composerData:%", -1, sqliteTransient),
             operation: "bind composer key prefix"
         )
         try checkCursorSQLite(
-            sqlite3_bind_int64(statement, 2, Int64(cursorMaximumInspectedRows) + 1),
+            sqlite3_bind_int64(statement, 3, Int64(cursorMaximumInspectedRows) + 1),
             operation: "bind composer row limit"
         )
 
         // Prepared once, reused (bind/step/reset) for every bubble lookup —
         // an exact parameterized point lookup, never string concatenation.
+        // Same bounded `boundedValue`/`valueByteCount` projection as the
+        // composer query above, never raw `value`.
         var bubbleStatement: OpaquePointer?
         let bubblePrepareRC = sqlite3_prepare_v2(
-            db, "SELECT value FROM cursorDiskKV WHERE key = ?", -1, &bubbleStatement, nil
+            db,
+            """
+            SELECT
+              CASE WHEN octet_length(value) <= ?1 THEN value ELSE NULL END AS boundedValue,
+              octet_length(value) AS valueByteCount
+            FROM cursorDiskKV WHERE key = ?2
+            """,
+            -1,
+            &bubbleStatement,
+            nil
         )
         try checkCursorSQLite(bubblePrepareRC, operation: "prepare bubble lookup")
         guard let bubbleStatement else {
@@ -830,8 +962,16 @@ enum SessionSnapshotSource {
                 sqlite3_clear_bindings(bubbleStatement),
                 operation: "clear bubble lookup bindings"
             )
+            // `sqlite3_clear_bindings` resets *every* host parameter to
+            // NULL, not just the one about to change — the byte bound must
+            // be rebound alongside the key on every lookup, not just once
+            // before the loop starts.
             try checkCursorSQLite(
-                sqlite3_bind_text(bubbleStatement, 1, bubbleKey, -1, sqliteTransient),
+                sqlite3_bind_int64(bubbleStatement, 1, Int64(cursorMaximumValueBytes)),
+                operation: "bind bubble lookup value byte bound"
+            )
+            try checkCursorSQLite(
+                sqlite3_bind_text(bubbleStatement, 2, bubbleKey, -1, sqliteTransient),
                 operation: "bind bubble lookup key"
             )
             let stepRC = simulatedBubbleStepResultCode ?? sqlite3_step(bubbleStatement)
@@ -847,12 +987,19 @@ enum SessionSnapshotSource {
                 return .absentOrMalformed
             }
             try checkCursorSQLiteRow(stepRC, operation: "read bubble lookup")
-            guard sqlite3_column_type(bubbleStatement, 0) == SQLITE_TEXT else {
+            // Byte count first, from its own always-safe-to-read INTEGER
+            // column — computed by `octet_length()` in SQL, never by
+            // touching `boundedValue`. Rejects an oversized row without
+            // ever calling `sqlite3_column_text`/`_blob` on it: the CASE
+            // projection already reduced an oversized `boundedValue` to
+            // SQL `NULL` server-side, but this guard sequence additionally
+            // ensures the Swift accessor calls themselves never run
+            // against oversized content.
+            let valueByteCount = Int(sqlite3_column_int64(bubbleStatement, 1))
+            guard valueByteCount > 0, valueByteCount <= cursorMaximumValueBytes else {
                 return .absentOrMalformed
             }
-            let valueByteCount = Int(sqlite3_column_bytes(bubbleStatement, 0))
-            guard valueByteCount > 0,
-                  valueByteCount <= cursorMaximumValueBytes,
+            guard sqlite3_column_type(bubbleStatement, 0) == SQLITE_TEXT,
                   let valueBytes = sqlite3_column_text(bubbleStatement, 0) else {
                 return .absentOrMalformed
             }
@@ -896,9 +1043,9 @@ enum SessionSnapshotSource {
                 // `cursorMaximumInspectedRows` instead of permanently
                 // failing merely because more history exists.
                 try checkCursorSQLiteRow(stepRC, operation: "read composer row-limit sentinel")
-                let sentinelRecencyMs: Int64? = sqlite3_column_type(statement, 2) == SQLITE_NULL
+                let sentinelRecencyMs: Int64? = sqlite3_column_type(statement, 3) == SQLITE_NULL
                     ? nil
-                    : saturatingInt64(sqlite3_column_double(statement, 2))
+                    : saturatingInt64(sqlite3_column_double(statement, 3))
                 if let sentinelRecencyMs,
                    isRecentTimestamp(sentinelRecencyMs, now: now, within: sessionCandidateWindowMs) {
                     stopReason = .rowLimit
@@ -921,12 +1068,14 @@ enum SessionSnapshotSource {
                       encoding: .utf8
                   ) else { continue }
 
-            guard sqlite3_column_type(statement, 1) == SQLITE_TEXT else { continue }
-            let valueByteCount = Int(sqlite3_column_bytes(statement, 1))
-            // Bounded blob processing: skip (never log) anything
-            // implausibly large for a composer record.
-            guard valueByteCount > 0,
-                  valueByteCount <= cursorMaximumValueBytes,
+            // Byte count first, from its own always-safe-to-read INTEGER
+            // column — computed by `octet_length()` in SQL, never by
+            // touching `boundedValue`. Rejects an oversized row without
+            // ever calling `sqlite3_column_text`/`_blob` on it, matching
+            // the bubble lookup above.
+            let valueByteCount = Int(sqlite3_column_int64(statement, 2))
+            guard valueByteCount > 0, valueByteCount <= cursorMaximumValueBytes else { continue }
+            guard sqlite3_column_type(statement, 1) == SQLITE_TEXT,
                   let valueBytes = sqlite3_column_text(statement, 1) else { continue }
 
             guard totalDecodedBytes + valueByteCount <= cursorMaximumTotalDecodedValueBytes else {

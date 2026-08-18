@@ -1166,6 +1166,57 @@ final class SessionSnapshotSourceTests: XCTestCase {
         }
     }
 
+    /// The bubble lookup's bounded `CASE WHEN octet_length(value) <= ?1 ...`
+    /// projection must reject an oversized bubble *value* (unlike the
+    /// dangling-bubble case above, this row genuinely exists — `sqlite3_step`
+    /// returns `SQLITE_ROW`, never `SQLITE_DONE`) purely from the always-safe
+    /// `valueByteCount` INTEGER column, without the SQL-level projection or
+    /// the Swift accessor ever needing to materialize the oversized text
+    /// itself. Confirms the "reject oversize without touching
+    /// `sqlite3_column_text`/`_blob`" requirement holds for bubble lookups
+    /// exactly as it already does for the composer row scan (see
+    /// `testCursorOversizedRowsAreSkippedAndSQLLikeStringsRemainPlainData`),
+    /// and that this rejection is a distinct code path from "SQLITE_DONE
+    /// means absent" — an existing, oversized row is still correctly treated
+    /// as an unusable/absent bubble, never a crash or a truncated read.
+    func testCursorOversizedBubbleValueIsTreatedAsAbsentViaBoundedProjection() async throws {
+        let home = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let dbURL = home
+            .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+        makeCursorFixtureDatabase(
+            at: dbURL,
+            key: "composerData:oversized-bubble",
+            valueJSON: """
+            {
+              "status": "completed",
+              "lastUpdatedAt": \(fixedNow - 65_000),
+              "fullConversationHeadersOnly": [
+                {"type": 1, "createdAt": \(fixedNow - 65_000)},
+                {"type": 2, "createdAt": \(fixedNow - 60_000), "bubbleId": "bubble-oversized"}
+              ]
+            }
+            """
+        )
+        let oversizedBubbleValue = #"{"toolFormerData":{"status":"inProgress","padding":""#
+            + String(repeating: "x", count: cursorMaximumValueBytes)
+            + #""}}"#
+        insertCursorFixtureRecord(
+            at: dbURL,
+            key: "bubbleId:oversized-bubble:bubble-oversized",
+            value: oversizedBubbleValue
+        )
+
+        let evidence = try await NativeSessionSnapshotSource(homeDirectory: home).snapshot(now: fixedNow)
+
+        // Without a resolvable (in-bounds) bubble, this exact 60s-old header
+        // falls back to the same "no tool signal" verdict as
+        // `testCursorComposerWithoutResolvableBubbleStaysInactive` — proving
+        // the oversized bubble was actually rejected, not silently truncated
+        // or crashed past, into some other unintended state.
+        XCTAssertTrue(evidence.filter { $0.family == .cursor }.isEmpty)
+    }
+
     // MARK: - Cursor: bounded scan adversarial tests (issue A)
 
     /// Comfortably more than `cursorMaximumInspectedRows`, all sharing the
@@ -1303,6 +1354,237 @@ final class SessionSnapshotSourceTests: XCTestCase {
 
         XCTAssertEqual(evidence.map(\.identity), ["target"])
         XCTAssertEqual(evidence.first?.reason, "generating")
+    }
+
+    // MARK: - Cursor row limit + extended recency shapes (header-only /
+    // string timestamps): proves `cursorRecencySqlExpression` covering every
+    // assessor-active timestamp shape (not just numeric root fields) is load
+    // bearing for the row-limit sentinel's safety, not merely cosmetic.
+    // Mirrors the analogous section in `main/services/agent-detector.test.ts`.
+
+    /// No root-level `lastUpdatedAt`/`createdAt`/
+    /// `conversationCheckpointLastUpdatedAt` at all — this composer's ONLY
+    /// recency signal is a `fullConversationHeadersOnly[*].createdAt`.
+    /// Before `cursorRecencySqlExpression` covered headers, this row's SQL
+    /// recency was `NULL` (unrankable): it sorted dead last under
+    /// `ORDER BY recencyMs DESC` no matter how recent its header actually
+    /// was, so thousands of "old but numerically rankable" rows could push
+    /// it beyond `cursorMaximumInspectedRows` and silently drop it. Inserted
+    /// first so it also has the lowest `rowid`, ruling out the `rowid`
+    /// tiebreaker from accidentally saving it.
+    func testCursorRowLimitRecoversAndDetectsHeaderOnlyActiveComposerDespiteThousandsOfOlderRows() throws {
+        let home = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let dbURL = home
+            .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+        makeCursorFixtureDatabase(
+            at: dbURL,
+            key: "composerData:header-only-active",
+            valueJSON: #"{"fullConversationHeadersOnly":[{"type":1,"createdAt":\#(fixedNow)}]}"#
+        )
+
+        // Comfortably more than cursorMaximumInspectedRows, every one an old
+        // (epoch-zero), purely-numeric, inactive composer with a strictly
+        // higher rowid than the header-only composer above.
+        var filler: [(key: String, value: String)] = []
+        for index in 0..<(cursorMaximumInspectedRows + 50) {
+            filler.append((
+                key: String(format: "composerData:old-%05d", index),
+                value: #"{"status":"completed","lastUpdatedAt":0}"#
+            ))
+        }
+        insertManyCursorFixtureRecords(at: dbURL, records: filler)
+
+        let fd = try XCTUnwrap(SessionSnapshotSource.openVerifiedRegularFile(at: dbURL.path, root: canonicalRoot(home)))
+        defer { close(fd) }
+        let evidence = try SessionSnapshotSource.queryCursorComposers(
+            fd: fd,
+            validatedPath: dbURL.path,
+            now: fixedNow
+        )
+
+        XCTAssertEqual(evidence.map(\.identity), ["header-only-active"])
+        XCTAssertEqual(evidence.first?.reason, "user prompt")
+    }
+
+    /// The only recency signal is `lastUpdatedAt` as an ISO-8601 string
+    /// (`Date.prototype.toISOString()`'s own canonical shape on the TS side;
+    /// the exact same string shape `Date.ISO8601FormatStyle` parses here)
+    /// instead of a JSON number — before `cursorRecencySqlExpression`
+    /// accepted string timestamps, `json_type(...) IN ('integer', 'real')`
+    /// excluded it entirely, so this row's SQL recency was also `NULL`.
+    func testCursorRowLimitRecoversAndDetectsStringTimestampActiveComposerDespiteThousandsOfOlderRows() throws {
+        let home = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let dbURL = home
+            .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+        makeCursorFixtureDatabase(
+            at: dbURL,
+            key: "composerData:string-timestamp-active",
+            valueJSON: #"{"status":"generating","lastUpdatedAt":"2023-11-14T22:13:20.000Z"}"#
+        )
+        // Confirms the fixture ISO string really is this suite's `fixedNow`
+        // under Swift's own parser, so a match below is a genuine parity
+        // proof rather than a coincidence of two independently-chosen values.
+        XCTAssertEqual(parseISO8601ToMs("2023-11-14T22:13:20.000Z"), fixedNow)
+
+        var filler: [(key: String, value: String)] = []
+        for index in 0..<(cursorMaximumInspectedRows + 50) {
+            filler.append((
+                key: String(format: "composerData:old-%05d", index),
+                value: #"{"status":"completed","lastUpdatedAt":0}"#
+            ))
+        }
+        insertManyCursorFixtureRecords(at: dbURL, records: filler)
+
+        let fd = try XCTUnwrap(SessionSnapshotSource.openVerifiedRegularFile(at: dbURL.path, root: canonicalRoot(home)))
+        defer { close(fd) }
+        let evidence = try SessionSnapshotSource.queryCursorComposers(
+            fd: fd,
+            validatedPath: dbURL.path,
+            now: fixedNow
+        )
+
+        XCTAssertEqual(evidence.map(\.identity), ["string-timestamp-active"])
+        XCTAssertEqual(evidence.first?.reason, "generating")
+    }
+
+    /// Mirrors `testCursorRowLimitStillThrowsWhenCutOffCandidateCouldPlausiblyStillBeActive`
+    /// above, but every row's ONLY recency signal is a conversation header's
+    /// `createdAt` rather than a root field — proving the new
+    /// header-recency contribution participates in the exact same fail-safe
+    /// "ambiguous sentinel" check instead of quietly bypassing it (e.g. by
+    /// mis-ranking a genuinely recent header-only row as unrankable/old).
+    func testCursorRowLimitStillThrowsWhenCutOffCandidateHeaderDerivedTimestampCouldPlausiblyStillBeActive() throws {
+        let home = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let dbURL = home
+            .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+        makeEmptyCursorFixtureDatabase(at: dbURL)
+
+        XCTAssertLessThan(Int64(cursorMaximumInspectedRows), sessionCandidateWindowMs)
+
+        let totalRows = cursorMaximumInspectedRows + 50
+        var records: [(key: String, value: String)] = []
+        for index in 0..<totalRows {
+            records.append((
+                key: String(format: "composerData:recent-header-%05d", index),
+                value: #"{"status":"completed","fullConversationHeadersOnly":[{"type":2,"createdAt":\#(fixedNow - Int64(index))}]}"#
+            ))
+        }
+        insertManyCursorFixtureRecords(at: dbURL, records: records)
+
+        let fd = try XCTUnwrap(SessionSnapshotSource.openVerifiedRegularFile(at: dbURL.path, root: canonicalRoot(home)))
+        defer { close(fd) }
+
+        var inspectedRows = 0
+        do {
+            _ = try SessionSnapshotSource.queryCursorComposers(
+                fd: fd,
+                validatedPath: dbURL.path,
+                now: fixedNow,
+                onRowInspected: { inspectedRows += 1 }
+            )
+            XCTFail("a plausibly-active cut-off candidate must fail the scan instead of silently reporting partial results")
+        } catch let error as CursorSessionScanError {
+            XCTAssertEqual(error, .scanIncomplete(reason: .rowLimit))
+        } catch {
+            XCTFail("expected typed CursorSessionScanError, got \(error)")
+        }
+
+        XCTAssertGreaterThan(inspectedRows, 0)
+        XCTAssertLessThanOrEqual(inspectedRows, cursorMaximumInspectedRows)
+        XCTAssertLessThan(inspectedRows, totalRows, "must never step through the entire table once bounded")
+    }
+
+    /// Same shape as `testCursorRowLimitRecoversWhenThousandsOfOldRowsExistBeyondNewestCandidates`
+    /// above, but exercising the new header/string recency paths for the
+    /// *old* history itself: every filler row's own recency is unambiguously
+    /// old (epoch-zero) via a header `createdAt` or a string `createdAt`,
+    /// not a numeric root field — proving old header/string-derived rows
+    /// are correctly recognized as old (not accidentally left
+    /// unrankable-`NULL`, which would still be "safe" but would defeat the
+    /// point of ranking them at all) and so hitting the row cap here must
+    /// not permanently fail the scan.
+    func testCursorRowLimitRecoversWhenThousandsOfOldRowsCarryOnlyHeaderOrStringDerivedRecency() throws {
+        let home = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let dbURL = home
+            .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+        makeEmptyCursorFixtureDatabase(at: dbURL)
+
+        let totalRows = cursorMaximumInspectedRows + 50
+        var records: [(key: String, value: String)] = []
+        for index in 0..<totalRows {
+            if index % 2 == 0 {
+                records.append((
+                    key: String(format: "composerData:old-header-%05d", index),
+                    value: #"{"status":"completed","fullConversationHeadersOnly":[{"type":2,"createdAt":0}]}"#
+                ))
+            } else {
+                records.append((
+                    key: String(format: "composerData:old-string-%05d", index),
+                    value: #"{"status":"completed","lastUpdatedAt":"1970-01-01T00:00:00.000Z"}"#
+                ))
+            }
+        }
+        records.append((
+            key: "composerData:z-active",
+            value: #"{"status":"generating","lastUpdatedAt":\#(fixedNow)}"#
+        ))
+        insertManyCursorFixtureRecords(at: dbURL, records: records)
+
+        let fd = try XCTUnwrap(SessionSnapshotSource.openVerifiedRegularFile(at: dbURL.path, root: canonicalRoot(home)))
+        defer { close(fd) }
+        let evidence = try SessionSnapshotSource.queryCursorComposers(
+            fd: fd,
+            validatedPath: dbURL.path,
+            now: fixedNow
+        )
+
+        XCTAssertEqual(evidence.map(\.identity), ["z-active"])
+    }
+
+    /// Source-level companion to
+    /// `testCursorScanLimitConstantsMatchSharedParityFixture` below (and to
+    /// `agent-detector.test.ts`'s "byte-count thresholds are bound named
+    /// parameters" assertion): the composer and bubble queries must select
+    /// a byte-count column plus a bounded `CASE` projection of the value —
+    /// never a raw, unbounded `value` column — and must bind the byte
+    /// threshold as a real SQLite parameter (`sqlite3_bind_int64`), never
+    /// interpolate it into the SQL text. Reads this file's own sibling
+    /// production source directly from disk (mirroring how
+    /// `TurnAssessorsTests.swift` locates its shared fixture oracle via
+    /// `#filePath`) since, unlike the TS worker source, Swift's SQL text
+    /// lives as literals inside `queryCursorComposers`/`lookUpBubble`, not
+    /// as an exported string constant a purely behavioral test could
+    /// introspect directly.
+    func testCursorComposerAndBubbleQueriesUseBoundedProjectionAndBoundByteThreshold() throws {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // Tests/Detection
+            .deletingLastPathComponent() // Tests
+            .deletingLastPathComponent() // Seer (apps/macos/Seer project root)
+            .appendingPathComponent("Sources/Detection/SessionSnapshotSource.swift")
+        let source = try String(contentsOf: url, encoding: .utf8)
+
+        let boundedProjection = "CASE WHEN octet_length(value) <= ?1 THEN value ELSE NULL END AS boundedValue"
+        XCTAssertEqual(
+            source.components(separatedBy: boundedProjection).count - 1,
+            2,
+            "both the composer and bubble queries must use the identical bounded CASE projection, never raw `value`"
+        )
+        XCTAssertEqual(
+            source.components(separatedBy: "octet_length(value) AS valueByteCount").count - 1,
+            2,
+            "both queries must also select the always-safe-to-read byte-count column"
+        )
+        XCTAssertTrue(source.contains("sqlite3_bind_int64(statement, 1, Int64(cursorMaximumValueBytes))"))
+        XCTAssertTrue(source.contains("sqlite3_bind_int64(bubbleStatement, 1, Int64(cursorMaximumValueBytes))"))
+
+        // Never a bare, unbounded raw-`value` selection (the pre-fix shape)
+        // reintroduced by accident.
+        XCTAssertFalse(source.contains("SELECT key, value,"))
+        XCTAssertFalse(source.contains("SELECT value FROM cursorDiskKV"))
     }
 
     /// Many rows that never match `key LIKE 'composerData:%'` must stay
