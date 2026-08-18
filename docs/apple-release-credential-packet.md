@@ -208,9 +208,21 @@ Checklist for this prerequisite:
 
 ## Required packet
 
-Use the App Store Connect API-key path as the primary notarization method. The
-Apple ID path is an optional fallback. A Developer ID Installer certificate is
-not required for a DMG release.
+Notarization has two mutually exclusive credential configurations: the App
+Store Connect API-key method and the Apple ID method. These are **not** a
+primary path with an optional fallback that can be layered on top of it —
+`.github/workflows/release-macos.yml` reads all eight notarization-related
+secrets (`APPLE_API_ISSUER`, `APPLE_API_KEY`, `APPLE_API_KEY_BASE64`,
+`APPLE_ID`, `APPLE_PASSWORD`) unconditionally and passes every one of them to
+`scripts/package-macos-release.sh`, which counts how many fields are present
+for each method and `fail`s the run if either method is only partially
+configured (1–2 of the 3 API-key fields, or 1 of the 2 Apple ID fields), **and
+also fails the run if both methods are fully configured at once** — it does
+not attempt either method automatically as a fallback for the other. Configure
+exactly one complete credential set as an environment secret, and leave every
+secret belonging to the other method entirely absent (not empty) from
+`macos-release`. **Recommended: the App Store Connect API-key method.** A
+Developer ID Installer certificate is not required for a DMG release.
 
 ### Required for signing
 
@@ -221,7 +233,7 @@ not required for a DMG release.
 | `APPLE_SIGNING_IDENTITY` | Exact Developer ID Application identity |
 | `APPLE_TEAM_ID` | Apple Developer team ID |
 
-### Required for primary notarization
+### Notarization method A: App Store Connect API key (recommended)
 
 | GitHub environment secret | Value |
 | --- | --- |
@@ -229,15 +241,28 @@ not required for a DMG release.
 | `APPLE_API_KEY` | App Store Connect API key ID |
 | `APPLE_API_KEY_BASE64` | Single-line base64 encoding of the downloaded `AuthKey_*.p8` |
 
-### Optional notarization fallback
+Configure all three of these, and do not configure any Method B (Apple ID)
+secret below in the same environment.
+
+### Notarization method B: Apple ID (alternative — do not combine with method A)
 
 | GitHub environment secret | Value |
 | --- | --- |
 | `APPLE_ID` | Apple Developer account email |
 | `APPLE_PASSWORD` | App-specific password created for notarization |
 
-The packaging script must choose one complete notarization method. It must not
-combine fields from two partial credential sets.
+Configure both of these only if Method A is not usable, and only if neither
+`APPLE_API_ISSUER`, `APPLE_API_KEY`, nor `APPLE_API_KEY_BASE64` is present in
+`macos-release`.
+
+The packaging script requires exactly one complete notarization method. It
+rejects a run with zero complete sets, a partial set for either method, or two
+complete sets configured simultaneously — it never combines fields from two
+partial sets and never falls back from one method to the other
+automatically. If you switch methods later, remove every secret belonging to
+the method you are no longer using (see "Load protected environment secrets
+safely" and "Verify configuration without reading secrets" below) before
+running the release workflow again.
 
 ### Required for binary publication
 
@@ -357,7 +382,10 @@ it to shell history.
 
 ## Obtain notarization credentials
 
-### App Store Connect API key
+Choose one method below. Do not complete both — see "Required packet" above
+for why the packaging script rejects the run if both are configured.
+
+### Method A: App Store Connect API key (recommended)
 
 Use an existing organization-controlled key if its policy permits reuse;
 otherwise create a dedicated key in App Store Connect under **Users and
@@ -372,11 +400,11 @@ Record:
 Apple permits the `.p8` file to be downloaded only once. Preserve the original
 in the approved secrets vault before continuing.
 
-### Apple ID fallback
+### Method B: Apple ID (alternative)
 
-If the fallback path is required, create a dedicated app-specific password for
-the Apple Developer account and record it as `APPLE_PASSWORD`. Do not use the
-account's normal password.
+If Method A is not usable, create a dedicated app-specific password for the
+Apple Developer account and record it as `APPLE_PASSWORD`, along with the
+account email as `APPLE_ID`. Do not use the account's normal password.
 
 ## Load protected environment secrets safely
 
@@ -387,6 +415,20 @@ zsh's history/pipeline handling differs from Bash's. Do not paste this block
 into a zsh prompt: start `bash` first, or save the block as a script and run
 `bash load-secrets.sh`. Create and protect the `macos-release` environment
 using the next section before running this.
+
+The block below is written for Method A (App Store Connect API key), the
+recommended notarization method: it loads only `APPLE_API_ISSUER`,
+`APPLE_API_KEY`, and `APPLE_API_KEY_BASE64`, and does **not** include
+`APPLE_ID` or `APPLE_PASSWORD`. If Method B (Apple ID) is being configured
+instead, replace the "Notarization method A" section with calls to
+`set_text_secret APPLE_ID "APPLE_ID"` and
+`set_text_secret APPLE_PASSWORD "APPLE_PASSWORD"`, and omit the three
+`APPLE_API_*` calls entirely — do not run both sections in the same pass.
+`gh secret set` only sets the secret it is given; it never removes a secret
+left over from the other method, so if `macos-release` was previously
+configured with the other method's secrets, delete them explicitly before
+switching (see "Switching notarization methods" below) rather than relying
+on this block to overwrite or clear them.
 
 The block below fails closed if shell xtrace is already enabled (checked
 first, before any other line runs), is Bash-only (`set -euo pipefail`), reads
@@ -473,15 +515,23 @@ printf '%s' "Developer ID Application: Soul Protocol LLC (9LR8Z8UQ9X)" |
   gh secret set APPLE_SIGNING_IDENTITY --repo OpenCoven/seer --env macos-release
 set_text_secret APPLE_TEAM_ID "APPLE_TEAM_ID"
 
-# --- Required for primary notarization ---
+# --- Notarization method A: App Store Connect API key (recommended) ---
+# Active by default. Do not also uncomment the Method B section below in the
+# same pass: the packaging script rejects a run that has both a complete
+# API-key set and a complete Apple ID set configured. If Method A is not
+# usable for this release, comment out these three lines instead of leaving
+# them alongside Method B.
 P8_PATH="/secure/path/AuthKey_EXAMPLE.p8"
 set_file_secret APPLE_API_KEY_BASE64 "${P8_PATH}"
 set_text_secret APPLE_API_ISSUER "APPLE_API_ISSUER"
 set_text_secret APPLE_API_KEY "APPLE_API_KEY"
 
-# --- Optional Apple ID fallback: run only if configuring it ---
-set_text_secret APPLE_ID "APPLE_ID"
-set_text_secret APPLE_PASSWORD "APPLE_PASSWORD"
+# --- Notarization method B: Apple ID (alternative) ---
+# Commented out by default. Uncomment these two lines only if Method A above
+# is commented out instead, and only after deleting any Method A secrets left
+# over from a previous pass (see "Switching notarization methods" below).
+# set_text_secret APPLE_ID "APPLE_ID"
+# set_text_secret APPLE_PASSWORD "APPLE_PASSWORD"
 
 # --- Required for binary publication: run only after OpenCoven/seer-releases
 #     exists, is initialized with a reviewed default-branch commit, and the
@@ -491,12 +541,41 @@ set_text_secret RELEASES_REPO_TOKEN "RELEASES_REPO_TOKEN"
 unset P12_PATH P8_PATH
 ```
 
-Run only the sections that apply to this pass (for example, omit the Apple ID
-fallback block if that path isn't being configured, and omit
-`RELEASES_REPO_TOKEN` until `OpenCoven/seer-releases` exists and is
-initialized). Each `set_*_secret` call is independent and can be copied out of
+Run only the sections that apply to this pass — exactly one of the two
+notarization method sections above should be uncommented, never both — and
+omit `RELEASES_REPO_TOKEN` until `OpenCoven/seer-releases` exists and is
+initialized. Each `set_*_secret` call is independent and can be copied out of
 the block on its own once `require_safe_secret_file`, `set_file_secret`,
 `read_required_value`, and `set_text_secret` are defined in the same shell.
+
+### Switching notarization methods
+
+If `macos-release` was previously configured with one notarization method and
+you are now switching to the other, `gh secret set` for the new method's
+secrets does not remove the old method's secrets — they remain configured and
+the packaging script will fail the run with "provide exactly one notarization
+credential set; both were provided" (`scripts/package-macos-release.sh`)
+until they are deleted. Delete the unused method's secrets explicitly before
+loading the new method's secrets:
+
+```bash
+# Switching to Method A (API key): delete Method B (Apple ID) secrets first.
+gh secret delete APPLE_ID --repo OpenCoven/seer --env macos-release
+gh secret delete APPLE_PASSWORD --repo OpenCoven/seer --env macos-release
+```
+
+```bash
+# Switching to Method B (Apple ID): delete Method A (API key) secrets first.
+gh secret delete APPLE_API_ISSUER --repo OpenCoven/seer --env macos-release
+gh secret delete APPLE_API_KEY --repo OpenCoven/seer --env macos-release
+gh secret delete APPLE_API_KEY_BASE64 --repo OpenCoven/seer --env macos-release
+```
+
+These commands are documented here for the operator to run manually when
+switching methods; this packet does not run them. Confirm the deletion with
+`gh secret list --repo OpenCoven/seer --env macos-release` (see "Verify
+configuration without reading secrets" below) before loading the new method's
+secrets or running the release workflow.
 
 Environment scope is intentional: repository-level secrets would be available
 to other workflows without the release approval gate. The release job must
@@ -587,7 +666,8 @@ gh api repos/OpenCoven/seer/environments/macos-release \
   --jq '{name, protection_rules, deployment_branch_policy}'
 ```
 
-For the primary API-key path, the expected environment secret names are:
+For Method A (App Store Connect API key, recommended), the expected
+environment secret names are:
 
 ```text
 APPLE_API_ISSUER
@@ -600,7 +680,30 @@ APPLE_TEAM_ID
 RELEASES_REPO_TOKEN
 ```
 
-`APPLE_ID` and `APPLE_PASSWORD` appear only when the fallback is configured.
+`APPLE_ID` and `APPLE_PASSWORD` must **not** appear in this listing. If they
+do, the packaging script will fail the run (`fail "provide exactly one
+notarization credential set; both were provided"` in
+`scripts/package-macos-release.sh`) — delete them per "Switching notarization
+methods" above.
+
+For Method B (Apple ID, alternative), the expected environment secret names
+are instead:
+
+```text
+APPLE_CERTIFICATE
+APPLE_CERTIFICATE_PASSWORD
+APPLE_ID
+APPLE_PASSWORD
+APPLE_SIGNING_IDENTITY
+APPLE_TEAM_ID
+RELEASES_REPO_TOKEN
+```
+
+`APPLE_API_ISSUER`, `APPLE_API_KEY`, and `APPLE_API_KEY_BASE64` must **not**
+appear in this listing; delete them per "Switching notarization methods"
+above if they do. Exactly one of these two lists — never a mix, and never
+neither — must match `gh secret list`'s output (aside from
+`RELEASES_REPO_TOKEN`, which is independent of the notarization method).
 
 The expected environment variable names (not secrets — safe to display in
 full with `gh variable get`) are:
@@ -628,6 +731,10 @@ been reviewed.
   good release, then run the protected validation path.
 - Treat any secret printed in terminal logs, CI logs, chat, or an issue as
   compromised.
+- If notarization methods are ever switched, confirm the previously used
+  method's secrets were deleted (not merely superseded) — see "Switching
+  notarization methods" above — so a leaked or rotated credential from the
+  unused method cannot silently remain configured.
 
 ## Completion checklist
 
@@ -649,10 +756,16 @@ been reviewed.
       response fields are expected and do not affect the check)
 - [ ] Developer ID Application `.p12` exported with private key
 - [ ] `.p12` password stored separately
-- [ ] App Store Connect issuer ID, key ID, and `.p8` secured
-- [ ] Optional Apple ID fallback intentionally enabled or omitted
+- [ ] Exactly one notarization method chosen: App Store Connect API key
+      (recommended: issuer ID, key ID, and `.p8` secured) **or** Apple ID
+      (app-specific password and account email) — not both, not neither
+- [ ] Every secret belonging to the notarization method **not** chosen is
+      confirmed absent from `macos-release` (deleted via `gh secret delete`
+      if it was configured for a previous release under the other method)
 - [ ] Fine-grained release token scoped only to `seer-releases`
-- [ ] Required `macos-release` environment secrets present by name
+- [ ] Required `macos-release` environment secrets present by name, matching
+      exactly one of the two expected-name lists in "Verify configuration
+      without reading secrets"
 - [ ] `RELEASE_WRITER_LOGIN` and `RELEASE_WRITER_ID` set to the exact login
       and numeric ID of the `RELEASES_REPO_TOKEN` owner
 - [ ] `macos-release` environment protection configured
