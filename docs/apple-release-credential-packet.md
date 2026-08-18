@@ -67,9 +67,27 @@ gate.
    currently documents as supporting both required reviewers on private-repo
    environments and `macos-14-xlarge` larger-runner entitlement — and enable
    the Actions billing/runner entitlement it requires.
-2. After the plan change, verify both controls before creating
-   `macos-release` or running the workflow. This packet only reads state; it
-   never changes billing, plan, or org settings.
+2. After the plan change, an organization administrator must provision an
+   arm64 macOS larger runner whose usable workflow label — the runner's
+   `name`, which is what a GitHub-hosted larger runner is addressed by in
+   `runs-on:` — is exactly `macos-14-xlarge`. This name must match the
+   workflow's fixed `runs-on: macos-14-xlarge` exactly; the workflow's
+   `runs-on` value and its `uname -m == arm64` assertion in
+   `.github/workflows/release-macos.yml` are not changed by this packet and
+   must not be changed to accommodate a differently named runner.
+3. The administrator must grant `OpenCoven/seer` access to that runner
+   through the runner group it belongs to (either by setting the group's
+   visibility to all repositories, or by adding `OpenCoven/seer` to the
+   group's selected-repositories list) and must confirm the runner's status
+   is `Ready` (not `Provisioning`, `Shutdown`, `Deleting`, or `Stuck`) before
+   it is relied on.
+4. The administrator must configure Actions billing for `OpenCoven` with a
+   nonzero budget/spending limit, since a runner that exists but has no
+   spending headroom will fail jobs once the included usage is exhausted.
+5. After the plan change, runner provisioning, access grant, and billing
+   configuration, verify all four before creating `macos-release` or running
+   the workflow. This packet only reads state; it never changes billing,
+   plan, runner, runner-group, or org settings.
 
 Read-only verification (safe to run repeatedly; none of these mutate state):
 
@@ -77,8 +95,31 @@ Read-only verification (safe to run repeatedly; none of these mutate state):
 gh api orgs/OpenCoven --jq '{plan: .plan.name, seats: .plan.filled_seats}'
 gh api repos/OpenCoven/seer --jq '{private, default_branch}'
 gh api repos/OpenCoven/seer/environments --jq '.environments[].name'
-gh api orgs/OpenCoven/actions/hosted-runners --jq '.total_count, .hosted_runners[].name'
+# Organization hosted-runners list response uses `.runners[]`, not
+# `.hosted_runners[]`.
+gh api orgs/OpenCoven/actions/hosted-runners \
+  --jq '.total_count, (.runners[] | {name, status, runner_group_id, platform})'
+# Substitute the runner_group_id printed above, then confirm that group
+# grants OpenCoven/seer access.
+RUNNER_GROUP_ID="paste-the-runner_group_id-from-above"
+gh api "orgs/OpenCoven/actions/runner-groups/${RUNNER_GROUP_ID}" \
+  --jq '{name, visibility, allows_public_repositories}'
+gh api "orgs/OpenCoven/actions/runner-groups/${RUNNER_GROUP_ID}/repositories" \
+  --jq '.repositories[].full_name'
 ```
+
+The commands above confirm the runner exists, is named `macos-14-xlarge`, is
+`Ready`, and belongs to a group whose repository list (or `all`/`private`
+visibility) includes `OpenCoven/seer`. They do **not** prove Actions billing
+has a nonzero budget — GitHub's budgets API
+(`GET /organizations/{org}/settings/billing/budgets`) requires organization
+admin or billing-manager credentials this token may not carry, and its shape
+varies by billing configuration. Verify the spending limit directly in the
+GitHub UI instead: **Organization settings > Billing and licensing > Spending
+limits > Actions**, and confirm the configured limit is greater than zero (or
+that "Unlimited" is deliberately selected). Listing runners or runner-group
+membership above is not evidence of a nonzero budget; check both,
+separately.
 
 Checklist for this prerequisite:
 
@@ -86,12 +127,19 @@ Checklist for this prerequisite:
       private-repository environments (Enterprise Cloud, or a GitHub-verified
       equivalent) — re-run the command above and confirm the plan name
       changed from `free`
-- [ ] Larger-runner (`macos-14-xlarge`) entitlement and Actions billing
-      confirmed enabled for `OpenCoven`, e.g. via
+- [ ] Larger-runner entitlement confirmed enabled for `OpenCoven`, and an
+      arm64 macOS larger runner named exactly `macos-14-xlarge` has been
+      provisioned and shows `status: Ready` via
       `gh api orgs/OpenCoven/actions/hosted-runners`
-- [ ] Both controls verified again immediately before `macos-release` is
-      created (plan/billing changes can be reverted independently of this
-      packet)
+- [ ] `OpenCoven/seer` confirmed present in that runner's runner-group
+      access (via `.../runner-groups/<id>/repositories`, or the group's
+      visibility is `all`)
+- [ ] Actions billing spending limit confirmed nonzero for `OpenCoven` via
+      the Billing and licensing UI (not provable from the runner-list API
+      alone)
+- [ ] All four controls verified again immediately before `macos-release` is
+      created (plan/billing/runner/access changes can be reverted
+      independently of this packet)
 
 ## Required packet
 
@@ -276,13 +324,16 @@ into a zsh prompt: start `bash` first, or save the block as a script and run
 using the next section before running this.
 
 The block below is Bash-only (`set -euo pipefail`), reads every sensitive
-value directly from `/dev/tty` (so it can't silently accept an empty value
-piped in from elsewhere), rejects blank input instead of setting an empty
-secret, validates that certificate/key files are readable, ordinary,
-non-symlink, non-empty files before encoding them, keeps `pipefail` in effect
-across every `base64 | tr | gh` pipeline, and unsets every value it reads once
-it has been sent to GitHub. It never prints a secret value or writes an
-encoded copy to disk.
+value with `IFS= read -r -s ... < /dev/tty` — directly from the controlling
+terminal (so it can't silently accept an empty value piped in from
+elsewhere) and with `IFS=` cleared (so leading/trailing whitespace in the
+entered value is preserved instead of being stripped by `read`) — rejects
+blank input instead of setting an empty secret, validates that
+certificate/key files are readable, ordinary, non-symlink, non-empty files
+before encoding them, keeps `pipefail` in effect across every
+`base64 | tr | gh` pipeline, and unsets every value it reads once it has been
+sent to GitHub. It never prints a secret value or writes an encoded copy to
+disk.
 
 ```bash
 set -euo pipefail
@@ -312,7 +363,9 @@ read_required_value() {
   # blank answer instead of setting an empty secret.
   local prompt="$1"
   local value
-  read -r -s -p "${prompt}: " value < /dev/tty
+  # IFS= preserves leading/trailing whitespace in the entered value instead
+  # of letting `read` strip it.
+  IFS= read -r -s -p "${prompt}: " value < /dev/tty
   echo >&2
   [[ -n "${value}" ]] || { echo "error: ${prompt} must not be empty" >&2; return 1; }
   printf '%s' "${value}"
