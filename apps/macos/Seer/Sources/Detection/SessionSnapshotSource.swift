@@ -55,17 +55,37 @@ public let codexHeadReadBytes = 32_000
 
 private let sessionSkippedDirectoryNames: Set<String> = [".git", "node_modules", "cache", "subagents"]
 /// Bounds retained active Cursor composers after each row has independently
-/// passed key/value, JSON-shape, and activity validation.
+/// passed key/value, JSON-shape, and activity validation. Reaching this cap
+/// is an intentional early exit (plenty of concurrent agents already found),
+/// never treated as a truncated/incomplete scan.
 let cursorMaximumValidCandidates = 200
 /// Bounds composer identifiers before allocating Swift strings for untrusted keys.
-private let cursorMaximumKeyBytes = 4_096
-/// Bounds how large a single composer JSON blob this reader will parse,
-/// defending against a pathological/corrupted row forcing an unbounded
-/// `JSONSerialization` allocation.
-private let cursorMaximumValueBytes = 4_000_000
+let cursorMaximumKeyBytes = 4_096
+/// Bounds how large a single composer or bubble JSON blob this reader will
+/// parse, defending against a pathological/corrupted row forcing an
+/// unbounded `JSONSerialization` allocation.
+let cursorMaximumValueBytes = 4_000_000
 /// Keeps a locked live Cursor database from stalling the three-second scan loop.
 let cursorSQLiteBusyTimeoutMilliseconds: Int32 = 100
 let cursorSQLiteQueryDeadlineMilliseconds = 4_000
+/// Hard cap on TOTAL `composerData:*` rows stepped through in one scan,
+/// counting inactive, malformed, duplicate, and active rows alike — unlike
+/// `cursorMaximumValidCandidates`, this bounds work regardless of how many
+/// rows turn out to be active. The composer query's SQL `LIMIT` is this
+/// value **+ 1**: if the (cap + 1)-th row is actually delivered by SQLite,
+/// more matching rows exist beyond what was inspected, so the scan must be
+/// treated as truncated rather than silently reporting only what it saw.
+let cursorMaximumInspectedRows = 2_000
+/// Hard cap on the cumulative bytes handed to `JSONSerialization` in one
+/// scan, summed across every composer AND bubble value decoded — bounds
+/// aggregate CPU/memory cost independent of the per-row
+/// `cursorMaximumValueBytes` cap (many medium rows can otherwise add up to
+/// an unbounded total even though no single row is individually oversized).
+let cursorMaximumTotalDecodedValueBytes = 64_000_000
+/// Hard cap on total distinct `bubbleId:<composerId>:<bubbleId>` point
+/// lookups performed in one scan, deduplicated globally so repeated or
+/// duplicate references never cost more than a single lookup.
+let cursorMaximumBubbleLookups = 400
 
 private final class CursorSQLiteDeadline {
     let uptime: TimeInterval
@@ -73,6 +93,33 @@ private final class CursorSQLiteDeadline {
     init(millisecondsFromNow: Int) {
         uptime = ProcessInfo.processInfo.systemUptime + Double(millisecondsFromNow) / 1_000
     }
+
+    var isExpired: Bool {
+        ProcessInfo.processInfo.systemUptime >= uptime
+    }
+}
+
+/// Every reason a Cursor scan stopped before naturally exhausting the
+/// `composerData:*` result set (`SQLITE_DONE`) or hitting the intentional
+/// `cursorMaximumValidCandidates` early exit. Any of these means the scan
+/// cannot know whether an uninspected row would have been active, so the
+/// caller must treat the whole scan as inconclusive rather than trusting
+/// whatever partial evidence was gathered.
+enum CursorScanIncompleteReason: String, Equatable, Sendable {
+    case rowLimit = "row limit"
+    case decodedByteLimit = "decoded byte limit"
+    case bubbleLookupLimit = "bubble lookup limit"
+    case deadline = "deadline"
+}
+
+/// Outcome of one bounded, parameterized `bubbleId:<composerId>:<bubbleId>`
+/// point lookup performed while scanning Cursor composers.
+private enum BubbleLookupOutcome {
+    case found(JSONObject)
+    case absentOrMalformed
+    /// The deadline, global bubble-lookup cap, or cumulative decoded-byte
+    /// cap was hit before this lookup could be (re)performed.
+    case limitExceeded
 }
 
 /// Operational SQLite failures propagate through `AgentDetector` so
@@ -80,6 +127,11 @@ private final class CursorSQLiteDeadline {
 enum CursorSessionScanError: Error, Equatable, Sendable, CustomStringConvertible {
     case databaseBusy(code: Int32)
     case databaseFailure(operation: String, code: Int32)
+    /// A hard bound (rows/bytes/bubble lookups/deadline) was exhausted
+    /// before the scan could conclusively enumerate every composer, so
+    /// whatever partial evidence exists must not be trusted — never
+    /// silently reported as "no active Cursor agents."
+    case scanIncomplete(reason: CursorScanIncompleteReason)
 
     var description: String {
         switch self {
@@ -87,6 +139,8 @@ enum CursorSessionScanError: Error, Equatable, Sendable, CustomStringConvertible
             return "Cursor session database is busy or locked (SQLite code \(code))"
         case .databaseFailure(let operation, let code):
             return "Cursor session database \(operation) failed (SQLite code \(code))"
+        case .scanIncomplete(let reason):
+            return "Cursor session scan stopped before completion (\(reason.rawValue)); treating as inconclusive"
         }
     }
 }
@@ -571,7 +625,10 @@ enum SessionSnapshotSource {
         fd: Int32,
         validatedPath: String,
         now: Int64,
-        onSnapshotEstablished: (() -> Void)? = nil
+        onSnapshotEstablished: (() -> Void)? = nil,
+        onRowInspected: (() -> Void)? = nil,
+        onBubbleLookup: (() -> Void)? = nil,
+        deadlineMillisecondsOverride: Int? = nil
     ) throws -> [SessionTurnEvidence] {
         let uri = URL(fileURLWithPath: validatedPath).absoluteString + "?mode=ro"
         var db: OpaquePointer?
@@ -607,24 +664,37 @@ enum SessionSnapshotSource {
             }
         }
 
-        let deadline = Unmanaged.passRetained(
-            CursorSQLiteDeadline(millisecondsFromNow: cursorSQLiteQueryDeadlineMilliseconds)
+        let deadlineTracker = CursorSQLiteDeadline(
+            millisecondsFromNow: deadlineMillisecondsOverride ?? cursorSQLiteQueryDeadlineMilliseconds
         )
         sqlite3_progress_handler(db, 1_000, { context in
             guard let context else { return 1 }
-            let deadline = Unmanaged<CursorSQLiteDeadline>
+            let tracker = Unmanaged<CursorSQLiteDeadline>
                 .fromOpaque(context)
                 .takeUnretainedValue()
-            return ProcessInfo.processInfo.systemUptime >= deadline.uptime ? 1 : 0
-        }, deadline.toOpaque())
+            return tracker.isExpired ? 1 : 0
+        }, Unmanaged.passUnretained(deadlineTracker).toOpaque())
         defer {
             sqlite3_progress_handler(db, 0, nil, nil)
-            deadline.release()
         }
 
+        // `ORDER BY rowid DESC`: cursorDiskKV is a plain SQLite KV table with
+        // no timestamp column, so the implicit rowid — bumped on every
+        // insert/upsert — is the only available, trustworthy (schema-level,
+        // not attacker-controlled-JSON) recency proxy. Cursor rewrites a
+        // composer's row whenever it changes, so the freshest activity
+        // surfaces first, which keeps a bounded scan useful (requirement 5):
+        // even if the row/byte/time budget runs out, it already covered the
+        // composers most likely to be currently active.
+        // `LIMIT ?` is bound to the inspected-row cap **+ 1**: SQL fetches at
+        // most that many rows (never the whole table); if the
+        // `(cap + 1)`-th row is actually delivered, more matching rows exist
+        // beyond what this scan inspected, which is the truncation signal.
         let sql = """
         SELECT key, value FROM cursorDiskKV
-        WHERE key LIKE 'composerData:%'
+        WHERE key LIKE ?
+        ORDER BY rowid DESC
+        LIMIT ?
         """
 
         var statement: OpaquePointer?
@@ -635,16 +705,100 @@ enum SessionSnapshotSource {
         }
         defer { sqlite3_finalize(statement) }
 
+        let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        sqlite3_bind_text(statement, 1, "composerData:%", -1, sqliteTransient)
+        sqlite3_bind_int64(statement, 2, Int64(cursorMaximumInspectedRows) + 1)
+
+        // Prepared once, reused (bind/step/reset) for every bubble lookup —
+        // an exact parameterized point lookup, never string concatenation.
+        var bubbleStatement: OpaquePointer?
+        let bubblePrepareRC = sqlite3_prepare_v2(
+            db, "SELECT value FROM cursorDiskKV WHERE key = ?", -1, &bubbleStatement, nil
+        )
+        try checkCursorSQLite(bubblePrepareRC, operation: "prepare bubble lookup")
+        guard let bubbleStatement else {
+            throw CursorSessionScanError.databaseFailure(operation: "prepare bubble lookup", code: bubblePrepareRC)
+        }
+        defer { sqlite3_finalize(bubbleStatement) }
+
         var evidence: [SessionTurnEvidence] = []
+        var rowsInspected = 0
+        var totalDecodedBytes = 0
+        var totalBubbleLookups = 0
+        var attemptedBubbleKeys = Set<String>()
+        var bubbleCache: [String: JSONObject] = [:]
+        var stopReason: CursorScanIncompleteReason?
+
+        // Every counter/flag above is charged identically whether the row
+        // or bubble turns out to be inactive, malformed, or a duplicate
+        // reference — limits count inspected work, not just active results.
+        func lookUpBubble(_ bubbleKey: String) -> BubbleLookupOutcome {
+            if attemptedBubbleKeys.contains(bubbleKey) {
+                // Duplicate reference (already attempted this scan): serve
+                // from cache without a second round trip or byte charge.
+                if let cached = bubbleCache[bubbleKey] { return .found(cached) }
+                return .absentOrMalformed
+            }
+            guard !deadlineTracker.isExpired else {
+                stopReason = stopReason ?? .deadline
+                return .limitExceeded
+            }
+            guard totalBubbleLookups < cursorMaximumBubbleLookups else {
+                stopReason = stopReason ?? .bubbleLookupLimit
+                return .limitExceeded
+            }
+            attemptedBubbleKeys.insert(bubbleKey)
+            totalBubbleLookups += 1
+            onBubbleLookup?()
+
+            sqlite3_reset(bubbleStatement)
+            sqlite3_clear_bindings(bubbleStatement)
+            sqlite3_bind_text(bubbleStatement, 1, bubbleKey, -1, sqliteTransient)
+            guard sqlite3_step(bubbleStatement) == SQLITE_ROW,
+                  sqlite3_column_type(bubbleStatement, 0) == SQLITE_TEXT else {
+                return .absentOrMalformed
+            }
+            let valueByteCount = Int(sqlite3_column_bytes(bubbleStatement, 0))
+            guard valueByteCount > 0,
+                  valueByteCount <= cursorMaximumValueBytes,
+                  let valueBytes = sqlite3_column_text(bubbleStatement, 0) else {
+                return .absentOrMalformed
+            }
+            guard totalDecodedBytes + valueByteCount <= cursorMaximumTotalDecodedValueBytes else {
+                stopReason = stopReason ?? .decodedByteLimit
+                return .limitExceeded
+            }
+            totalDecodedBytes += valueByteCount
+            let valueData = Data(bytes: valueBytes, count: valueByteCount)
+            guard let bubble = (try? JSONSerialization.jsonObject(with: valueData)) as? JSONObject else {
+                return .absentOrMalformed
+            }
+            bubbleCache[bubbleKey] = bubble
+            return .found(bubble)
+        }
+
         var stepRC = sqlite3_step(statement)
         if stepRC != SQLITE_DONE {
             try checkCursorSQLiteRow(stepRC, operation: "establish composer snapshot")
         }
         onSnapshotEstablished?()
-        while evidence.count < cursorMaximumValidCandidates {
+
+        rowLoop: while evidence.count < cursorMaximumValidCandidates {
             if stepRC == SQLITE_DONE { break }
+            guard !deadlineTracker.isExpired else {
+                stopReason = .deadline
+                break
+            }
+            guard rowsInspected < cursorMaximumInspectedRows else {
+                stopReason = .rowLimit
+                break
+            }
             try checkCursorSQLiteRow(stepRC, operation: "read composer query")
-            defer { stepRC = sqlite3_step(statement) }
+            rowsInspected += 1
+            defer {
+                onRowInspected?()
+                stepRC = sqlite3_step(statement)
+            }
 
             guard sqlite3_column_type(statement, 0) == SQLITE_TEXT else { continue }
             let keyByteCount = Int(sqlite3_column_bytes(statement, 0))
@@ -662,21 +816,66 @@ enum SessionSnapshotSource {
             guard valueByteCount > 0,
                   valueByteCount <= cursorMaximumValueBytes,
                   let valueBytes = sqlite3_column_text(statement, 1) else { continue }
+
+            guard totalDecodedBytes + valueByteCount <= cursorMaximumTotalDecodedValueBytes else {
+                stopReason = .decodedByteLimit
+                break rowLoop
+            }
+            totalDecodedBytes += valueByteCount
             let valueData = Data(bytes: valueBytes, count: valueByteCount)
 
             guard let record = (try? JSONSerialization.jsonObject(with: valueData)) as? JSONObject else { continue }
 
-            let assessment = assessCursorComposerRecord(record, now: now)
-            guard assessment.active else { continue }
-
             let identity = key.hasPrefix("composerData:") ? String(key.dropFirst("composerData:".count)) : key
+
+            // First pass never touches bubbles (bubbles default to `[:]`);
+            // `lastActivityAt` is folded purely from already-decoded,
+            // trusted composer/header fields, so it is identical whether or
+            // not bubbles are ultimately consulted below.
+            let provisional = assessCursorComposerRecord(record, now: now)
+            var finalAssessment = provisional
+
+            if !provisional.active
+                && isRecentTimestamp(provisional.lastActivityAt, now: now, within: toolTurnGraceMs) {
+                // Only a plausibly-recent composer's verdict can change
+                // once a hidden bubble tool status is known — this keeps
+                // bubble lookups bounded to the small fraction of composers
+                // where they could possibly matter, instead of spending
+                // budget on every long-completed conversation the scan
+                // steps over.
+                var bubbles: [String: JSONObject] = [:]
+                var truncatedByBubbleLookup = false
+                for bubbleId in cursorRelevantBubbleIds(record) {
+                    switch lookUpBubble("bubbleId:\(identity):\(bubbleId)") {
+                    case .found(let bubble):
+                        bubbles[bubbleId] = bubble
+                    case .absentOrMalformed:
+                        continue
+                    case .limitExceeded:
+                        truncatedByBubbleLookup = true
+                    }
+                    if truncatedByBubbleLookup { break }
+                }
+                if truncatedByBubbleLookup { break rowLoop }
+                finalAssessment = assessCursorComposerRecord(record, bubbles: bubbles, now: now)
+            }
+
+            guard finalAssessment.active else { continue }
             evidence.append(SessionTurnEvidence(
                 family: .cursor,
                 identity: identity,
-                label: assessment.label,
-                reason: assessment.reason,
-                lastActivityAt: assessment.lastActivityAt
+                label: finalAssessment.label,
+                reason: finalAssessment.reason,
+                lastActivityAt: finalAssessment.lastActivityAt
             ))
+        }
+
+        // Any stop reason other than natural exhaustion (`SQLITE_DONE`) or
+        // the intentional `cursorMaximumValidCandidates` early exit means an
+        // unseen row/bubble could have been active — never trust the
+        // partial evidence gathered so far in that case.
+        if let stopReason {
+            throw CursorSessionScanError.scanIncomplete(reason: stopReason)
         }
 
         try executeCursorSQL(db, sql: "COMMIT", operation: "commit read transaction")

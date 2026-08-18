@@ -757,6 +757,7 @@ export type CursorConversationHeader = {
   type?: unknown;
   createdAt?: unknown;
   grouping?: unknown;
+  bubbleId?: unknown;
 };
 
 type ValidatedCursorConversationHeader = {
@@ -767,7 +768,16 @@ type ValidatedCursorConversationHeader = {
     shellStatus?: string;
     turnDurationMs?: number;
   };
+  /**
+   * References the real `bubbleId:<composerId>:<bubbleId>` row carrying this
+   * header's actual message/tool content. `undefined` when absent (older
+   * data) or when validation rejected a non-string value.
+   */
+  bubbleId?: string;
 };
+
+/** A single already-decoded `bubbleId:<composerId>:<bubbleId>` row's JSON value. */
+export type CursorBubbleRecord = Record<string, unknown>;
 
 // `toolStatus`/`shellStatus` are always lowercased before this set is
 // checked, so every entry here must already be lowercase or it can never
@@ -779,6 +789,50 @@ export const CURSOR_RUNNING_TOOL_STATUSES = new Set([
   "in_progress",
   "inprogress",
 ]);
+
+/**
+ * Every hard bound enforced while scanning Cursor's `cursorDiskKV` table,
+ * centralized here — the single source of truth for both this pure-policy
+ * module (`cursorRelevantBubbleIds` below) and the IO layer
+ * (`agent-detector.ts`, which imports every one of these rather than
+ * declaring its own copies) — so the two layers can never silently drift
+ * apart on a limit. A row/byte/lookup/time budget is only useful if it is
+ * enforced identically everywhere it is checked.
+ *
+ * Mirrored 1:1 in Swift's `SessionSnapshotSource.swift` /
+ * `TurnAssessors.swift` constants of the same meaning, and asserted equal
+ * to them (in both languages) via the shared
+ * `tests/fixtures/agent-detection/cursor-scan-limits.json` parity fixture.
+ */
+/** Stop collecting once this many *active* composer candidates are found. */
+export const CURSOR_MAX_ACTIVE_CANDIDATES = 200;
+/** Reject/skip any `cursorDiskKV` key longer than this many UTF-8 bytes. */
+export const CURSOR_MAX_KEY_BYTES = 4_096;
+/** Reject/skip any single `cursorDiskKV` value longer than this many UTF-8 bytes. */
+export const CURSOR_MAX_VALUE_BYTES = 4_000_000;
+/** `sqlite3_busy_timeout` applied to the read-only Cursor vault connection. */
+export const CURSOR_SQLITE_BUSY_TIMEOUT_MS = 100;
+/** Wall-clock budget for one whole Cursor scan, independent of row/byte caps. */
+export const CURSOR_SQLITE_QUERY_DEADLINE_MS = 4_000;
+/**
+ * Hard cap on TOTAL rows inspected in one scan — counts inactive, malformed,
+ * duplicate, and active rows alike, independent of `CURSOR_MAX_ACTIVE_CANDIDATES`
+ * (which only counts *active* results). This is the fix for issue A: without
+ * this bound, unlimited inactive/malformed rows (each up to
+ * `CURSOR_MAX_VALUE_BYTES`) could consume the whole scan deadline repeatedly
+ * while the active-result counter never advances.
+ */
+export const CURSOR_MAX_INSPECTED_ROWS = 2_000;
+/** Hard cap on cumulative decoded bytes (composer values + bubble values) per scan. */
+export const CURSOR_MAX_TOTAL_DECODED_VALUE_BYTES = 64_000_000;
+/** Hard cap on total `bubbleId:` row lookups performed in one scan. */
+export const CURSOR_MAX_BUBBLE_LOOKUPS = 400;
+/**
+ * Bounds how many of a composer's trailing conversation headers are ever
+ * considered for a bubble lookup — a long-running conversation must not
+ * force an unbounded (or even just large) number of per-composer lookups.
+ */
+export const CURSOR_MAX_RECENT_HEADERS_PER_COMPOSER = 8;
 
 export function cursorProjectLabel(record: CursorComposerRecord): string | undefined {
   const workspace = record.workspaceIdentifier;
@@ -885,6 +939,7 @@ function validateCursorHeaders(value: unknown): ValidatedCursorConversationHeade
     if (candidate.type !== 1 && candidate.type !== 2) continue;
     const createdAt = parseCursorTimestamp(candidate.createdAt);
     if (createdAt === null) continue;
+    if (!validateOptionalString(candidate, "bubbleId")) continue;
 
     let grouping: ValidatedCursorConversationHeader["grouping"] = {};
     if (candidate.grouping !== undefined) {
@@ -913,7 +968,8 @@ function validateCursorHeaders(value: unknown): ValidatedCursorConversationHeade
         ...(typeof duration === "number" ? { turnDurationMs: duration } : {}),
       };
     }
-    headers.push({ type: candidate.type, createdAt, grouping });
+    const bubbleId = typeof candidate.bubbleId === "string" && candidate.bubbleId ? candidate.bubbleId : undefined;
+    headers.push({ type: candidate.type, createdAt, grouping, ...(bubbleId ? { bubbleId } : {}) });
   }
   if (value.length > 0 && headers.length === 0) return null;
   return headers;
@@ -924,16 +980,66 @@ function malformedCursorAssessment(): TurnAssessment {
 }
 
 /**
+ * Returns the bounded, deduplicated, order-preserving list of bubble ids
+ * that could affect this composer's CURRENT activity: the trailing
+ * `CURSOR_MAX_RECENT_HEADERS_PER_COMPOSER` headers' bubble ids, restricted
+ * to `type === 2` (assistant/tool) since a user bubble (type 1) never
+ * carries `toolFormerData`. Only the tail of a conversation can possibly be
+ * a currently-running tool, so older headers are never inspected. Returns
+ * an empty array for a malformed record or one with no headers at all —
+ * the caller's own `assessCursorComposerRecord` call independently reports
+ * "malformed cursor composer" in that case, so no bubble lookups are
+ * useful. Used by `agent-detector.ts` (the IO layer) to decide which real
+ * `bubbleId:<composerId>:<bubbleId>` rows are worth a bounded lookup,
+ * before ever calling this pure module's assessor.
+ */
+export function cursorRelevantBubbleIds(record: CursorComposerRecord): string[] {
+  const headers = validateCursorHeaders(record.fullConversationHeadersOnly);
+  if (headers === null) return [];
+  const seen = new Set<string>();
+  const ids: string[] = [];
+  for (const header of headers.slice(-CURSOR_MAX_RECENT_HEADERS_PER_COMPOSER)) {
+    if (header.type !== 2 || header.bubbleId === undefined) continue;
+    if (utf8ByteLength(header.bubbleId) > CURSOR_MAX_KEY_BYTES) continue;
+    if (seen.has(header.bubbleId)) continue;
+    seen.add(header.bubbleId);
+    ids.push(header.bubbleId);
+  }
+  return ids;
+}
+
+// `Buffer` is Node-only; this module stays environment-agnostic (it may be
+// evaluated in a renderer/browser-ish context), so byte length is measured
+// with the standard `TextEncoder` Web API instead.
+function utf8ByteLength(value: string): number {
+  return new TextEncoder().encode(value).length;
+}
+
+/**
  * Cursor often leaves composer status stuck at "completed" on disk while a turn
  * is still running (especially during shell/tool waits). Prefer conversation
  * headers: an open user turn without turnDurationMs, or a tool still loading.
+ *
+ * `bubbles` maps a real `bubbleId:<composerId>:<bubbleId>` row's bubble id
+ * to its already-decoded JSON content (the caller — `agent-detector.ts` —
+ * performs the bounded, parameterized lookups via `cursorRelevantBubbleIds`;
+ * this function stays pure/IO-free). Each resolved bubble's
+ * `toolFormerData.status` is lowercased and fed into exactly the same
+ * running/completed status checks as the legacy header-embedded
+ * `grouping.toolFormerStatus`/`grouping.shellStatus` fields — real Cursor
+ * data never populates those header fields directly, but existing callers
+ * that construct records with them directly (tests, and any legacy
+ * embedded shape this code intentionally still supports) keep working
+ * unchanged. Defaults to `{}` so every existing call site — none of which
+ * know about bubbles — is unaffected.
  */
 export function assessCursorComposerRecord(
   record: CursorComposerRecord,
   now: number,
+  bubbles: Record<string, CursorBubbleRecord> = {},
 ): TurnAssessment & { label?: string } {
   try {
-    return assessValidatedCursorComposerRecord(record, now);
+    return assessValidatedCursorComposerRecord(record, now, bubbles);
   } catch {
     return malformedCursorAssessment();
   }
@@ -942,6 +1048,7 @@ export function assessCursorComposerRecord(
 function assessValidatedCursorComposerRecord(
   record: CursorComposerRecord,
   now: number,
+  bubbles: Record<string, CursorBubbleRecord>,
 ): TurnAssessment & { label?: string } {
   if (!isPlainCursorObject(record) || !validateCursorRecordFields(record)) {
     return malformedCursorAssessment();
@@ -987,10 +1094,19 @@ function assessValidatedCursorComposerRecord(
       typeof grouping.toolFormerStatus === "string" ? grouping.toolFormerStatus.toLowerCase() : "";
     const shellStatus =
       typeof grouping.shellStatus === "string" ? grouping.shellStatus.toLowerCase() : "";
+    // Real Cursor data: the header only references a bubble id; the actual
+    // tool status lives in that bubble's own row.
+    const bubble = header.bubbleId !== undefined ? bubbles[header.bubbleId] : undefined;
+    const bubbleToolFormerData = isPlainCursorObject(bubble?.toolFormerData)
+      ? (bubble.toolFormerData as Record<string, unknown>)
+      : undefined;
+    const bubbleStatus =
+      typeof bubbleToolFormerData?.status === "string" ? bubbleToolFormerData.status.toLowerCase() : "";
 
     if (
       CURSOR_RUNNING_TOOL_STATUSES.has(toolStatus) ||
-      CURSOR_RUNNING_TOOL_STATUSES.has(shellStatus)
+      CURSOR_RUNNING_TOOL_STATUSES.has(shellStatus) ||
+      CURSOR_RUNNING_TOOL_STATUSES.has(bubbleStatus)
     ) {
       runningTool = true;
       openTurnTouchesTools = true;
@@ -1019,7 +1135,11 @@ function assessValidatedCursorComposerRecord(
       shellStatus === "success" ||
       shellStatus === "completed" ||
       shellStatus === "error" ||
-      shellStatus === "failed"
+      shellStatus === "failed" ||
+      bubbleStatus === "completed" ||
+      bubbleStatus === "success" ||
+      bubbleStatus === "error" ||
+      bubbleStatus === "failed"
     ) {
       // Tool finished but the turn may still stream a final reply.
       openTurnTouchesTools = true;
@@ -1101,6 +1221,15 @@ export type DetectionFixture =
       format: "cursor";
       identity: string;
       record: CursorComposerRecord;
+      /**
+       * Optional `bubbleId:<composerId>:<bubbleId>` rows referenced by
+       * `record.fullConversationHeadersOnly[].bubbleId`, keyed by bubble id.
+       * Mirrors the `bubbles` sibling object the shared
+       * `cursor-tool-inprogress.json` fixture provides for its realistic
+       * separated-bubble shape. Omitted (or empty) for fixtures that never
+       * reference a bubble id, including any legacy embedded-status fixture.
+       */
+      bubbles?: Record<string, CursorBubbleRecord>;
     }
   | {
       kind: "process";
@@ -1135,7 +1264,7 @@ export function assessDetectionFixture(fixture: DetectionFixture, now: number): 
   }
 
   if (fixture.format === "cursor") {
-    const assessment = assessCursorComposerRecord(fixture.record, now);
+    const assessment = assessCursorComposerRecord(fixture.record, now, fixture.bubbles ?? {});
     return {
       active: assessment.active,
       source: "session",

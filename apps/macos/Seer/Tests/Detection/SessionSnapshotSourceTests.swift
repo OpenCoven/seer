@@ -589,6 +589,29 @@ final class SessionSnapshotSourceTests: XCTestCase {
         XCTAssertEqual(sqlite3_step(statement), SQLITE_DONE)
     }
 
+    /// Inserts many rows through a single connection/prepared statement/
+    /// transaction — the adversarial tests below need hundreds to thousands
+    /// of rows, and `insertCursorFixtureRecord`'s per-call open/close would
+    /// make those needlessly slow.
+    private func insertManyCursorFixtureRecords(at url: URL, records: [(key: String, value: String)]) {
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &db), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        XCTAssertEqual(sqlite3_exec(db, "BEGIN", nil, nil, nil), SQLITE_OK)
+        var statement: OpaquePointer?
+        XCTAssertEqual(sqlite3_prepare_v2(db, "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)", -1, &statement, nil), SQLITE_OK)
+        defer { sqlite3_finalize(statement) }
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        for record in records {
+            sqlite3_reset(statement)
+            sqlite3_clear_bindings(statement)
+            sqlite3_bind_text(statement, 1, record.key, -1, transient)
+            sqlite3_bind_text(statement, 2, record.value, -1, transient)
+            XCTAssertEqual(sqlite3_step(statement), SQLITE_DONE)
+        }
+        XCTAssertEqual(sqlite3_exec(db, "COMMIT", nil, nil, nil), SQLITE_OK)
+    }
+
     private func openCursorWriter(at url: URL, wal: Bool) throws -> OpaquePointer {
         var db: OpaquePointer?
         let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI
@@ -887,6 +910,371 @@ final class SessionSnapshotSourceTests: XCTestCase {
         let cursorEvidence = evidence.filter { $0.family == .cursor }
         XCTAssertTrue(cursorEvidence.isEmpty, "a symlinked state.vscdb pointing outside home must never be consumed")
         XCTAssertFalse(evidence.contains { $0.identity == "POISON" }, "the sentinel poison composer id must never appear")
+    }
+
+    // MARK: - Cursor: realistic bubble tool status (issue B)
+
+    /// Real Cursor data: the composer header only references a bubble id;
+    /// the actual tool status lives in a separate
+    /// `bubbleId:<composerId>:<bubbleId>` row's `toolFormerData.status`.
+    /// End-to-end proof (real SQLite, real bounded scan path — not just the
+    /// pure assessor) that this realistic shape is detected as an active
+    /// running tool call, which the unrealistic embedded-status fixture this
+    /// replaces could never exercise.
+    func testCursorRealisticBubbleRowIsDetectedAsActiveToolCall() async throws {
+        let home = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let dbURL = home
+            .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+        makeCursorFixtureDatabase(
+            at: dbURL,
+            key: "composerData:realistic-active",
+            valueJSON: """
+            {
+              "status": "completed",
+              "lastUpdatedAt": \(fixedNow - 65_000),
+              "fullConversationHeadersOnly": [
+                {"type": 1, "createdAt": \(fixedNow - 65_000)},
+                {"type": 2, "createdAt": \(fixedNow - 60_000), "bubbleId": "bubble-tool-1"}
+              ]
+            }
+            """
+        )
+        insertCursorFixtureRecord(
+            at: dbURL,
+            key: "bubbleId:realistic-active:bubble-tool-1",
+            value: #"{"toolFormerData":{"status":"inProgress"}}"#
+        )
+
+        let evidence = try await NativeSessionSnapshotSource(homeDirectory: home).snapshot(now: fixedNow)
+
+        let cursorEvidence = evidence.filter { $0.family == .cursor }
+        XCTAssertEqual(cursorEvidence.map(\.identity), ["realistic-active"])
+        XCTAssertEqual(cursorEvidence.first?.reason, "tool_call in progress")
+    }
+
+    /// Without the bubble lookup, this exact composer (60s-old header, no
+    /// embedded legacy status) would be judged stale under the narrower
+    /// 45s `turnActiveGraceMs` window — proving the bubble content is what
+    /// flips the verdict, not some other coincidental signal.
+    func testCursorComposerWithoutResolvableBubbleStaysInactive() async throws {
+        let home = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let dbURL = home
+            .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+        makeCursorFixtureDatabase(
+            at: dbURL,
+            key: "composerData:dangling-bubble",
+            valueJSON: """
+            {
+              "status": "completed",
+              "lastUpdatedAt": \(fixedNow - 65_000),
+              "fullConversationHeadersOnly": [
+                {"type": 1, "createdAt": \(fixedNow - 65_000)},
+                {"type": 2, "createdAt": \(fixedNow - 60_000), "bubbleId": "bubble-never-written"}
+              ]
+            }
+            """
+        )
+        // Deliberately no `bubbleId:dangling-bubble:bubble-never-written` row.
+
+        let evidence = try await NativeSessionSnapshotSource(homeDirectory: home).snapshot(now: fixedNow)
+
+        XCTAssertTrue(evidence.filter { $0.family == .cursor }.isEmpty)
+    }
+
+    /// Requirement 7: the legacy embedded `grouping.toolFormerStatus` shape
+    /// this code already, intentionally supports (proven at the pure
+    /// assessor level by `testCursorToolStatusInProgressMixedCaseIsActive`)
+    /// must keep working through the full real SQLite scan path too, not
+    /// just in isolation.
+    func testCursorLegacyEmbeddedToolStatusStillActiveThroughSQLitePath() async throws {
+        let home = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let dbURL = home
+            .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+        makeCursorFixtureDatabase(
+            at: dbURL,
+            key: "composerData:legacy-active",
+            valueJSON: """
+            {
+              "status": "completed",
+              "lastUpdatedAt": \(fixedNow - 5_000),
+              "fullConversationHeadersOnly": [
+                {"type": 2, "createdAt": \(fixedNow - 5_000), "grouping": {"toolFormerStatus": "inProgress"}}
+              ]
+            }
+            """
+        )
+
+        let evidence = try await NativeSessionSnapshotSource(homeDirectory: home).snapshot(now: fixedNow)
+
+        let cursorEvidence = evidence.filter { $0.family == .cursor }
+        XCTAssertEqual(cursorEvidence.map(\.identity), ["legacy-active"])
+        XCTAssertEqual(cursorEvidence.first?.reason, "tool_call in progress")
+    }
+
+    /// Duplicate bubble references within one composer must cost exactly
+    /// one real SQL lookup — proves the scan batches/dedupes rather than
+    /// paying a round trip per (redundant) reference.
+    func testCursorDuplicateBubbleReferencesAreLookedUpOnlyOnce() throws {
+        let home = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let dbURL = home
+            .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+        makeCursorFixtureDatabase(
+            at: dbURL,
+            key: "composerData:duplicate-refs",
+            valueJSON: """
+            {
+              "status": "completed",
+              "lastUpdatedAt": \(fixedNow - 65_000),
+              "fullConversationHeadersOnly": [
+                {"type": 1, "createdAt": \(fixedNow - 65_000)},
+                {"type": 2, "createdAt": \(fixedNow - 64_000), "bubbleId": "bubble-dup"},
+                {"type": 2, "createdAt": \(fixedNow - 63_000), "bubbleId": "bubble-dup"},
+                {"type": 2, "createdAt": \(fixedNow - 60_000), "bubbleId": "bubble-dup"}
+              ]
+            }
+            """
+        )
+        insertCursorFixtureRecord(
+            at: dbURL,
+            key: "bubbleId:duplicate-refs:bubble-dup",
+            value: #"{"toolFormerData":{"status":"inProgress"}}"#
+        )
+
+        let fd = try XCTUnwrap(SessionSnapshotSource.openVerifiedRegularFile(at: dbURL.path, root: canonicalRoot(home)))
+        defer { close(fd) }
+
+        var bubbleLookups = 0
+        let evidence = try SessionSnapshotSource.queryCursorComposers(
+            fd: fd,
+            validatedPath: dbURL.path,
+            now: fixedNow,
+            onBubbleLookup: { bubbleLookups += 1 }
+        )
+
+        XCTAssertEqual(evidence.map(\.identity), ["duplicate-refs"])
+        XCTAssertEqual(bubbleLookups, 1, "three references to the same bubble id must cost exactly one lookup")
+    }
+
+    // MARK: - Cursor: bounded scan adversarial tests (issue A)
+
+    /// Exceeding `cursorMaximumInspectedRows` (all inactive/malformed, so the
+    /// intentional 200-active early exit never fires) must fail the scan
+    /// with a typed, conservative error — never silently report "no active
+    /// Cursor agents" from a truncated view — and the SQL/loop must never
+    /// step through anywhere near the full table.
+    func testCursorRowLimitExceededThrowsScanIncompleteAndBoundsInspectedRows() throws {
+        let home = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let dbURL = home
+            .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+        makeEmptyCursorFixtureDatabase(at: dbURL)
+
+        let totalRows = cursorMaximumInspectedRows + 50
+        var records: [(key: String, value: String)] = []
+        for index in 0..<totalRows {
+            records.append((
+                key: String(format: "composerData:row-%05d", index),
+                value: #"{"status":"completed","lastUpdatedAt":0}"#
+            ))
+        }
+        insertManyCursorFixtureRecords(at: dbURL, records: records)
+
+        let fd = try XCTUnwrap(SessionSnapshotSource.openVerifiedRegularFile(at: dbURL.path, root: canonicalRoot(home)))
+        defer { close(fd) }
+
+        var inspectedRows = 0
+        do {
+            _ = try SessionSnapshotSource.queryCursorComposers(
+                fd: fd,
+                validatedPath: dbURL.path,
+                now: fixedNow,
+                onRowInspected: { inspectedRows += 1 }
+            )
+            XCTFail("exceeding the inspected-row cap must fail the scan instead of silently reporting partial results")
+        } catch let error as CursorSessionScanError {
+            XCTAssertEqual(error, .scanIncomplete(reason: .rowLimit))
+        } catch {
+            XCTFail("expected typed CursorSessionScanError, got \(error)")
+        }
+
+        XCTAssertGreaterThan(inspectedRows, 0)
+        XCTAssertLessThanOrEqual(inspectedRows, cursorMaximumInspectedRows + 1)
+        XCTAssertLessThan(inspectedRows, totalRows, "must never step through the entire table once bounded")
+    }
+
+    /// Many medium composer rows whose sum exceeds
+    /// `cursorMaximumTotalDecodedValueBytes`, even though each is
+    /// individually within the per-row `cursorMaximumValueBytes` cap, must
+    /// still fail the scan conservatively — the aggregate cap is
+    /// independent of the per-row cap.
+    func testCursorCumulativeDecodedByteLimitExceededThrowsScanIncomplete() throws {
+        let home = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let dbURL = home
+            .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+        makeEmptyCursorFixtureDatabase(at: dbURL)
+
+        let padding = String(repeating: "x", count: 3_500_000)
+        var records: [(key: String, value: String)] = []
+        for index in 0..<20 {
+            records.append((
+                key: String(format: "composerData:big-%02d", index),
+                value: #"{"status":"completed","lastUpdatedAt":0,"padding":""# + padding + #""}"#
+            ))
+        }
+        insertManyCursorFixtureRecords(at: dbURL, records: records)
+
+        let fd = try XCTUnwrap(SessionSnapshotSource.openVerifiedRegularFile(at: dbURL.path, root: canonicalRoot(home)))
+        defer { close(fd) }
+
+        do {
+            _ = try SessionSnapshotSource.queryCursorComposers(fd: fd, validatedPath: dbURL.path, now: fixedNow)
+            XCTFail("exceeding the cumulative decoded-byte cap must fail the scan instead of silently reporting partial results")
+        } catch let error as CursorSessionScanError {
+            XCTAssertEqual(error, .scanIncomplete(reason: .decodedByteLimit))
+        } catch {
+            XCTFail("expected typed CursorSessionScanError, got \(error)")
+        }
+    }
+
+    /// Many distinct, plausibly-recent composers each referencing
+    /// `cursorMaximumRecentHeadersPerComposer` distinct bubble ids
+    /// collectively exceed the global `cursorMaximumBubbleLookups` budget —
+    /// the scan must fail conservatively rather than silently stop looking
+    /// up bubbles (which could hide a genuinely running tool call).
+    func testCursorBubbleLookupLimitExceededThrowsScanIncomplete() throws {
+        let home = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let dbURL = home
+            .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+        makeEmptyCursorFixtureDatabase(at: dbURL)
+
+        // 55 * 8 = 440 distinct bubble references > cursorMaximumBubbleLookups (400).
+        let composerCount = 55
+        var records: [(key: String, value: String)] = []
+        for composerIndex in 0..<composerCount {
+            var headers: [String] = []
+            for bubbleIndex in 0..<cursorMaximumRecentHeadersPerComposer {
+                headers.append(
+                    #"{"type":2,"createdAt":\#(fixedNow - 60_000 + Int64(bubbleIndex)),"bubbleId":"tool-\#(composerIndex)-\#(bubbleIndex)"}"#
+                )
+            }
+            let value = """
+            {"status":"completed","lastUpdatedAt":\(fixedNow - 61_000),"fullConversationHeadersOnly":[\(headers.joined(separator: ","))]}
+            """
+            records.append((key: "composerData:many-bubbles-\(composerIndex)", value: value))
+        }
+        insertManyCursorFixtureRecords(at: dbURL, records: records)
+
+        let fd = try XCTUnwrap(SessionSnapshotSource.openVerifiedRegularFile(at: dbURL.path, root: canonicalRoot(home)))
+        defer { close(fd) }
+
+        var bubbleLookups = 0
+        do {
+            _ = try SessionSnapshotSource.queryCursorComposers(
+                fd: fd,
+                validatedPath: dbURL.path,
+                now: fixedNow,
+                onBubbleLookup: { bubbleLookups += 1 }
+            )
+            XCTFail("exceeding the bubble-lookup cap must fail the scan instead of silently reporting partial results")
+        } catch let error as CursorSessionScanError {
+            XCTAssertEqual(error, .scanIncomplete(reason: .bubbleLookupLimit))
+        } catch {
+            XCTFail("expected typed CursorSessionScanError, got \(error)")
+        }
+
+        XCTAssertGreaterThan(bubbleLookups, 0)
+        XCTAssertLessThanOrEqual(bubbleLookups, cursorMaximumBubbleLookups)
+    }
+
+    /// A slow-processing scan (simulated via `onRowInspected`) that exceeds
+    /// its deadline before naturally exhausting the result set must fail the
+    /// scan rather than report only what it managed to inspect in time.
+    func testCursorDeadlineExhaustionThrowsScanIncompleteBeforeInspectingAllRows() throws {
+        let home = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let dbURL = home
+            .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+        makeEmptyCursorFixtureDatabase(at: dbURL)
+
+        let totalRows = 40
+        var records: [(key: String, value: String)] = []
+        for index in 0..<totalRows {
+            records.append((
+                key: String(format: "composerData:slow-%02d", index),
+                value: #"{"status":"completed","lastUpdatedAt":0}"#
+            ))
+        }
+        insertManyCursorFixtureRecords(at: dbURL, records: records)
+
+        let fd = try XCTUnwrap(SessionSnapshotSource.openVerifiedRegularFile(at: dbURL.path, root: canonicalRoot(home)))
+        defer { close(fd) }
+
+        var inspectedRows = 0
+        do {
+            _ = try SessionSnapshotSource.queryCursorComposers(
+                fd: fd,
+                validatedPath: dbURL.path,
+                now: fixedNow,
+                onRowInspected: {
+                    inspectedRows += 1
+                    usleep(5_000) // 5ms per row: a handful of rows blows a 20ms deadline.
+                },
+                deadlineMillisecondsOverride: 20
+            )
+            XCTFail("a scan that exceeds its deadline must fail instead of silently reporting partial results")
+        } catch let error as CursorSessionScanError {
+            XCTAssertEqual(error, .scanIncomplete(reason: .deadline))
+        } catch {
+            XCTFail("expected typed CursorSessionScanError, got \(error)")
+        }
+
+        XCTAssertGreaterThan(inspectedRows, 0)
+        XCTAssertLessThan(inspectedRows, totalRows, "must stop before exhausting all rows once the deadline passes")
+    }
+
+    /// Cross-language parity: both Swift and TypeScript load the same shared
+    /// fixture (`tests/fixtures/agent-detection/cursor-scan-limits.json`) and
+    /// assert their own bound constants against it, so the two
+    /// implementations can never silently drift apart on these numbers.
+    func testCursorScanLimitConstantsMatchSharedParityFixture() throws {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // Tests/Detection
+            .deletingLastPathComponent() // Tests
+            .deletingLastPathComponent() // Seer (apps/macos/Seer project root)
+            .deletingLastPathComponent() // apps/macos
+            .deletingLastPathComponent() // apps
+            .deletingLastPathComponent() // repository root
+            .appendingPathComponent("tests/fixtures/agent-detection/cursor-scan-limits.json")
+        let data = try Data(contentsOf: url)
+        let limits = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+        XCTAssertEqual((limits["cursorMaximumValidCandidates"] as? NSNumber)?.intValue, cursorMaximumValidCandidates)
+        XCTAssertEqual((limits["cursorMaximumKeyBytes"] as? NSNumber)?.intValue, cursorMaximumKeyBytes)
+        XCTAssertEqual((limits["cursorMaximumValueBytes"] as? NSNumber)?.intValue, cursorMaximumValueBytes)
+        XCTAssertEqual(
+            (limits["cursorSQLiteBusyTimeoutMilliseconds"] as? NSNumber)?.int32Value,
+            cursorSQLiteBusyTimeoutMilliseconds
+        )
+        XCTAssertEqual(
+            (limits["cursorSQLiteQueryDeadlineMilliseconds"] as? NSNumber)?.intValue,
+            cursorSQLiteQueryDeadlineMilliseconds
+        )
+        XCTAssertEqual((limits["cursorMaximumInspectedRows"] as? NSNumber)?.intValue, cursorMaximumInspectedRows)
+        XCTAssertEqual(
+            (limits["cursorMaximumTotalDecodedValueBytes"] as? NSNumber)?.intValue,
+            cursorMaximumTotalDecodedValueBytes
+        )
+        XCTAssertEqual((limits["cursorMaximumBubbleLookups"] as? NSNumber)?.intValue, cursorMaximumBubbleLookups)
+        XCTAssertEqual(
+            (limits["cursorMaximumRecentHeadersPerComposer"] as? NSNumber)?.intValue,
+            cursorMaximumRecentHeadersPerComposer
+        )
     }
 
 }

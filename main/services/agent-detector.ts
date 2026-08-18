@@ -1,8 +1,8 @@
-import { execFile, spawn } from "node:child_process";
+import { execFile } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { StringDecoder } from "node:string_decoder";
+import { DatabaseSync } from "node:sqlite";
 import { promisify } from "node:util";
 
 import { logger } from "@glaze/core/backend";
@@ -16,12 +16,23 @@ import {
   assessGrokTurn,
   buildFriendlyDetail,
   codexProjectLabelFromPath,
+  CURSOR_MAX_ACTIVE_CANDIDATES,
+  CURSOR_MAX_BUBBLE_LOOKUPS,
+  CURSOR_MAX_INSPECTED_ROWS,
+  CURSOR_MAX_KEY_BYTES,
+  CURSOR_MAX_TOTAL_DECODED_VALUE_BYTES,
+  CURSOR_MAX_VALUE_BYTES,
+  CURSOR_SQLITE_BUSY_TIMEOUT_MS,
+  CURSOR_SQLITE_QUERY_DEADLINE_MS,
+  cursorRelevantBubbleIds,
   friendlySessionLabel,
   isRecentTimestamp,
   matchAgentKind,
   PROCESS_ONLY_CPU_THRESHOLD,
   SESSION_CANDIDATE_WINDOW_MS,
+  TOOL_TURN_GRACE_MS,
   type AgentKind,
+  type CursorBubbleRecord,
   type CursorComposerRecord,
   type TurnAssessment,
 } from "./agent-detection-policy.js";
@@ -43,11 +54,6 @@ export const MAX_SESSION_INSPECTED_ENTRIES_PER_ROOT = 2_048;
 export const MAX_SESSION_INSPECTED_DIRECTORIES_PER_ROOT = 128;
 const SESSION_TAIL_BYTES = 120_000;
 const CODEX_HEAD_SCAN_BYTES = 32_000;
-const CURSOR_MAX_ACTIVE_CANDIDATES = 200;
-const CURSOR_MAX_KEY_BYTES = 4_096;
-const CURSOR_MAX_VALUE_BYTES = 4_000_000;
-const CURSOR_MAX_ROW_BYTES = CURSOR_MAX_KEY_BYTES + CURSOR_MAX_VALUE_BYTES + 1_024;
-const CURSOR_QUERY_TIMEOUT_MS = 4_000;
 
 /**
  * EXPERIMENTAL Raycast AI log hack (not a supported API).
@@ -317,11 +323,80 @@ type ActiveTurnHit = TurnAssessment & {
   identity: string;
 };
 
+/** Every reason a Cursor scan can stop before conclusively enumerating every
+ * matching `cursorDiskKV` row (natural `LIMIT`-bounded exhaustion aside). */
+export type CursorScanIncompleteReason =
+  | "rowLimit"
+  | "decodedByteLimit"
+  | "bubbleLookupLimit"
+  | "deadline";
+
+/**
+ * Thrown when a Cursor scan is stopped — by a hard bound (rows, cumulative
+ * decoded bytes, bubble lookups, or elapsed time) or by an operational
+ * SQLite failure (busy/locked/corrupt) — before it could conclusively
+ * enumerate every composer. `detectActiveAgents`'s caller
+ * (`monitor.ts`'s `scanOnce`) must never treat this as "zero active Cursor
+ * agents": its existing catch-and-retain behavior keeps the last
+ * successful agent list instead, exactly as it already does for any other
+ * unexpected detector failure.
+ */
+export class CursorSessionScanError extends Error {
+  readonly reason: CursorScanIncompleteReason | "databaseError";
+  readonly cause?: unknown;
+
+  constructor(reason: CursorScanIncompleteReason | "databaseError", options?: { cause?: unknown }) {
+    super(
+      reason === "databaseError"
+        ? `Cursor session database operation failed${
+            options?.cause instanceof Error ? `: ${options.cause.message}` : ""
+          }`
+        : `Cursor session scan stopped before completion (${reason}); treating as inconclusive`,
+    );
+    this.name = "CursorSessionScanError";
+    this.reason = reason;
+    this.cause = options?.cause;
+  }
+}
+
+/**
+ * Test-only instrumentation. Every field is `undefined` at every production
+ * call site, so none of this can affect real scans — only tests that
+ * explicitly construct hooks can observe inspected-row/bubble-lookup counts
+ * or force a near-immediate deadline.
+ */
+type CursorScanTestHooks = {
+  onRowInspected?: () => void;
+  onBubbleLookup?: () => void;
+  deadlineMillisecondsOverride?: number;
+};
+
+/** Outcome of one bounded, parameterized `bubbleId:<composerId>:<bubbleId>` point lookup. */
+type BubbleLookupOutcome =
+  | { kind: "found"; bubble: CursorBubbleRecord }
+  | { kind: "absentOrMalformed" }
+  | { kind: "limitExceeded" };
+
 /**
  * Cursor IDE stores composer/agent state in globalStorage state.vscdb
  * (cursorDiskKV composerData:*). Disk `status` is unreliable mid-turn, so we
- * also inspect conversation headers for open turns and running tools.
- * Returns every active composer so concurrent agents all appear in the menu.
+ * also inspect conversation headers for open turns and running tools — and,
+ * since real Cursor data records a running tool's actual status in a
+ * separate `bubbleId:<composerId>:<bubbleId>` row rather than embedding it
+ * in the header itself, a bounded set of those rows too (see
+ * `cursorRelevantBubbleIds`). Returns every active composer so concurrent
+ * agents all appear in the menu.
+ *
+ * Every hard bound below (see `agent-detection-policy.ts`'s
+ * `CURSOR_MAX_*`/`CURSOR_SQLITE_*` constants) counts inactive, malformed,
+ * duplicate, and active rows/lookups alike. Reaching any of them — other
+ * than the intentional `CURSOR_MAX_ACTIVE_CANDIDATES` early exit once
+ * plenty of concurrent agents are already found, or natural exhaustion of
+ * the `LIMIT`-bounded result set — throws `CursorSessionScanError` rather
+ * than silently returning whatever partial evidence was gathered so far: an
+ * unbounded/pathological Cursor vault must never be able to make this
+ * function falsely report "no active Cursor agents" merely because a bound
+ * was hit before the scan could look far enough.
  */
 export async function detectCursorComposerActivity(
   now: number,
@@ -334,157 +409,238 @@ export async function detectCursorComposerActivity(
     "globalStorage",
     "state.vscdb",
   ),
+  testHooks?: CursorScanTestHooks,
 ): Promise<ActiveTurnHit[]> {
-
   try {
     await fs.access(dbPath);
   } catch {
     return [];
   }
 
-  return new Promise((resolve) => {
-    const dbUri = `file:${dbPath}?mode=ro`;
-    const child = spawn(
-      "/usr/bin/sqlite3",
-      [
-        "-readonly",
-        "-json",
-        dbUri,
-        `SELECT key, value FROM cursorDiskKV
-         WHERE key LIKE 'composerData:%'`,
-      ],
-      { stdio: ["ignore", "pipe", "pipe"] },
+  return queryCursorComposers(dbPath, now, testHooks);
+}
+
+function queryCursorComposers(
+  dbPath: string,
+  now: number,
+  testHooks?: CursorScanTestHooks,
+): ActiveTurnHit[] {
+  let db: DatabaseSync;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true, timeout: CURSOR_SQLITE_BUSY_TIMEOUT_MS });
+  } catch (error) {
+    throw new CursorSessionScanError("databaseError", { cause: error });
+  }
+
+  try {
+    return runCursorScan(db, dbPath, now, testHooks);
+  } finally {
+    try {
+      db.close();
+    } catch {
+      // Best-effort close only: a result or a thrown error has already
+      // been determined by this point, and a close failure must not
+      // override either.
+    }
+  }
+}
+
+function runCursorScan(
+  db: DatabaseSync,
+  dbPath: string,
+  now: number,
+  testHooks?: CursorScanTestHooks,
+): ActiveTurnHit[] {
+  const deadlineAtMs =
+    performance.now() + (testHooks?.deadlineMillisecondsOverride ?? CURSOR_SQLITE_QUERY_DEADLINE_MS);
+  const deadlineExpired = () => performance.now() >= deadlineAtMs;
+
+  let transactionOpen = false;
+  try {
+    db.exec("BEGIN");
+    transactionOpen = true;
+
+    // `ORDER BY rowid DESC`: cursorDiskKV is a plain SQLite KV table with no
+    // timestamp column, so the implicit rowid — bumped on every
+    // insert/upsert — is the only available, trustworthy (schema-level,
+    // not attacker-controlled-JSON) recency proxy. Cursor rewrites a
+    // composer's row whenever it changes, so the freshest activity
+    // surfaces first, which keeps a bounded scan useful even if the
+    // row/byte/time budget runs out before reaching the end of the table.
+    // `LIMIT ?` is bound to the inspected-row cap **+ 1**: SQL fetches at
+    // most that many rows (never the whole table); if the `(cap + 1)`-th
+    // row is actually delivered, more matching rows exist beyond what this
+    // scan inspected, which is the truncation signal.
+    const composerStatement = db.prepare(
+      "SELECT key, value FROM cursorDiskKV WHERE key LIKE ? ORDER BY rowid DESC LIMIT ?",
     );
-    const active: ActiveTurnHit[] = [];
-    const decoder = new StringDecoder("utf8");
-    let pending = "";
-    let pendingBytes = 0;
-    let discardingOversizedLine = false;
-    let intentionallyStopped = false;
-    let timedOut = false;
-    let childError: Error | null = null;
-    let stderr = "";
+    // Prepared once, reused (bound fresh per call) for every bubble
+    // lookup — an exact parameterized point lookup, never SQL
+    // concatenation.
+    const bubbleStatement = db.prepare("SELECT value FROM cursorDiskKV WHERE key = ?");
 
-    const parseRow = (line: string) => {
-      let encoded = line.trim();
-      if (encoded.startsWith("[")) encoded = encoded.slice(1);
-      if (encoded.endsWith("]")) encoded = encoded.slice(0, -1);
-      if (encoded.endsWith(",")) encoded = encoded.slice(0, -1);
-      if (!encoded) return;
+    const evidence: ActiveTurnHit[] = [];
+    let rowsInspected = 0;
+    let totalDecodedBytes = 0;
+    let totalBubbleLookups = 0;
+    const attemptedBubbleKeys = new Set<string>();
+    const bubbleCache = new Map<string, CursorBubbleRecord>();
+    let stopReason: CursorScanIncompleteReason | null = null;
 
-      let row: unknown;
+    // Every counter/flag here is charged identically whether the row or
+    // bubble turns out to be inactive, malformed, or a duplicate reference
+    // — limits count inspected work, not just active results.
+    const lookUpBubble = (bubbleKey: string): BubbleLookupOutcome => {
+      if (attemptedBubbleKeys.has(bubbleKey)) {
+        // Duplicate reference (already attempted this scan): serve from
+        // cache without a second round trip or byte charge.
+        const cached = bubbleCache.get(bubbleKey);
+        return cached ? { kind: "found", bubble: cached } : { kind: "absentOrMalformed" };
+      }
+      if (deadlineExpired()) {
+        stopReason ??= "deadline";
+        return { kind: "limitExceeded" };
+      }
+      if (totalBubbleLookups >= CURSOR_MAX_BUBBLE_LOOKUPS) {
+        stopReason ??= "bubbleLookupLimit";
+        return { kind: "limitExceeded" };
+      }
+      attemptedBubbleKeys.add(bubbleKey);
+      totalBubbleLookups += 1;
+      testHooks?.onBubbleLookup?.();
+
+      const row = bubbleStatement.get(bubbleKey) as { value?: unknown } | undefined;
+      if (!row || typeof row.value !== "string") return { kind: "absentOrMalformed" };
+      const valueByteCount = Buffer.byteLength(row.value, "utf8");
+      if (valueByteCount === 0 || valueByteCount > CURSOR_MAX_VALUE_BYTES) {
+        return { kind: "absentOrMalformed" };
+      }
+      if (totalDecodedBytes + valueByteCount > CURSOR_MAX_TOTAL_DECODED_VALUE_BYTES) {
+        stopReason ??= "decodedByteLimit";
+        return { kind: "limitExceeded" };
+      }
+      totalDecodedBytes += valueByteCount;
+      let bubble: unknown;
       try {
-        row = JSON.parse(encoded);
+        bubble = JSON.parse(row.value);
       } catch {
-        return;
+        return { kind: "absentOrMalformed" };
       }
-      if (!row || typeof row !== "object" || Array.isArray(row)) return;
-      const { key, value } = row as { key?: unknown; value?: unknown };
-      if (
-        typeof key !== "string" ||
-        !key.startsWith("composerData:") ||
-        Buffer.byteLength(key, "utf8") > CURSOR_MAX_KEY_BYTES ||
-        typeof value !== "string" ||
-        value.length === 0 ||
-        Buffer.byteLength(value, "utf8") > CURSOR_MAX_VALUE_BYTES
-      ) {
-        return;
+      if (!bubble || typeof bubble !== "object" || Array.isArray(bubble)) {
+        return { kind: "absentOrMalformed" };
       }
+      bubbleCache.set(bubbleKey, bubble as CursorBubbleRecord);
+      return { kind: "found", bubble: bubble as CursorBubbleRecord };
+    };
+
+    rowLoop: for (const row of composerStatement.iterate("composerData:%", CURSOR_MAX_INSPECTED_ROWS + 1)) {
+      if (deadlineExpired()) {
+        stopReason = "deadline";
+        break;
+      }
+      if (rowsInspected >= CURSOR_MAX_INSPECTED_ROWS) {
+        stopReason = "rowLimit";
+        break;
+      }
+      rowsInspected += 1;
+      testHooks?.onRowInspected?.();
+
+      if (typeof row.key !== "string") continue;
+      const keyByteCount = Buffer.byteLength(row.key, "utf8");
+      if (keyByteCount === 0 || keyByteCount > CURSOR_MAX_KEY_BYTES) continue;
+
+      if (typeof row.value !== "string") continue;
+      const valueByteCount = Buffer.byteLength(row.value, "utf8");
+      // Bounded blob processing: skip (never log) anything implausibly
+      // large for a composer record.
+      if (valueByteCount === 0 || valueByteCount > CURSOR_MAX_VALUE_BYTES) continue;
+
+      if (totalDecodedBytes + valueByteCount > CURSOR_MAX_TOTAL_DECODED_VALUE_BYTES) {
+        stopReason = "decodedByteLimit";
+        break;
+      }
+      totalDecodedBytes += valueByteCount;
 
       let record: unknown;
       try {
-        record = JSON.parse(value);
+        record = JSON.parse(row.value);
       } catch {
-        return;
+        continue;
       }
-      if (!record || typeof record !== "object" || Array.isArray(record)) return;
+      if (!record || typeof record !== "object" || Array.isArray(record)) continue;
 
+      const key = row.key;
+      const identity = key.startsWith("composerData:") ? key.slice("composerData:".length) : key;
+
+      let finalAssessment: TurnAssessment & { label?: string };
       try {
-        const assessment = assessCursorComposerRecord(record as CursorComposerRecord, now);
-        if (!assessment.active) return;
-        active.push({
-          ...assessment,
-          filePath: dbPath,
-          identity: key.slice("composerData:".length),
-        });
-        if (active.length >= CURSOR_MAX_ACTIVE_CANDIDATES) {
-          intentionallyStopped = true;
-          child.kill("SIGTERM");
+        // First pass never touches bubbles; `lastActivityAt` is folded
+        // purely from already-decoded, trusted composer/header fields, so
+        // it is identical whether or not bubbles are ultimately consulted
+        // below.
+        const provisional = assessCursorComposerRecord(record as CursorComposerRecord, now);
+        finalAssessment = provisional;
+
+        if (!provisional.active && isRecentTimestamp(provisional.lastActivityAt, now, TOOL_TURN_GRACE_MS)) {
+          // Only a plausibly-recent composer's verdict can change once a
+          // hidden bubble tool status is known — this keeps bubble lookups
+          // bounded to the small fraction of composers where they could
+          // possibly matter, instead of spending budget on every
+          // long-completed conversation the scan steps over.
+          const bubbles: Record<string, CursorBubbleRecord> = {};
+          let truncatedByBubbleLookup = false;
+          for (const bubbleId of cursorRelevantBubbleIds(record as CursorComposerRecord)) {
+            const outcome = lookUpBubble(`bubbleId:${identity}:${bubbleId}`);
+            if (outcome.kind === "found") {
+              bubbles[bubbleId] = outcome.bubble;
+            } else if (outcome.kind === "limitExceeded") {
+              truncatedByBubbleLookup = true;
+              break;
+            }
+          }
+          if (truncatedByBubbleLookup) break rowLoop;
+          finalAssessment = assessCursorComposerRecord(record as CursorComposerRecord, now, bubbles);
         }
       } catch {
         logger.debug("detector", "Skipped malformed Cursor composer row", {
           reason: "assessment exception",
         });
+        continue;
       }
-    };
 
-    const appendLineFragment = (fragment: string, lineEnded: boolean) => {
-      if (discardingOversizedLine) {
-        if (lineEnded) discardingOversizedLine = false;
-        return;
-      }
-      const fragmentBytes = Buffer.byteLength(fragment, "utf8");
-      if (pendingBytes + fragmentBytes > CURSOR_MAX_ROW_BYTES) {
-        pending = "";
-        pendingBytes = 0;
-        discardingOversizedLine = !lineEnded;
-        return;
-      }
-      pending += fragment;
-      pendingBytes += fragmentBytes;
-      if (lineEnded) {
-        parseRow(pending);
-        pending = "";
-        pendingBytes = 0;
-      }
-    };
+      if (!finalAssessment.active) continue;
+      evidence.push({
+        ...finalAssessment,
+        filePath: dbPath,
+        identity,
+      });
+      if (evidence.length >= CURSOR_MAX_ACTIVE_CANDIDATES) break;
+    }
 
-    const consume = (text: string) => {
-      let offset = 0;
-      while (offset < text.length) {
-        const newline = text.indexOf("\n", offset);
-        if (newline === -1) {
-          appendLineFragment(text.slice(offset), false);
-          return;
-        }
-        appendLineFragment(text.slice(offset, newline), true);
-        offset = newline + 1;
+    // Any stop reason other than natural `LIMIT`-bounded exhaustion or the
+    // intentional `CURSOR_MAX_ACTIVE_CANDIDATES` early exit means an unseen
+    // row or bubble could have been active — never trust the partial
+    // evidence gathered so far in that case.
+    if (stopReason) {
+      throw new CursorSessionScanError(stopReason);
+    }
+
+    db.exec("COMMIT");
+    transactionOpen = false;
+    evidence.sort((a, b) => b.lastActivityAt - a.lastActivityAt);
+    return evidence;
+  } catch (error) {
+    if (transactionOpen) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        // Best-effort rollback only; the error/result already determined
+        // above takes precedence.
       }
-    };
-
-    child.stdout.on("data", (chunk: Buffer) => consume(decoder.write(chunk)));
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk: string) => {
-      if (stderr.length < 8_192) stderr += chunk.slice(0, 8_192 - stderr.length);
-    });
-    child.once("error", (error) => {
-      childError = error;
-    });
-
-    const timeout = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGKILL");
-    }, CURSOR_QUERY_TIMEOUT_MS);
-    timeout.unref?.();
-
-    child.once("close", (code, signal) => {
-      clearTimeout(timeout);
-      consume(decoder.end());
-      if (pendingBytes > 0 && !discardingOversizedLine) parseRow(pending);
-      if (childError || timedOut || (!intentionallyStopped && code !== 0)) {
-        logger.debug("detector", "Failed to read Cursor composer state", {
-          error: childError,
-          code,
-          signal,
-          stderr,
-        });
-        resolve([]);
-        return;
-      }
-      active.sort((a, b) => b.lastActivityAt - a.lastActivityAt);
-      resolve(active);
-    });
-  });
+    }
+    if (error instanceof CursorSessionScanError) throw error;
+    throw new CursorSessionScanError("databaseError", { cause: error });
+  }
 }
 
 type RaycastChatEvent = {

@@ -136,7 +136,15 @@ final class TurnAssessorsTests: XCTestCase {
             else {
                 throw FixtureAssessorError.invalidFixture(testCase.fixtureFile)
             }
-            let assessment = assessCursorComposerRecord(record, now: now)
+            var bubbles: [String: JSONObject] = [:]
+            if let rawBubbles = asRecord(data["bubbles"]) {
+                for (bubbleId, value) in rawBubbles {
+                    if let bubble = asRecord(value) {
+                        bubbles[bubbleId] = bubble
+                    }
+                }
+            }
+            let assessment = assessCursorComposerRecord(record, bubbles: bubbles, now: now)
             return FixtureExpected(
                 active: assessment.active,
                 source: .session,
@@ -913,6 +921,141 @@ final class TurnAssessorsTests: XCTestCase {
             XCTAssertTrue(shellAssessment.active, "shellStatus \"\(rawStatus)\" should be active")
             XCTAssertEqual(shellAssessment.reason, "tool_call in progress", "shellStatus \"\(rawStatus)\" should report a running tool")
         }
+    }
+
+    // MARK: - Cursor: realistic bubble-based tool status (issue B)
+
+    /// Real Cursor state never embeds `grouping.toolFormerStatus` — the
+    /// header only references a bubble id, and the actual tool status lives
+    /// in that bubble's own `bubbleId:<composerId>:<bubbleId>` row under
+    /// `toolFormerData.status`. This proves the bubble-derived source alone
+    /// (no legacy embedded fields at all) is enough to classify a running
+    /// tool call as active, mirroring
+    /// `testCursorToolStatusInProgressMixedCaseIsActive` for the legacy path.
+    func testCursorBubbleToolFormerDataStatusInProgressIsActive() {
+        let now: Int64 = 1_786_449_620_000
+        let record: JSONObject = [
+            "status": "completed",
+            "lastUpdatedAt": now - 5_000,
+            "fullConversationHeadersOnly": [
+                ["type": 2, "createdAt": now - 5_000, "bubbleId": "bubble-1"] as JSONObject,
+            ],
+        ]
+        let bubbles: [String: JSONObject] = [
+            "bubble-1": ["toolFormerData": ["status": "inProgress"]],
+        ]
+
+        let withoutBubble = assessCursorComposerRecord(record, now: now)
+        XCTAssertFalse(withoutBubble.active, "a bare bubble reference with no bubble content must not itself imply activity")
+
+        let withBubble = assessCursorComposerRecord(record, bubbles: bubbles, now: now)
+        XCTAssertTrue(withBubble.active, "toolFormerData.status \"inProgress\" resolved via the referenced bubble must classify the tool call as active")
+        XCTAssertEqual(withBubble.reason, "tool_call in progress")
+    }
+
+    /// Every raw case variant of "in progress" must normalize identically
+    /// whether the status arrives via the legacy embedded header field or
+    /// the realistic bubble row — same allowlist, same lowercasing.
+    func testCursorBubbleToolFormerDataStatusCaseVariantsAreActive() {
+        let now: Int64 = 1_786_449_620_000
+        for rawStatus in ["inProgress", "INPROGRESS", "InProgress", "inprogress", "in_progress"] {
+            let record: JSONObject = [
+                "status": "completed",
+                "lastUpdatedAt": now - 5_000,
+                "fullConversationHeadersOnly": [
+                    ["type": 2, "createdAt": now - 5_000, "bubbleId": "bubble-1"] as JSONObject,
+                ],
+            ]
+            let bubbles: [String: JSONObject] = [
+                "bubble-1": ["toolFormerData": ["status": rawStatus]],
+            ]
+            let assessment = assessCursorComposerRecord(record, bubbles: bubbles, now: now)
+            XCTAssertTrue(assessment.active, "bubble toolFormerData.status \"\(rawStatus)\" should be active")
+            XCTAssertEqual(assessment.reason, "tool_call in progress", "bubble toolFormerData.status \"\(rawStatus)\" should report a running tool")
+        }
+    }
+
+    /// A resolved bubble reporting a terminal status (mirroring the legacy
+    /// `shellStatus`/`toolFormerStatus` terminal set) marks the turn as
+    /// tool-touched/completed rather than running, exactly like the legacy
+    /// embedded fields already do.
+    func testCursorBubbleToolFormerDataTerminalStatusesAreNotRunning() {
+        let now: Int64 = 1_786_449_620_000
+        for rawStatus in ["completed", "success", "error", "failed"] {
+            let record: JSONObject = [
+                "status": "completed",
+                "lastUpdatedAt": now - 5_000,
+                "fullConversationHeadersOnly": [
+                    ["type": 1, "createdAt": now - 10_000] as JSONObject,
+                    ["type": 2, "createdAt": now - 5_000, "bubbleId": "bubble-1"] as JSONObject,
+                ],
+            ]
+            let bubbles: [String: JSONObject] = [
+                "bubble-1": ["toolFormerData": ["status": rawStatus]],
+            ]
+            let assessment = assessCursorComposerRecord(record, bubbles: bubbles, now: now)
+            XCTAssertNotEqual(assessment.reason, "tool_call in progress", "terminal bubble status \"\(rawStatus)\" must not report a running tool")
+        }
+    }
+
+    /// A missing bubble (dangling reference), a bubble present but lacking
+    /// `toolFormerData`, and a non-object `toolFormerData.status` must all be
+    /// treated identically to "no status" rather than crashing or throwing.
+    func testCursorBubbleMissingOrMalformedNeverCrashesOrFalselyActivates() {
+        let now: Int64 = 1_786_449_620_000
+        let record: JSONObject = [
+            "status": "completed",
+            "lastUpdatedAt": now - 5_000,
+            "fullConversationHeadersOnly": [
+                ["type": 2, "createdAt": now - 5_000, "bubbleId": "bubble-missing"] as JSONObject,
+            ],
+        ]
+        let malformedBubbleSets: [[String: JSONObject]] = [
+            [:], // dangling reference: bubble id not present at all.
+            ["bubble-missing": [:]], // bubble present, no toolFormerData at all.
+            ["bubble-missing": ["toolFormerData": "not-an-object"]],
+            ["bubble-missing": ["toolFormerData": ["status": NSNumber(value: 1)]]],
+            ["bubble-missing": ["toolFormerData": ["status": NSNull()]]],
+        ]
+        for bubbles in malformedBubbleSets {
+            let assessment = assessCursorComposerRecord(record, bubbles: bubbles, now: now)
+            XCTAssertNotEqual(assessment.reason, "tool_call in progress")
+        }
+    }
+
+    /// `cursorRelevantBubbleIds` must exclude `type == 1` (user) bubble ids
+    /// and deduplicate a repeated reference within the trailing window.
+    func testCursorRelevantBubbleIdsExcludesUserBubblesAndDeduplicates() {
+        let record: JSONObject = [
+            "fullConversationHeadersOnly": [
+                ["type": 1, "createdAt": Int64(0), "bubbleId": "user-0"] as JSONObject,
+                ["type": 2, "createdAt": Int64(1), "bubbleId": "tool-0"] as JSONObject,
+                ["type": 1, "createdAt": Int64(2), "bubbleId": "user-1"] as JSONObject,
+                ["type": 2, "createdAt": Int64(3), "bubbleId": "tool-1"] as JSONObject,
+                // Duplicate reference to an already-listed bubble id.
+                ["type": 2, "createdAt": Int64(4), "bubbleId": "tool-0"] as JSONObject,
+            ],
+        ]
+
+        XCTAssertEqual(cursorRelevantBubbleIds(record), ["tool-0", "tool-1"])
+    }
+
+    /// A conversation with more trailing `type == 2` bubble references than
+    /// `cursorMaximumRecentHeadersPerComposer` must be capped to exactly that
+    /// many — the most recent ones — never growing unbounded with
+    /// conversation length (this is what keeps the global
+    /// `cursorMaximumBubbleLookups` scan budget meaningful).
+    func testCursorRelevantBubbleIdsBoundedToRecentHeadersPerComposer() {
+        var headers: [JSONObject] = []
+        for index in 0..<12 {
+            headers.append(["type": 2, "createdAt": Int64(index), "bubbleId": "tool-\(index)"])
+        }
+        let record: JSONObject = ["fullConversationHeadersOnly": headers]
+
+        let ids = cursorRelevantBubbleIds(record)
+
+        XCTAssertEqual(cursorMaximumRecentHeadersPerComposer, 8)
+        XCTAssertEqual(ids, ["tool-4", "tool-5", "tool-6", "tool-7", "tool-8", "tool-9", "tool-10", "tool-11"])
     }
 
     func testAssessCodexTurnDistinguishesApprovalFromCompletion() {

@@ -6,10 +6,20 @@ import test from "node:test";
 
 import {
   AGENT_KINDS,
+  CURSOR_MAX_ACTIVE_CANDIDATES,
+  CURSOR_MAX_BUBBLE_LOOKUPS,
+  CURSOR_MAX_INSPECTED_ROWS,
+  CURSOR_MAX_KEY_BYTES,
+  CURSOR_MAX_RECENT_HEADERS_PER_COMPOSER,
+  CURSOR_MAX_TOTAL_DECODED_VALUE_BYTES,
+  CURSOR_MAX_VALUE_BYTES,
   CURSOR_RUNNING_TOOL_STATUSES,
+  CURSOR_SQLITE_BUSY_TIMEOUT_MS,
+  CURSOR_SQLITE_QUERY_DEADLINE_MS,
   TIMESTAMP_FUTURE_SKEW_MS,
   assessCursorComposerRecord,
   assessDetectionFixture,
+  cursorRelevantBubbleIds,
   isRecentTimestamp,
   matchAgentKind,
 } from "../main/services/agent-detection-policy.ts";
@@ -209,6 +219,154 @@ test("Cursor tool status 'inProgress' (and normalized case variants) classify th
   }
 });
 
+// MARK: - Cursor bubble-aware assessor (issue B)
+//
+// Real Cursor state stores a running tool's actual status in a separate
+// `bubbleId:<composerId>:<bubbleId>` row's `toolFormerData.status`, not
+// embedded in the composer header itself (that legacy embedded shape is
+// still supported — see the "inProgress" case-variant test above — but is
+// not what real Cursor installs ever write). These mirror
+// `TurnAssessorsTests.swift`'s bubble-aware tests 1:1 so both languages
+// prove the same behavior against the same pure assessor contract.
+
+test("Cursor bubble toolFormerData.status inProgress resolved via bubbleId makes the tool call active", () => {
+  const timestampNow = 1_786_449_620_000;
+  const record = {
+    status: "completed",
+    lastUpdatedAt: timestampNow - 5_000,
+    fullConversationHeadersOnly: [
+      { type: 2, createdAt: timestampNow - 5_000, bubbleId: "bubble-1" },
+    ],
+  };
+  const bubbles = { "bubble-1": { toolFormerData: { status: "inProgress" } } };
+
+  const withoutBubble = assessCursorComposerRecord(record, timestampNow);
+  assert.equal(
+    withoutBubble.active,
+    false,
+    "a bare bubble reference with no bubble content must not itself imply activity",
+  );
+
+  const withBubble = assessCursorComposerRecord(record, timestampNow, bubbles);
+  assert.equal(
+    withBubble.active,
+    true,
+    'toolFormerData.status "inProgress" resolved via the referenced bubble must classify the tool call as active',
+  );
+  assert.equal(withBubble.reason, "tool_call in progress");
+});
+
+test("Cursor bubble toolFormerData.status case variants are all active", () => {
+  const timestampNow = 1_786_449_620_000;
+  for (const rawStatus of ["inProgress", "INPROGRESS", "InProgress", "inprogress", "in_progress"]) {
+    const record = {
+      status: "completed",
+      lastUpdatedAt: timestampNow - 5_000,
+      fullConversationHeadersOnly: [
+        { type: 2, createdAt: timestampNow - 5_000, bubbleId: "bubble-1" },
+      ],
+    };
+    const bubbles = { "bubble-1": { toolFormerData: { status: rawStatus } } };
+    const assessment = assessCursorComposerRecord(record, timestampNow, bubbles);
+    assert.equal(assessment.active, true, `bubble toolFormerData.status "${rawStatus}" should be active`);
+    assert.equal(
+      assessment.reason,
+      "tool_call in progress",
+      `bubble toolFormerData.status "${rawStatus}" should report a running tool`,
+    );
+  }
+});
+
+test("Cursor bubble toolFormerData terminal statuses are not reported as a running tool", () => {
+  const timestampNow = 1_786_449_620_000;
+  for (const rawStatus of ["completed", "success", "error", "failed"]) {
+    const record = {
+      status: "completed",
+      lastUpdatedAt: timestampNow - 5_000,
+      fullConversationHeadersOnly: [
+        { type: 1, createdAt: timestampNow - 10_000 },
+        { type: 2, createdAt: timestampNow - 5_000, bubbleId: "bubble-1" },
+      ],
+    };
+    const bubbles = { "bubble-1": { toolFormerData: { status: rawStatus } } };
+    const assessment = assessCursorComposerRecord(record, timestampNow, bubbles);
+    assert.notEqual(
+      assessment.reason,
+      "tool_call in progress",
+      `terminal bubble status "${rawStatus}" must not report a running tool`,
+    );
+  }
+});
+
+test("Cursor missing or malformed bubble content never crashes or falsely activates", () => {
+  const timestampNow = 1_786_449_620_000;
+  const record = {
+    status: "completed",
+    lastUpdatedAt: timestampNow - 5_000,
+    fullConversationHeadersOnly: [
+      { type: 2, createdAt: timestampNow - 5_000, bubbleId: "bubble-missing" },
+    ],
+  };
+  const malformedBubbleSets = [
+    {}, // dangling reference: bubble id not present at all.
+    { "bubble-missing": {} }, // bubble present, no toolFormerData at all.
+    { "bubble-missing": { toolFormerData: "not-an-object" } },
+    { "bubble-missing": { toolFormerData: { status: 1 } } },
+    { "bubble-missing": { toolFormerData: { status: null } } },
+  ];
+  for (const bubbles of malformedBubbleSets) {
+    assert.doesNotThrow(() => {
+      const assessment = assessCursorComposerRecord(record, timestampNow, bubbles);
+      assert.notEqual(assessment.reason, "tool_call in progress");
+    });
+  }
+});
+
+test("cursorRelevantBubbleIds excludes user bubbles and deduplicates repeated references", () => {
+  const record = {
+    fullConversationHeadersOnly: [
+      { type: 1, createdAt: 0, bubbleId: "user-0" },
+      { type: 2, createdAt: 1, bubbleId: "tool-0" },
+      { type: 1, createdAt: 2, bubbleId: "user-1" },
+      { type: 2, createdAt: 3, bubbleId: "tool-1" },
+      // Duplicate reference to an already-listed bubble id.
+      { type: 2, createdAt: 4, bubbleId: "tool-0" },
+    ],
+  };
+
+  assert.deepEqual(cursorRelevantBubbleIds(record), ["tool-0", "tool-1"]);
+});
+
+test("cursorRelevantBubbleIds is bounded to the trailing CURSOR_MAX_RECENT_HEADERS_PER_COMPOSER references", () => {
+  const headers = Array.from({ length: 12 }, (_, index) => ({
+    type: 2,
+    createdAt: index,
+    bubbleId: `tool-${index}`,
+  }));
+  const record = { fullConversationHeadersOnly: headers };
+
+  const ids = cursorRelevantBubbleIds(record);
+
+  assert.equal(CURSOR_MAX_RECENT_HEADERS_PER_COMPOSER, 8);
+  assert.deepEqual(ids, ["tool-4", "tool-5", "tool-6", "tool-7", "tool-8", "tool-9", "tool-10", "tool-11"]);
+});
+
+// MARK: - Cross-language bound-constant parity (issue A)
+
+test("Cursor scan limit constants match the shared cross-language parity fixture", () => {
+  const limits = readJson("cursor-scan-limits.json");
+
+  assert.equal(limits.cursorMaximumValidCandidates, CURSOR_MAX_ACTIVE_CANDIDATES);
+  assert.equal(limits.cursorMaximumKeyBytes, CURSOR_MAX_KEY_BYTES);
+  assert.equal(limits.cursorMaximumValueBytes, CURSOR_MAX_VALUE_BYTES);
+  assert.equal(limits.cursorSQLiteBusyTimeoutMilliseconds, CURSOR_SQLITE_BUSY_TIMEOUT_MS);
+  assert.equal(limits.cursorSQLiteQueryDeadlineMilliseconds, CURSOR_SQLITE_QUERY_DEADLINE_MS);
+  assert.equal(limits.cursorMaximumInspectedRows, CURSOR_MAX_INSPECTED_ROWS);
+  assert.equal(limits.cursorMaximumTotalDecodedValueBytes, CURSOR_MAX_TOTAL_DECODED_VALUE_BYTES);
+  assert.equal(limits.cursorMaximumBubbleLookups, CURSOR_MAX_BUBBLE_LOOKUPS);
+  assert.equal(limits.cursorMaximumRecentHeadersPerComposer, CURSOR_MAX_RECENT_HEADERS_PER_COMPOSER);
+});
+
 const APPROVED_FAMILIES = [
   "claude-code",
   "codex",
@@ -257,6 +415,7 @@ function buildFixture(testCase) {
       format: "cursor",
       identity: doc.composerKey,
       record: doc.record,
+      bubbles: doc.bubbles ?? {},
     };
   }
 

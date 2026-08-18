@@ -746,6 +746,14 @@ public func assessGenericMtime(mtimeMs: Int64, now: Int64) -> TurnAssessment {
 // match — a mixed-case "inProgress" entry previously never matched.
 private let cursorRunningToolStatuses: Set<String> = ["loading", "running", "pending", "in_progress", "inprogress"]
 
+/// Real Cursor state stores tool-call status in a separate `bubbleId:
+/// <composerId>:<bubbleId>` row's `toolFormerData.status` — composer headers
+/// only ever reference a bubble id, they do not embed status directly. Bounds
+/// how many of a composer's trailing headers are even eligible to have their
+/// bubble looked up: only the tail of a conversation can possibly be "a tool
+/// CURRENTLY running," so older headers are never worth an I/O round trip.
+public let cursorMaximumRecentHeadersPerComposer = 8
+
 private func isLongHexIdentifier(_ text: String) -> Bool {
     guard text.count >= 16 else { return false }
     return text.unicodeScalars.allSatisfy { scalar in
@@ -785,6 +793,10 @@ private struct ValidatedCursorConversationHeader {
     let type: Int
     let createdAt: Int64
     let grouping: JSONObject
+    /// References the real `bubbleId:<composerId>:<bubbleId>` row carrying
+    /// this header's actual message/tool content. `nil` when absent (older
+    /// data) or when validation rejected a non-string value.
+    let bubbleId: String?
 }
 
 private func parseCursorTimestamp(_ value: Any?) -> Int64? {
@@ -849,7 +861,8 @@ private func validateCursorHeaders(_ value: Any?) -> [ValidatedCursorConversatio
         guard let header = asRecord(candidate),
               let rawType = finiteNumber(header["type"]),
               rawType == 1 || rawType == 2,
-              let createdAt = parseCursorTimestamp(header["createdAt"]) else {
+              let createdAt = parseCursorTimestamp(header["createdAt"]),
+              hasValidOptionalString(header, field: "bubbleId") else {
             continue
         }
 
@@ -867,15 +880,42 @@ private func validateCursorHeaders(_ value: Any?) -> [ValidatedCursorConversatio
             }
             grouping = rawGrouping
         }
+        let bubbleId = header["bubbleId"] as? String
         headers.append(
             ValidatedCursorConversationHeader(
                 type: Int(rawType),
                 createdAt: createdAt,
-                grouping: grouping
+                grouping: grouping,
+                bubbleId: (bubbleId?.isEmpty == false) ? bubbleId : nil
             )
         )
     }
     return candidates.isEmpty || !headers.isEmpty ? headers : nil
+}
+
+/// Returns the bounded, deduplicated, order-preserving list of bubble ids
+/// that could affect this composer's CURRENT activity: the trailing
+/// `cursorMaximumRecentHeadersPerComposer` headers' bubble ids, restricted to
+/// `type == 2` (assistant/tool) since a user bubble, type 1, never carries
+/// `toolFormerData`. Only the tail of a conversation can possibly be a
+/// currently-running tool, so older headers are never inspected. Returns an
+/// empty array for a malformed record or one with no headers at all — the
+/// caller's own `assessCursorComposerRecord` call independently reports
+/// "malformed cursor composer" in that case, so no bubble lookups are useful.
+/// Used by `SessionSnapshotSource` (I/O layer) to decide which real
+/// `bubbleId:<composerId>:<bubbleId>` rows are worth a bounded lookup, before
+/// ever calling this pure assessor.
+func cursorRelevantBubbleIds(_ record: JSONObject) -> [String] {
+    guard let headers = validateCursorHeaders(record["fullConversationHeadersOnly"]) else { return [] }
+    var seen = Set<String>()
+    var ids: [String] = []
+    for header in headers.suffix(cursorMaximumRecentHeadersPerComposer) where header.type == 2 {
+        guard let bubbleId = header.bubbleId,
+              bubbleId.utf8.count <= cursorMaximumKeyBytes,
+              seen.insert(bubbleId).inserted else { continue }
+        ids.append(bubbleId)
+    }
+    return ids
 }
 
 private func malformedCursorAssessment() -> TurnAssessment {
@@ -885,7 +925,24 @@ private func malformedCursorAssessment() -> TurnAssessment {
 /// Cursor often leaves composer status stuck at "completed" on disk while a turn
 /// is still running (especially during shell/tool waits). Prefer conversation
 /// headers: an open user turn without turnDurationMs, or a tool still loading.
-public func assessCursorComposerRecord(_ record: JSONObject, now: Int64) -> TurnAssessment {
+///
+/// `bubbles` maps a real `bubbleId:<composerId>:<bubbleId>` row's bubble id to
+/// its already-decoded JSON content (the caller — `SessionSnapshotSource` —
+/// performs the bounded, parameterized lookups via `cursorRelevantBubbleIds`;
+/// this function stays pure/I/O-free). Each resolved bubble's
+/// `toolFormerData.status` is lowercased and fed into exactly the same
+/// running/completed status checks as the legacy header-embedded
+/// `grouping.toolFormerStatus`/`grouping.shellStatus` fields — real Cursor
+/// data never populates those header fields directly, but existing callers
+/// that construct records with them directly (tests, and any legacy embedded
+/// shape this code intentionally still supports) keep working unchanged.
+/// Defaults to empty so every existing call site — none of which know about
+/// bubbles — is unaffected.
+public func assessCursorComposerRecord(
+    _ record: JSONObject,
+    bubbles: [String: JSONObject] = [:],
+    now: Int64
+) -> TurnAssessment {
     guard validateCursorRecordFields(record),
           let headers = validateCursorHeaders(record["fullConversationHeadersOnly"]) else {
         return malformedCursorAssessment()
@@ -932,8 +989,14 @@ public func assessCursorComposerRecord(_ record: JSONObject, now: Int64) -> Turn
         let grouping = header.grouping
         let toolStatus = (grouping["toolFormerStatus"] as? String)?.lowercased() ?? ""
         let shellStatus = (grouping["shellStatus"] as? String)?.lowercased() ?? ""
+        // Real Cursor data: the header only references a bubble id; the
+        // actual tool status lives in that bubble's own row.
+        let bubble = header.bubbleId.flatMap { bubbles[$0] }
+        let bubbleStatus = (asRecord(bubble?["toolFormerData"])?["status"] as? String)?.lowercased() ?? ""
 
-        if cursorRunningToolStatuses.contains(toolStatus) || cursorRunningToolStatuses.contains(shellStatus) {
+        if cursorRunningToolStatuses.contains(toolStatus)
+            || cursorRunningToolStatuses.contains(shellStatus)
+            || cursorRunningToolStatuses.contains(bubbleStatus) {
             runningTool = true
             openTurnTouchesTools = true
             sawCompletedTurnAfterUser = false
@@ -966,7 +1029,8 @@ public func assessCursorComposerRecord(_ record: JSONObject, now: Int64) -> Turn
         }
 
         if toolStatus == "completed" || shellStatus == "success" || shellStatus == "completed"
-            || shellStatus == "error" || shellStatus == "failed" {
+            || shellStatus == "error" || shellStatus == "failed"
+            || bubbleStatus == "completed" || bubbleStatus == "success" || bubbleStatus == "error" || bubbleStatus == "failed" {
             // Tool finished but the turn may still stream a final reply.
             openTurnTouchesTools = true
             sawCompletedTurnAfterUser = false
