@@ -29,7 +29,6 @@ import {
   buildRendererBuildManifest,
   computeRendererAssetDigest,
   computeRendererBuildDigest,
-  prepareRendererAssetDigestHelperImage,
   rendererBuildInputFiles,
   serializeRendererBuildManifest,
 } from "./renderer-build-identity.mjs";
@@ -2251,14 +2250,6 @@ function consumerArguments() {
 
 async function main() {
   const consumer = consumerArguments();
-  // Compile (or, in tests, load) the renderer asset digest helper's image
-  // once, before ever acquiring the renderer build lock below, so that
-  // real compile - the only one this whole process ever pays for, see
-  // loadOrCompileRendererAssetDigestHelperImageOnce - never consumes any of
-  // the lock's own liveness budget. Every computeRendererAssetDigest call
-  // made later in this process, including ones made while the lock is
-  // held, reuses this same cached image.
-  prepareRendererAssetDigestHelperImage();
   const lock = await acquireLock();
   let operationError = null;
   trace("start", lock.token);

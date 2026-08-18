@@ -117,34 +117,33 @@ for (const { name, path } of workflows) {
     }
   });
 
-  test(`${name}: includes the renderer asset digest private-helper test file alongside renderer-build-identity.test.mjs`, () => {
-    // scripts/renderer-build-identity.mjs's no-shared-canonical private
-    // work-directory design (compile/validate/spawn/revalidate/cleanup a
-    // fresh, unique, mode-0700-owned helper instance per invocation - see
-    // its module doc comment) replaced an earlier lock-free "stage then
-    // publish to a canonical path" design that was rejected for
-    // validation/publication/execution TOCTOU and ambient-permission
-    // flaws. tests/renderer-asset-digest-private-helper.test.mjs is the
-    // only test file covering that design's own safety properties
-    // directly (private-directory/helper-file validation, validate-then-
-    // spawn swap detection, cleanup isolation, compiler failure, and
-    // abandoned/concurrent run directories); a future edit dropping it
-    // from either official gate would silently stop exercising all of
-    // that in CI while tests/renderer-build-identity.test.mjs continued
-    // to look green.
+  test(`${name}: includes the renderer asset digest helper test file alongside renderer-build-identity.test.mjs`, () => {
+    // scripts/renderer-build-identity.mjs's system-interpreter design (Node
+    // reads scripts/renderer-asset-digest.py's own source bytes and pipes
+    // them to trusted /usr/bin/python3 over stdin - see its module doc
+    // comment) replaced an earlier compiled-Swift/private-directory/cache
+    // design that was rejected for compilation cost, publication/execution
+    // TOCTOU, and ambient-permission flaws. tests/renderer-asset-digest-helper.test.mjs
+    // is the only test file covering that design's own safety properties
+    // directly (trusted-interpreter validation, exact-stdin-bytes execution
+    // independent of any on-disk path, size/count/path limits, hook
+    // timeout/process-group cleanup, the overall deadline, and malformed-
+    // output handling); a future edit dropping it from either official gate
+    // would silently stop exercising all of that in CI while
+    // tests/renderer-build-identity.test.mjs continued to look green.
     const source = readFileSync(path, "utf8");
     const invocations = extractNodeTestInvocations(source);
-    const privateHelperInvocations = invocations.filter((invocation) =>
-      invocation.includes("tests/renderer-asset-digest-private-helper.test.mjs"),
+    const assetDigestHelperInvocations = invocations.filter((invocation) =>
+      invocation.includes("tests/renderer-asset-digest-helper.test.mjs"),
     );
     assert.ok(
-      privateHelperInvocations.length > 0,
-      `expected ${name} to invoke tests/renderer-asset-digest-private-helper.test.mjs at least once`,
+      assetDigestHelperInvocations.length > 0,
+      `expected ${name} to invoke tests/renderer-asset-digest-helper.test.mjs at least once`,
     );
-    for (const invocation of privateHelperInvocations) {
+    for (const invocation of assetDigestHelperInvocations) {
       assert.ok(
         invocation.includes("tests/renderer-build-identity.test.mjs"),
-        `${name} should run tests/renderer-asset-digest-private-helper.test.mjs alongside ` +
+        `${name} should run tests/renderer-asset-digest-helper.test.mjs alongside ` +
           `tests/renderer-build-identity.test.mjs (both exercise scripts/renderer-build-identity.mjs):\n${invocation}`,
       );
     }

@@ -240,7 +240,7 @@ private enum BundledRenderer {
     }
 
     /// Canonical asset-path ordering shared with `renderer-build-identity.mjs`
-    /// and `renderer-asset-digest.swift`: compare exact UTF-8 bytes, with no
+    /// and `renderer-asset-digest.py`: compare exact UTF-8 bytes, with no
     /// locale collation, case folding, or Unicode normalization.
     private static func canonicalRendererAssetPathPrecedes(_ left: String, _ right: String) -> Bool {
         let leftBytes = Array(left.utf8)

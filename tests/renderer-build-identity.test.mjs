@@ -29,7 +29,7 @@ const repoRoot = dirname(here);
 
 const HEX_SHA256 = /^[0-9a-f]{64}$/;
 const assetDigestHook = join(here, "helpers", "renderer-asset-digest-test-hook.mjs");
-const assetDigestHelper = join(repoRoot, "scripts", "renderer-asset-digest.swift");
+const assetDigestHelper = join(repoRoot, "scripts", "renderer-asset-digest.py");
 const buildIdentityModuleURL = pathToFileURL(
   join(repoRoot, "scripts", "renderer-build-identity.mjs"),
 ).href;
@@ -53,12 +53,18 @@ function expectedAssetDigest(assets) {
   return sha256Hex(Buffer.from(manifestLines, "utf8"));
 }
 
-function collectAssetsWithSwiftHelper(rendererRoot) {
+function collectAssetsWithPythonHelper(rendererRoot) {
+  // Independent oracle: this reads the helper's source bytes and pipes them to
+  // `/usr/bin/python3 -` itself, deliberately not reusing
+  // `spawnRendererAssetDigestHelper` from the module under test, so a bug in
+  // that shared spawn plumbing cannot mask itself from this parity check.
+  const source = readFileSync(assetDigestHelper);
   return JSON.parse(
-    execFileSync("swift", [assetDigestHelper, rendererRoot], {
+    execFileSync("/usr/bin/python3", ["-", rendererRoot], {
       cwd: repoRoot,
+      input: source,
       encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
     }),
   );
 }
@@ -181,23 +187,23 @@ test("computeRendererAssetDigest uses shared UTF-8 byte ordering for non-ASCII p
       writeFileSync(join(rendererRoot, relativePath), `${relativePath}\n`);
     }
 
-    const helperAssets = collectAssetsWithSwiftHelper(rendererRoot);
+    const helperAssets = collectAssetsWithPythonHelper(rendererRoot);
     const helperPaths = helperAssets.map((asset) => asset.relativePath);
     assert.ok(
       helperPaths.some((relativePath) => /[^\0-\x7F]/.test(relativePath)),
-      "the Swift helper must collect the non-ASCII asset paths",
+      "the Python helper must collect the non-ASCII asset paths",
     );
     assert.deepEqual(
       helperPaths,
       [...helperPaths].sort(compareRendererAssetPaths),
-      "the Swift helper must emit the same UTF-8 byte order Node uses for asset manifests",
+      "the Python helper must emit the same UTF-8 byte order Node uses for asset manifests",
     );
 
     const expectedDigest = expectedAssetDigest(helperAssets);
     assert.equal(
       computeRendererAssetDigest(rendererRoot),
       expectedDigest,
-      "Node must construct the same canonical UTF-8-byte-ordered manifest as the Swift helper",
+      "Node must construct the same canonical UTF-8-byte-ordered manifest as the Python helper",
     );
 
     const [firstLocale, secondLocale] = twoAvailableLocales();
