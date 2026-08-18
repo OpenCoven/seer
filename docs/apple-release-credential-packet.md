@@ -211,18 +211,23 @@ Checklist for this prerequisite:
 Notarization has two mutually exclusive credential configurations: the App
 Store Connect API-key method and the Apple ID method. These are **not** a
 primary path with an optional fallback that can be layered on top of it —
-`.github/workflows/release-macos.yml` reads all eight notarization-related
-secrets (`APPLE_API_ISSUER`, `APPLE_API_KEY`, `APPLE_API_KEY_BASE64`,
-`APPLE_ID`, `APPLE_PASSWORD`) unconditionally and passes every one of them to
-`scripts/package-macos-release.sh`, which counts how many fields are present
-for each method and `fail`s the run if either method is only partially
-configured (1–2 of the 3 API-key fields, or 1 of the 2 Apple ID fields), **and
-also fails the run if both methods are fully configured at once** — it does
-not attempt either method automatically as a fallback for the other. Configure
-exactly one complete credential set as an environment secret, and leave every
-secret belonging to the other method entirely absent (not empty) from
-`macos-release`. **Recommended: the App Store Connect API-key method.** A
-Developer ID Installer certificate is not required for a DMG release.
+`.github/workflows/release-macos.yml` reads all nine `APPLE_*` secrets: 4
+signing secrets that are always required (`APPLE_CERTIFICATE`,
+`APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_TEAM_ID`) plus
+5 notarization-related secrets split across the two mutually exclusive
+methods (3 API-key fields — `APPLE_API_ISSUER`, `APPLE_API_KEY`,
+`APPLE_API_KEY_BASE64` — and 2 Apple ID fields — `APPLE_ID`,
+`APPLE_PASSWORD`). All nine are read unconditionally and passed to
+`scripts/package-macos-release.sh`, which counts how many of the 5
+notarization fields are present for each method and `fail`s the run if
+either method is only partially configured (1–2 of the 3 API-key fields, or
+1 of the 2 Apple ID fields), **and also fails the run if both methods are
+fully configured at once** — it does not attempt either method automatically
+as a fallback for the other. Configure exactly one complete notarization
+credential set (3 or 2 secrets, never both) as an environment secret, and
+leave every secret belonging to the other method entirely absent (not empty)
+from `macos-release`. **Recommended: the App Store Connect API-key method.**
+A Developer ID Installer certificate is not required for a DMG release.
 
 ### Required for signing
 
@@ -577,9 +582,67 @@ switching methods; this packet does not run them. Confirm the deletion with
 configuration without reading secrets" below) before loading the new method's
 secrets or running the release workflow.
 
+### Audit repository and organization secrets for precedence risk
+
+Deleting the unused method's secrets from the `macos-release` **environment**
+is not sufficient on its own. GitHub Actions resolves a same-named secret
+with `environment > repository > organization` precedence: if a
+repository-level or organization-level secret with the same name as a
+deleted environment secret still exists and is visible to `OpenCoven/seer`,
+it becomes the effective value the next time the release job runs — silently
+reviving the unused notarization method instead of leaving it absent. Audit
+both scopes before, or immediately after, deleting the environment secrets,
+using name/metadata-only commands that never print a secret value:
+
+```bash
+# Repository-scope secrets (outside the macos-release environment)
+gh secret list --repo OpenCoven/seer
+
+# Organization secrets, with their visibility to member repositories
+gh secret list --org OpenCoven \
+  --json name,visibility,numSelectedRepos,selectedReposURL
+
+# For any org secret above with visibility "selected", confirm whether
+# OpenCoven/seer is one of the selected repositories
+gh api "orgs/OpenCoven/actions/secrets/<SECRET_NAME>/repositories" \
+  --jq '.repositories[].full_name'
+```
+
+If `gh secret list --repo OpenCoven/seer` lists any of the five notarization
+secret names (`APPLE_API_ISSUER`, `APPLE_API_KEY`, `APPLE_API_KEY_BASE64`,
+`APPLE_ID`, `APPLE_PASSWORD`) at repository scope, delete the unused
+method's repository-level entries too — a leftover repository-level secret
+is otherwise inert only for as long as the higher-precedence environment
+copy exists:
+
+```bash
+# Repository-scope equivalent of the environment deletions above
+# (omit --env; run only for the method being abandoned)
+gh secret delete APPLE_ID --repo OpenCoven/seer
+gh secret delete APPLE_PASSWORD --repo OpenCoven/seer
+```
+
+Likewise, if `gh secret list --org OpenCoven` shows an organization secret
+with one of these five names and its `visibility` field is `all`, or
+`private` and `OpenCoven/seer` is a private repository, or `selected` and
+`OpenCoven/seer` appears in that secret's repository list, remove
+`OpenCoven/seer`'s access to it before switching methods — either by
+deleting the organization secret (if no other repository requires it) or by
+narrowing its visibility to exclude `OpenCoven/seer`. These are
+org-admin-scoped actions outside this packet's operator role for
+`OpenCoven/seer` alone; coordinate with an organization owner rather than
+running them unreviewed. As with the environment-secret deletions above, all
+repository- and organization-scope commands in this section are documented
+for the operator (or organization owner) to run manually — this packet does
+not run them and makes no claim that any repository or organization secret
+has been read, changed, or deleted.
+
 Environment scope is intentional: repository-level secrets would be available
 to other workflows without the release approval gate. The release job must
-declare `environment: macos-release` before it can access these secrets.
+declare `environment: macos-release` before it can access these secrets. That
+intent holds only while no same-named repository- or organization-level
+secret is also visible to `OpenCoven/seer` — the audit above is what
+verifies it, not the environment configuration alone.
 
 ## Configure the protected environment
 
@@ -664,6 +727,13 @@ gh secret list --repo OpenCoven/seer --env macos-release
 gh variable list --repo OpenCoven/seer --env macos-release
 gh api repos/OpenCoven/seer/environments/macos-release \
   --jq '{name, protection_rules, deployment_branch_policy}'
+
+# Repository- and organization-scope secrets, checked for the same-name
+# precedence risk described in "Audit repository and organization secrets
+# for precedence risk" above
+gh secret list --repo OpenCoven/seer
+gh secret list --org OpenCoven \
+  --json name,visibility,numSelectedRepos,selectedReposURL
 ```
 
 For Method A (App Store Connect API key, recommended), the expected
@@ -684,7 +754,12 @@ RELEASES_REPO_TOKEN
 do, the packaging script will fail the run (`fail "provide exactly one
 notarization credential set; both were provided"` in
 `scripts/package-macos-release.sh`) — delete them per "Switching notarization
-methods" above.
+methods" above. Both names must also be absent from `gh secret list --repo
+OpenCoven/seer` (repository scope) and unreachable from `OpenCoven/seer`
+through any `OpenCoven` organization secret (per "Audit repository and
+organization secrets for precedence risk" above) — an environment-scope
+listing alone does not rule out a same-named secret resurfacing through
+repository or organization precedence once the environment copy is deleted.
 
 For Method B (Apple ID, alternative), the expected environment secret names
 are instead:
@@ -701,9 +776,14 @@ RELEASES_REPO_TOKEN
 
 `APPLE_API_ISSUER`, `APPLE_API_KEY`, and `APPLE_API_KEY_BASE64` must **not**
 appear in this listing; delete them per "Switching notarization methods"
-above if they do. Exactly one of these two lists — never a mix, and never
-neither — must match `gh secret list`'s output (aside from
-`RELEASES_REPO_TOKEN`, which is independent of the notarization method).
+above if they do. All three names must also be absent from `gh secret list
+--repo OpenCoven/seer` (repository scope) and unreachable from
+`OpenCoven/seer` through any `OpenCoven` organization secret (per "Audit
+repository and organization secrets for precedence risk" above), for the same
+precedence-fallback reason as the Method A check. Exactly one of these two
+lists — never a mix, and never neither — must match `gh secret list`'s
+output (aside from `RELEASES_REPO_TOKEN`, which is independent of the
+notarization method).
 
 The expected environment variable names (not secrets — safe to display in
 full with `gh variable get`) are:
@@ -732,9 +812,12 @@ been reviewed.
 - Treat any secret printed in terminal logs, CI logs, chat, or an issue as
   compromised.
 - If notarization methods are ever switched, confirm the previously used
-  method's secrets were deleted (not merely superseded) — see "Switching
-  notarization methods" above — so a leaked or rotated credential from the
-  unused method cannot silently remain configured.
+  method's secrets were deleted (not merely superseded) at every applicable
+  scope — environment, repository, and any visible organization secret — see
+  "Switching notarization methods" and "Audit repository and organization
+  secrets for precedence risk" above — so a leaked or rotated credential from
+  the unused method cannot silently remain configured or resurface through
+  secret precedence.
 
 ## Completion checklist
 
@@ -759,9 +842,17 @@ been reviewed.
 - [ ] Exactly one notarization method chosen: App Store Connect API key
       (recommended: issuer ID, key ID, and `.p8` secured) **or** Apple ID
       (app-specific password and account email) — not both, not neither
-- [ ] Every secret belonging to the notarization method **not** chosen is
-      confirmed absent from `macos-release` (deleted via `gh secret delete`
-      if it was configured for a previous release under the other method)
+- [ ] Every secret name belonging to the notarization method **not** chosen
+      is confirmed absent at every applicable scope: the `macos-release`
+      environment (deleted via `gh secret delete ... --env macos-release` if
+      it was configured for a previous release under the other method), the
+      `OpenCoven/seer` repository (via `gh secret list --repo
+      OpenCoven/seer`), and any `OpenCoven` organization secret visible to
+      `OpenCoven/seer` (deleted or restricted so its visibility excludes
+      `OpenCoven/seer`) — see "Audit repository and organization secrets for
+      precedence risk"; the intended environment-only design otherwise still
+      leaves the unused method reachable via repository/organization
+      precedence once only the environment copy is removed
 - [ ] Fine-grained release token scoped only to `seer-releases`
 - [ ] Required `macos-release` environment secrets present by name, matching
       exactly one of the two expected-name lists in "Verify configuration
