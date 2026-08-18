@@ -255,13 +255,34 @@ export function computeRendererBuildDigest(repoRoot) {
 // `usercustomize` module reachable only through the user's own site
 // directory, can ever substitute themselves for a real standard-library
 // module this helper imports (`json`, `hashlib`, etc.) or run arbitrary code
-// during interpreter start-up. `sanitizedPythonEnvironment` below strips
-// every `PYTHON*`-prefixed environment variable from the child's own
-// environment as well, purely as defense in depth: `-I` alone already makes
-// CPython itself ignore all of them, but the environment actually handed to
-// the child never contains one in the first place, so nothing about this
-// module's own behavior ever depends on `-I` continuing to honor every one
-// of them correctly in every future CPython version.
+// during interpreter start-up.
+//
+// `-I` alone is not enough, though: on a stock macOS install `/usr/bin/python3`
+// is not a self-contained CPython binary - it is a small Xcode/Command Line
+// Tools dispatch shim that resolves and re-execs whichever real interpreter
+// the *active developer directory/toolchain* currently points at, and that
+// resolution is itself steered by ordinary environment variables
+// (`DEVELOPER_DIR`, `TOOLCHAINS`, `SDKROOT`). `assertTrustedSystemInterpreterOrThrow`
+// only validates the fixed shim path itself (root-owned, non-symlink,
+// non-group/other-writable); it has no way to validate whatever the shim
+// resolves to next, so a caller able to set those variables in this
+// process's own environment could otherwise redirect a "trusted, validated
+// system interpreter" invocation to an entirely different, unvalidated,
+// possibly user-controlled developer toolchain without tripping that check
+// at all. `DYLD_*` variables (`DYLD_INSERT_LIBRARIES` foremost) are a
+// separate, equally real vector: they let any dynamically linked executable
+// - including whatever the shim ultimately execs - be made to load an
+// attacker-supplied library into its own address space before a single line
+// of the piped program ever runs. `sanitizedPythonEnvironment` below
+// defends against both by construction: rather than trying to enumerate
+// every dangerous variable (an open-ended, easy-to-under-enumerate blocklist
+// that both of the above would have slipped through), it hands the child an
+// *allowlist* of the handful of variables the helper genuinely needs -
+// nothing named `DEVELOPER_DIR`, `TOOLCHAINS`, `SDKROOT`, anything
+// `DYLD_*`-prefixed, or any `PYTHON*`-prefixed variable (redundant with `-I`
+// above, kept here too purely as defense in depth) can ever reach the child,
+// no matter what this process's own environment contains or gains in the
+// future.
 const rendererAssetDigestHelperSource = join(
   dirname(fileURLToPath(import.meta.url)),
   "renderer-asset-digest.py",
@@ -331,21 +352,56 @@ export function assertTrustedSystemInterpreterOrThrow(path) {
 }
 
 /**
- * Defense in depth alongside `-I`: builds the exact environment object handed
- * to the child interpreter by dropping every `PYTHON*`-prefixed variable
- * (`PYTHONPATH`, `PYTHONSTARTUP`, `PYTHONNOUSERSITE`, a future `PYTHONWHATEVER`,
- * etc.) from `sourceEnv`. `-I` already makes CPython itself ignore all of
- * them regardless of what the child's environment contains, so this function
- * changes nothing about a correctly behaving interpreter - it exists purely
- * so this module's own behavior never relies on `-I` continuing to do so.
- * Exported so tests can exercise it directly against synthetic environments
+ * The complete, fixed set of environment variables `sanitizedPythonEnvironment`
+ * ever hands the child interpreter - an explicit allowlist, not a blocklist.
+ * Every one of these is either something the helper's own execution can
+ * genuinely depend on or is otherwise inert for it:
+ *
+ *   - `PATH`: standard process convention; the interpreter itself is always
+ *     invoked by the one fixed absolute path in `TRUSTED_SYSTEM_PYTHON3_PATH`
+ *     and the helper never spawns a subprocess of its own, so this is never
+ *     actually consulted to *locate* anything the helper runs - kept only
+ *     because an empty `PATH` is an unusual, needlessly surprising process
+ *     environment to hand any child.
+ *   - `HOME`: harmless location metadata; the helper never reads or writes
+ *     any path derived from it (`-I` also disables the user site-packages
+ *     directory `HOME` would otherwise help resolve).
+ *   - `TMPDIR`: same - the helper creates no temporary files of its own.
+ *   - `LANG`, `LC_ALL`, `LC_CTYPE`: locale/text-encoding hints only; letting
+ *     these through does not change *what code runs*, only how already-fixed
+ *     stdout text might be encoded.
+ *
+ * Deliberately absent, and therefore *never* forwarded no matter what this
+ * process's own environment contains: `DEVELOPER_DIR`, `TOOLCHAINS`, and
+ * `SDKROOT` (the Xcode/Command Line Tools active-toolchain/SDK selection
+ * variables `/usr/bin/python3`'s own dispatch shim consults to decide which
+ * real interpreter to re-exec - see the discussion above
+ * `TRUSTED_SYSTEM_PYTHON3_PATH`), every `DYLD_*`-prefixed dynamic-linker
+ * variable (`DYLD_INSERT_LIBRARIES` foremost - library-injection vectors for
+ * *any* dynamically linked executable), and every `PYTHON*`-prefixed
+ * variable (`PYTHONPATH`, `PYTHONSTARTUP`, `PYTHONNOUSERSITE`, a future
+ * `PYTHONWHATEVER`, etc. - already redundant with `-I`, excluded here too
+ * purely as defense in depth so this module's own behavior never relies on
+ * `-I` continuing to honor every one of them correctly in every future
+ * CPython version).
+ */
+const PYTHON_HELPER_ENV_ALLOWLIST = ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE"];
+
+/**
+ * Builds the exact environment object handed to the child interpreter: an
+ * explicit allowlist (see `PYTHON_HELPER_ENV_ALLOWLIST`) rather than an
+ * attempt to enumerate every dangerous variable, so a toolchain-selection or
+ * library-injection variable this repository hasn't thought of yet still
+ * can never reach the child - only ever the fixed, named handful of keys
+ * above, and only when `sourceEnv` actually defines them. Exported so tests
+ * can exercise it directly against synthetic (including hostile) environments
  * without needing to spawn a real interpreter.
  */
 export function sanitizedPythonEnvironment(sourceEnv) {
   const sanitized = {};
-  for (const [key, value] of Object.entries(sourceEnv ?? {})) {
-    if (/^PYTHON/.test(key)) continue;
-    sanitized[key] = value;
+  for (const key of PYTHON_HELPER_ENV_ALLOWLIST) {
+    const value = sourceEnv?.[key];
+    if (value !== undefined) sanitized[key] = value;
   }
   return sanitized;
 }

@@ -336,21 +336,35 @@ test("spawnRendererAssetDigestHelper fails clearly (never hangs, never returns t
   );
 });
 
-test("sanitizedPythonEnvironment drops every PYTHON-prefixed key and leaves every other key untouched", () => {
+test("sanitizedPythonEnvironment keeps only its fixed allowlist, dropping every PYTHON-prefixed key, every toolchain-selection key, every DYLD_-prefixed key, and any other unrecognized key", () => {
   const sanitized = sanitizedPythonEnvironment({
     PATH: "/usr/bin:/bin",
+    HOME: "/Users/real",
+    TMPDIR: "/tmp/real",
+    LANG: "en_US.UTF-8",
+    LC_ALL: "en_US.UTF-8",
+    LC_CTYPE: "en_US.UTF-8",
     PYTHONPATH: "/evil/pythonpath",
     PYTHONSTARTUP: "/evil/startup.py",
     PYTHONNOUSERSITE: "0",
     PYTHONHOME: "/evil/home",
     PYTHONSOMETHINGFUTURE: "whatever a future CPython release adds",
-    HOME: "/Users/real",
-    LANG: "en_US.UTF-8",
+    DEVELOPER_DIR: "/evil/developer-dir",
+    TOOLCHAINS: "com.evil.toolchain",
+    SDKROOT: "/evil/sdk",
+    DYLD_INSERT_LIBRARIES: "/evil/inject.dylib",
+    DYLD_LIBRARY_PATH: "/evil/lib",
+    DYLD_FRAMEWORK_PATH: "/evil/framework",
+    DYLD_SOMETHINGFUTURE: "whatever a future dyld release adds",
+    SOME_OTHER_UNRELATED_VAR: "should also be dropped",
   });
   assert.deepEqual(sanitized, {
     PATH: "/usr/bin:/bin",
     HOME: "/Users/real",
+    TMPDIR: "/tmp/real",
     LANG: "en_US.UTF-8",
+    LC_ALL: "en_US.UTF-8",
+    LC_CTYPE: "en_US.UTF-8",
   });
 });
 
@@ -508,6 +522,155 @@ test("computeRendererAssetDigest is unaffected by a hostile sitecustomize.py rea
       false,
       "the hostile sitecustomize.py module body must never execute",
     );
+  });
+});
+
+test("computeRendererAssetDigest is unaffected by a hostile DEVELOPER_DIR/TOOLCHAINS/SDKROOT/PYTHONPATH combination, and none of the attacker content they point at ever selects or executes", () => {
+  withScratchDir("hostile-toolchain-env-", (scratchRoot) => {
+    // A fake "developer directory" carrying its own `usr/bin/xcrun`: this is
+    // exactly the shape `/usr/bin/python3`'s own dispatch shim looks for
+    // once `DEVELOPER_DIR` points somewhere else (see the discussion above
+    // `TRUSTED_SYSTEM_PYTHON3_PATH` in scripts/renderer-build-identity.mjs).
+    // If `DEVELOPER_DIR` ever reached the child, the shim would re-exec
+    // *this* attacker-controlled `xcrun` instead of the real one - so this
+    // fixture writes a marker and fails loudly the moment it is ever
+    // invoked with any arguments at all.
+    const fakeDeveloperDir = join(scratchRoot, "fake-developer-dir");
+    const fakeXcrunPath = join(fakeDeveloperDir, "usr", "bin", "xcrun");
+    mkdirSync(dirname(fakeXcrunPath), { recursive: true });
+    const xcrunMarkerPath = join(scratchRoot, "attacker-xcrun-marker.txt");
+    writeFileSync(
+      fakeXcrunPath,
+      [
+        "#!/bin/sh",
+        `echo "ATTACKER XCRUN EXECUTED: $@" > ${JSON.stringify(xcrunMarkerPath)}`,
+        'echo "attacker xcrun executed" >&2',
+        "exit 1",
+        "",
+      ].join("\n"),
+    );
+    chmodSync(fakeXcrunPath, 0o755);
+
+    // Prove this fixture is a live attack against a raw, non-isolated
+    // invocation of the real system interpreter first (bypassing this
+    // module's own env sanitization entirely), so a future change to how
+    // `/usr/bin/python3` resolves `DEVELOPER_DIR` can never silently turn
+    // the rest of this test into a no-op that "passes" without actually
+    // proving anything. The fake `xcrun` above always exits non-zero, so
+    // this raw invocation is expected to throw - only the marker file it
+    // leaves behind (or doesn't) is under test here.
+    try {
+      execFileSync(TRUSTED_PYTHON3, ["-I", "-c", "print(1)"], {
+        env: { DEVELOPER_DIR: fakeDeveloperDir },
+        encoding: "utf8",
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    } catch {
+      // Expected: the fake xcrun always exits non-zero.
+    }
+    assert.equal(
+      existsSync(xcrunMarkerPath),
+      true,
+      "the fake DEVELOPER_DIR fixture itself must be a real attack against a raw, non-isolated /usr/bin/python3 invocation",
+    );
+    rmSync(xcrunMarkerPath, { force: true });
+
+    // A hostile PYTHONPATH directory shadowing both hashlib and
+    // sitecustomize, exactly like the dedicated PYTHONPATH/sitecustomize
+    // tests above, combined here alongside the toolchain-selection vectors
+    // so this test proves none of them - together - ever reach the child.
+    const evilPythonPathDir = join(scratchRoot, "evil-pythonpath");
+    mkdirSync(evilPythonPathDir, { recursive: true });
+    const hashlibMarkerPath = join(scratchRoot, "attacker-hashlib-marker.txt");
+    writeFileSync(
+      join(evilPythonPathDir, "hashlib.py"),
+      [
+        `open(${JSON.stringify(hashlibMarkerPath)}, "w").write("EXECUTED")`,
+        "class sha256:",
+        "    def __init__(self, *args, **kwargs):",
+        "        pass",
+        "    def update(self, *args, **kwargs):",
+        "        pass",
+        "    def hexdigest(self):",
+        "        return 'f' * 64",
+        "",
+      ].join("\n"),
+    );
+    const sitecustomizeMarkerPath = join(scratchRoot, "attacker-sitecustomize-marker.txt");
+    writeFileSync(
+      join(evilPythonPathDir, "sitecustomize.py"),
+      `open(${JSON.stringify(sitecustomizeMarkerPath)}, "w").write("EXECUTED")\n`,
+    );
+
+    const rendererRoot = join(scratchRoot, "renderer");
+    mkdirSync(rendererRoot, { recursive: true });
+    writeFileSync(join(rendererRoot, "index.ts"), "content\n");
+    const trustedDigest = computeRendererAssetDigest(rendererRoot);
+
+    const hostileOverrides = {
+      DEVELOPER_DIR: fakeDeveloperDir,
+      TOOLCHAINS: "com.attacker.evil-toolchain",
+      SDKROOT: join(scratchRoot, "evil-sdk"),
+      PYTHONPATH: evilPythonPathDir,
+    };
+    const previousValues = {};
+    for (const key of Object.keys(hostileOverrides)) {
+      previousValues[key] = process.env[key];
+      process.env[key] = hostileOverrides[key];
+    }
+    let digestUnderAttack;
+    try {
+      digestUnderAttack = computeRendererAssetDigest(rendererRoot);
+    } finally {
+      for (const key of Object.keys(hostileOverrides)) {
+        if (previousValues[key] === undefined) delete process.env[key];
+        else process.env[key] = previousValues[key];
+      }
+    }
+
+    assert.equal(
+      digestUnderAttack,
+      trustedDigest,
+      "a hostile DEVELOPER_DIR/TOOLCHAINS/SDKROOT/PYTHONPATH combination must never change the computed digest",
+    );
+    assert.equal(
+      existsSync(xcrunMarkerPath),
+      false,
+      "a hostile DEVELOPER_DIR must never cause the child interpreter's own toolchain resolution to run an attacker-controlled xcrun",
+    );
+    assert.equal(
+      existsSync(hashlibMarkerPath),
+      false,
+      "a hostile PYTHONPATH-shadowed hashlib module must never execute even alongside a hostile DEVELOPER_DIR/TOOLCHAINS/SDKROOT",
+    );
+    assert.equal(
+      existsSync(sitecustomizeMarkerPath),
+      false,
+      "a hostile PYTHONPATH-reachable sitecustomize.py must never execute even alongside a hostile DEVELOPER_DIR/TOOLCHAINS/SDKROOT",
+    );
+
+    // Directly confirm none of the hostile keys - nor a DYLD_-prefixed
+    // injection variable added for good measure - ever reach the child's
+    // own environment in the first place, not merely that this particular
+    // fixture happened to have no observable effect.
+    const sanitizedUnderAttack = sanitizedPythonEnvironment({
+      ...process.env,
+      ...hostileOverrides,
+      DYLD_INSERT_LIBRARIES: "/evil/inject.dylib",
+    });
+    for (const key of [
+      "DEVELOPER_DIR",
+      "TOOLCHAINS",
+      "SDKROOT",
+      "PYTHONPATH",
+      "DYLD_INSERT_LIBRARIES",
+    ]) {
+      assert.equal(
+        Object.hasOwn(sanitizedUnderAttack, key),
+        false,
+        `${key} must never be present in the environment handed to the child interpreter`,
+      );
+    }
   });
 });
 

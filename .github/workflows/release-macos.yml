@@ -170,6 +170,7 @@ jobs:
             tests/renderer-asset-digest-helper.test.mjs \
             tests/standalone-renderer.test.mjs \
             tests/standalone-renderer-lock.test.mjs \
+            tests/standalone-build-gate-serialization.test.mjs \
             tests/safe-app-publication.test.mjs \
             tests/release-manifest.test.mjs \
             tests/package-macos-release.test.mjs \
