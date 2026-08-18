@@ -623,11 +623,18 @@ progress.
 # list`) no fixed page count can hide an older queued/waiting run, and this
 # keeps working once step 1 disables the workflow (a disabled workflow's
 # past runs remain listable via this endpoint; only new runs stop being
-# created). Fails closed: nonzero exit and a visible ID/status listing if
-# any non-completed run remains, silent zero exit only when none do.
-active_runs="$(gh api --paginate \
+# created). Fails closed in every case: if the enumeration call itself
+# fails (API error, auth failure, network error, 404 — e.g. the workflow
+# file was renamed or moved), that is a verification failure, not zero
+# active runs, and must not be treated as "drained"; if any non-completed
+# run is found, it is listed; the success message below prints only once
+# the exhaustive check actually completed and found none.
+if ! active_runs="$(gh api --paginate \
   'repos/OpenCoven/seer/actions/workflows/release-macos.yml/runs?per_page=100' \
-  --jq '.workflow_runs[] | select(.status != "completed") | [.id, .status] | @tsv')"
+  --jq '.workflow_runs[] | select(.status != "completed") | [.id, .status] | @tsv')"; then
+  echo "Failed to verify release-macos.yml run status (gh api error: auth, network, or 404) — treat as unverified, not as zero active runs." >&2
+  exit 1
+fi
 if [ -n "$active_runs" ]; then
   echo "Active (non-completed) release-macos.yml runs found:" >&2
   printf '%s\n' "$active_runs" >&2
@@ -636,8 +643,10 @@ fi
 echo "No active release-macos.yml runs (exhaustive paginated check)."
 ```
 
-If this exits nonzero and lists run IDs, drain each listed run before
-continuing:
+If this exits nonzero, resolve the cause before continuing: a printed
+verification-failed message means the enumeration itself could not be
+trusted (fix the underlying `gh api` error and re-run), while a listing of
+run IDs means drain each listed run:
 
 ```bash
 # Documented for the operator to run manually, once per run ID returned
@@ -868,11 +877,18 @@ gh secret list --org OpenCoven \
 # notarization methods safely" > step 2 above for why this must be empty
 # before, and stay empty during, any secret change). --paginate walks every
 # page, so no --limit value can hide an older non-completed run, and this
-# keeps working once the workflow is disabled. Fails closed: nonzero exit
-# and a visible ID/status listing if any non-completed run remains.
-active_runs="$(gh api --paginate \
+# keeps working once the workflow is disabled. Fails closed in every case:
+# if the enumeration call itself fails (API error, auth failure, network
+# error, 404), that is a verification failure, not zero active runs, and
+# must not be treated as safe to proceed; if any non-completed run is
+# found, it is listed; the success message below prints only once the
+# exhaustive check actually completed and found none.
+if ! active_runs="$(gh api --paginate \
   'repos/OpenCoven/seer/actions/workflows/release-macos.yml/runs?per_page=100' \
-  --jq '.workflow_runs[] | select(.status != "completed") | [.id, .status] | @tsv')"
+  --jq '.workflow_runs[] | select(.status != "completed") | [.id, .status] | @tsv')"; then
+  echo "Failed to verify release-macos.yml run status (gh api error: auth, network, or 404) — treat as unverified, not as zero active runs." >&2
+  exit 1
+fi
 if [ -n "$active_runs" ]; then
   echo "Active (non-completed) release-macos.yml runs found:" >&2
   printf '%s\n' "$active_runs" >&2
