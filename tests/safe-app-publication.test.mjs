@@ -101,19 +101,77 @@ function spawnPublisher(options) {
     child.on("error", reject);
     child.on("close", (status, signal) => resolve({ status, signal, stdout, stderr }));
   });
-  return { child, completion };
+  return { child, completion, detached };
 }
 
-async function waitForPath(path, child) {
-  const deadline = Date.now() + 5000;
+// Matches the bounded-poll convention used by the other long-running-process
+// tests in this repo (tests/package-macos-release.test.mjs,
+// tests/standalone-renderer-lock.test.mjs): a named, generous default that
+// still fails fast on a genuinely stuck publisher, but does not flake under
+// full-suite/CI resource contention the way a fixed 5s deadline did.
+const HOOK_READY_TIMEOUT_MS = 20_000;
+const PUBLISHER_TERMINATION_TIMEOUT_MS = 10_000;
+
+async function waitForPath(path, child, timeoutMs = HOOK_READY_TIMEOUT_MS) {
+  const deadline = Date.now() + timeoutMs;
   while (!existsSync(path)) {
     if (child.exitCode !== null || child.signalCode !== null) {
       throw new Error(`publisher exited before creating ${path}`);
     }
     if (Date.now() >= deadline) {
-      throw new Error(`timed out waiting for ${path}`);
+      throw new Error(`timed out after ${timeoutMs}ms waiting for ${path}`);
     }
     await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+async function withTimeout(promise, timeoutMs, message) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Guarantees a spawned publisher (and any hook it is blocked in) is reliably
+// terminated and awaited on every path, including a readiness timeout or an
+// assertion throwing mid-scenario, so a stuck child can never survive into
+// later tests. Only ever signals the exact child pid, or its exact process
+// group when the child was spawned detached -- never a name-based kill.
+async function terminatePublisher(running, hook) {
+  const { child, completion, detached } = running;
+  if (hook) {
+    try {
+      writeFileSync(hook.releasePath, "release\n");
+    } catch {
+      // Best effort: unblock a hook that may still be polling for this file.
+    }
+  }
+  if (child.exitCode === null && child.signalCode === null) {
+    try {
+      if (detached) {
+        process.kill(-child.pid, "SIGKILL");
+      } else {
+        child.kill("SIGKILL");
+      }
+    } catch (error) {
+      if (error.code !== "ESRCH") throw error;
+    }
+  }
+  try {
+    await withTimeout(
+      completion,
+      PUBLISHER_TERMINATION_TIMEOUT_MS,
+      `publisher pid ${child.pid} did not exit within ${PUBLISHER_TERMINATION_TIMEOUT_MS}ms of termination`,
+    );
+  } catch (error) {
+    // Cleanup must never mask the test's own assertion failure; surface a
+    // loud warning instead so a genuinely undead process is still visible.
+    console.error(error);
   }
 }
 
@@ -527,10 +585,15 @@ test("SIGINT during source copy rolls back the pair and exits 130", async () => 
       detached: true,
       env: hook.env,
     });
-    await waitForPath(hook.readyPath, running.child);
-    process.kill(-running.child.pid, "SIGINT");
-    writeFileSync(hook.releasePath, "release\n");
-    const result = await running.completion;
+    let result;
+    try {
+      await waitForPath(hook.readyPath, running.child);
+      process.kill(-running.child.pid, "SIGINT");
+      writeFileSync(hook.releasePath, "release\n");
+      result = await running.completion;
+    } finally {
+      await terminatePublisher(running, hook);
+    }
 
     assert.equal(result.status, 130, `unexpected result:\n${result.stdout}\n${result.stderr}`);
     assert.equal(result.signal, null);
@@ -575,10 +638,15 @@ test("SIGTERM between app and provenance swaps rolls back the pair and exits 143
       detached: true,
       env: hook.env,
     });
-    await waitForPath(hook.readyPath, running.child);
-    process.kill(-running.child.pid, "SIGTERM");
-    writeFileSync(hook.releasePath, "release\n");
-    const result = await running.completion;
+    let result;
+    try {
+      await waitForPath(hook.readyPath, running.child);
+      process.kill(-running.child.pid, "SIGTERM");
+      writeFileSync(hook.releasePath, "release\n");
+      result = await running.completion;
+    } finally {
+      await terminatePublisher(running, hook);
+    }
 
     assert.equal(result.status, 143, `unexpected result:\n${result.stdout}\n${result.stderr}`);
     assert.equal(result.signal, null);
@@ -625,10 +693,15 @@ test("the next publisher recovers a SIGKILL-abandoned paired swap before staging
       testHookPhase: "after-app-publish",
       env: hook.env,
     });
-    await waitForPath(hook.readyPath, running.child);
-    assert.equal(running.child.kill("SIGKILL"), true);
-    writeFileSync(hook.releasePath, "release\n");
-    const killed = await running.completion;
+    let killed;
+    try {
+      await waitForPath(hook.readyPath, running.child);
+      assert.equal(running.child.kill("SIGKILL"), true);
+      writeFileSync(hook.releasePath, "release\n");
+      killed = await running.completion;
+    } finally {
+      await terminatePublisher(running, hook);
+    }
     assert.equal(killed.signal, "SIGKILL");
 
     const recovery = publish({ fixtureRepo, sourceApp: failingSource, derivedData });
