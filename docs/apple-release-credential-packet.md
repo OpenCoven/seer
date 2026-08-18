@@ -32,6 +32,67 @@ GitHub exposes existing secret names but never their values, so the working
 `coven-cave` secrets cannot be copied out of GitHub. Load Seer's secrets again
 from the approved original `.p12`, `.p8`, password, and account records.
 
+## Plan and billing prerequisite (blocking)
+
+Verified with read-only `gh api` calls on 2026-08-17:
+
+- The `OpenCoven` organization's GitHub plan is `free`.
+- `OpenCoven/seer` is private with default branch `main`.
+- `repos/OpenCoven/seer/environments` lists only `copilot`; `macos-release`
+  does not exist yet.
+- `.github/workflows/release-macos.yml` requires the protected `macos-release`
+  environment (with required-reviewer approval) and `runs-on: macos-14-xlarge`
+  for its signing/notarization job.
+
+GitHub's required-reviewers environment protection is only available on
+private repositories under GitHub Enterprise Cloud — it is public-repository
+only on Free, Pro, and Team. Larger GitHub-hosted runners such as
+`macos-14-xlarge` additionally require an organization on GitHub Team or
+Enterprise Cloud with larger-runner/Actions billing enabled; Free-plan
+organizations cannot provision them at all. `OpenCoven` on its current Free
+plan can supply **neither** control this workflow's approved security gate
+depends on, for a repository that must stay private
+(`SOURCE_REPOSITORY_PRIVATE` is asserted `true` in the workflow's first step).
+
+This is a hard blocker on the release path, independent of and prior to every
+other step in this packet. It does not change, weaken, or redesign the
+approved gate (required reviewers on `macos-release` plus `macos-14-xlarge`
+remain mandatory) — it only identifies that the current plan cannot host that
+gate.
+
+**Required external action (Val/admin only, not performed by this packet):**
+
+1. Upgrade or reassign the `OpenCoven` organization to a GitHub plan —
+   GitHub Enterprise Cloud, or another plan/billing configuration GitHub
+   currently documents as supporting both required reviewers on private-repo
+   environments and `macos-14-xlarge` larger-runner entitlement — and enable
+   the Actions billing/runner entitlement it requires.
+2. After the plan change, verify both controls before creating
+   `macos-release` or running the workflow. This packet only reads state; it
+   never changes billing, plan, or org settings.
+
+Read-only verification (safe to run repeatedly; none of these mutate state):
+
+```bash
+gh api orgs/OpenCoven --jq '{plan: .plan.name, seats: .plan.filled_seats}'
+gh api repos/OpenCoven/seer --jq '{private, default_branch}'
+gh api repos/OpenCoven/seer/environments --jq '.environments[].name'
+gh api orgs/OpenCoven/actions/hosted-runners --jq '.total_count, .hosted_runners[].name'
+```
+
+Checklist for this prerequisite:
+
+- [ ] `orgs/OpenCoven` plan confirmed to support required reviewers on
+      private-repository environments (Enterprise Cloud, or a GitHub-verified
+      equivalent) — re-run the command above and confirm the plan name
+      changed from `free`
+- [ ] Larger-runner (`macos-14-xlarge`) entitlement and Actions billing
+      confirmed enabled for `OpenCoven`, e.g. via
+      `gh api orgs/OpenCoven/actions/hosted-runners`
+- [ ] Both controls verified again immediately before `macos-release` is
+      created (plan/billing changes can be reverted independently of this
+      packet)
+
 ## Required packet
 
 Use the App Store Connect API-key path as the primary notarization method. The
@@ -72,7 +133,29 @@ combine fields from two partial credential sets.
 | `RELEASES_REPO_TOKEN` | Fine-grained token limited to release writes in `OpenCoven/seer-releases` |
 
 Create `RELEASES_REPO_TOKEN` only after the public release repository has been
-explicitly approved and created. Grant access only to that repository, with:
+explicitly approved and created, **and** initialized with a reviewed commit on
+its default branch — for example a product `README` added as part of the
+repository's initial creation. This packet does not create
+`OpenCoven/seer-releases`; that remains an explicit external action.
+
+An empty default branch (no commits) fails `acquire_remote_lock` in
+`scripts/release-macos-draft.sh`: it calls
+`GET repos/OpenCoven/seer-releases/git/ref/heads/<default_branch>` and requires
+the response to resolve to an object of `type == "commit"` with a
+40-character lowercase SHA, aborting the release with "release repository
+default branch does not point to a commit" otherwise. Verify this precondition
+read-only before provisioning the token or using the workflow:
+
+```bash
+default_branch="$(gh api repos/OpenCoven/seer-releases --jq '.default_branch')"
+gh api "repos/OpenCoven/seer-releases/git/ref/heads/${default_branch}" \
+  --jq '{type: .object.type, sha: .object.sha}'
+```
+
+This must print `{"type":"commit","sha":"<40 lowercase hex characters>"}`
+before the token is created or the release workflow is run.
+
+Grant access only to that repository, with:
 
 - **Contents:** Read and write
 - **Metadata:** Read-only, implicitly required by GitHub
@@ -184,76 +267,100 @@ account's normal password.
 
 ## Load protected environment secrets safely
 
-Run these commands from a trusted local terminal. They stream files directly to
-GitHub and avoid writing encoded copies to disk. Create and protect the
-`macos-release` environment using the next section before running them.
+Run these commands from a trusted local terminal, in an **explicit Bash
+shell**. macOS's default interactive shell is zsh, and zsh's `read -p` does
+not silence or terminate input the same way Bash's `read -r -s -p` does, and
+zsh's history/pipeline handling differs from Bash's. Do not paste this block
+into a zsh prompt: start `bash` first, or save the block as a script and run
+`bash load-secrets.sh`. Create and protect the `macos-release` environment
+using the next section before running this.
+
+The block below is Bash-only (`set -euo pipefail`), reads every sensitive
+value directly from `/dev/tty` (so it can't silently accept an empty value
+piped in from elsewhere), rejects blank input instead of setting an empty
+secret, validates that certificate/key files are readable, ordinary,
+non-symlink, non-empty files before encoding them, keeps `pipefail` in effect
+across every `base64 | tr | gh` pipeline, and unsets every value it reads once
+it has been sent to GitHub. It never prints a secret value or writes an
+encoded copy to disk.
 
 ```bash
+set -euo pipefail
+
 cd /path/to/seer
+
+require_safe_secret_file() {
+  local path="$1"
+  [[ ! -L "${path}" ]] || { echo "error: ${path} must not be a symlink" >&2; return 1; }
+  [[ -e "${path}" ]] || { echo "error: ${path} does not exist" >&2; return 1; }
+  [[ -f "${path}" ]] || { echo "error: ${path} is not a regular file" >&2; return 1; }
+  [[ -r "${path}" ]] || { echo "error: ${path} is not readable" >&2; return 1; }
+  [[ -s "${path}" ]] || { echo "error: ${path} is empty" >&2; return 1; }
+}
+
+set_file_secret() {
+  local secret_name="$1"
+  local path="$2"
+  require_safe_secret_file "${path}"
+  base64 < "${path}" | tr -d '\n' |
+    gh secret set "${secret_name}" --repo OpenCoven/seer --env macos-release
+}
+
+read_required_value() {
+  # Reads from the controlling terminal, not stdin, so this cannot be
+  # satisfied by piping in an empty (or any) value, and fails closed on a
+  # blank answer instead of setting an empty secret.
+  local prompt="$1"
+  local value
+  read -r -s -p "${prompt}: " value < /dev/tty
+  echo >&2
+  [[ -n "${value}" ]] || { echo "error: ${prompt} must not be empty" >&2; return 1; }
+  printf '%s' "${value}"
+}
+
+set_text_secret() {
+  local secret_name="$1"
+  local prompt="$2"
+  local value
+  value="$(read_required_value "${prompt}")"
+  printf '%s' "${value}" |
+    gh secret set "${secret_name}" --repo OpenCoven/seer --env macos-release
+  unset value
+}
+
+# --- Required for signing ---
 P12_PATH="/secure/path/Seer-Developer-ID-Application.p12"
-P8_PATH="/secure/path/AuthKey_EXAMPLE.p8"
-
-base64 < "$P12_PATH" | tr -d '\n' |
-  gh secret set APPLE_CERTIFICATE --repo OpenCoven/seer --env macos-release
-base64 < "$P8_PATH" | tr -d '\n' |
-  gh secret set APPLE_API_KEY_BASE64 --repo OpenCoven/seer --env macos-release
-```
-
-Load text secrets without putting their values in command history:
-
-```bash
-read -r -s -p "APPLE_CERTIFICATE_PASSWORD: " VALUE; echo
-printf '%s' "$VALUE" |
-  gh secret set APPLE_CERTIFICATE_PASSWORD --repo OpenCoven/seer --env macos-release
-unset VALUE
-
-read -r -s -p "APPLE_API_ISSUER: " VALUE; echo
-printf '%s' "$VALUE" |
-  gh secret set APPLE_API_ISSUER --repo OpenCoven/seer --env macos-release
-unset VALUE
-
-read -r -s -p "APPLE_API_KEY: " VALUE; echo
-printf '%s' "$VALUE" |
-  gh secret set APPLE_API_KEY --repo OpenCoven/seer --env macos-release
-unset VALUE
-
-read -r -s -p "APPLE_TEAM_ID: " VALUE; echo
-printf '%s' "$VALUE" |
-  gh secret set APPLE_TEAM_ID --repo OpenCoven/seer --env macos-release
-unset VALUE
-```
-
-The signing identity is not secret, but use the same input path for
-consistency:
-
-```bash
-printf '%s' \
-  "Developer ID Application: Soul Protocol LLC (9LR8Z8UQ9X)" |
+set_file_secret APPLE_CERTIFICATE "${P12_PATH}"
+set_text_secret APPLE_CERTIFICATE_PASSWORD "APPLE_CERTIFICATE_PASSWORD"
+# Not secret, but sent the same way for consistency.
+printf '%s' "Developer ID Application: Soul Protocol LLC (9LR8Z8UQ9X)" |
   gh secret set APPLE_SIGNING_IDENTITY --repo OpenCoven/seer --env macos-release
+set_text_secret APPLE_TEAM_ID "APPLE_TEAM_ID"
+
+# --- Required for primary notarization ---
+P8_PATH="/secure/path/AuthKey_EXAMPLE.p8"
+set_file_secret APPLE_API_KEY_BASE64 "${P8_PATH}"
+set_text_secret APPLE_API_ISSUER "APPLE_API_ISSUER"
+set_text_secret APPLE_API_KEY "APPLE_API_KEY"
+
+# --- Optional Apple ID fallback: run only if configuring it ---
+set_text_secret APPLE_ID "APPLE_ID"
+set_text_secret APPLE_PASSWORD "APPLE_PASSWORD"
+
+# --- Required for binary publication: run only after OpenCoven/seer-releases
+#     exists, is initialized with a reviewed default-branch commit, and the
+#     fine-grained token is approved ---
+set_text_secret RELEASES_REPO_TOKEN "RELEASES_REPO_TOKEN"
+
+unset P12_PATH P8_PATH
 ```
 
-If configuring the Apple ID fallback:
-
-```bash
-read -r -s -p "APPLE_ID: " VALUE; echo
-printf '%s' "$VALUE" |
-  gh secret set APPLE_ID --repo OpenCoven/seer --env macos-release
-unset VALUE
-
-read -r -s -p "APPLE_PASSWORD: " VALUE; echo
-printf '%s' "$VALUE" |
-  gh secret set APPLE_PASSWORD --repo OpenCoven/seer --env macos-release
-unset VALUE
-```
-
-After `OpenCoven/seer-releases` exists and the fine-grained token is approved:
-
-```bash
-read -r -s -p "RELEASES_REPO_TOKEN: " VALUE; echo
-printf '%s' "$VALUE" |
-  gh secret set RELEASES_REPO_TOKEN --repo OpenCoven/seer --env macos-release
-unset VALUE
-```
+Run only the sections that apply to this pass (for example, omit the Apple ID
+fallback block if that path isn't being configured, and omit
+`RELEASES_REPO_TOKEN` until `OpenCoven/seer-releases` exists and is
+initialized). Each `set_*_secret` call is independent and can be copied out of
+the block on its own once `require_safe_secret_file`, `set_file_secret`,
+`read_required_value`, and `set_text_secret` are defined in the same shell.
 
 Environment scope is intentional: repository-level secrets would be available
 to other workflows without the release approval gate. The release job must
@@ -262,7 +369,10 @@ declare `environment: macos-release` before it can access these secrets.
 ## Configure the protected environment
 
 Create a GitHub environment named `macos-release` only after the release
-workflow has merged to the default branch.
+workflow has merged to the default branch **and** the plan and billing
+prerequisite above has been verified — required reviewers cannot be enabled on
+a private-repository environment, and this environment cannot be scheduled
+onto `macos-14-xlarge`, until that upgrade is confirmed.
 
 Configure:
 
@@ -384,9 +494,16 @@ been reviewed.
 
 ## Completion checklist
 
+- [ ] `OpenCoven` organization plan/billing upgraded from Free and verified to
+      support required reviewers on private-repository environments plus
+      `macos-14-xlarge` larger-runner entitlement
 - [ ] Release workflow implemented, reviewed, merged to the default branch,
       and pushed
 - [ ] `OpenCoven/seer-releases` explicitly approved and created
+- [ ] `OpenCoven/seer-releases` default branch initialized with a reviewed
+      commit (e.g. an initial product `README`) and verified to resolve to a
+      `commit` object via `git/ref/heads/<default_branch>`, matching
+      `acquire_remote_lock`'s precondition
 - [ ] Immutable releases enabled on `OpenCoven/seer-releases` and verified by
       confirming `.enabled` is `true` in the API response (additional
       response fields are expected and do not affect the check)
