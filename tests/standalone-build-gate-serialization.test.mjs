@@ -151,28 +151,15 @@ for (const { name, path } of workflows) {
     }
   });
 
-  test(`${name}: invokes this very test file (tests/standalone-build-gate-serialization.test.mjs) by name in its explicit test-file list`, () => {
-    // This file only ever guards anything in ${name} if a worker process
-    // actually runs it there. It is deliberately checked here exactly the
-    // same way every other file above is checked - a plain, hardcoded
-    // literal string looked up in the workflow's own explicit invocation
-    // list - never by deriving "this file's own name" from
-    // `import.meta.url`/`fileURLToPath` or otherwise assuming its own
-    // presence: this file is just another ordinary Node test file in that
-    // command, with no special self-awareness, so a future edit that drops
-    // it from either workflow's explicit list fails this assertion exactly
-    // like dropping any other file from that list would.
-    const source = readFileSync(path, "utf8");
-    const invocations = extractNodeTestInvocations(source);
-    const selfInvocations = invocations.filter((invocation) =>
-      invocation.includes("tests/standalone-build-gate-serialization.test.mjs"),
-    );
-    assert.ok(
-      selfInvocations.length > 0,
-      `expected ${name} to invoke tests/standalone-build-gate-serialization.test.mjs itself in an ` +
-        "explicit test-file list (not merely rely on it being reachable through some other glob)",
-    );
-  });
+  // Registration of *this* file (tests/standalone-build-gate-serialization.test.mjs)
+  // in ${name}'s explicit test-file list used to be self-checked right here,
+  // but a self-check can only run if a worker process is still executing
+  // this very file - if a future edit dropped it from ${name}'s list, the
+  // assertion guarding against exactly that removal would disappear along
+  // with it, and CI would stay green. That guard now lives in
+  // tests/identity.test.mjs instead, which is registered independently (and
+  // first) in both workflows' explicit lists, so it keeps working even if
+  // this file is removed from CI.
 }
 
 test("scripts/build-standalone-renderer.mjs still resolves its lock directory relative to its own file location", () => {

@@ -16,6 +16,32 @@ function readJson(relativePath) {
   return JSON.parse(readText(relativePath));
 }
 
+const ciWorkflows = [
+  { name: "standalone-ci.yml", path: ".github/workflows/standalone-ci.yml" },
+  { name: "release-macos.yml", path: ".github/workflows/release-macos.yml" },
+];
+
+/**
+ * Extracts every distinct `node --test ...` shell invocation from a workflow
+ * source, keeping each invocation's continuation lines (`\` line
+ * continuations) joined so the full file list can be inspected together.
+ */
+function extractNodeTestInvocations(source) {
+  const invocations = [];
+  const lines = source.split("\n");
+  for (let i = 0; i < lines.length; i += 1) {
+    if (!/node --test\b/.test(lines[i])) continue;
+    let block = lines[i];
+    let j = i;
+    while (block.trimEnd().endsWith("\\")) {
+      j += 1;
+      block += `\n${lines[j]}`;
+    }
+    invocations.push(block);
+  }
+  return invocations;
+}
+
 function gitChangeSet() {
   return execFileSync(
     "git",
@@ -146,6 +172,31 @@ test("UpdateService is constructed with the real packaged app version, not a har
     "main/index.ts must never hardcode UpdateService's currentVersion to a fixed string",
   );
 });
+
+for (const { name, path } of ciWorkflows) {
+  test(`${name}: invokes tests/standalone-build-gate-serialization.test.mjs by name in its explicit test-file list`, () => {
+    // tests/standalone-build-gate-serialization.test.mjs used to assert its
+    // own registration in these workflows' explicit "node --test" file
+    // lists, but that self-check only runs if a worker process is still
+    // executing that very file - if a future edit drops the file from
+    // ${name}'s list, the assertion guarding against exactly that removal
+    // disappears along with it, and CI stays green. This file
+    // (tests/identity.test.mjs) is registered independently in *both*
+    // workflows' explicit lists (first in each) and is guaranteed by the
+    // workflow baseline, so it can still catch the gate-serialization file
+    // being dropped from CI.
+    const source = readText(path);
+    const invocations = extractNodeTestInvocations(source);
+    const gateSerializationInvocations = invocations.filter((invocation) =>
+      invocation.includes("tests/standalone-build-gate-serialization.test.mjs"),
+    );
+    assert.ok(
+      gateSerializationInvocations.length > 0,
+      `expected ${name} to invoke tests/standalone-build-gate-serialization.test.mjs in an explicit ` +
+        "test-file list (not merely rely on it being reachable through some other glob)",
+    );
+  });
+}
 
 test("No forbidden generated artifacts are in the change set", () => {
   const changeSet = gitChangeSet();
