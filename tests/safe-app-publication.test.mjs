@@ -577,6 +577,11 @@ test("a source-copy failure removes its verified private staging directory", () 
 test("SIGINT during source copy rolls back the pair and exits 130", async () => {
   mkdirSync(join(repoRoot, "build"), { recursive: true });
   const scratch = mkdtempSync(join(repoRoot, "build", "safe-publication-sigint-"));
+  // Only cleared once terminatePublisher proves the exact child/process group
+  // has actually exited. If termination itself rejects, the scratch dir (and
+  // any surviving hook/child it still holds open) must be preserved rather
+  // than deleted out from under a process that may still be using it.
+  let terminationFailed = false;
   try {
     const fixtureRepo = join(scratch, "repo");
     const oldSource = join(scratch, "old-source", "Seer.app");
@@ -608,7 +613,12 @@ test("SIGINT during source copy rolls back the pair and exits 130", async () => 
       writeFileSync(hook.releasePath, "release\n");
       result = await awaitPublisherCompletion(running);
     } finally {
-      await terminatePublisher(running, hook);
+      try {
+        await terminatePublisher(running, hook);
+      } catch (error) {
+        terminationFailed = true;
+        throw error;
+      }
     }
 
     assert.equal(result.status, 130, `unexpected result:\n${result.stdout}\n${result.stderr}`);
@@ -623,13 +633,23 @@ test("SIGINT during source copy rolls back the pair and exits 130", async () => 
     );
     assert.deepEqual(transactionArtifacts(fixtureRepo), []);
   } finally {
-    rmSync(scratch, { recursive: true, force: true });
+    // Skipped when termination failed above: a surviving hook/child may
+    // still be using the scratch dir, so deleting it here would race a
+    // live process instead of proving it is safe to clean up.
+    if (!terminationFailed) {
+      rmSync(scratch, { recursive: true, force: true });
+    }
   }
 });
 
 test("SIGTERM between app and provenance swaps rolls back the pair and exits 143", async () => {
   mkdirSync(join(repoRoot, "build"), { recursive: true });
   const scratch = mkdtempSync(join(repoRoot, "build", "safe-publication-sigterm-"));
+  // Only cleared once terminatePublisher proves the exact child/process group
+  // has actually exited. If termination itself rejects, the scratch dir (and
+  // any surviving hook/child it still holds open) must be preserved rather
+  // than deleted out from under a process that may still be using it.
+  let terminationFailed = false;
   try {
     const fixtureRepo = join(scratch, "repo");
     const oldSource = join(scratch, "old-source", "Seer.app");
@@ -661,7 +681,12 @@ test("SIGTERM between app and provenance swaps rolls back the pair and exits 143
       writeFileSync(hook.releasePath, "release\n");
       result = await awaitPublisherCompletion(running);
     } finally {
-      await terminatePublisher(running, hook);
+      try {
+        await terminatePublisher(running, hook);
+      } catch (error) {
+        terminationFailed = true;
+        throw error;
+      }
     }
 
     assert.equal(result.status, 143, `unexpected result:\n${result.stdout}\n${result.stderr}`);
@@ -676,13 +701,23 @@ test("SIGTERM between app and provenance swaps rolls back the pair and exits 143
     );
     assert.deepEqual(transactionArtifacts(fixtureRepo), []);
   } finally {
-    rmSync(scratch, { recursive: true, force: true });
+    // Skipped when termination failed above: a surviving hook/child may
+    // still be using the scratch dir, so deleting it here would race a
+    // live process instead of proving it is safe to clean up.
+    if (!terminationFailed) {
+      rmSync(scratch, { recursive: true, force: true });
+    }
   }
 });
 
 test("the next publisher recovers a SIGKILL-abandoned paired swap before staging", async () => {
   mkdirSync(join(repoRoot, "build"), { recursive: true });
   const scratch = mkdtempSync(join(repoRoot, "build", "safe-publication-sigkill-"));
+  // Only cleared once terminatePublisher proves the exact child/process group
+  // has actually exited. If termination itself rejects, the scratch dir (and
+  // any surviving hook/child it still holds open) must be preserved rather
+  // than deleted out from under a process that may still be using it.
+  let terminationFailed = false;
   try {
     const fixtureRepo = join(scratch, "repo");
     const oldSource = join(scratch, "old-source", "Seer.app");
@@ -723,10 +758,19 @@ test("the next publisher recovers a SIGKILL-abandoned paired swap before staging
       // hook subprocess dies alongside the publisher instead of surviving
       // orphaned in the Node test runner's own process group.
       process.kill(-running.child.pid, "SIGKILL");
-      writeFileSync(hook.releasePath, "release\n");
+      // Do not release the hook here. If the SIGKILL only reached the
+      // publisher's pid instead of its whole process group, a surviving
+      // hook could still exit cleanly on release and mask that regression.
+      // Awaiting completion directly proves the group-wide SIGKILL is what
+      // actually brought the hook (and publisher) down.
       killed = await awaitPublisherCompletion(running);
     } finally {
-      await terminatePublisher(running, hook);
+      try {
+        await terminatePublisher(running, hook);
+      } catch (error) {
+        terminationFailed = true;
+        throw error;
+      }
     }
     assert.equal(killed.signal, "SIGKILL");
 
@@ -743,7 +787,12 @@ test("the next publisher recovers a SIGKILL-abandoned paired swap before staging
     );
     assert.deepEqual(transactionArtifacts(fixtureRepo), []);
   } finally {
-    rmSync(scratch, { recursive: true, force: true });
+    // Skipped when termination failed above: a surviving hook/child may
+    // still be using the scratch dir, so deleting it here would race a
+    // live process instead of proving it is safe to clean up.
+    if (!terminationFailed) {
+      rmSync(scratch, { recursive: true, force: true });
+    }
   }
 });
 
