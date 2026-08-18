@@ -152,32 +152,25 @@ jobs:
       - name: Install locked standalone dependencies
         run: npm ci
 
-      # --test-concurrency=1 serializes these files: tests/standalone-renderer.test.mjs
-      # and tests/standalone-renderer-lock.test.mjs both drive
+      # The explicit standalone-safe test-file list and the
+      # `--test-concurrency=1` pin (tests/standalone-renderer.test.mjs and
+      # tests/standalone-renderer-lock.test.mjs both drive
       # scripts/build-standalone-renderer.mjs against this repository's real
-      # .seer-standalone-renderer.lock directory (the lock test intentionally
-      # overwrites that directory to simulate stale/synthetic lock owners).
-      # Node's test runner otherwise executes test files in parallel worker
-      # processes by default, which races both files over the same physical
-      # lock directory and build/standalone-renderer output, producing
-      # nondeterministic EEXIST/owner-mismatch failures.
+      # .seer-standalone-renderer.lock directory, so they must never run as
+      # concurrent worker processes) live in one repository-owned module,
+      # scripts/run-standalone-tests.mjs, run here via the
+      # `test:standalone-safe` package script. This job's release-only
+      # draft/workflow policy tests (tests/release-macos-draft-policy.test.mjs,
+      # tests/release-macos-workflow.test.mjs) are part of that same shared
+      # superset list — see that module for why they are credential/network
+      # safe. tests/standalone-boundary.test.mjs is deliberately excluded
+      # from that module's list and run as its own explicit step after
+      # "Build unsigned Seer.app" below instead. Both this workflow and
+      # .github/workflows/standalone-ci.yml invoke the exact same package
+      # script, so there is no hand-maintained duplicate file list to drift
+      # between them.
       - name: Run standalone-safe unit tests
-        run: |
-          set -euo pipefail
-          node --test --test-concurrency=1 \
-            tests/identity.test.mjs \
-            tests/renderer-build-identity.test.mjs \
-            tests/renderer-asset-digest-helper.test.mjs \
-            tests/standalone-renderer.test.mjs \
-            tests/standalone-renderer-lock.test.mjs \
-            tests/standalone-build-gate-serialization.test.mjs \
-            tests/safe-app-publication.test.mjs \
-            tests/release-manifest.test.mjs \
-            tests/package-macos-release.test.mjs \
-            tests/release-macos-draft-policy.test.mjs \
-            tests/release-macos-workflow.test.mjs \
-            tests/agent-detection-parity.test.mjs \
-            tests/tray-update-error-handling.test.mjs
+        run: npm run test:standalone-safe
 
       - name: Run shared renderer unit tests
         run: npm run test:renderer

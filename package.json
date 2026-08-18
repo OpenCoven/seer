@@ -15,6 +15,7 @@
     "build:macos": "node scripts/build-standalone-renderer.mjs -- bash scripts/build-macos-app.sh",
     "check:standalone-boundary": "node scripts/check-standalone-boundary.mjs",
     "test:build-macos-destination-safety": "node --test tests/safe-app-publication.test.mjs",
+    "test:standalone-safe": "node scripts/run-standalone-tests.mjs",
     "dev": "node glaze.ts dev",
     "dev:renderer": "node glaze.ts dev:renderer",
     "lint": "node glaze.ts lint",

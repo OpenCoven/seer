@@ -4,10 +4,8 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import test from "node:test";
-import {
-  extractNodeTestInvocations,
-  invocationHasTestFile,
-} from "./helpers/workflow-node-test-invocations.mjs";
+import yaml from "js-yaml";
+import { STANDALONE_SAFE_TEST_FILES } from "../scripts/run-standalone-tests.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = dirname(here);
@@ -24,6 +22,30 @@ const ciWorkflows = [
   { name: "standalone-ci.yml", path: ".github/workflows/standalone-ci.yml" },
   { name: "release-macos.yml", path: ".github/workflows/release-macos.yml" },
 ];
+
+/**
+ * Returns every job step across `workflowSource` whose string `run:` value
+ * is exactly `exactRun` — a plain YAML-parsed equality check, not a scan of
+ * shell tokens, so there is nothing here that needs to understand quoting,
+ * comments, or control operators the way the deleted
+ * tests/helpers/workflow-node-test-invocations.mjs shell tokenizer did.
+ */
+function findStepsByExactRun(workflowSource, exactRun) {
+  const workflow = yaml.load(workflowSource);
+  const steps = [];
+  if (typeof workflow !== "object" || workflow === null || typeof workflow.jobs !== "object" || workflow.jobs === null) {
+    return steps;
+  }
+  for (const job of Object.values(workflow.jobs)) {
+    if (typeof job !== "object" || job === null || !Array.isArray(job.steps)) continue;
+    for (const step of job.steps) {
+      if (typeof step === "object" && step !== null && step.run === exactRun) {
+        steps.push(step);
+      }
+    }
+  }
+  return steps;
+}
 
 function gitChangeSet() {
   return execFileSync(
@@ -157,33 +179,47 @@ test("UpdateService is constructed with the real packaged app version, not a har
 });
 
 for (const { name, path } of ciWorkflows) {
-  test(`${name}: invokes tests/standalone-build-gate-serialization.test.mjs by name in its explicit test-file list`, () => {
-    // tests/standalone-build-gate-serialization.test.mjs used to assert its
-    // own registration in these workflows' explicit "node --test" file
-    // lists, but that self-check only runs if a worker process is still
-    // executing that very file - if a future edit drops the file from
-    // ${name}'s list, the assertion guarding against exactly that removal
-    // disappears along with it, and CI stays green. This file
-    // (tests/identity.test.mjs) is registered independently in *both*
-    // workflows' explicit lists (first in each) and is guaranteed by the
-    // workflow baseline, so it can still catch the gate-serialization file
-    // being dropped from CI.
+  test(`${name}: invokes the standalone-safe test suite via the shared npm script`, () => {
+    // Both workflows used to hand-maintain their own explicit "node --test"
+    // file list; verifying a given file was registered required parsing
+    // that shell text back out of the YAML. Now both workflows invoke the
+    // exact same fixed, argument-free command, so verifying that is a
+    // single exact-string comparison against the parsed YAML `run:` value -
+    // no shell parsing required. *Which* files that command runs is
+    // asserted separately below, directly against
+    // scripts/run-standalone-tests.mjs's exported list.
     const source = readText(path);
-    const invocations = extractNodeTestInvocations(source);
-    const gateSerializationInvocations = invocations.filter((invocation) =>
-      invocationHasTestFile(
-        invocation,
-        "tests/standalone-build-gate-serialization.test.mjs",
-      ),
-    );
-    assert.ok(
-      gateSerializationInvocations.length > 0,
-      `expected ${name} to invoke tests/standalone-build-gate-serialization.test.mjs in an explicit ` +
-        "test-file list (not merely rely on it being reachable through some other glob), as its own " +
-        "exact shell argument token - not merely appearing somewhere in the step's script text",
+    const steps = findStepsByExactRun(source, "npm run test:standalone-safe");
+    assert.equal(
+      steps.length,
+      1,
+      `expected exactly one step in ${name} whose run: value is exactly "npm run test:standalone-safe" ` +
+        "(a bare package-script invocation, not a variant with an inline pipe, comment, or additional " +
+        "shell command)",
     );
   });
 }
+
+test("scripts/run-standalone-tests.mjs still registers tests/standalone-build-gate-serialization.test.mjs", () => {
+  // tests/standalone-build-gate-serialization.test.mjs used to assert its
+  // own registration in each workflow's explicit "node --test" file list,
+  // but that self-check only ran if a worker process was still executing
+  // that very file - if a future edit dropped the file from the shared
+  // list, the assertion guarding against exactly that removal would
+  // disappear along with it, and CI would stay green. This file
+  // (tests/identity.test.mjs) is itself registered in
+  // scripts/run-standalone-tests.mjs's STANDALONE_SAFE_TEST_FILES - the one
+  // list both workflows run via `npm run test:standalone-safe`, asserted
+  // above - so it keeps working even if
+  // tests/standalone-build-gate-serialization.test.mjs is ever removed from
+  // that list.
+  assert.ok(
+    STANDALONE_SAFE_TEST_FILES.includes("tests/standalone-build-gate-serialization.test.mjs"),
+    "scripts/run-standalone-tests.mjs's STANDALONE_SAFE_TEST_FILES must directly list " +
+      "tests/standalone-build-gate-serialization.test.mjs (not merely rely on it being reachable " +
+      "through some other glob or transitively-included file)",
+  );
+});
 
 test("No forbidden generated artifacts are in the change set", () => {
   const changeSet = gitChangeSet();

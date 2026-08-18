@@ -65,39 +65,33 @@ jobs:
       - name: Prepare diagnostics directory
         run: mkdir -p ci-logs
 
-      # Explicit file list, not `tests/*.test.mjs`: this repo's `tests/`
-      # directory also holds tests/glaze-runtime-resolution.test.mjs (the
-      # Glaze/Electron SDK-resolution wrapper — out of scope for this
-      # standalone-only runner) and tests/standalone-boundary.test.mjs,
-      # which is run as its own explicit step after "Build unsigned
-      # Seer.app" below (its shared `main/services/update-check.test.ts`
-      # sibling is exercised via the "Run shared renderer unit tests" step
-      # instead). Release packaging tests stub every signing/notarization
-      # tool and never use credentials or contact Apple services.
-      # --test-concurrency=1 serializes these files: tests/standalone-renderer.test.mjs
-      # and tests/standalone-renderer-lock.test.mjs both drive
+      # The explicit standalone-safe test-file list, the `--test-concurrency=1`
+      # pin (tests/standalone-renderer.test.mjs and
+      # tests/standalone-renderer-lock.test.mjs both drive
       # scripts/build-standalone-renderer.mjs against this repository's real
-      # .seer-standalone-renderer.lock directory (the lock test intentionally
-      # overwrites that directory to simulate stale/synthetic lock owners).
-      # Node's test runner otherwise executes test files in parallel worker
-      # processes by default, which races both files over the same physical
-      # lock directory and build/standalone-renderer output, producing
-      # nondeterministic EEXIST/owner-mismatch failures.
+      # .seer-standalone-renderer.lock directory, so they must never run as
+      # concurrent worker processes), and the release-only draft/workflow
+      # policy tests all live in one repository-owned module,
+      # scripts/run-standalone-tests.mjs, run here via the
+      # `test:standalone-safe` package script — not `tests/*.test.mjs`,
+      # which would also pull in tests/glaze-runtime-resolution.test.mjs
+      # (the Glaze/Electron SDK-resolution wrapper — out of scope for this
+      # standalone-only runner). The release-only draft/workflow policy
+      # tests are included in this pull-request-triggered runner too (one
+      # shared superset list, not a second hand-reviewed list) because they
+      # stub every signing/notarization/`curl`/`gh` invocation behind fakes
+      # on `PATH` or perform only static source/YAML analysis — never real
+      # credentials or network access. tests/standalone-boundary.test.mjs is
+      # deliberately excluded from that module's list and run as its own
+      # explicit step after "Build unsigned Seer.app" below instead (its
+      # shared `main/services/update-check.test.ts` sibling is exercised via
+      # the "Run shared renderer unit tests" step instead). Both this
+      # workflow and .github/workflows/release-macos.yml invoke the exact
+      # same package script, so there is no hand-maintained duplicate file
+      # list to drift between them; GitHub Actions captures this step's
+      # stdout/stderr itself, so no `tee` redirect is needed here.
       - name: Run standalone-safe unit tests (identity, renderer, publication, packaging, agent-detection, update)
-        run: |
-          set -euo pipefail
-          node --test --test-concurrency=1 \
-            tests/identity.test.mjs \
-            tests/renderer-build-identity.test.mjs \
-            tests/renderer-asset-digest-helper.test.mjs \
-            tests/standalone-renderer.test.mjs \
-            tests/standalone-renderer-lock.test.mjs \
-            tests/standalone-build-gate-serialization.test.mjs \
-            tests/safe-app-publication.test.mjs \
-            tests/release-manifest.test.mjs \
-            tests/package-macos-release.test.mjs \
-            tests/agent-detection-parity.test.mjs \
-            tests/tray-update-error-handling.test.mjs 2>&1 | tee ci-logs/unit-tests.log
+        run: npm run test:standalone-safe
 
       - name: Run shared renderer unit tests
         run: |
