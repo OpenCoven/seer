@@ -89,6 +89,7 @@ jobs:
           node --test --test-concurrency=1 \
             tests/identity.test.mjs \
             tests/renderer-build-identity.test.mjs \
+            tests/renderer-asset-digest-private-helper.test.mjs \
             tests/standalone-renderer.test.mjs \
             tests/standalone-renderer-lock.test.mjs \
             tests/safe-app-publication.test.mjs \

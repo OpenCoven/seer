@@ -19,10 +19,10 @@ import { spawnSync } from "node:child_process";
 import console from "node:console";
 import { createHash, randomBytes } from "node:crypto";
 import {
+  chmodSync,
   closeSync,
   constants,
   fstatSync,
-  linkSync,
   lstatSync,
   mkdirSync,
   openSync,
@@ -222,10 +222,26 @@ const rendererAssetDigestHelperSource = join(
   dirname(fileURLToPath(import.meta.url)),
   "renderer-asset-digest.swift",
 );
-const rendererAssetDigestHelperCache = join(
+const rendererAssetDigestPrivateRunsRootParentDir = join(
   dirname(dirname(rendererAssetDigestHelperSource)),
   "build",
-  ".renderer-asset-digest-helper",
+);
+// A fixed, well-known *parent* directory name is fine to share by name
+// across every process/invocation: nothing is ever published or contended
+// for at this exact path. It exists only to hold each invocation's own
+// unique, unpredictable run directory (see
+// createPrivateRendererAssetDigestRunDir below); this parent is itself
+// verified real/non-symlink/current-uid-owned/mode-0700 (see
+// ensurePrivateDirectory) every time, so - regardless of `build/`'s own
+// permissions - no other OS user can ever traverse into it, let alone
+// create, read, or race the creation of anything inside it.
+// Exported only so tests can place deliberately abandoned/malformed
+// fixtures at the exact same path production uses (e.g. to prove a
+// leftover directory from a killed process never blocks a later,
+// independent real call) without duplicating this path-construction logic.
+export const rendererAssetDigestPrivateRunsRoot = join(
+  rendererAssetDigestPrivateRunsRootParentDir,
+  ".renderer-asset-digest-runs",
 );
 
 function lstatOrNull(path) {
@@ -255,110 +271,109 @@ function sameFileSystemIdentity(left, right) {
   );
 }
 
-// The helper below is compiled and published without any mutual-exclusion
-// lock at all. `helperPath` is content-addressed by the Swift source's own
-// sha256 (see `compiledRendererAssetDigestHelper()`), so every concurrent
-// process compiling the *same* source is - by construction - trying to
-// publish byte-identical content to the exact same path: there is nothing
-// to serialize between them. Each process instead compiles into its own
-// unique, unpredictable, same-directory staging path and publishes with a
-// single `linkSync` (POSIX `link(2)`): creating a new path is atomic and
-// all-or-nothing, so at most one process's link to a given canonical path
-// can ever succeed - every other process's link of that same path fails
-// with `EEXIST` and simply defers to whichever content already won.
+// The helper below has no shared canonical name at all: nothing is ever
+// staged-then-published, locked, or reused across calls or processes. Every
+// single call that needs it (see readDescriptorAnchoredRendererAssets)
+// compiles its own fresh copy into its own unique, unpredictable, private
+// work directory - created fresh, used once, and removed again before that
+// call returns - so there is no shared state for a validation/publication/
+// execution TOCTOU to ever open a window in, and no canonical winner whose
+// identity a concurrent or later call could race, displace, or wedge.
 //
-// This has no equivalent of any of the lock-protocol failure modes a
-// crash-safe mutual-exclusion lock is still exposed to: there is no
-// "successor" a slow reclaimer or a process's own cleanup could ever
-// displace, because nothing is ever renamed or deleted *at* the canonical
-// path - only unique, per-process staging files are ever unlinked, and a
-// process's own staging path can never coincide with the canonical path
-// or another process's staging path. There is no "still initializing"
-// grace period that could reclaim a live-but-paused owner, because there
-// is no multi-step owner-commit sequence to be caught mid-way through: a
-// `link()` either has not happened yet, or has already completed with
-// fully-formed content - never in between. There is no pid-based liveness
-// check at all, so pid reuse can never matter. And there is no
-// bounded-wait/deadline loop to overrun, because nothing ever waits: a
-// loser resolves the winner's content immediately instead of polling for
-// it. A process killed at any point leaves, at worst, an inert, uniquely
-// named staging file nothing else ever looks at - never a canonical lock
-// that could wedge a future build.
+// Exclusivity comes entirely from filesystem permissions, not from any
+// mutual-exclusion protocol: `ensurePrivateDirectory` requires the private
+// runs root and every run directory under it to be a real, non-symlink
+// directory, owned by the current uid, and mode *exactly* 0700 (rejecting
+// any group/world bit at all) - normalizing (`chmodSync`) newly created
+// directories rather than trusting the mode requested at creation, because
+// that request is itself subject to the ambient umask and can otherwise
+// come out *less* permissive than intended (observed directly: an unusual
+// umask can leave a freshly created "mode 0700" directory completely
+// inaccessible, though never more permissive than requested - umask only
+// ever clears bits). A preexisting parent that is not already exactly this
+// shape is never "fixed" (chmod'd, or deleted and recreated) - fixing a
+// symlink planted at that exact path could affect whatever it actually
+// points at - it is rejected outright, failing closed. Since no other OS
+// user can ever traverse, read, or write a 0700 directory owned by someone
+// else, nothing outside this process's own uid can pre-create, observe, or
+// tamper with anything inside its run directory, regardless of `build/`'s
+// own (unrelated, unchanged) permissions.
 //
-// Both the staged file (before publication) and the canonical path (this
-// process's own just-published file, or a concurrent winner's) are
-// independently verified - `lstat`, then re-checked by an `O_NOFOLLOW`
-// descriptor's `fstat` - to be the exact same regular, non-symlink,
-// current-user-owned, executable file throughout: this process never
-// publishes content it has not itself validated, and never trusts (let
-// alone executes) whatever ends up at the canonical path merely because
-// *a* `link()` happened to succeed or fail.
+// The compiled file itself is chmod 0500 (owner read+execute, no write bit
+// at all) immediately after compilation, then independently validated -
+// `lstat`, then re-checked by an `O_NOFOLLOW`-opened descriptor's `fstat` -
+// to be a regular, non-symlink, current-uid-owned, non-empty,
+// owner-executable file that is not writable by any group or other user.
+// That descriptor is kept open through the spawn immediately below it
+// (`spawnValidatedPrivateRendererAssetDigestHelperFile`), which spawns by
+// the private pathname - Node has no portable way to exec an already-open
+// descriptor directly - and then revalidates identity immediately
+// afterward: a fresh `lstat` of that same pathname (catching a full
+// unlink-and-replace, which the kept-open descriptor's own `fstat` cannot
+// see, since it still refers to the original, now-detached inode) and a
+// fresh `fstat` of the original descriptor re-checked against every
+// rejection rule (catching an in-place mutation of that same inode, e.g. a
+// chmod or truncate-and-overwrite that never unlinked the path at all).
+// This cannot *prevent* a same-uid actor from swapping the file between
+// validation and spawn - no pathname-based exec ever can - it only
+// guarantees such a swap is always detected and thrown, never silently
+// trusted. Under this design's threat model (a 0700, current-uid-owned
+// private run directory nothing else can traverse or write into), no other
+// OS user can ever perform that swap in the first place.
 //
-// `rendererAssetDigestHelperCandidateRejectionReason()`,
-// `verifyRendererAssetDigestHelperCandidateOrNull()`, and
-// `publishRendererAssetDigestHelperCandidate()` are exported *only* so
-// tests/renderer-asset-digest-publish.test.mjs can construct precise
-// on-disk fixtures (preexisting symlinks/non-regular/non-executable
-// canonical state, abandoned staging files, racing publishers) and drive
-// this exact logic deterministically, without needing a real `swiftc`
-// compile for every case. `compiledRendererAssetDigestHelper()` below is
-// the only production caller.
+// Cleanup only ever removes the exact run directory this call itself just
+// created, and only after re-verifying (fresh `lstat` + identity check)
+// that it still is that exact directory - never a path that merely looks
+// similar, and never any *other* call's or process's run directory. This
+// module never scans the shared runs root for "abandoned" entries to clean
+// up: a process killed at any point (compiler failure, a SIGKILL, anything
+// in between) leaves at worst one inert, uniquely named leftover directory
+// nothing else ever looks at, waits on, or depends on - it can never wedge,
+// block, or otherwise affect any other, fully independent call, each of
+// which always creates and only ever touches its own unique path.
 
 /**
  * Pure check over an already-obtained `fs.Stats` (or, in tests, a
- * fabricated stand-in exposing the same shape) for why it would be
- * rejected as a renderer asset digest helper candidate, or `null` if it
- * looks like a plausible one. Kept separate from the lstat/open(
- * `O_NOFOLLOW`)/fstat identity dance in
- * {@link verifyRendererAssetDigestHelperCandidateOrNull} so "owned by a
- * different user" can be exercised deterministically in tests: actually
- * creating a file on disk owned by a different uid would require
- * root/multi-user privileges no test environment can assume, but
- * fabricating a `Stats`-shaped object with a foreign `uid` requires none.
+ * fabricated stand-in exposing the same shape) for why `stats` would be
+ * rejected as a private run directory (or the runs root itself), or `null`
+ * if it looks safe. Kept separate from the on-disk lstat/open(
+ * `O_NOFOLLOW`)/fstat identity dance in {@link verifyPrivateDirectoryOrThrow}
+ * so "owned by a different user" can be exercised deterministically in
+ * tests without root/multi-user privileges.
  */
-export function rendererAssetDigestHelperCandidateRejectionReason(stats) {
-  if (!stats.isFile()) return "must be a regular file";
+export function privateDirectoryRejectionReason(stats) {
+  if (!stats.isDirectory()) return "must be a real directory";
   if (stats.uid !== process.getuid()) return "is not owned by the current user";
-  if ((stats.mode & constants.S_IXUSR) === 0) return "is not executable";
-  if (stats.size <= 0) return "is empty";
+  if ((stats.mode & 0o777) !== 0o700) return "must be mode 0700, rejecting any group/world access";
   return null;
 }
 
 /**
- * Verifies that `path` is a regular, non-symlink, current-user-owned,
- * non-empty, owner-executable file, opened `O_NOFOLLOW` and re-checked by
- * descriptor so it can never be swapped out from under the check (never
- * trusting the initial `lstat` alone, which a symlink installed
- * immediately afterward could invalidate). Returns its `fs.Stats` on
- * success, or `null` only when nothing exists at `path` at all (the
- * ordinary "not staged/published yet" case). Anything else - a symlink, a
- * directory or other non-regular file, a file owned by someone else, a
- * non-executable or empty file, or one that changes identity between the
- * `lstat` and the `fstat` - throws: malformed or tampered helper state
- * must never be silently treated as absent, valid, or safe to overwrite.
+ * Verifies that `path` is a real, non-symlink directory, owned by the
+ * current user, mode *exactly* 0700 - opened `O_NOFOLLOW|O_DIRECTORY` and
+ * re-checked by descriptor so it can never be swapped out from under the
+ * check (never trusting the initial `lstat` alone, which a symlink
+ * installed immediately afterward could invalidate). Throws on absolutely
+ * any mismatch, including absence: unlike the removed publish design,
+ * nothing here is ever a legitimate "not published yet" state - a missing
+ * or malformed directory is always an error the caller must fail closed on,
+ * never silently treated as safe to create-over or reuse.
  */
-export function verifyRendererAssetDigestHelperCandidateOrNull(path, label) {
-  const before = lstatOrNull(path);
-  if (!before) return null;
+export function verifyPrivateDirectoryOrThrow(path, label) {
+  const before = lstatSync(path);
   if (before.isSymbolicLink()) {
     throw new Error(`${label} must not be a symlink: ${path}`);
   }
-  if (!before.isFile()) {
-    throw new Error(`${label} must be a regular file: ${path}`);
+  if (!before.isDirectory()) {
+    throw new Error(`${label} must be a real directory: ${path}`);
   }
-  let descriptor;
-  try {
-    descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-  } catch (error) {
-    if (error && error.code === "ENOENT") return null; // vanished between the lstat and this open.
-    throw error;
-  }
+  const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_DIRECTORY);
   try {
     const after = fstatSync(descriptor);
     if (!sameFileSystemIdentity(before, after)) {
       throw new Error(`${label} changed identity while being verified: ${path}`);
     }
-    const rejection = rendererAssetDigestHelperCandidateRejectionReason(after);
+    const rejection = privateDirectoryRejectionReason(after);
     if (rejection) {
       throw new Error(`${label} ${rejection}: ${path}`);
     }
@@ -369,89 +384,213 @@ export function verifyRendererAssetDigestHelperCandidateOrNull(path, label) {
 }
 
 /**
- * Publishes `stagingPath` - a file this caller has already fully written
- * and closed, at a same-directory path unique to this process/attempt -
- * to `canonicalPath` via a single atomic, no-clobber `linkSync`: the only
- * primitive this design relies on for exclusivity, since at most one
- * `link()` of any given new path can ever succeed.
- *
- * `stagingPath` is independently verified *before* the link attempt (this
- * process must never publish content it has not itself validated), and
- * `canonicalPath` is independently re-verified *after* - regardless of
- * whether this call's own link won or a concurrent publisher's did,
- * because that outcome alone says nothing about whether the file now at
- * `canonicalPath` (this call's own, a concurrent winner's, or something
- * pre-existing entirely outside this protocol) is actually valid.
- *
- * `stagingPath` is always removed before returning or throwing. It is
- * unique to this call and never the canonical path, so removing it can
- * never affect `canonicalPath` or any other process's own staging file -
- * whether this call's link won, lost, or validation itself failed.
+ * Ensures `path` is a private (real, non-symlink, current-uid-owned, mode
+ * 0700) directory, creating it fresh if nothing exists there yet, and
+ * always independently verifying it (whether just created or preexisting)
+ * before returning. Creation always normalizes the mode with an explicit
+ * `chmodSync` immediately afterward rather than trusting `mkdirSync`'s own
+ * `mode` option, which is itself subject to the ambient umask (umask can
+ * only ever clear bits, so a freshly created directory here can come out
+ * *less* permissive than 0700 - even fully inaccessible - but never more;
+ * there is accordingly no window where it is briefly more open than
+ * intended). A preexisting path that fails verification is never repaired
+ * (chmod'd, or removed and recreated) - only ever rejected - so this
+ * always fails closed on an unsafe preexisting parent instead of guessing
+ * at whether it is safe to reuse or "fix".
  */
-export function publishRendererAssetDigestHelperCandidate(stagingPath, canonicalPath) {
-  try {
-    const staged = verifyRendererAssetDigestHelperCandidateOrNull(
-      stagingPath,
-      "freshly compiled renderer asset digest helper",
-    );
-    if (!staged) {
-      throw new Error(`freshly compiled renderer asset digest helper is missing: ${stagingPath}`);
-    }
-    try {
-      linkSync(stagingPath, canonicalPath);
-    } catch (error) {
-      // `EEXIST` is the *only* possible outcome for every loser: a
-      // concurrent publisher's link to `canonicalPath` already succeeded
-      // first, and its content is already complete and immutable there.
-      // There is nothing to undo and nothing more to do.
-      if (!error || error.code !== "EEXIST") throw error;
-    }
-  } finally {
-    rmSync(stagingPath, { force: true });
+export function ensurePrivateDirectory(path, label) {
+  if (!lstatOrNull(path)) {
+    mkdirSync(path, { mode: 0o700 });
+    chmodSync(path, 0o700);
   }
-
-  const published = verifyRendererAssetDigestHelperCandidateOrNull(
-    canonicalPath,
-    "renderer asset digest helper",
-  );
-  if (!published) {
-    throw new Error(
-      `renderer asset digest helper is missing immediately after publication: ${canonicalPath}`,
-    );
-  }
-  return published;
+  return verifyPrivateDirectoryOrThrow(path, label);
 }
 
-function compiledRendererAssetDigestHelper() {
-  if (process.platform !== "darwin") {
-    throw new Error("descriptor-anchored renderer asset hashing requires macOS");
+/**
+ * Creates one fresh, unique, unpredictable (pid *and* 128 random bits -
+ * never a predictable name anything could pre-create or pre-empt, though
+ * under this design's 0700-parent threat model no other uid ever could
+ * regardless) private run directory under the already-validated `root`,
+ * verifies it, and returns its path alongside the verified `fs.Stats`
+ * cleanup later re-checks identity against.
+ */
+export function createPrivateRendererAssetDigestRunDir(root) {
+  const path = join(root, `run-${process.pid}-${randomBytes(16).toString("hex")}`);
+  return { path, stats: ensurePrivateDirectory(path, "renderer asset digest private run directory") };
+}
+
+/**
+ * Removes exactly the run directory this process itself created - never
+ * any other path - and only after re-verifying (fresh `lstat` + identity
+ * check against the `stats` captured at creation time) that it still is
+ * that exact, untampered directory. A mismatch (vanished, replaced,
+ * symlinked, or otherwise no longer identical) never triggers a recursive
+ * delete: it is logged and left in place, exactly as an abandoned
+ * leftover from a killed process would be (see the module doc comment
+ * above) - this can never wedge or affect any other, independent call.
+ * Never throws: a failed or skipped cleanup must never fail an otherwise-
+ * already-completed (successful or not) digest computation.
+ */
+export function removePrivateRendererAssetDigestRunDirIfSafe(runDir) {
+  const current = lstatOrNull(runDir.path);
+  if (!current || current.isSymbolicLink() || !current.isDirectory() || !sameFileSystemIdentity(runDir.stats, current)) {
+    if (current) {
+      console.error(
+        `renderer asset digest private run directory changed identity before cleanup, leaving it in place: ${runDir.path}`,
+      );
+    }
+    return;
   }
-
-  const source = readFileSync(rendererAssetDigestHelperSource);
-  const helperPath = join(
-    rendererAssetDigestHelperCache,
-    `renderer-asset-digest-${sha256Hex(source)}`,
-  );
-  if (verifyRendererAssetDigestHelperCandidateOrNull(helperPath, "renderer asset digest helper")) {
-    return helperPath;
+  try {
+    rmSync(runDir.path, { recursive: true });
+  } catch (error) {
+    console.error(
+      `failed to remove renderer asset digest private run directory ${runDir.path}: ${error.message}`,
+    );
   }
+}
 
-  mkdirSync(rendererAssetDigestHelperCache, { recursive: true });
+/**
+ * Ensures the shared (by name only - never by content or state) private
+ * runs root exists and is safe, creates one fresh unique run directory
+ * under it, hands its path to `run`, and always attempts to remove exactly
+ * that run directory afterward (see
+ * removePrivateRendererAssetDigestRunDirIfSafe) regardless of whether `run`
+ * succeeded or threw. A compiler failure or any other error `run` throws
+ * still triggers cleanup of this call's own run directory before
+ * propagating - it can never block any other, fully independent call, each
+ * of which creates and only ever touches its own unique directory.
+ */
+export function withPrivateRendererAssetDigestHelper(run) {
+  mkdirSync(rendererAssetDigestPrivateRunsRootParentDir, { recursive: true });
+  ensurePrivateDirectory(rendererAssetDigestPrivateRunsRoot, "renderer asset digest private runs root");
+  const runDir = createPrivateRendererAssetDigestRunDir(rendererAssetDigestPrivateRunsRoot);
 
-  // Unique and unpredictable (pid *and* random bytes - never just a
-  // predictable name another process, or an attacker on a shared cache
-  // directory, could pre-create/pre-empt), but always in the same
-  // directory as `helperPath` so `linkSync` below never crosses a
-  // filesystem boundary.
-  const stagingPath = join(
-    rendererAssetDigestHelperCache,
-    `.renderer-asset-digest-staging-${process.pid}-${randomBytes(16).toString("hex")}`,
-  );
-  const compilation = spawnSync("swiftc", [rendererAssetDigestHelperSource, "-o", stagingPath], {
+  let result;
+  let failure;
+  try {
+    result = run(runDir.path);
+  } catch (error) {
+    failure = error;
+  }
+  removePrivateRendererAssetDigestRunDirIfSafe(runDir);
+  if (failure) throw failure;
+  return result;
+}
+
+/**
+ * Pure check over an already-obtained `fs.Stats` (or, in tests, a
+ * fabricated stand-in) for why it would be rejected as the compiled
+ * renderer asset digest helper executable, or `null` if it looks safe to
+ * trust and spawn. Kept separate from the on-disk identity dance in
+ * {@link openValidatedPrivateRendererAssetDigestHelperFile} so
+ * "owned by a different user" can be exercised deterministically in tests
+ * without root/multi-user privileges. Beyond the removed publish design's
+ * own checks, this also rejects group/world *writability* specifically
+ * (independent of the exact mode bits) - defense in depth on top of the
+ * 0500 chmod compilation always applies, in case that chmod's own effect
+ * were ever somehow bypassed.
+ */
+export function rendererAssetDigestHelperFileRejectionReason(stats) {
+  if (!stats.isFile()) return "must be a regular file";
+  if (stats.uid !== process.getuid()) return "is not owned by the current user";
+  if ((stats.mode & constants.S_IXUSR) === 0) return "is not executable by its owner";
+  if ((stats.mode & (constants.S_IWGRP | constants.S_IWOTH)) !== 0) {
+    return "is writable by a group or other user";
+  }
+  if (stats.size <= 0) return "is empty";
+  return null;
+}
+
+/**
+ * Verifies that `path` is a regular, non-symlink, current-uid-owned,
+ * non-empty, owner-executable, not-group-or-world-writable file - `lstat`,
+ * then re-checked by an `O_NOFOLLOW`-opened descriptor's `fstat`, so it can
+ * never be swapped out from under the check (never trusting the initial
+ * `lstat` alone, which a symlink installed immediately afterward could
+ * invalidate). Throws on any mismatch, including absence. Returns the open
+ * descriptor and its stats; the caller must keep the descriptor open
+ * through the spawn (see {@link spawnValidatedPrivateRendererAssetDigestHelperFile})
+ * and is responsible for closing it afterward.
+ */
+export function openValidatedPrivateRendererAssetDigestHelperFile(path, label) {
+  const before = lstatSync(path);
+  if (before.isSymbolicLink()) {
+    throw new Error(`${label} must not be a symlink: ${path}`);
+  }
+  if (!before.isFile()) {
+    throw new Error(`${label} must be a regular file: ${path}`);
+  }
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const after = fstatSync(fd);
+    if (!sameFileSystemIdentity(before, after)) {
+      throw new Error(`${label} changed identity while being verified: ${path}`);
+    }
+    const rejection = rendererAssetDigestHelperFileRejectionReason(after);
+    if (rejection) {
+      throw new Error(`${label} ${rejection}: ${path}`);
+    }
+    return { fd, stats: after };
+  } catch (error) {
+    closeSync(fd);
+    throw error;
+  }
+}
+
+/**
+ * Spawns the already-validated `path` (see
+ * {@link openValidatedPrivateRendererAssetDigestHelperFile}) by pathname -
+ * Node has no portable way to exec an already-open descriptor directly -
+ * then revalidates identity immediately afterward, before the caller may
+ * trust `spawnSync`'s result: a fresh `lstat` of `path` compared against
+ * the stats captured at validation time (catching a full unlink-and-replace
+ * or a symlink swap - a scenario the kept-open descriptor's own `fstat`
+ * cannot see, since it still refers to the original, now-detached inode),
+ * and a fresh `fstat` of that original descriptor re-checked against every
+ * rejection rule (catching an in-place mutation of that same inode, e.g. a
+ * chmod or truncate-and-overwrite that never unlinked the path at all).
+ *
+ * This cannot *prevent* a same-uid actor from swapping the file between
+ * validation and this call - no pathname-based exec ever can - it only
+ * guarantees such a swap is always detected and thrown, never silently
+ * trusted. Under this design's threat model (a 0700, current-uid-owned
+ * private run directory nothing else can traverse or write into), no other
+ * OS user can ever perform that swap in the first place.
+ */
+export function spawnValidatedPrivateRendererAssetDigestHelperFile(path, opened, label, args, spawnOptions) {
+  const result = spawnSync(path, args, spawnOptions);
+
+  const afterPath = lstatOrNull(path);
+  if (!afterPath || afterPath.isSymbolicLink() || !sameFileSystemIdentity(opened.stats, afterPath)) {
+    throw new Error(`${label} changed identity between validation and spawn: ${path}`);
+  }
+  const afterDescriptor = fstatSync(opened.fd);
+  const rejection = rendererAssetDigestHelperFileRejectionReason(afterDescriptor);
+  if (rejection) {
+    throw new Error(`${label} ${rejection} immediately after spawn: ${path}`);
+  }
+  return result;
+}
+
+/**
+ * Compiles `sourcePath` into a file named `digest-helper` inside `runDir`
+ * (already private and validated by the caller - see
+ * {@link withPrivateRendererAssetDigestHelper}) and chmods it 0500 (owner
+ * read+execute, no write bit at all - not even for its own owner, so
+ * nothing can trivially mutate it in place afterward without an explicit
+ * chmod first) before returning its path. Never caches, reuses, or shares
+ * this compiled output with any other call: every call compiles its own.
+ * Compiler stdout/stderr are bounded (`maxBuffer`) so a runaway or
+ * unexpectedly verbose `swiftc` invocation can never grow unbounded.
+ */
+export function compilePrivateRendererAssetDigestHelper(sourcePath, runDir) {
+  const helperPath = join(runDir, "digest-helper");
+  const compilation = spawnSync("swiftc", [sourcePath, "-o", helperPath], {
     encoding: "utf8",
+    maxBuffer: 8 * 1024 * 1024,
   });
   if (compilation.error || compilation.status !== 0) {
-    rmSync(stagingPath, { force: true });
     throw new Error(
       `unable to compile descriptor-anchored renderer asset digest helper: ${
         compilation.error?.message ?? compilation.stderr?.trim() ?? "swiftc failed"
@@ -459,8 +598,7 @@ function compiledRendererAssetDigestHelper() {
       { cause: compilation.error },
     );
   }
-
-  publishRendererAssetDigestHelperCandidate(stagingPath, helperPath);
+  chmodSync(helperPath, 0o500);
   return helperPath;
 }
 
@@ -481,7 +619,14 @@ function normalizeAfterCollectionHook(afterCollection) {
   return afterCollection;
 }
 
+// This call compiles, validates, spawns, revalidates, and cleans up a
+// brand-new private helper instance every single time it runs (see
+// withPrivateRendererAssetDigestHelper above): there is no cache, no
+// canonical path, and nothing shared or reused across calls or processes.
 function readDescriptorAnchoredRendererAssets(rendererRoot, afterCollection) {
+  if (process.platform !== "darwin") {
+    throw new Error("descriptor-anchored renderer asset hashing requires macOS");
+  }
   const hook = normalizeAfterCollectionHook(afterCollection);
   const args = [resolve(rendererRoot)];
   if (hook) {
@@ -490,40 +635,52 @@ function readDescriptorAnchoredRendererAssets(rendererRoot, afterCollection) {
       Buffer.from(JSON.stringify(hook), "utf8").toString("base64"),
     );
   }
-  const result = spawnSync(compiledRendererAssetDigestHelper(), args, {
-    encoding: "utf8",
-    maxBuffer: 32 * 1024 * 1024,
+
+  return withPrivateRendererAssetDigestHelper((runDirPath) => {
+    const helperPath = compilePrivateRendererAssetDigestHelper(rendererAssetDigestHelperSource, runDirPath);
+    const opened = openValidatedPrivateRendererAssetDigestHelperFile(helperPath, "renderer asset digest helper");
+    try {
+      const result = spawnValidatedPrivateRendererAssetDigestHelperFile(
+        helperPath,
+        opened,
+        "renderer asset digest helper",
+        args,
+        { encoding: "utf8", maxBuffer: 32 * 1024 * 1024 },
+      );
+      if (result.error || result.status !== 0) {
+        throw new Error(
+          result.stderr?.trim() ||
+            result.error?.message ||
+            "descriptor-anchored renderer asset digest helper failed",
+          { cause: result.error },
+        );
+      }
+      let assets;
+      try {
+        assets = JSON.parse(result.stdout);
+      } catch (error) {
+        throw new Error("descriptor-anchored renderer asset digest helper returned invalid JSON", {
+          cause: error,
+        });
+      }
+      if (
+        !Array.isArray(assets) ||
+        assets.some(
+          (asset) =>
+            !asset ||
+            typeof asset !== "object" ||
+            typeof asset.relativePath !== "string" ||
+            typeof asset.sha256 !== "string" ||
+            !/^[0-9a-f]{64}$/.test(asset.sha256),
+        )
+      ) {
+        throw new Error("descriptor-anchored renderer asset digest helper returned invalid assets");
+      }
+      return assets;
+    } finally {
+      closeSync(opened.fd);
+    }
   });
-  if (result.error || result.status !== 0) {
-    throw new Error(
-      result.stderr?.trim() ||
-        result.error?.message ||
-        "descriptor-anchored renderer asset digest helper failed",
-      { cause: result.error },
-    );
-  }
-  let assets;
-  try {
-    assets = JSON.parse(result.stdout);
-  } catch (error) {
-    throw new Error("descriptor-anchored renderer asset digest helper returned invalid JSON", {
-      cause: error,
-    });
-  }
-  if (
-    !Array.isArray(assets) ||
-    assets.some(
-      (asset) =>
-        !asset ||
-        typeof asset !== "object" ||
-        typeof asset.relativePath !== "string" ||
-        typeof asset.sha256 !== "string" ||
-        !/^[0-9a-f]{64}$/.test(asset.sha256),
-    )
-  ) {
-    throw new Error("descriptor-anchored renderer asset digest helper returned invalid assets");
-  }
-  return assets;
 }
 
 /**

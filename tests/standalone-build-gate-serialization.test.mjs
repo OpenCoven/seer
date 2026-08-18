@@ -116,6 +116,39 @@ for (const { name, path } of workflows) {
       );
     }
   });
+
+  test(`${name}: includes the renderer asset digest private-helper test file alongside renderer-build-identity.test.mjs`, () => {
+    // scripts/renderer-build-identity.mjs's no-shared-canonical private
+    // work-directory design (compile/validate/spawn/revalidate/cleanup a
+    // fresh, unique, mode-0700-owned helper instance per invocation - see
+    // its module doc comment) replaced an earlier lock-free "stage then
+    // publish to a canonical path" design that was rejected for
+    // validation/publication/execution TOCTOU and ambient-permission
+    // flaws. tests/renderer-asset-digest-private-helper.test.mjs is the
+    // only test file covering that design's own safety properties
+    // directly (private-directory/helper-file validation, validate-then-
+    // spawn swap detection, cleanup isolation, compiler failure, and
+    // abandoned/concurrent run directories); a future edit dropping it
+    // from either official gate would silently stop exercising all of
+    // that in CI while tests/renderer-build-identity.test.mjs continued
+    // to look green.
+    const source = readFileSync(path, "utf8");
+    const invocations = extractNodeTestInvocations(source);
+    const privateHelperInvocations = invocations.filter((invocation) =>
+      invocation.includes("tests/renderer-asset-digest-private-helper.test.mjs"),
+    );
+    assert.ok(
+      privateHelperInvocations.length > 0,
+      `expected ${name} to invoke tests/renderer-asset-digest-private-helper.test.mjs at least once`,
+    );
+    for (const invocation of privateHelperInvocations) {
+      assert.ok(
+        invocation.includes("tests/renderer-build-identity.test.mjs"),
+        `${name} should run tests/renderer-asset-digest-private-helper.test.mjs alongside ` +
+          `tests/renderer-build-identity.test.mjs (both exercise scripts/renderer-build-identity.mjs):\n${invocation}`,
+      );
+    }
+  });
 }
 
 test("scripts/build-standalone-renderer.mjs still resolves its lock directory relative to its own file location", () => {
