@@ -111,6 +111,7 @@ function spawnPublisher(options) {
 // full-suite/CI resource contention the way a fixed 5s deadline did.
 const HOOK_READY_TIMEOUT_MS = 20_000;
 const PUBLISHER_TERMINATION_TIMEOUT_MS = 10_000;
+const SIGNAL_COMPLETION_TIMEOUT_MS = 10_000;
 
 async function waitForPath(path, child, timeoutMs = HOOK_READY_TIMEOUT_MS) {
   const deadline = Date.now() + timeoutMs;
@@ -137,6 +138,20 @@ async function withTimeout(promise, timeoutMs, message) {
   }
 }
 
+// Bounded wait for a signaled publisher's completion, used in the signal
+// tests' own try blocks (before the finally that runs terminatePublisher). If
+// a publisher hangs instead of reacting to the delivered signal, this rejects
+// on the timeout rather than awaiting forever, so control still reaches the
+// finally and terminatePublisher can force the child/process group down.
+async function awaitPublisherCompletion(running, timeoutMs = SIGNAL_COMPLETION_TIMEOUT_MS) {
+  const { child, completion } = running;
+  return withTimeout(
+    completion,
+    timeoutMs,
+    `publisher pid ${child.pid} did not exit within ${timeoutMs}ms of the delivered signal`,
+  );
+}
+
 // Guarantees a spawned publisher (and any hook it is blocked in) is reliably
 // terminated and awaited on every path, including a readiness timeout or an
 // assertion throwing mid-scenario, so a stuck child can never survive into
@@ -149,6 +164,8 @@ async function terminatePublisher(running, hook) {
       writeFileSync(hook.releasePath, "release\n");
     } catch {
       // Best effort: unblock a hook that may still be polling for this file.
+      // This can never substitute for proof of termination below -- it is
+      // only an attempt to help a well-behaved hook exit faster.
     }
   }
   if (child.exitCode === null && child.signalCode === null) {
@@ -162,17 +179,16 @@ async function terminatePublisher(running, hook) {
       if (error.code !== "ESRCH") throw error;
     }
   }
-  try {
-    await withTimeout(
-      completion,
-      PUBLISHER_TERMINATION_TIMEOUT_MS,
-      `publisher pid ${child.pid} did not exit within ${PUBLISHER_TERMINATION_TIMEOUT_MS}ms of termination`,
-    );
-  } catch (error) {
-    // Cleanup must never mask the test's own assertion failure; surface a
-    // loud warning instead so a genuinely undead process is still visible.
-    console.error(error);
-  }
+  // No catch here: cleanup must prove the exact child/process group has
+  // exited within the bounded timeout. A hung completion means the SIGKILL
+  // above did not bring down the exact child/group, so the timeout rejection
+  // must propagate and fail the test -- it must never be swallowed, or a
+  // surviving process could silently leak past this test's teardown.
+  await withTimeout(
+    completion,
+    PUBLISHER_TERMINATION_TIMEOUT_MS,
+    `publisher pid ${child.pid} did not exit within ${PUBLISHER_TERMINATION_TIMEOUT_MS}ms of termination`,
+  );
 }
 
 function makeBlockingHook(scratch) {
@@ -590,7 +606,7 @@ test("SIGINT during source copy rolls back the pair and exits 130", async () => 
       await waitForPath(hook.readyPath, running.child);
       process.kill(-running.child.pid, "SIGINT");
       writeFileSync(hook.releasePath, "release\n");
-      result = await running.completion;
+      result = await awaitPublisherCompletion(running);
     } finally {
       await terminatePublisher(running, hook);
     }
@@ -643,7 +659,7 @@ test("SIGTERM between app and provenance swaps rolls back the pair and exits 143
       await waitForPath(hook.readyPath, running.child);
       process.kill(-running.child.pid, "SIGTERM");
       writeFileSync(hook.releasePath, "release\n");
-      result = await running.completion;
+      result = await awaitPublisherCompletion(running);
     } finally {
       await terminatePublisher(running, hook);
     }
@@ -685,20 +701,30 @@ test("the next publisher recovers a SIGKILL-abandoned paired swap before staging
     const oldProvenance = readFileSync(provenancePath, "utf8");
     const hook = makeBlockingHook(scratch);
 
+    // Spawned detached (like the SIGINT/SIGTERM scenarios above) so this
+    // publisher and its blocking-hook subprocess own an exact process group
+    // of their own, distinct from the Node test runner's. Without this, the
+    // hook's bash script is a sibling process inheriting the runner's own
+    // process group, and killing only the Python child pid would abandon
+    // that hook subprocess alive inside the runner's group.
     const running = spawnPublisher({
       fixtureRepo,
       sourceApp: newSource,
       derivedData,
       testHook: hook.hookPath,
       testHookPhase: "after-app-publish",
+      detached: true,
       env: hook.env,
     });
     let killed;
     try {
       await waitForPath(hook.readyPath, running.child);
-      assert.equal(running.child.kill("SIGKILL"), true);
+      // Target the exact process group (never a name-based kill) so the
+      // hook subprocess dies alongside the publisher instead of surviving
+      // orphaned in the Node test runner's own process group.
+      process.kill(-running.child.pid, "SIGKILL");
       writeFileSync(hook.releasePath, "release\n");
-      killed = await running.completion;
+      killed = await awaitPublisherCompletion(running);
     } finally {
       await terminatePublisher(running, hook);
     }
