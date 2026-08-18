@@ -229,6 +229,52 @@ function createRendererFixture(scratch) {
   };
 }
 
+/**
+ * A minimal counterpart to createRendererFixture, used only by the 64-waiter
+ * stale-lock stress test below. That test always sets
+ * SEER_RENDERER_BUILD_TEST_BUILDER, which replaces the real `vite build`
+ * step entirely (see the comment on that test) - so the actual *contents*
+ * of renderer/ and the fixed top-level input files never affect anything
+ * the test observes. Their mere existence as real, non-symlink
+ * files/directories still matters: rendererBuildInputFiles and
+ * computeRendererBuildDigest walk and hash them on every one of the stress
+ * test's 320 wrapper invocations, exactly as in production. Copying the
+ * real ~280KB renderer/ tree and ~300KB package-lock.json that many times
+ * over is pure overhead for a test that was never about renderer content -
+ * this fixture keeps the real scripts (the actual code under test)
+ * byte-for-byte, but replaces every content-irrelevant input with a single
+ * tiny placeholder.
+ */
+function createMinimalRendererFixture(scratch) {
+  const fixtureRepo = join(scratch, "repo");
+  mkdirSync(join(fixtureRepo, "scripts"), { recursive: true });
+  mkdirSync(join(fixtureRepo, "renderer"), { recursive: true });
+  writeFileSync(join(fixtureRepo, "renderer", "index.ts"), "export {};\n");
+  for (const relativePath of [
+    "standalone-window.html",
+    "vite.standalone.config.ts",
+    "package.json",
+    "package-lock.json",
+    "tsconfig.standalone.json",
+    "tsconfig.json",
+  ]) {
+    writeFileSync(join(fixtureRepo, relativePath), "minimal lock-stress fixture placeholder\n");
+  }
+  for (const relativePath of [
+    "scripts/build-standalone-renderer.mjs",
+    "scripts/renderer-consumer-gate.mjs",
+    "scripts/renderer-asset-digest.py",
+    "scripts/renderer-build-identity.mjs",
+  ]) {
+    cpSync(join(repoRoot, relativePath), join(fixtureRepo, relativePath));
+  }
+  return {
+    repo: fixtureRepo,
+    vite: join(repoRoot, "node_modules", ".bin", "vite"),
+    wrapper: join(fixtureRepo, "scripts", "build-standalone-renderer.mjs"),
+  };
+}
+
 function blockingViteConfig(source) {
   const withImports = source.replace(
     'import process from "node:process";',
@@ -536,7 +582,7 @@ test("EEXIST followed by a disappearing lock retries across repeated handoffs", 
 test("64 stale-lock waiters repeatedly hand off without overlap, failures, or leaked locks", async () => {
   mkdirSync(join(repoRoot, "build"), { recursive: true });
   const scratch = mkdtempSync(join(repoRoot, "build", "renderer-stale-lock-stress-"));
-  const fixture = createRendererFixture(scratch);
+  const fixture = createMinimalRendererFixture(scratch);
 
   // This stress test alone launches 64 waiters * 5 repetitions = 320 real
   // wrapper invocations, each of which recomputes a renderer asset digest as
@@ -626,6 +672,35 @@ test("64 stale-lock waiters repeatedly hand off without overlap, failures, or le
       assert.deepEqual(rendererLockArtifacts(fixture.repo), []);
       assert.deepEqual(privateRendererArtifacts(fixture.repo), []);
     }
+
+    // Proves the minimal fixture is not so minimal that it accidentally
+    // stops exercising real source snapshot/build publication: the last
+    // repetition's winning waiter must still have published a manifest
+    // whose sourceDigest is a genuine hash over this fixture's own (tiny)
+    // renderer/ and top-level input files, computed the exact same way
+    // production does - not a stub, constant, or otherwise-unverified value.
+    const manifestPath = join(
+      fixture.repo,
+      "build",
+      "standalone-renderer",
+      "Renderer",
+      "build-manifest.json",
+    );
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    assert.equal(
+      manifest.sourceDigest,
+      computeRendererBuildDigest(fixture.repo),
+      "the minimal fixture's published sourceDigest must match a fresh recomputation over its real renderer/ and top-level input files",
+    );
+    const inputFiles = rendererBuildInputFiles(fixture.repo);
+    assert.ok(
+      inputFiles.length > 0,
+      "the minimal fixture must still declare at least one real build input file for source snapshot/digest publication to actually exercise",
+    );
+    assert.ok(
+      inputFiles.includes("renderer/index.ts"),
+      "the minimal fixture's renderer/ placeholder file must itself be a real declared build input",
+    );
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }

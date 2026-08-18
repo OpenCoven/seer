@@ -126,11 +126,13 @@ for (const { name, path } of workflows) {
     // TOCTOU, and ambient-permission flaws. tests/renderer-asset-digest-helper.test.mjs
     // is the only test file covering that design's own safety properties
     // directly (trusted-interpreter validation, exact-stdin-bytes execution
-    // independent of any on-disk path, size/count/path limits, hook
-    // timeout/process-group cleanup, the overall deadline, and malformed-
-    // output handling); a future edit dropping it from either official gate
-    // would silently stop exercising all of that in CI while
-    // tests/renderer-build-identity.test.mjs continued to look green.
+    // independent of any on-disk path, size/count/path limits, isolated-mode
+    // (`-I`) resistance to a hostile PYTHONPATH/sitecustomize/cwd shadow
+    // module, the declarative in-process test-action protocol, the overall
+    // deadline, and malformed-output handling); a future edit dropping it
+    // from either official gate would silently stop exercising all of that
+    // in CI while tests/renderer-build-identity.test.mjs continued to look
+    // green.
     const source = readFileSync(path, "utf8");
     const invocations = extractNodeTestInvocations(source);
     const assetDigestHelperInvocations = invocations.filter((invocation) =>

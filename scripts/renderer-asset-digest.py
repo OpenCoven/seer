@@ -4,21 +4,29 @@
 Ports, byte-for-byte in observable contract, the deleted
 `renderer-asset-digest.swift` helper: `scripts/renderer-build-identity.mjs`
 reads *this file's own source bytes* fresh from disk and pipes them,
-verbatim, to the trusted system interpreter's stdin (`/usr/bin/python3 -`)
-- this file is never compiled, never written to a temporary file, and never
-executed by a repository-relative pathname. There is accordingly no shared
-canonical executable, no cache, no private run directory, and no
-publication/execution TOCTOU: the only "artifact" of any invocation is a
-single, short-lived `/usr/bin/python3` process that reads its own program
-from stdin and exits.
+verbatim, to the trusted system interpreter's stdin
+(`/usr/bin/python3 -I -`) - this file is never compiled, never written to a
+temporary file, and never executed by a repository-relative pathname. There
+is accordingly no shared canonical executable, no cache, no private run
+directory, and no publication/execution TOCTOU: the only "artifact" of any
+invocation is a single, short-lived `/usr/bin/python3` process that reads its
+own program from stdin and exits. `-I` (isolated mode) means that process
+never honors an inherited `PYTHONPATH`, never adds the current working
+directory to `sys.path`, and never consults user site-packages/
+`sitecustomize` - so nothing this process happens to be spawned with, or
+from, can substitute a hostile module for a real standard-library one this
+file imports.
 
 CLI contract (all consumed positionally/by flag, no environment lookups of
 its own beyond what CPython itself always honors):
 
     <absolute-renderer-root>
-    [--after-collection-hook <base64-json>]
+    [--test-action <base64-json>]
     [--deadline-seconds <positive-integer>]
-    [--hook-timeout-seconds <positive-integer>]
+
+`--test-action` is test-only: production never supplies it (see
+`run_test_action` below for the fixed, closed set of narrow, in-process
+actions it can request).
 
 Emits a JSON array of ``{"relativePath": ..., "sha256": ...}`` objects,
 canonically sorted, to stdout on success (exit 0). Emits a single
@@ -45,7 +53,6 @@ import json
 import os
 import signal
 import stat
-import subprocess
 import sys
 import time
 
@@ -68,7 +75,6 @@ MAX_TOTAL_ASSET_BYTES = 4 * 1024 * 1024 * 1024
 MAX_RELATIVE_PATH_BYTES = 4096
 
 DEFAULT_DEADLINE_SECONDS = 45
-DEFAULT_HOOK_TIMEOUT_SECONDS = 20
 
 EXCLUDED_MANIFEST_NAME = "build-manifest.json"
 
@@ -79,9 +85,8 @@ FILE_OPEN_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
 
 USAGE = (
     "usage: renderer-asset-digest <absolute-renderer-root> "
-    "[--after-collection-hook <base64-json>] "
-    "[--deadline-seconds <positive-integer>] "
-    "[--hook-timeout-seconds <positive-integer>]"
+    "[--test-action <base64-json>] "
+    "[--deadline-seconds <positive-integer>]"
 )
 
 
@@ -355,12 +360,12 @@ def directory_entry_names(directory):
 
     # Explicitly `dup()` before listing, exactly mirroring the Swift
     # helper's own manual `Darwin.dup` + `fdopendir`, rather than relying on
-    # `os.listdir`/`os.scandir` accepting (and, per CPython's own
-    # implementation, never closing) a bare fd directly. Both behaviors have
-    # been verified empirically on this platform's Python 3, but the
-    # explicit duplicate keeps this module's own intent self-documenting
-    # and independent of that undocumented, version-specific guarantee:
-    # `directory.fd` itself is never at risk of being closed by listing it.
+    # `os.scandir` accepting (and, per CPython's own implementation, never
+    # closing) a bare fd directly. Both behaviors have been verified
+    # empirically on this platform's Python 3, but the explicit duplicate
+    # keeps this module's own intent self-documenting and independent of
+    # that undocumented, version-specific guarantee: `directory.fd` itself
+    # is never at risk of being closed by listing it.
     try:
         duplicate_fd = os.dup(directory.fd)
     except OSError as error:
@@ -370,8 +375,38 @@ def directory_entry_names(directory):
             ),
             error,
         ) from error
+
+    # `os.scandir`, unlike `os.listdir`, hands entries back one at a time
+    # from an incremental `readdir`-backed iterator instead of eagerly
+    # reading and materializing the *entire* directory into one Python list
+    # before this function gets to look at a single name. That laziness is
+    # what makes the bound below a real, enforced-*during*-enumeration limit
+    # rather than an after-the-fact check on a list that was already fully
+    # built: a directory containing millions of entries is rejected right
+    # after the (MAX_ENTRY_COUNT + 1)th one is read, never after every one
+    # of them has already been pulled off disk and held in memory. Only the
+    # bounded list actually collected is ever passed to `sorted()`.
+    #
+    # This is deliberately a *local*, single-directory bound - independent
+    # of, and strictly earlier-firing than, `collect_assets`'s own global
+    # `budget.entry_count` bound below, which still separately catches many
+    # directories each under this local bound cumulatively exceeding
+    # `MAX_ENTRY_COUNT` across the whole renderer tree. A single directory
+    # that by itself exceeds `MAX_ENTRY_COUNT` necessarily also exceeds that
+    # global bound, so both bounds reject with the identical message; this
+    # one simply never lets such a directory's entries be fully read and
+    # sorted first.
+    names = []
     try:
-        names = os.listdir(duplicate_fd)
+        with os.scandir(duplicate_fd) as entries:
+            for entry in entries:
+                if len(names) >= MAX_ENTRY_COUNT:
+                    raise digest_failure(
+                        "renderer asset collection exceeds the maximum entry count of {}".format(
+                            MAX_ENTRY_COUNT
+                        )
+                    )
+                names.append(entry.name)
     except OSError as error:
         raise system_error(
             "unable to enumerate renderer asset directory: {}".format(directory.relative_path),
@@ -571,159 +606,91 @@ def sha256_of_descriptor(fd, relative_path, expected):
 
 
 # ---------------------------------------------------------------------------
-# Process-group bounded execution. The optional `--after-collection-hook` is
-# test-only (production never supplies one) but must still never be able to
-# hang this helper, or this process, forever: it always runs in its own new
-# session/process group (`start_new_session=True`), is always waited on with
-# a finite timeout, and - on a timeout *or* after any ordinary exit, so a
-# hook that itself forked a still-running descendant can never leak one past
-# this function returning - is always torn down by signaling its exact
-# process group (never a bare PID, which could hit an unrelated, later
-# process if the hook's own leader has already exited and that PID been
-# recycled) and awaited until it is confirmed gone or a bounded cleanup
-# deadline itself elapses.
-def _process_group_alive(pgid):
-    if not isinstance(pgid, int) or pgid <= 0:
-        return False
+# Declarative, in-process test actions. `--test-action` is test-only
+# (production never supplies one, and `run_test_action` never runs unless a
+# test explicitly asked for one, via the CLI, exactly like every existing
+# production invocation) and deliberately closed: `_TEST_ACTIONS` below is
+# the exhaustive set of actions any test may ever request, each a plain,
+# synchronous filesystem call this same process makes directly - never a
+# subprocess, never a new process/session/process group. There is
+# accordingly nothing here for the overall SIGALRM deadline (`_on_alarm`/
+# `main` below) to separately reach into and clean up: an action either
+# finishes well within that deadline or, for `delay`, is itself interrupted
+# by the very same alarm-raised `DeadlineExceeded` that would interrupt any
+# other blocking call in this file, at whatever point `time.sleep` happens
+# to be. This is the one narrow test seam a prior, deleted design instead
+# built out of an arbitrary externally-supplied executable running in its
+# own process group - a shape that could never fully guarantee every
+# descendant a hook chose to spawn (including one that itself called
+# `setsid`, detaching from the very process group being torn down) was
+# actually reachable for cleanup. A fixed, closed, in-process action
+# vocabulary has no such gap: there is never a descendant to lose track of.
+_TEST_ACTIONS = {
+    "replace-file-with-symlink": 2,
+    "replace-file-with-file": 2,
+    "replace-file-with-directory": 1,
+    "mutate-file": 1,
+    "replace-directory-with-symlink": 3,
+    "delay": 1,
+}
+
+
+def _decode_test_action(encoded):
     try:
-        os.killpg(pgid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        # Mirrors this repository's existing `isProcessGroupAlive` in
-        # scripts/build-standalone-renderer.mjs: unable to prove the group
-        # is gone is treated as "still alive", never as "assume dead" -
-        # retaining caution here is always safer than declaring a
-        # potentially-live process stale. In practice this is only ever
-        # observed, on this platform, for the brief window in which the
-        # hook's own direct process has exited but not yet been reaped by
-        # us (a zombie) - `_terminate_process_group` below always polls
-        # `process.poll()` (which reaps as a side effect) interleaved with
-        # this check specifically to keep that window as short as possible.
-        return True
+        decoded = base64.b64decode(encoded, validate=True)
+        payload = json.loads(decoded.decode("utf-8"))
+    except Exception:
+        raise digest_failure("test action is invalid") from None
+    if (
+        not isinstance(payload, dict)
+        or not isinstance(payload.get("action"), str)
+        or payload["action"] not in _TEST_ACTIONS
+        or not isinstance(payload.get("args"), list)
+        or len(payload["args"]) != _TEST_ACTIONS[payload["action"]]
+        or not all(isinstance(argument, str) for argument in payload["args"])
+    ):
+        raise digest_failure("test action is invalid")
+    return {"action": payload["action"], "args": list(payload["args"])}
 
 
-def _signal_process_group(pgid, sig):
-    try:
-        os.killpg(pgid, sig)
-    except (ProcessLookupError, PermissionError):
-        pass
-
-
-def _terminate_process_group(process, label):
-    """Terminates the exact process group led by `process` (our own direct
-    child, so its own exit is always independently reapable/confirmable via
-    `process.poll()`, never only via the group-wide, signal-based
-    `_process_group_alive` check). `process.poll()` is deliberately called
-    on every single polling iteration below, interleaved with every
-    `_process_group_alive` check: reaping our own direct child the instant
-    it exits keeps it from lingering as a zombie, which is the one
-    condition observed (empirically, on this platform) to make a process
-    group's own signal-existence check itself return an ambiguous
-    permission error instead of cleanly resolving to alive/dead.
+def run_test_action(test_action):
+    """Performs exactly one narrow, in-process filesystem action between
+    asset collection and descriptor re-verification - see the module
+    docstring and `_TEST_ACTIONS` above for why this replaces a prior,
+    deleted subprocess-hook design. `test_action` is `None` on every
+    production invocation (no `--test-action` flag was supplied), in which
+    case this is a no-op.
     """
-    pgid = process.pid
-    process.poll()
-    if not _process_group_alive(pgid):
+    if test_action is None:
         return
-    _signal_process_group(pgid, signal.SIGTERM)
-    term_deadline = time.monotonic() + 2.0
-    while time.monotonic() < term_deadline:
-        process.poll()
-        if not _process_group_alive(pgid):
-            return
-        time.sleep(0.02)
-    process.poll()
-    if not _process_group_alive(pgid):
-        return
-    _signal_process_group(pgid, signal.SIGKILL)
-    kill_deadline = time.monotonic() + 2.0
-    while time.monotonic() < kill_deadline:
-        process.poll()
-        if not _process_group_alive(pgid):
-            return
-        time.sleep(0.02)
-    process.poll()
-    if _process_group_alive(pgid):
-        raise digest_failure(
-            "{} process group {} remained alive after termination".format(label, pgid)
-        )
-
-
-# Set only while a hook child is actually running, so the top-level SIGALRM
-# handler's own defensive cleanup (see `main`) can find and terminate it even
-# if the overall deadline fires while `run_hook` is itself blocked inside
-# `process.wait(...)` (or inside its own termination polling loop). This is
-# deliberately a module-level, not function-local, value, and deliberately
-# holds the `Popen` object itself (not just its pid) so that cleanup can
-# always interleave reaping (see `_terminate_process_group`) regardless of
-# which code path (`run_hook` itself, or `main`'s deadline handler) performs
-# it. Once a `DeadlineExceeded` interrupts a blocked wait, it propagates
-# straight through `run_hook` (which does not catch it) and unwinds past the
-# local frame that would otherwise have cleaned up - only a value that
-# survives that unwind lets `main`'s own `except DeadlineExceeded` handler
-# still find and terminate the exact process. It is intentionally never
-# cleared in a `finally`, only ever explicitly on the ordinary/timeout
-# completion paths below and by `main` itself after a deadline-triggered
-# cleanup.
-_active_hook_process = None
-
-
-def run_hook(hook, hook_timeout_seconds):
-    global _active_hook_process
-    if hook is None:
-        return
-
-    # Block SIGALRM for the brief window between spawning the hook and
-    # recording it as the active hook process: without this, a deadline
-    # that fires in that exact window could interrupt us after `Popen` has
-    # already created the child but before `_active_hook_process` is set,
-    # which would leak the child past `main`'s own cleanup (it can only
-    # terminate a process it knows about).
-    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
-    try:
-        try:
-            process = subprocess.Popen(
-                [hook["executable"], *hook["args"]],
-                start_new_session=True,
-            )
-        except OSError as error:
-            raise digest_failure(
-                "renderer asset collection hook failed to start: {}".format(
-                    error.strerror or error
-                )
-            ) from error
-        _active_hook_process = process
-    finally:
-        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
-
-    # From here on, a `DeadlineExceeded` raised by the alarm handler is
-    # allowed to interrupt `wait()` (or the termination poll below) and
-    # propagate immediately - `_active_hook_process` stays set for `main`
-    # to find in that case, so nothing is left uncleaned.
-    timed_out = False
-    try:
-        process.wait(timeout=hook_timeout_seconds)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-
-    # Always reconcile the process group afterward - even a hook that
-    # exited normally and promptly may have left a background descendant of
-    # its own still running - never only on the timeout path.
-    _terminate_process_group(process, "renderer asset collection hook")
-    if process.poll() is None:
-        process.wait()
-    _active_hook_process = None
-
-    if timed_out:
-        raise digest_failure(
-            "renderer asset collection hook did not finish within {}s and was killed".format(
-                hook_timeout_seconds
-            )
-        )
-    if process.returncode != 0:
-        raise digest_failure("renderer asset collection hook failed")
+    name = test_action["action"]
+    args = test_action["args"]
+    if name == "replace-file-with-symlink":
+        target, replacement = args
+        os.unlink(target)
+        os.symlink(replacement, target)
+    elif name == "replace-file-with-file":
+        replacement, target = args
+        os.rename(replacement, target)
+    elif name == "replace-file-with-directory":
+        (target,) = args
+        os.unlink(target)
+        os.mkdir(target)
+    elif name == "mutate-file":
+        (target,) = args
+        with open(target, "w") as handle:
+            handle.write("in-place mutation after asset collection\n")
+    elif name == "replace-directory-with-symlink":
+        target, parked, replacement = args
+        os.rename(target, parked)
+        os.symlink(replacement, target)
+    elif name == "delay":
+        (seconds,) = args
+        time.sleep(float(seconds))
+    else:
+        # Unreachable: _decode_test_action only ever returns an action name
+        # present in _TEST_ACTIONS.
+        raise digest_failure("test action is invalid")
 
 
 def _on_alarm(_signum, _frame):
@@ -742,23 +709,6 @@ def _positive_int(raw, flag):
     return value
 
 
-def _decode_hook(encoded):
-    try:
-        decoded = base64.b64decode(encoded, validate=True)
-        payload = json.loads(decoded.decode("utf-8"))
-    except Exception:
-        raise digest_failure("renderer asset collection hook is invalid") from None
-    if (
-        not isinstance(payload, dict)
-        or not isinstance(payload.get("executable"), str)
-        or not payload["executable"]
-        or not isinstance(payload.get("args"), list)
-        or not all(isinstance(argument, str) for argument in payload["args"])
-    ):
-        raise digest_failure("renderer asset collection hook is invalid")
-    return {"executable": payload["executable"], "args": list(payload["args"])}
-
-
 def parse_arguments(argv):
     if not argv:
         raise digest_failure(USAGE)
@@ -766,16 +716,15 @@ def parse_arguments(argv):
     if not root.startswith("/"):
         raise digest_failure("renderer root must be an absolute path")
 
-    hook = None
+    test_action = None
     deadline_seconds = DEFAULT_DEADLINE_SECONDS
-    hook_timeout_seconds = DEFAULT_HOOK_TIMEOUT_SECONDS
     index = 1
     while index < len(argv):
         flag = argv[index]
-        if flag == "--after-collection-hook":
+        if flag == "--test-action":
             if index + 1 >= len(argv):
                 raise digest_failure(USAGE)
-            hook = _decode_hook(argv[index + 1])
+            test_action = _decode_test_action(argv[index + 1])
             index += 2
             continue
         if flag == "--deadline-seconds":
@@ -784,23 +733,12 @@ def parse_arguments(argv):
             deadline_seconds = _positive_int(argv[index + 1], "--deadline-seconds")
             index += 2
             continue
-        if flag == "--hook-timeout-seconds":
-            if index + 1 >= len(argv):
-                raise digest_failure(USAGE)
-            hook_timeout_seconds = _positive_int(argv[index + 1], "--hook-timeout-seconds")
-            index += 2
-            continue
         raise digest_failure(USAGE)
 
-    # No relationship between `hook_timeout_seconds` and `deadline_seconds`
-    # is enforced here: the overall deadline must remain free to act as a
-    # true backstop that can preempt and clean up a hook even if the hook's
-    # own timeout is (mis)configured longer than the deadline, or has not
-    # yet elapsed - see `run_hook` and `main`'s `DeadlineExceeded` handling.
-    return root, hook, deadline_seconds, hook_timeout_seconds
+    return root, test_action, deadline_seconds
 
 
-def compute_asset_hashes(root_path, hook, hook_timeout_seconds):
+def compute_asset_hashes(root_path, test_action):
     components = [component for component in root_path.split("/") if component != ""]
     if any(component in (".", "..") for component in components):
         raise digest_failure("renderer root path is invalid")
@@ -850,7 +788,7 @@ def compute_asset_hashes(root_path, hook, hook_timeout_seconds):
         budget = CollectionBudget()
         collect_assets(renderer_root_index, "", directories, assets, pool, budget)
 
-        run_hook(hook, hook_timeout_seconds)
+        run_test_action(test_action)
         verify_pinned_descriptors(directories, renderer_root_index, assets)
 
         hashes = []
@@ -869,16 +807,12 @@ def compute_asset_hashes(root_path, hook, hook_timeout_seconds):
 
 
 def main():
-    root, hook, deadline_seconds, hook_timeout_seconds = parse_arguments(sys.argv[1:])
+    root, test_action, deadline_seconds = parse_arguments(sys.argv[1:])
 
     previous_handler = signal.signal(signal.SIGALRM, _on_alarm)
     signal.alarm(deadline_seconds)
     try:
-        hashes = compute_asset_hashes(root, hook, hook_timeout_seconds)
-    except DeadlineExceeded:
-        if _active_hook_process is not None:
-            _terminate_process_group(_active_hook_process, "renderer asset collection hook")
-        raise
+        hashes = compute_asset_hashes(root, test_action)
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, previous_handler)

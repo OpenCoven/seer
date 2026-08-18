@@ -28,17 +28,13 @@ const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = dirname(here);
 
 const HEX_SHA256 = /^[0-9a-f]{64}$/;
-const assetDigestHook = join(here, "helpers", "renderer-asset-digest-test-hook.mjs");
 const assetDigestHelper = join(repoRoot, "scripts", "renderer-asset-digest.py");
 const buildIdentityModuleURL = pathToFileURL(
   join(repoRoot, "scripts", "renderer-build-identity.mjs"),
 ).href;
 
-function afterCollectionHook(action, ...args) {
-  return {
-    executable: process.execPath,
-    args: [assetDigestHook, action, ...args],
-  };
+function afterCollectionAction(action, ...args) {
+  return { action, args };
 }
 
 function sha256Hex(bytes) {
@@ -226,7 +222,7 @@ test("computeRendererAssetDigest rejects an asset replaced by a symlink after co
     assert.throws(
       () =>
         computeRendererAssetDigest(rendererRoot, {
-          afterCollection: afterCollectionHook(
+          afterCollection: afterCollectionAction(
             "replace-file-with-symlink",
             assetPath,
             symlinkTarget,
@@ -247,7 +243,7 @@ test("computeRendererAssetDigest rejects an asset replaced by a different regula
     assert.throws(
       () =>
         computeRendererAssetDigest(rendererRoot, {
-          afterCollection: afterCollectionHook(
+          afterCollection: afterCollectionAction(
             "replace-file-with-file",
             replacementPath,
             assetPath,
@@ -266,7 +262,7 @@ test("computeRendererAssetDigest rejects an asset replaced by a non-regular file
     assert.throws(
       () =>
         computeRendererAssetDigest(rendererRoot, {
-          afterCollection: afterCollectionHook("replace-file-with-directory", assetPath),
+          afterCollection: afterCollectionAction("replace-file-with-directory", assetPath),
         }),
       /renderer asset must be a regular file after opening: index\.ts/i,
     );
@@ -281,7 +277,7 @@ test("computeRendererAssetDigest rejects an in-place asset mutation after collec
     assert.throws(
       () =>
         computeRendererAssetDigest(rendererRoot, {
-          afterCollection: afterCollectionHook("mutate-file", assetPath),
+          afterCollection: afterCollectionAction("mutate-file", assetPath),
         }),
       /renderer asset changed identity while being opened: index\.ts/i,
     );
@@ -302,7 +298,7 @@ test("computeRendererAssetDigest rejects a parent-directory symlink replacement 
     assert.throws(
       () =>
         computeRendererAssetDigest(rendererRoot, {
-          afterCollection: afterCollectionHook(
+          afterCollection: afterCollectionAction(
             "replace-directory-with-symlink",
             parentPath,
             parkedParent,
@@ -327,7 +323,7 @@ test("computeRendererAssetDigest rejects a renderer-root symlink replacement eve
     assert.throws(
       () =>
         computeRendererAssetDigest(rendererRoot, {
-          afterCollection: afterCollectionHook(
+          afterCollection: afterCollectionAction(
             "replace-directory-with-symlink",
             rendererRoot,
             parkedRoot,

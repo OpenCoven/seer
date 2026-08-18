@@ -1,7 +1,7 @@
 // Direct, low-level tests for the non-cached system-interpreter design:
 // scripts/renderer-asset-digest.py itself (invoked exactly the way
-// scripts/renderer-build-identity.mjs invokes it - `/usr/bin/python3 -` with
-// the helper's own source bytes piped via stdin, never executed by a
+// scripts/renderer-build-identity.mjs invokes it - `/usr/bin/python3 -I -`
+// with the helper's own source bytes piped via stdin, never executed by a
 // repository-relative pathname) and renderer-build-identity.mjs's own
 // interpreter-trust/spawn seam.
 //
@@ -11,11 +11,12 @@
 // swap-after-collection matrix via afterCollection). This file deliberately
 // does not repeat that coverage; it instead exercises properties specific
 // to *this* design - the exact-bytes-over-stdin contract, the interpreter
-// trust check, the defensive size/count/path bounds, hook
-// timeout/process-group cleanup, and the absence of any on-disk helper
-// artifact - most of them directly against the raw helper (bypassing
-// renderer-build-identity.mjs's own wiring entirely) so a bug in that
-// shared wiring can never mask a regression here.
+// trust check, the defensive size/count/path bounds, isolated-mode
+// resistance to a hostile PYTHONPATH/sitecustomize/cwd shadow module, the
+// declarative in-process test-action protocol, and the absence of any
+// on-disk helper artifact - most of them directly against the raw helper
+// (bypassing renderer-build-identity.mjs's own wiring entirely) so a bug in
+// that shared wiring can never mask a regression here.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
@@ -38,6 +39,7 @@ import test from "node:test";
 import {
   assertTrustedSystemInterpreterOrThrow,
   computeRendererAssetDigest,
+  sanitizedPythonEnvironment,
   spawnRendererAssetDigestHelper,
   systemInterpreterRejectionReason,
 } from "../scripts/renderer-build-identity.mjs";
@@ -48,8 +50,6 @@ const TRUSTED_PYTHON3 = "/usr/bin/python3";
 const helperPath = join(repoRoot, "scripts", "renderer-asset-digest.py");
 const helperSourceBytes = readFileSync(helperPath);
 const helperSourceText = helperSourceBytes.toString("utf8");
-const descendantHookScript = join(here, "helpers", "renderer-asset-digest-hook-descendant.mjs");
-const swapHookScript = join(here, "helpers", "renderer-asset-digest-test-hook.mjs");
 
 function scratchDir(prefix) {
   mkdirSync(join(repoRoot, "build"), { recursive: true });
@@ -99,6 +99,26 @@ function runHelperDirectly(source, args) {
 }
 
 /**
+ * Replaces exactly one literal substring in `source` - used only to reach a
+ * defensive bound (entry count, path length, per-file size, total size), or
+ * to instrument a single specific line, in a test-sized fixture instead of
+ * an unrealistically huge one. Asserting a single occurrence means a future
+ * rename/reformat of the target line fails the test loudly instead of
+ * silently turning the patch into a no-op. Composable: `source` need not be
+ * the pristine committed text, so a second call can patch a first call's
+ * own output.
+ */
+function withExactlyOneReplacement(source, literalLine, replacementLine) {
+  const occurrences = source.split(literalLine).length - 1;
+  assert.equal(
+    occurrences,
+    1,
+    `expected exactly one occurrence of ${JSON.stringify(literalLine)} in the given source`,
+  );
+  return source.replace(literalLine, replacementLine);
+}
+
+/**
  * Returns a copy of the committed helper source with exactly one literal
  * substring replaced - used only to reach a defensive bound (entry count,
  * path length, per-file size, total size) in a test-sized fixture instead
@@ -107,17 +127,11 @@ function runHelperDirectly(source, args) {
  * turning the patch into a no-op.
  */
 function patchedHelperSource(literalLine, replacementLine) {
-  const occurrences = helperSourceText.split(literalLine).length - 1;
-  assert.equal(
-    occurrences,
-    1,
-    `expected exactly one occurrence of ${JSON.stringify(literalLine)} in the committed helper source`,
-  );
-  return helperSourceText.replace(literalLine, replacementLine);
+  return withExactlyOneReplacement(helperSourceText, literalLine, replacementLine);
 }
 
-function afterCollectionHookArg(executable, args) {
-  return Buffer.from(JSON.stringify({ executable, args }), "utf8").toString("base64");
+function testActionArg(action, args) {
+  return Buffer.from(JSON.stringify({ action, args }), "utf8").toString("base64");
 }
 
 test("systemInterpreterRejectionReason", async (t) => {
@@ -322,7 +336,182 @@ test("spawnRendererAssetDigestHelper fails clearly (never hangs, never returns t
   );
 });
 
-test("the raw helper rejects a symlinked asset present from the start (no hook/race involved)", () => {
+test("sanitizedPythonEnvironment drops every PYTHON-prefixed key and leaves every other key untouched", () => {
+  const sanitized = sanitizedPythonEnvironment({
+    PATH: "/usr/bin:/bin",
+    PYTHONPATH: "/evil/pythonpath",
+    PYTHONSTARTUP: "/evil/startup.py",
+    PYTHONNOUSERSITE: "0",
+    PYTHONHOME: "/evil/home",
+    PYTHONSOMETHINGFUTURE: "whatever a future CPython release adds",
+    HOME: "/Users/real",
+    LANG: "en_US.UTF-8",
+  });
+  assert.deepEqual(sanitized, {
+    PATH: "/usr/bin:/bin",
+    HOME: "/Users/real",
+    LANG: "en_US.UTF-8",
+  });
+});
+
+test("sanitizedPythonEnvironment tolerates an undefined or empty source environment", () => {
+  assert.deepEqual(sanitizedPythonEnvironment(undefined), {});
+  assert.deepEqual(sanitizedPythonEnvironment({}), {});
+});
+
+test("computeRendererAssetDigest is unaffected by a hostile PYTHONPATH shadowing hashlib, and the shadow module never executes", () => {
+  withScratchDir("hostile-pythonpath-", (scratchRoot) => {
+    const rendererRoot = join(scratchRoot, "renderer");
+    mkdirSync(rendererRoot, { recursive: true });
+    writeFileSync(join(rendererRoot, "index.ts"), "content\n");
+    const trustedDigest = computeRendererAssetDigest(rendererRoot);
+
+    const evilPythonPathDir = join(scratchRoot, "evil-pythonpath");
+    mkdirSync(evilPythonPathDir, { recursive: true });
+    const markerPath = join(scratchRoot, "hashlib-marker.txt");
+    writeFileSync(
+      join(evilPythonPathDir, "hashlib.py"),
+      [
+        `open(${JSON.stringify(markerPath)}, "w").write("EXECUTED")`,
+        "class sha256:",
+        "    def __init__(self, *args, **kwargs):",
+        "        pass",
+        "    def update(self, *args, **kwargs):",
+        "        pass",
+        "    def hexdigest(self):",
+        "        return 'f' * 64",
+        "",
+      ].join("\n"),
+    );
+
+    const previousPythonPath = process.env.PYTHONPATH;
+    process.env.PYTHONPATH = evilPythonPathDir;
+    let digestUnderAttack;
+    try {
+      digestUnderAttack = computeRendererAssetDigest(rendererRoot);
+    } finally {
+      if (previousPythonPath === undefined) delete process.env.PYTHONPATH;
+      else process.env.PYTHONPATH = previousPythonPath;
+    }
+    assert.equal(
+      digestUnderAttack,
+      trustedDigest,
+      "a hostile PYTHONPATH-shadowed hashlib module must never be importable by the isolated helper",
+    );
+    assert.equal(
+      existsSync(markerPath),
+      false,
+      "the hostile hashlib.py module body must never execute",
+    );
+  });
+});
+
+test("computeRendererAssetDigest is unaffected by a hostile cwd shadowing json, and the shadow module never executes", () => {
+  withScratchDir("hostile-cwd-", (scratchRoot) => {
+    const rendererRoot = join(scratchRoot, "renderer");
+    mkdirSync(rendererRoot, { recursive: true });
+    writeFileSync(join(rendererRoot, "index.ts"), "content\n");
+    const trustedDigest = computeRendererAssetDigest(rendererRoot);
+
+    const markerPath = join(scratchRoot, "json-marker.txt");
+    writeFileSync(
+      join(scratchRoot, "json.py"),
+      [
+        `open(${JSON.stringify(markerPath)}, "w").write("EXECUTED")`,
+        'raise SystemExit("hostile cwd-shadowed json module executed")',
+        "",
+      ].join("\n"),
+    );
+
+    // rendererRoot is already an absolute path, so relocating cwd never
+    // changes which fixture directory is actually hashed - only whether a
+    // `json.py` sitting in the new cwd is (wrongly) importable.
+    const previousCwd = process.cwd();
+    process.chdir(scratchRoot);
+    let digestUnderAttack;
+    try {
+      digestUnderAttack = computeRendererAssetDigest(rendererRoot);
+    } finally {
+      process.chdir(previousCwd);
+    }
+    assert.equal(
+      digestUnderAttack,
+      trustedDigest,
+      "a hostile cwd-shadowed json module must never be importable by the isolated helper",
+    );
+    assert.equal(
+      existsSync(markerPath),
+      false,
+      "the hostile json.py module body must never execute",
+    );
+  });
+});
+
+test("computeRendererAssetDigest is unaffected by a hostile sitecustomize.py reachable only via a hostile HOME, and it never executes", () => {
+  withScratchDir("hostile-home-", (scratchRoot) => {
+    const fakeHome = join(scratchRoot, "fake-home");
+    mkdirSync(fakeHome, { recursive: true });
+
+    // Ask a real, non-isolated interpreter what user site-packages
+    // directory *it* computes for this fake HOME on this machine/platform,
+    // so the attack targets the exact path this Python actually consults
+    // instead of a guessed, possibly stale/wrong location.
+    const userSiteDir = execFileSync(
+      TRUSTED_PYTHON3,
+      ["-c", "import site, sys; sys.stdout.write(site.getusersitepackages())"],
+      { env: { ...process.env, HOME: fakeHome }, encoding: "utf8" },
+    ).trim();
+    assert.ok(
+      userSiteDir.startsWith(fakeHome),
+      `expected the computed per-user site dir (${userSiteDir}) to live under the fake HOME (${fakeHome})`,
+    );
+    mkdirSync(userSiteDir, { recursive: true });
+    const markerPath = join(scratchRoot, "sitecustomize-marker.txt");
+    writeFileSync(
+      join(userSiteDir, "sitecustomize.py"),
+      `open(${JSON.stringify(markerPath)}, "w").write("EXECUTED")\n`,
+    );
+
+    // Prove this fake HOME is a live attack against a non-isolated
+    // interpreter first, so a future change to Python's own per-user
+    // site-lookup rules can never silently turn the rest of this test into
+    // a no-op that "passes" without actually proving anything.
+    execFileSync(TRUSTED_PYTHON3, ["-c", "pass"], { env: { ...process.env, HOME: fakeHome } });
+    assert.equal(
+      existsSync(markerPath),
+      true,
+      "the fake HOME fixture itself must be a real sitecustomize attack against a non-isolated interpreter",
+    );
+    rmSync(markerPath, { force: true });
+
+    const rendererRoot = join(scratchRoot, "renderer");
+    mkdirSync(rendererRoot, { recursive: true });
+    writeFileSync(join(rendererRoot, "index.ts"), "content\n");
+    const trustedDigest = computeRendererAssetDigest(rendererRoot);
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = fakeHome;
+    let digestUnderAttack;
+    try {
+      digestUnderAttack = computeRendererAssetDigest(rendererRoot);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+    }
+    assert.equal(
+      digestUnderAttack,
+      trustedDigest,
+      "a hostile per-user sitecustomize.py must never be importable by the isolated helper even under a hostile HOME",
+    );
+    assert.equal(
+      existsSync(markerPath),
+      false,
+      "the hostile sitecustomize.py module body must never execute",
+    );
+  });
+});
+
+test("the raw helper rejects a symlinked asset present from the start (no test-action/race involved)", () => {
   withScratchDir("symlink-base-case-", (scratchRoot) => {
     const rendererRoot = join(scratchRoot, "renderer");
     mkdirSync(rendererRoot, { recursive: true });
@@ -376,7 +565,7 @@ test("the raw helper has no hidden-file exclusion of its own: a leading-dot asse
   });
 });
 
-test("the raw helper's own --after-collection-hook rejects a symlink swap, proving swap resistance is intrinsic to the helper itself, not just Node's wiring", () => {
+test("the raw helper's own --test-action rejects a symlink swap, proving swap resistance is intrinsic to the helper itself, not just Node's wiring", () => {
   withScratchDir("swap-resistance-", (scratchRoot) => {
     const rendererRoot = join(scratchRoot, "renderer");
     mkdirSync(rendererRoot, { recursive: true });
@@ -385,19 +574,10 @@ test("the raw helper's own --after-collection-hook rejects a symlink swap, provi
     const symlinkTarget = join(scratchRoot, "outside-renderer.txt");
     writeFileSync(symlinkTarget, "must never be hashed through a renderer asset path\n");
 
-    const hookArg = afterCollectionHookArg(process.execPath, [
-      swapHookScript,
-      "replace-file-with-symlink",
-      assetPath,
-      symlinkTarget,
-    ]);
+    const actionArg = testActionArg("replace-file-with-symlink", [assetPath, symlinkTarget]);
     assert.throws(
       () =>
-        runHelperDirectly(helperSourceBytes, [
-          rendererRoot,
-          "--after-collection-hook",
-          hookArg,
-        ]),
+        runHelperDirectly(helperSourceBytes, [rendererRoot, "--test-action", actionArg]),
       /renderer asset must not be a symlink: index\.ts/,
     );
   });
@@ -414,6 +594,50 @@ test("computeRendererAssetDigest byte-patched to a tiny MAX_ENTRY_COUNT rejects 
     assert.throws(
       () => spawnRendererAssetDigestHelper(Buffer.from(patchedSource, "utf8"), [rendererRoot]),
       /exceeds the maximum entry count of 3/,
+    );
+  });
+});
+
+test("directory_entry_names rejects a directory of far more real entries than a tiny MAX_ENTRY_COUNT without ever visiting them all", () => {
+  withScratchDir("limit-entry-count-bounded-", (scratchRoot) => {
+    const rendererRoot = join(scratchRoot, "renderer");
+    mkdirSync(rendererRoot, { recursive: true });
+    const realEntryCount = 50;
+    for (let index = 0; index < realEntryCount; index += 1) {
+      writeFileSync(join(rendererRoot, `f${index}.txt`), "x");
+    }
+
+    // Instruments the exact `names.append(entry.name)` line inside
+    // directory_entry_names's os.scandir loop to also append one byte to
+    // visitCounterPath every time an entry is actually visited - the only
+    // way to observe, from outside the helper's own process, how many of
+    // the real 50 on-disk entries were ever read before the bound fired,
+    // rather than merely observing that the final error message is
+    // correct (which a helper that still fully materializes the directory
+    // first, then checks a count, would also produce).
+    const patchedEntryCount = 5;
+    const visitCounterPath = join(scratchRoot, "scandir-visit-counter");
+    writeFileSync(visitCounterPath, "");
+    const instrumentedSource = withExactlyOneReplacement(
+      patchedHelperSource("MAX_ENTRY_COUNT = 200_000", `MAX_ENTRY_COUNT = ${patchedEntryCount}`),
+      "                names.append(entry.name)\n",
+      "                names.append(entry.name)\n" +
+        `                with open(${JSON.stringify(visitCounterPath)}, "a") as _scandir_visit_counter:\n` +
+        '                    _scandir_visit_counter.write("x")\n',
+    );
+
+    assert.throws(
+      () => spawnRendererAssetDigestHelper(Buffer.from(instrumentedSource, "utf8"), [rendererRoot]),
+      new RegExp(`exceeds the maximum entry count of ${patchedEntryCount}`),
+    );
+    const visitedEntryCount = readFileSync(visitCounterPath, "utf8").length;
+    assert.ok(
+      visitedEntryCount <= patchedEntryCount,
+      `expected at most ${patchedEntryCount} entries to ever be appended before the bound fired, observed ${visitedEntryCount}`,
+    );
+    assert.ok(
+      visitedEntryCount < realEntryCount,
+      `expected the real ${realEntryCount}-entry directory to never be fully materialized before rejection, observed ${visitedEntryCount} visited entries`,
     );
   });
 });
@@ -467,101 +691,33 @@ test("computeRendererAssetDigest byte-patched to a tiny MAX_TOTAL_ASSET_BYTES re
   });
 });
 
-test("a hook that itself exceeds --hook-timeout-seconds is killed, with a clear error, well before its own sleep would finish", () => {
-  withScratchDir("hook-own-timeout-", (scratchRoot) => {
-    const rendererRoot = join(scratchRoot, "renderer");
-    mkdirSync(rendererRoot, { recursive: true });
-    writeFileSync(join(rendererRoot, "index.ts"), "content\n");
-
-    const hookArg = afterCollectionHookArg("/bin/sleep", ["30"]);
-    const started = Date.now();
-    assert.throws(
-      () =>
-        runHelperDirectly(helperSourceBytes, [
-          rendererRoot,
-          "--after-collection-hook",
-          hookArg,
-          "--deadline-seconds",
-          "20",
-          "--hook-timeout-seconds",
-          "1",
-        ]),
-      /renderer asset collection hook did not finish within 1s and was killed/,
-    );
-    const elapsedMs = Date.now() - started;
-    assert.ok(
-      elapsedMs < 10_000,
-      `expected the hook's own 1s timeout to fire well before its 30s sleep, took ${elapsedMs}ms`,
-    );
-  });
-});
-
-test("the overall --deadline-seconds preempts and cleans up a hook whose own --hook-timeout-seconds has not yet elapsed", () => {
+test("the overall --deadline-seconds preempts a declarative delay test action that has not yet finished", () => {
   withScratchDir("overall-deadline-", (scratchRoot) => {
     const rendererRoot = join(scratchRoot, "renderer");
     mkdirSync(rendererRoot, { recursive: true });
     writeFileSync(join(rendererRoot, "index.ts"), "content\n");
 
-    const hookArg = afterCollectionHookArg("/bin/sleep", ["30"]);
+    // The "delay" test action is a plain, in-process time.sleep - there is
+    // no subprocess of any kind for the helper to separately bound, so the
+    // helper's own overall SIGALRM deadline (see _on_alarm/main in
+    // renderer-asset-digest.py) is the only thing that can ever preempt it.
+    const actionArg = testActionArg("delay", ["30"]);
     const started = Date.now();
     assert.throws(
       () =>
         runHelperDirectly(helperSourceBytes, [
           rendererRoot,
-          "--after-collection-hook",
-          hookArg,
+          "--test-action",
+          actionArg,
           "--deadline-seconds",
           "1",
-          "--hook-timeout-seconds",
-          "20",
         ]),
       /descriptor-anchored renderer asset digest helper exceeded its overall deadline/,
     );
     const elapsedMs = Date.now() - started;
     assert.ok(
       elapsedMs < 10_000,
-      `expected the 1s overall deadline to fire well before the hook's own 20s timeout, took ${elapsedMs}ms`,
-    );
-  });
-});
-
-test("a hook's own background descendant is still reaped even when the hook itself exits promptly and successfully", async () => {
-  await withScratchDir("hook-descendant-", async (scratchRoot) => {
-    const rendererRoot = join(scratchRoot, "renderer");
-    mkdirSync(rendererRoot, { recursive: true });
-    writeFileSync(join(rendererRoot, "index.ts"), "content\n");
-    const markerPath = join(scratchRoot, "descendant-marker.txt");
-
-    // The hook process itself spawns a background grandchild that would
-    // write markerPath after 3s, then exits immediately (selfDelayMs=0).
-    const hookArg = afterCollectionHookArg(process.execPath, [
-      descendantHookScript,
-      markerPath,
-      "3000",
-      "0",
-    ]);
-    const assets = JSON.parse(
-      runHelperDirectly(helperSourceBytes, [
-        rendererRoot,
-        "--after-collection-hook",
-        hookArg,
-        "--deadline-seconds",
-        "10",
-        "--hook-timeout-seconds",
-        "5",
-      ]),
-    );
-    assert.deepEqual(
-      assets.map((asset) => asset.relativePath),
-      ["index.ts"],
-    );
-    assert.equal(existsSync(markerPath), false, "the hook returned promptly; its descendant has not run yet");
-
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 3_500));
-    assert.equal(
-      existsSync(markerPath),
-      false,
-      "the hook's process group must be terminated as a whole, reaping its background descendant, even though the hook process itself already exited successfully",
+      `expected the 1s overall deadline to fire well before the requested 30s delay, took ${elapsedMs}ms`,
     );
   });
 });

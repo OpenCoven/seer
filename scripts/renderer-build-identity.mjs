@@ -225,7 +225,7 @@ export function computeRendererBuildDigest(repoRoot) {
 //      module goes through - no separate file-reading path to keep in sync;
 //   2. validates /usr/bin/python3 is exactly the trusted, root-owned,
 //      non-symlink system interpreter (see assertTrustedSystemInterpreterOrThrow);
-//   3. spawns that exact interpreter as `/usr/bin/python3 - <args...>`,
+//   3. spawns that exact interpreter as `/usr/bin/python3 -I - <args...>`,
 //      piping the bytes read in step 1 verbatim to its stdin.
 //
 // `-` tells Python to read and execute its program from stdin: the process
@@ -245,6 +245,23 @@ export function computeRendererBuildDigest(repoRoot) {
 // abandoned `build/.renderer-asset-digest-runs/`) is simply never
 // referenced by any code below - its presence, absence, or contents can
 // never influence this module's behavior.
+//
+// `-I` (isolated mode) always precedes `-`: it makes CPython ignore every
+// `PYTHON*` environment variable (`PYTHONPATH` foremost among them), never
+// add the current working directory or script directory to `sys.path`, and
+// never process the user site-packages directory - so neither an inherited
+// `PYTHONPATH`, nor a same-named stdlib-shadowing file sitting in whatever
+// directory this process happens to be spawned from, nor a `sitecustomize`/
+// `usercustomize` module reachable only through the user's own site
+// directory, can ever substitute themselves for a real standard-library
+// module this helper imports (`json`, `hashlib`, etc.) or run arbitrary code
+// during interpreter start-up. `sanitizedPythonEnvironment` below strips
+// every `PYTHON*`-prefixed environment variable from the child's own
+// environment as well, purely as defense in depth: `-I` alone already makes
+// CPython itself ignore all of them, but the environment actually handed to
+// the child never contains one in the first place, so nothing about this
+// module's own behavior ever depends on `-I` continuing to honor every one
+// of them correctly in every future CPython version.
 const rendererAssetDigestHelperSource = join(
   dirname(fileURLToPath(import.meta.url)),
   "renderer-asset-digest.py",
@@ -314,8 +331,28 @@ export function assertTrustedSystemInterpreterOrThrow(path) {
 }
 
 /**
+ * Defense in depth alongside `-I`: builds the exact environment object handed
+ * to the child interpreter by dropping every `PYTHON*`-prefixed variable
+ * (`PYTHONPATH`, `PYTHONSTARTUP`, `PYTHONNOUSERSITE`, a future `PYTHONWHATEVER`,
+ * etc.) from `sourceEnv`. `-I` already makes CPython itself ignore all of
+ * them regardless of what the child's environment contains, so this function
+ * changes nothing about a correctly behaving interpreter - it exists purely
+ * so this module's own behavior never relies on `-I` continuing to do so.
+ * Exported so tests can exercise it directly against synthetic environments
+ * without needing to spawn a real interpreter.
+ */
+export function sanitizedPythonEnvironment(sourceEnv) {
+  const sanitized = {};
+  for (const [key, value] of Object.entries(sourceEnv ?? {})) {
+    if (/^PYTHON/.test(key)) continue;
+    sanitized[key] = value;
+  }
+  return sanitized;
+}
+
+/**
  * Low-level spawn seam: (re-)validates the trusted interpreter, then runs
- * `/usr/bin/python3 - ...args` with `sourceBytes` supplied verbatim via
+ * `/usr/bin/python3 -I - ...args` with `sourceBytes` supplied verbatim via
  * stdin, bounding both wall-clock time and captured output. `sourceBytes` is
  * executed *exactly*: whatever this `Buffer`/`string` contains is the
  * program `/usr/bin/python3` runs, regardless of whether a file of the same
@@ -330,11 +367,11 @@ export function assertTrustedSystemInterpreterOrThrow(path) {
  * (meaning "unbounded" to Node's own `child_process.spawnSync`) and never
  * negative. This is Node's own outer backstop only: the helper enforces its
  * own, tighter overall deadline internally (see `--deadline-seconds` below
- * and that file's own `main`/`_on_alarm`), including cleaning up any
- * `--after-collection-hook` descendant itself before it exits - so under
- * normal operation this outer bound is never the one that fires, and Node
- * never needs to (and does not) reach into a process group of its own to
- * collect descendants on timeout.
+ * and that file's own `main`/`_on_alarm`) - so under normal operation this
+ * outer bound is never the one that fires. The helper never spawns a
+ * subprocess of its own (see `run_test_action` in that file), so there is
+ * never a descendant or process group of any kind for either bound to clean
+ * up on timeout.
  */
 export function spawnRendererAssetDigestHelper(sourceBytes, args, { timeoutMs } = {}) {
   assertTrustedSystemInterpreterOrThrow(TRUSTED_SYSTEM_PYTHON3_PATH);
@@ -345,12 +382,13 @@ export function spawnRendererAssetDigestHelper(sourceBytes, args, { timeoutMs } 
   if (!Number.isSafeInteger(resolvedTimeoutMs) || resolvedTimeoutMs <= 0) {
     throw new Error("renderer asset digest helper timeout must be a positive integer");
   }
-  const result = spawnSync(TRUSTED_SYSTEM_PYTHON3_PATH, ["-", ...args], {
+  const result = spawnSync(TRUSTED_SYSTEM_PYTHON3_PATH, ["-I", "-", ...args], {
     input: sourceBytes,
     encoding: "utf8",
     maxBuffer: 32 * 1024 * 1024,
     timeout: resolvedTimeoutMs,
     killSignal: "SIGKILL",
+    env: sanitizedPythonEnvironment(process.env),
   });
   if (result.error?.code === "ETIMEDOUT") {
     throw new Error(
@@ -390,18 +428,18 @@ export function spawnRendererAssetDigestHelper(sourceBytes, args, { timeoutMs } 
   return assets;
 }
 
-function normalizeAfterCollectionHook(afterCollection) {
+function normalizeAfterCollectionAction(afterCollection) {
   if (afterCollection === undefined) return null;
   if (
     !afterCollection ||
     typeof afterCollection !== "object" ||
     Array.isArray(afterCollection) ||
-    typeof afterCollection.executable !== "string" ||
+    typeof afterCollection.action !== "string" ||
     !Array.isArray(afterCollection.args) ||
     afterCollection.args.some((argument) => typeof argument !== "string")
   ) {
     throw new TypeError(
-      "afterCollection must be an object with an executable string and string args array",
+      "afterCollection must be an object with an action string and string args array",
     );
   }
   return afterCollection;
@@ -465,27 +503,28 @@ function fastFixtureAssetDigestCollection(rendererRoot, afterCollection) {
 
 // Node's own outer spawn timeout (SEER_RENDERER_ASSET_DIGEST_HELPER_TIMEOUT_MS)
 // must always leave the helper's own SIGALRM-based deadline comfortable room
-// to fire *first*: the helper cleans up its own `--after-collection-hook`
-// descendant as part of handling that deadline (see main/_on_alarm in
-// renderer-asset-digest.py), but Node's own SIGKILL-on-timeout has no such
-// awareness of - and no portable way to safely discover and reach into - a
-// hook descendant's own separate session/process group from the outside. If
-// Node's outer bound ever fired *before* the helper's own deadline could, a
-// still-running hook descendant could be left behind. Requiring a minimum
-// headroom below makes that ordering a structural property of every call
-// through readDescriptorAnchoredRendererAssets, rather than something that
-// depends on the two independently-overridable env vars happening to agree.
+// to fire *first*: that internal deadline lets the helper raise its own
+// specific "exceeded its overall deadline" failure (see main/_on_alarm in
+// renderer-asset-digest.py) with a clean, informative stderr message, rather
+// than being abruptly SIGKILLed by Node's own cruder outer bound, which can
+// only ever report a generic "did not finish...and was killed" message with
+// no information about what the helper was actually doing. Requiring a
+// minimum headroom below makes that ordering a structural property of every
+// call through readDescriptorAnchoredRendererAssets, rather than something
+// that depends on the two independently-overridable env vars happening to
+// agree.
 const RENDERER_ASSET_DIGEST_TIMEOUT_HEADROOM_MS = 5_000;
 
 /**
  * Reads scripts/renderer-asset-digest.py's own bytes fresh off disk (never
- * cached) and pipes them into a fresh `/usr/bin/python3 -` invocation for
+ * cached) and pipes them into a fresh `/usr/bin/python3 -I -` invocation for
  * every real call - see spawnRendererAssetDigestHelper above for the full
- * no-cache/no-publish/no-compile rationale. `--deadline-seconds`/
- * `--hook-timeout-seconds` are always passed explicitly (even when equal to
- * the helper's own defaults) so both remain independently test-overridable
- * via environment variables without ever touching the committed helper
- * source.
+ * no-cache/no-publish/no-compile rationale. `--deadline-seconds` is always
+ * passed explicitly (even when equal to the helper's own default) so it
+ * remains independently test-overridable via an environment variable
+ * without ever touching the committed helper source. `--test-action` is
+ * only ever passed when a test explicitly supplies `afterCollection`;
+ * production never does.
  */
 function readDescriptorAnchoredRendererAssets(rendererRoot, afterCollection) {
   if (process.platform !== "darwin") {
@@ -494,16 +533,12 @@ function readDescriptorAnchoredRendererAssets(rendererRoot, afterCollection) {
   if (process.env.SEER_RENDERER_BUILD_TEST_BUILDER) {
     return fastFixtureAssetDigestCollection(rendererRoot, afterCollection);
   }
-  const hook = normalizeAfterCollectionHook(afterCollection);
+  const testAction = normalizeAfterCollectionAction(afterCollection);
   const source = readRegularFileNoFollow(
     rendererAssetDigestHelperSource,
     "renderer asset digest helper source",
   );
   const deadlineSeconds = positiveIntegerFromEnv("SEER_RENDERER_ASSET_DIGEST_DEADLINE_SECONDS", 45);
-  const hookTimeoutSeconds = positiveIntegerFromEnv(
-    "SEER_RENDERER_ASSET_DIGEST_HOOK_TIMEOUT_SECONDS",
-    20,
-  );
   const helperTimeoutMs = positiveIntegerFromEnv(
     "SEER_RENDERER_ASSET_DIGEST_HELPER_TIMEOUT_MS",
     60_000,
@@ -514,20 +549,14 @@ function readDescriptorAnchoredRendererAssets(rendererRoot, afterCollection) {
       `SEER_RENDERER_ASSET_DIGEST_HELPER_TIMEOUT_MS (${helperTimeoutMs}) must be at least ` +
         `${minimumHelperTimeoutMs}ms (the ${deadlineSeconds}s deadline plus ` +
         `${RENDERER_ASSET_DIGEST_TIMEOUT_HEADROOM_MS}ms headroom), so the helper's own deadline ` +
-        "always fires - and cleans up any hook descendant - before Node's outer spawn timeout could",
+        "always fires with its own clean error message before Node's outer spawn timeout could",
     );
   }
-  const args = [
-    resolve(rendererRoot),
-    "--deadline-seconds",
-    String(deadlineSeconds),
-    "--hook-timeout-seconds",
-    String(hookTimeoutSeconds),
-  ];
-  if (hook) {
+  const args = [resolve(rendererRoot), "--deadline-seconds", String(deadlineSeconds)];
+  if (testAction) {
     args.push(
-      "--after-collection-hook",
-      Buffer.from(JSON.stringify(hook), "utf8").toString("base64"),
+      "--test-action",
+      Buffer.from(JSON.stringify(testAction), "utf8").toString("base64"),
     );
   }
   return spawnRendererAssetDigestHelper(source, args, { timeoutMs: helperTimeoutMs });
