@@ -3,6 +3,11 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import {
+  extractNodeTestInvocations,
+  invocationHasTestFile,
+  invocationPinsConcurrency1,
+} from "./helpers/workflow-node-test-invocations.mjs";
 
 // Characterization test for the standalone renderer build-lock race:
 //
@@ -39,27 +44,6 @@ const workflows = [
   { name: "release-macos.yml", path: join(repoRoot, ".github", "workflows", "release-macos.yml") },
 ];
 
-/**
- * Extracts every distinct `node --test ...` shell invocation from a workflow
- * source, keeping each invocation's continuation lines (`\` line
- * continuations) joined so the full file list can be inspected together.
- */
-function extractNodeTestInvocations(source) {
-  const invocations = [];
-  const lines = source.split("\n");
-  for (let i = 0; i < lines.length; i += 1) {
-    if (!/node --test\b/.test(lines[i])) continue;
-    let block = lines[i];
-    let j = i;
-    while (block.trimEnd().endsWith("\\")) {
-      j += 1;
-      block += `\n${lines[j]}`;
-    }
-    invocations.push(block);
-  }
-  return invocations;
-}
-
 test("the root npm test script serializes all tests/*.test.mjs files (no default Node test-runner file concurrency)", () => {
   assert.equal(
     packageJson.scripts.test,
@@ -77,7 +61,7 @@ for (const { name, path } of workflows) {
     assert.ok(invocations.length > 0, `expected at least one "node --test" invocation in ${name}`);
 
     const lockInvocations = invocations.filter((invocation) =>
-      invocation.includes("tests/standalone-renderer-lock.test.mjs"),
+      invocationHasTestFile(invocation, "tests/standalone-renderer-lock.test.mjs"),
     );
     assert.ok(
       lockInvocations.length > 0,
@@ -85,15 +69,14 @@ for (const { name, path } of workflows) {
     );
 
     for (const invocation of lockInvocations) {
-      assert.match(
-        invocation,
-        /node --test --test-concurrency=1\b/,
-        `${name} invocation of tests/standalone-renderer-lock.test.mjs must pin --test-concurrency=1:\n${invocation}`,
+      assert.ok(
+        invocationPinsConcurrency1(invocation),
+        `${name} invocation of tests/standalone-renderer-lock.test.mjs must pin --test-concurrency=1:\n${invocation.tokens.join(" ")}`,
       );
       assert.ok(
-        invocation.includes("tests/standalone-renderer.test.mjs"),
+        invocationHasTestFile(invocation, "tests/standalone-renderer.test.mjs"),
         `${name} must run tests/standalone-renderer.test.mjs in the same serialized invocation as ` +
-          `tests/standalone-renderer-lock.test.mjs (both share the real renderer build lock):\n${invocation}`,
+          `tests/standalone-renderer-lock.test.mjs (both share the real renderer build lock):\n${invocation.tokens.join(" ")}`,
       );
     }
   });
@@ -102,17 +85,16 @@ for (const { name, path } of workflows) {
     const source = readFileSync(path, "utf8");
     const invocations = extractNodeTestInvocations(source);
     const boundaryInvocations = invocations.filter((invocation) =>
-      invocation.includes("tests/standalone-boundary.test.mjs"),
+      invocationHasTestFile(invocation, "tests/standalone-boundary.test.mjs"),
     );
     assert.ok(
       boundaryInvocations.length > 0,
       `expected ${name} to invoke tests/standalone-boundary.test.mjs at least once`,
     );
     for (const invocation of boundaryInvocations) {
-      assert.match(
-        invocation,
-        /node --test --test-concurrency=1\b/,
-        `${name} invocation of tests/standalone-boundary.test.mjs must pin --test-concurrency=1:\n${invocation}`,
+      assert.ok(
+        invocationPinsConcurrency1(invocation),
+        `${name} invocation of tests/standalone-boundary.test.mjs must pin --test-concurrency=1:\n${invocation.tokens.join(" ")}`,
       );
     }
   });
@@ -136,7 +118,7 @@ for (const { name, path } of workflows) {
     const source = readFileSync(path, "utf8");
     const invocations = extractNodeTestInvocations(source);
     const assetDigestHelperInvocations = invocations.filter((invocation) =>
-      invocation.includes("tests/renderer-asset-digest-helper.test.mjs"),
+      invocationHasTestFile(invocation, "tests/renderer-asset-digest-helper.test.mjs"),
     );
     assert.ok(
       assetDigestHelperInvocations.length > 0,
@@ -144,9 +126,9 @@ for (const { name, path } of workflows) {
     );
     for (const invocation of assetDigestHelperInvocations) {
       assert.ok(
-        invocation.includes("tests/renderer-build-identity.test.mjs"),
+        invocationHasTestFile(invocation, "tests/renderer-build-identity.test.mjs"),
         `${name} should run tests/renderer-asset-digest-helper.test.mjs alongside ` +
-          `tests/renderer-build-identity.test.mjs (both exercise scripts/renderer-build-identity.mjs):\n${invocation}`,
+          `tests/renderer-build-identity.test.mjs (both exercise scripts/renderer-build-identity.mjs):\n${invocation.tokens.join(" ")}`,
       );
     }
   });

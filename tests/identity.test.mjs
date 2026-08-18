@@ -4,6 +4,10 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import test from "node:test";
+import {
+  extractNodeTestInvocations,
+  invocationHasTestFile,
+} from "./helpers/workflow-node-test-invocations.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = dirname(here);
@@ -20,27 +24,6 @@ const ciWorkflows = [
   { name: "standalone-ci.yml", path: ".github/workflows/standalone-ci.yml" },
   { name: "release-macos.yml", path: ".github/workflows/release-macos.yml" },
 ];
-
-/**
- * Extracts every distinct `node --test ...` shell invocation from a workflow
- * source, keeping each invocation's continuation lines (`\` line
- * continuations) joined so the full file list can be inspected together.
- */
-function extractNodeTestInvocations(source) {
-  const invocations = [];
-  const lines = source.split("\n");
-  for (let i = 0; i < lines.length; i += 1) {
-    if (!/node --test\b/.test(lines[i])) continue;
-    let block = lines[i];
-    let j = i;
-    while (block.trimEnd().endsWith("\\")) {
-      j += 1;
-      block += `\n${lines[j]}`;
-    }
-    invocations.push(block);
-  }
-  return invocations;
-}
 
 function gitChangeSet() {
   return execFileSync(
@@ -188,12 +171,16 @@ for (const { name, path } of ciWorkflows) {
     const source = readText(path);
     const invocations = extractNodeTestInvocations(source);
     const gateSerializationInvocations = invocations.filter((invocation) =>
-      invocation.includes("tests/standalone-build-gate-serialization.test.mjs"),
+      invocationHasTestFile(
+        invocation,
+        "tests/standalone-build-gate-serialization.test.mjs",
+      ),
     );
     assert.ok(
       gateSerializationInvocations.length > 0,
       `expected ${name} to invoke tests/standalone-build-gate-serialization.test.mjs in an explicit ` +
-        "test-file list (not merely rely on it being reachable through some other glob)",
+        "test-file list (not merely rely on it being reachable through some other glob), as its own " +
+        "exact shell argument token - not merely appearing somewhere in the step's script text",
     );
   });
 }
