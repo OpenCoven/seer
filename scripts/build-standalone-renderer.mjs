@@ -729,6 +729,30 @@ function claimAndRemoveStaleLock(directoryInfo, claim) {
     }
     fsyncDirectory(repoRoot);
     runReclaimTestHook("quarantine-fsynced");
+
+    // The claim must stay held for the entire quarantine removal below: releasing
+    // it any earlier would let another waiter's cleanupAbandonedLockQuarantines()
+    // inspect or remove this exact quarantine directory concurrently, racing this
+    // process's own unlinks and rmdir. Other waiters block on inspectReclaimClaim()
+    // while this claim's owner is alive, so holding it here guarantees a single
+    // remover for this quarantine. It is only released after removal fully
+    // completes (or immediately below on a caught error, once this process has
+    // stopped touching the filesystem) so a crash still leaves a recoverable,
+    // unambiguously-owned claim/quarantine pair for the next waiter.
+    removeVerifiedDirectory(
+      quarantinePath,
+      quarantineInfo,
+      knownEntries,
+      "renderer lock quarantine",
+      {
+        onEntryRemoved(name) {
+          if (name === "owner.json") runReclaimTestHook("quarantine-owner-unlinked");
+        },
+        onDirectoryRemoved() {
+          runReclaimTestHook("quarantine-removed");
+        },
+      },
+    );
   } catch (error) {
     if (lstatOrNull(reclaimClaimPath)) {
       releaseReclaimClaim(claim);
@@ -737,20 +761,6 @@ function claimAndRemoveStaleLock(directoryInfo, claim) {
   }
 
   releaseReclaimClaim(claim);
-  removeVerifiedDirectory(
-    quarantinePath,
-    quarantineInfo,
-    knownEntries,
-    "renderer lock quarantine",
-    {
-      onEntryRemoved(name) {
-        if (name === "owner.json") runReclaimTestHook("quarantine-owner-unlinked");
-      },
-      onDirectoryRemoved() {
-        runReclaimTestHook("quarantine-removed");
-      },
-    },
-  );
   return true;
 }
 

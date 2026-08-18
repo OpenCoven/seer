@@ -32,6 +32,7 @@ const failingProcessGroupPath = join(here, "helpers", "renderer-failing-process-
 const exitedLeaderGroupPath = join(here, "helpers", "renderer-exited-leader-group.mjs");
 const publicationKillHookPath = join(here, "helpers", "renderer-publication-kill-hook.mjs");
 const reclaimKillHookPath = join(here, "helpers", "renderer-reclaim-kill-hook.mjs");
+const reclaimPauseHookPath = join(here, "helpers", "renderer-reclaim-pause-hook.mjs");
 const releaseKillHookPath = join(here, "helpers", "renderer-release-kill-hook.mjs");
 const consumerGatePath = join(repoRoot, "scripts", "renderer-consumer-gate.mjs");
 const consumerSetupKillHookPath = join(here, "helpers", "renderer-consumer-setup-kill-hook.mjs");
@@ -611,9 +612,95 @@ test("64 stale-lock waiters repeatedly hand off without overlap, failures, or le
   }
 });
 
+test("the reclaim claim is retained through quarantine removal, blocking a concurrent reclaimer", async () => {
+  mkdirSync(join(repoRoot, "build"), { recursive: true });
+  const scratch = mkdtempSync(join(repoRoot, "build", "renderer-reclaim-retained-test-"));
+  const fixture = createRendererFixture(scratch);
+  const readyPath = join(scratch, "quarantine-owner-unlinked.ready");
+  const releasePath = join(scratch, "quarantine-owner-unlinked.release");
+  const lockDir = writeSyntheticLock(
+    {
+      token: "stale-retained-claim",
+      pid: 2147483647,
+      createdAtMs: 0,
+      bootIdentity: currentBootIdentity(),
+      processStartIdentity: "dead-owner",
+    },
+    null,
+    fixture.repo,
+  );
+  const claimDir = `${lockDir}.reclaim-claim`;
+  let paused = null;
+  try {
+    paused = runWrapper({
+      env: {
+        SEER_RENDERER_RECLAIM_TEST_HOOK: reclaimPauseHookPath,
+        SEER_RENDERER_RECLAIM_TEST_PHASE: "quarantine-owner-unlinked",
+        SEER_RENDERER_RECLAIM_TEST_READY_PATH: readyPath,
+        SEER_RENDERER_RECLAIM_TEST_RELEASE_PATH: releasePath,
+        SEER_RENDERER_BUILD_TEST_BUILDER: testBuilderPath,
+        SEER_RENDERER_BUILD_TEST_MARKER: "reclaim-retained-owner",
+        SEER_RENDERER_LOCK_STALE_MS: "0",
+        SEER_RENDERER_LOCK_POLL_MS: "1",
+        SEER_RENDERER_LOCK_WAIT_MS: "120000",
+      },
+      root: fixture.repo,
+      script: fixture.wrapper,
+    });
+    await waitForFile(readyPath, 120_000);
+
+    // The reclaimer paused itself mid-way through removing the quarantined
+    // lock (owner.json already unlinked, the directory itself not yet
+    // rmdir'd). It must still own its reclaim claim at this point -- nothing
+    // may treat the claim as free while the quarantine removal is in flight.
+    assert.equal(
+      existsSync(claimDir),
+      true,
+      "reclaim claim must be retained until quarantine removal is fully complete",
+    );
+    assert.deepEqual(readdirSync(claimDir), ["claim.json"]);
+
+    const contender = await runWrapper({
+      env: {
+        SEER_RENDERER_BUILD_TEST_BUILDER: testBuilderPath,
+        SEER_RENDERER_BUILD_TEST_MARKER: "reclaim-retained-contender",
+        SEER_RENDERER_LOCK_STALE_MS: "0",
+        SEER_RENDERER_LOCK_POLL_MS: "1",
+        SEER_RENDERER_LOCK_WAIT_MS: "200",
+      },
+      root: fixture.repo,
+      script: fixture.wrapper,
+    }).completed;
+    // A concurrent waiter must merely time out behind the still-held claim; it
+    // must never race into cleanupAbandonedLockQuarantines() and observe (or
+    // cause) a torn quarantine directory.
+    assert.notEqual(contender.code, 0);
+    assert.match(contender.stderr, /timed out.*renderer lock/is);
+    assert.doesNotMatch(contender.stderr, /changed identity|unexpected entr/i);
+    assert.equal(existsSync(claimDir), true);
+
+    writeFileSync(releasePath, "release\n");
+    const result = await paused.completed;
+    assert.equal(result.code, 0, `paused reclaimer failed:\n${result.stdout}\n${result.stderr}`);
+    assert.equal(existsSync(lockDir), false);
+    assert.deepEqual(rendererLockArtifacts(fixture.repo), []);
+  } finally {
+    if (paused && paused.child.exitCode === null && paused.child.signalCode === null) {
+      writeFileSync(releasePath, "release\n");
+      await paused.completed;
+    }
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
 test("hard kills at every external reclaim phase recover without leaking claims or quarantines", async () => {
   mkdirSync(join(repoRoot, "build"), { recursive: true });
   const scratch = mkdtempSync(join(repoRoot, "build", "renderer-reclaim-kill-test-"));
+  // The claim is released only after the quarantine is fully torn down, so
+  // quarantine-owner-unlinked/quarantine-removed must fire before
+  // claim-owner-unlinked/claim-removed. This ordering is load-bearing: it is
+  // what prevents another waiter from ever observing a released claim while
+  // this quarantine directory is still mid-removal.
   const phases = [
     "claim-created",
     "claim-temp-created",
@@ -622,10 +709,10 @@ test("hard kills at every external reclaim phase recover without leaking claims 
     "claim-committed",
     "lock-quarantined",
     "quarantine-fsynced",
-    "claim-owner-unlinked",
-    "claim-removed",
     "quarantine-owner-unlinked",
     "quarantine-removed",
+    "claim-owner-unlinked",
+    "claim-removed",
   ];
   try {
     for (const phase of phases) {
@@ -656,7 +743,7 @@ test("hard kills at every external reclaim phase recover without leaking claims 
       }).completed;
       assert.equal(killed.signal, "SIGKILL", `${phase} did not hard-kill:\n${killed.stderr}`);
       assert.equal(readFileSync(readyPath, "utf8"), `${phase}\n`);
-      if (phase === "quarantine-removed") {
+      if (phase === "claim-removed") {
         assert.deepEqual(rendererLockArtifacts(fixture.repo), []);
       } else {
         assert.ok(rendererLockArtifacts(fixture.repo).length > 0);
