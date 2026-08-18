@@ -1035,19 +1035,31 @@ enum SessionSnapshotSource {
                 // SQL-computed `recencyMs` without assessing it as a
                 // composer (never spends a row/byte/bubble budget on it).
                 // Rows are already ordered newest-first by validated JSON
-                // recency (rowid only breaks ties), so if even this
-                // cut-off candidate's own timestamp is too old — or
-                // absent/malformed, sorting last as SQL `NULL` — to
-                // plausibly still be active, every omitted row beyond it is
-                // provably no newer either: accept the newest
-                // `cursorMaximumInspectedRows` instead of permanently
-                // failing merely because more history exists.
+                // recency (rowid only breaks ties), so truncation is only
+                // ever safe when this cut-off candidate's own timestamp is
+                // *definitively* older than the candidate window's lower
+                // bound — every omitted row beyond it is then provably no
+                // newer either, so the newest `cursorMaximumInspectedRows`
+                // can be accepted instead of permanently failing merely
+                // because more history exists. A missing/unrankable
+                // (`NULL`, sorting last), recent, OR too-far-future
+                // sentinel must all stay inconclusive (`.rowLimit`):
+                // `isRecentTimestamp` is deliberately NOT used here — it
+                // reports a far-future timestamp as not recent too, which
+                // would wrongly bless truncation as safe even though a
+                // corrupt/adversarial far-future recency value could rank
+                // ahead of, and thereby hide, a genuinely active composer
+                // beyond the cap. `isDefinitelyOlderThanWindowLowerBound`
+                // requires the sentinel to be on the *old* side of the
+                // window's lower bound specifically.
                 try checkCursorSQLiteRow(stepRC, operation: "read composer row-limit sentinel")
                 let sentinelRecencyMs: Int64? = sqlite3_column_type(statement, 3) == SQLITE_NULL
                     ? nil
                     : saturatingInt64(sqlite3_column_double(statement, 3))
-                if let sentinelRecencyMs,
-                   isRecentTimestamp(sentinelRecencyMs, now: now, within: sessionCandidateWindowMs) {
+                let sentinelDefinitelyOld = sentinelRecencyMs.map {
+                    isDefinitelyOlderThanWindowLowerBound($0, now: now, within: sessionCandidateWindowMs)
+                } ?? false
+                if !sentinelDefinitelyOld {
                     stopReason = .rowLimit
                 }
                 break

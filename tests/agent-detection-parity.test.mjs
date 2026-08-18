@@ -18,13 +18,17 @@ import {
   CURSOR_SQLITE_BUSY_TIMEOUT_MS,
   CURSOR_SQLITE_QUERY_DEADLINE_MS,
   MAX_SUPPORTED_TIMESTAMP_MS,
+  SESSION_CANDIDATE_WINDOW_MS,
   TIMESTAMP_FUTURE_SKEW_MS,
   assessCursorComposerRecord,
   assessDetectionFixture,
   cursorRecencySqlExpression,
   cursorRelevantBubbleIds,
+  isCanonicalCursorIsoTimestamp,
+  isDefinitelyOlderThanWindowLowerBound,
   isRecentTimestamp,
   matchAgentKind,
+  parseCursorTimestamp,
 } from "../main/services/agent-detection-policy.ts";
 
 /**
@@ -697,18 +701,101 @@ test("Cursor SQL recency matches the assessor for a future-skewed timestamp, and
   assert.equal(assessedLastActivityAt(outOfRange), 0);
 });
 
-test("Cursor SQL recency documents its one intentional assessor divergence: date-only strings", () => {
-  // "2024-01-15" is a string shape Date.parse (and so this TS assessor)
-  // happily accepts, but Swift's Date.ISO8601FormatStyle flatly rejects —
-  // confirmed empirically (see cursorRecencySqlExpression's doc comment).
-  // Supporting it here would only ever benefit the TS side of a supposedly
-  // shared expression, trading a narrow, unobserved-in-real-data gap for a
-  // *new*, permanent TS/Swift ranking disagreement. This is the one
-  // deliberately-excluded shape where SQL and the assessor do NOT agree —
-  // documented here as a locked-in, intentional exception, not an
-  // oversight, and bounded because real Cursor data only ever emits
-  // numeric epoch-millisecond timestamps on disk.
-  const record = { fullConversationHeadersOnly: [{ type: 1, createdAt: "2024-01-15" }] };
-  assert.equal(sqlRecencyFor(record), 0);
-  assert.notEqual(assessedLastActivityAt(record), 0);
+test("parseCursorTimestamp accepts exactly the canonical ISO-8601 grammar and rejects every lenient Date.parse shape", () => {
+  // The one grammar `parseCursorTimestamp`, `cursorRecencySqlExpression`'s
+  // SQL shape guard, and the Swift port's `Date.ISO8601FormatStyle` all
+  // intentionally agree on: `YYYY-MM-DDTHH:MM:SS[.fraction](Z|±HH:MM)`,
+  // case-sensitive `T`/`Z`, seconds required. `isCanonicalCursorIsoTimestamp`
+  // is the single exported validator `parseCursorTimestamp` itself uses, so
+  // this test and the parser cannot silently drift apart.
+  for (const canonical of [
+    "2024-01-15T10:20:30Z",
+    "2024-01-15T10:20:30.123Z",
+    "2024-01-15T10:20:30.1Z",
+    "2024-01-15T10:20:30.123456Z",
+    "2024-01-15T10:20:30+00:00",
+    "2024-01-15T10:20:30-05:30",
+    "2024-01-15T10:20:30.123+05:30",
+  ]) {
+    assert.ok(isCanonicalCursorIsoTimestamp(canonical), canonical);
+    assert.notEqual(parseCursorTimestamp(canonical), null, canonical);
+  }
+
+  // Every shape `Date.parse` alone would happily accept, but that must NOT
+  // be blessed as a Cursor-timestamp string: this is the fix for the
+  // formerly-"documented divergence" — these shapes must be rejected
+  // consistently by `isCanonicalCursorIsoTimestamp` and `parseCursorTimestamp`
+  // alike, not treated as an intentional TS/Swift/SQL disagreement.
+  for (const lenient of [
+    "2024-01-15", // date-only
+    "2024-01-15t10:20:30Z", // lower-case t
+    "2024-01-15T10:20:30z", // lower-case z
+    "2024-01-15 10:20:30Z", // space instead of T
+    "Mon, 15 Jan 2024 10:20:30 GMT", // RFC-2822
+    "2024-01-15T10:20Z", // minute-only, no seconds
+    "2024-01-15T10:20:30", // zone-less
+  ]) {
+    assert.equal(isCanonicalCursorIsoTimestamp(lenient), false, lenient);
+    assert.equal(parseCursorTimestamp(lenient), null, lenient);
+    // Confirm these really are shapes `Date.parse` alone would accept —
+    // otherwise this test would not be exercising the intended divergence
+    // from unrestricted `Date.parse` at all.
+    assert.ok(Number.isFinite(Date.parse(lenient)), `fixture assumption: Date.parse must accept ${lenient}`);
+  }
+});
+
+test("Cursor SQL recency, parseCursorTimestamp, and the assessor now agree that every lenient string shape is unrankable — no blessed divergence", () => {
+  // Previously "documented" as the one intentional assessor divergence:
+  // `Date.parse` (and so the old, unrestricted `parseCursorTimestamp`)
+  // happily accepted a bare date-only string, while Swift's
+  // `Date.ISO8601FormatStyle` flatly rejected it. `parseCursorTimestamp` is
+  // now gated by the same `isCanonicalCursorIsoTimestamp` grammar the SQL
+  // shape guard already enforced, so all three engines agree: a date-only
+  // (or lower-case/RFC/space/minute-only) header timestamp is unrankable
+  // and contributes nothing to the composer's `lastActivityAt`.
+  for (const createdAt of [
+    "2024-01-15",
+    "2024-01-15t10:20:30Z",
+    "2024-01-15T10:20:30z",
+    "2024-01-15 10:20:30Z",
+    "Mon, 15 Jan 2024 10:20:30 GMT",
+    "2024-01-15T10:20Z",
+    "2024-01-15T10:20:30",
+  ]) {
+    const record = { fullConversationHeadersOnly: [{ type: 1, createdAt }] };
+    assert.equal(sqlRecencyFor(record), 0, createdAt);
+    assert.equal(assessedLastActivityAt(record), 0, createdAt);
+  }
+});
+
+// MARK: - Cursor row-limit truncation safety: overflow-safe lower-bound
+// comparison (`isDefinitelyOlderThanWindowLowerBound`), not `isRecentTimestamp`.
+//
+// `isRecentTimestamp` reports a far-future timestamp as "not recent" (its
+// future-skew tolerance rejects it), which is a completely different claim
+// from "definitely older than the candidate window's lower bound". Treating
+// "not recent" as "safe to truncate" would let a corrupt/adversarial
+// far-future recency value rank ahead of, and thereby hide, a genuinely
+// active composer beyond `CURSOR_MAX_INSPECTED_ROWS`.
+
+test("isDefinitelyOlderThanWindowLowerBound is not the negation of isRecentTimestamp: a far-future timestamp is inconclusive, not safe", () => {
+  const now = 1_700_000_000_000;
+  const windowMs = SESSION_CANDIDATE_WINDOW_MS;
+  const farFuture = now + 365 * 24 * 60 * 60 * 1000;
+
+  // isRecentTimestamp reports the far-future timestamp as NOT recent...
+  assert.equal(isRecentTimestamp(farFuture, now, windowMs), false);
+  // ...but it must also NOT be treated as definitively old: it is neither
+  // recent nor safely-in-the-past, it is inconclusive.
+  assert.equal(isDefinitelyOlderThanWindowLowerBound(farFuture, now, windowMs), false);
+
+  // A genuinely recent timestamp is inconclusive too (not definitively old).
+  assert.equal(isDefinitelyOlderThanWindowLowerBound(now - 1_000, now, windowMs), false);
+
+  // Exactly at the lower bound is not *strictly* older, so still inconclusive.
+  assert.equal(isDefinitelyOlderThanWindowLowerBound(now - windowMs, now, windowMs), false);
+
+  // Only a timestamp strictly older than the lower bound is definitively old.
+  assert.equal(isDefinitelyOlderThanWindowLowerBound(now - windowMs - 1, now, windowMs), true);
+  assert.equal(isDefinitelyOlderThanWindowLowerBound(0, now, windowMs), true);
 });

@@ -1309,6 +1309,68 @@ final class SessionSnapshotSourceTests: XCTestCase {
         XCTAssertLessThan(inspectedRows, totalRows, "must never step through the entire table once bounded")
     }
 
+    /// Regression for the "far-future sentinel treated as safe" defect:
+    /// `isRecentTimestamp` reports a far-future timestamp as "not recent"
+    /// (its future-skew tolerance rejects it), so the old sentinel check —
+    /// which called `isRecentTimestamp` and only flagged `rowLimit` when it
+    /// returned `true` — would wrongly treat a corrupted/adversarial
+    /// far-future `(cap + 1)`-th row as "safe to truncate", silently
+    /// dropping a genuinely active composer ranked behind it. Every filler
+    /// row here carries its own unique far-future `lastUpdatedAt`
+    /// (~1 year ahead of `fixedNow`), so under `ORDER BY recencyMs DESC`
+    /// they all sort ahead of the one hidden, genuinely active composer
+    /// (whose recency is the real `fixedNow`), pushing it beyond the row
+    /// cap. `isDefinitelyOlderThanWindowLowerBound` must still recognize
+    /// the far-future sentinel as inconclusive (not "definitely old") and
+    /// the scan must fail closed with `.rowLimit` rather than silently
+    /// reporting an empty/partial result.
+    func testCursorRowLimitStillThrowsWhenThousandsOfRowsCarryAFarFutureRecency() throws {
+        let home = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let dbURL = home
+            .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+        makeEmptyCursorFixtureDatabase(at: dbURL)
+
+        let farFutureBase = fixedNow + 365 * 24 * 60 * 60 * 1000
+        let totalRows = cursorMaximumInspectedRows + 50
+        var records: [(key: String, value: String)] = []
+        for index in 0..<totalRows {
+            records.append((
+                key: String(format: "composerData:future-%05d", index),
+                value: #"{"status":"completed","lastUpdatedAt":\#(farFutureBase + Int64(index))}"#
+            ))
+        }
+        // Hidden, genuinely active composer: ranks behind every far-future
+        // filler row above and so falls beyond the row cap.
+        records.append((
+            key: "composerData:hidden-active",
+            value: #"{"status":"generating","lastUpdatedAt":\#(fixedNow)}"#
+        ))
+        insertManyCursorFixtureRecords(at: dbURL, records: records)
+
+        let fd = try XCTUnwrap(SessionSnapshotSource.openVerifiedRegularFile(at: dbURL.path, root: canonicalRoot(home)))
+        defer { close(fd) }
+
+        var inspectedRows = 0
+        do {
+            _ = try SessionSnapshotSource.queryCursorComposers(
+                fd: fd,
+                validatedPath: dbURL.path,
+                now: fixedNow,
+                onRowInspected: { inspectedRows += 1 }
+            )
+            XCTFail("a far-future sentinel must fail the scan instead of being wrongly treated as provably old/safe")
+        } catch let error as CursorSessionScanError {
+            XCTAssertEqual(error, .scanIncomplete(reason: .rowLimit))
+        } catch {
+            XCTFail("expected typed CursorSessionScanError, got \(error)")
+        }
+
+        XCTAssertGreaterThan(inspectedRows, 0)
+        XCTAssertLessThanOrEqual(inspectedRows, cursorMaximumInspectedRows)
+        XCTAssertLessThan(inspectedRows, totalRows, "must never step through the entire table once bounded")
+    }
+
     /// "target" gets the lowest `rowid` (inserted first) with an old value,
     /// then `cursorMaximumInspectedRows` filler rows are inserted after it
     /// (all higher `rowid`s, equally old/non-active), then "target" is

@@ -396,6 +396,56 @@ export function isRecentTimestamp(
   );
 }
 
+/**
+ * Overflow-safe "definitely older than the candidate window's lower bound"
+ * predicate — deliberately distinct from `isRecentTimestamp` above, and
+ * *not* its logical negation. A row-limit truncation sentinel (the
+ * (cap + 1)-th row, ordered newest-first by recency, that a bounded scan
+ * peeks at without ever assessing) is only safe to treat as proof every
+ * omitted row beyond it is no newer when this sentinel's own timestamp is
+ * conclusively older than `now - windowMs`. Three other cases must all stay
+ * *inconclusive* (return `false`) rather than being waved through as safe:
+ *  - missing/unrankable (the caller must not even call this for a `null`
+ *    sentinel — see every call site below),
+ *  - recent (inside the window — the row could plausibly still be active),
+ *  - and, critically, too-far-future: `isRecentTimestamp` itself reports a
+ *    far-future timestamp as **not** recent (its `age >= -timestampFutureSkewMs`
+ *    check fails for `age` far below zero), so naively treating
+ *    "not recent" as "safe to truncate" would let a corrupt or adversarial
+ *    far-future recency value rank thousands of rows ahead of a genuinely
+ *    active composer, push that composer's row past the cap, and then have
+ *    the future-dated sentinel wrongly bless the truncation as safe. This
+ *    function requires the sentinel to be on the *old* side of the window's
+ *    lower bound specifically, not merely "not recent" by any other
+ *    definition.
+ *
+ * `windowMs`/`maxSupportedTimestampMs` are real trailing parameters for the
+ * same reason as `isRecentTimestamp`'s (see its comment above) — the Cursor
+ * SQLite worker driver's `toString()`-reconstructed call site always passes
+ * both explicitly.
+ */
+export function isDefinitelyOlderThanWindowLowerBound(
+  timestampMs: number,
+  now: number,
+  windowMs: number,
+  maxSupportedTimestampMs: number = MAX_SUPPORTED_TIMESTAMP_MS,
+): boolean {
+  if (
+    !Number.isFinite(timestampMs) ||
+    !Number.isFinite(now) ||
+    !Number.isFinite(windowMs) ||
+    Math.abs(timestampMs) > maxSupportedTimestampMs ||
+    Math.abs(now) > maxSupportedTimestampMs ||
+    windowMs < 0 ||
+    windowMs > maxSupportedTimestampMs
+  ) {
+    return false;
+  }
+
+  const lowerBoundMs = now - windowMs;
+  return Number.isFinite(lowerBoundMs) && timestampMs < lowerBoundMs;
+}
+
 export function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" ? (value as Record<string, unknown>) : null;
 }
@@ -941,17 +991,19 @@ export const CURSOR_TIMESTAMP_FIELDS_BY_PRIORITY = [
  *       `parseCursorTimestamp` accepts that can make a composer active:
  *       a JSON number (seconds when `<= secondsThresholdMs`, else already
  *       milliseconds — mirroring the `> 1e12` heuristic exactly) or a JSON
- *       string in strict `YYYY-MM-DDTHH:MM:SS[.fff...](Z|±HH:MM)` form —
- *       the one string shape empirically confirmed to parse to the exact
- *       same millisecond value under both this codebase's TS parser
- *       (`Date.parse`) and its Swift parser (`Date.ISO8601FormatStyle`).
- *       Any other string (zone-less, date-only, lower-case `t`/`z`,
+ *       string matching `isCanonicalCursorIsoTimestamp`'s exact
+ *       `YYYY-MM-DDTHH:MM:SS[.fraction](Z|±HH:MM)` grammar — the one string
+ *       shape confirmed to parse to the exact same millisecond value under
+ *       both this codebase's TS parser (`Date.parse`, gated by that same
+ *       shape guard) and its Swift parser (`Date.ISO8601FormatStyle`). Any
+ *       other string (zone-less, date-only, lower-case `t`/`z`,
  *       space-separated, no-seconds, or otherwise lenient-but-ambiguous
- *       `Date.parse` shapes) is deliberately left unrankable here: real
- *       Cursor data only ever emits epoch-millisecond numbers on disk, so
- *       this restriction never under-ranks genuine data, and Swift's
- *       stricter ISO 8601 parser flatly rejects several of those shapes
- *       anyway, so ranking on them could silently diverge between engines.
+ *       `Date.parse` shapes) is unrankable here for the same reason it is
+ *       unparseable to `parseCursorTimestamp` itself: real Cursor data only
+ *       ever emits epoch-millisecond numbers on disk, so this restriction
+ *       never under-ranks genuine data, and Swift's stricter ISO 8601
+ *       parser flatly rejects several of those shapes anyway, so ranking on
+ *       them could silently diverge between engines.
  *       A value that reaches SQLite's own date parser is additionally
  *       shape-guarded by `GLOB`/`substr` *before* `julianday()` ever runs,
  *       and the millisecond conversion is `ROUND`ed — confirmed empirically
@@ -1092,6 +1144,42 @@ export function isPlainCursorObject(value: unknown): value is Record<string, unk
 }
 
 /**
+ * The exact ISO-8601 string grammar `parseCursorTimestamp` accepts:
+ * `YYYY-MM-DDTHH:MM:SS[.fraction](Z|±HH:MM)`, case-sensitive `T`/`Z`
+ * (a lower-case `t` or `z` is rejected), seconds required (no date-only or
+ * minute-only shape), and no other separator (no space in place of `T`, no
+ * RFC-2822 mail-date form). This is the single canonical grammar this
+ * codebase intentionally supports for a Cursor timestamp *string* — it is
+ * deliberately narrower than what `Date.parse` alone would accept, because
+ * it must agree with two other independent parsers of the exact same
+ * on-disk value: `cursorRecencySqlExpression`'s SQL `GLOB`/`substr` shape
+ * guard (`agent-detection-policy.ts`, above) and the Swift port's
+ * `Date.ISO8601FormatStyle` (confirmed empirically to flatly reject a
+ * date-only string, a minute-only string, a space-separated string, and a
+ * lower-case `t`; it also happens to tolerate a lower-case trailing `z` as
+ * an accidental Foundation leniency, which this grammar does not mirror —
+ * real Cursor data never emits one, so rejecting it here only ever
+ * tightens, never narrows, real-world coverage, and keeps this grammar
+ * identical to the SQL guard's literal-uppercase-only `Z` check instead of
+ * introducing a third, subtly different accepted shape).
+ *
+ * Exported (not just module-private) as the one shared validator so
+ * `parseCursorTimestamp`, its test suite, and the SQL-shape parity tests
+ * all check the identical grammar rather than each restating their own
+ * regex that could silently drift out of sync with the other two.
+ * `.toString()`-reconstructible with zero free variables (the pattern is a
+ * literal inside the function body, not a top-level `const` some other
+ * bundled module's name could collide with and force a rename of — see
+ * `isRecentTimestamp`'s comment for why that matters to the Cursor worker
+ * driver), so it is safe to call directly (as a same-module free-variable
+ * reference, like every other cross-function call in this file) from
+ * `parseCursorTimestamp` below.
+ */
+export function isCanonicalCursorIsoTimestamp(value: string): boolean {
+  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/.test(value);
+}
+
+/**
  * Exported (see `isRecentTimestamp`'s comment) so `agent-detector.ts`'s
  * Cursor worker driver can both `.toString()`-reconstruct this function and
  * pass `maxSupportedTimestampMs` explicitly at every internal call site
@@ -1105,7 +1193,13 @@ export function parseCursorTimestamp(
   let parsed: number;
   if (typeof value === "number" && Number.isFinite(value)) {
     parsed = value > 1e12 ? value : value * 1000;
-  } else if (typeof value === "string" && value.trim()) {
+  } else if (typeof value === "string" && isCanonicalCursorIsoTimestamp(value)) {
+    // `Date.parse` is otherwise unrestricted (RFC-2822, date-only,
+    // space-separated, lower-case `t`/`z`, minute-only, and more) — the
+    // `isCanonicalCursorIsoTimestamp` guard above is what actually narrows
+    // acceptance to the one grammar this parser intentionally supports;
+    // `Date.parse` on an already-shape-validated string only ever
+    // computes the millisecond value.
     parsed = Date.parse(value);
   } else {
     return null;

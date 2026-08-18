@@ -1261,13 +1261,15 @@ final class TurnAssessorsTests: XCTestCase {
         XCTAssertEqual(assessedOutOfRange, 0)
     }
 
-    /// Unlike TS (`Date.parse` happily accepts a bare date-only string — see
-    /// `agent-detection-parity.test.mjs`'s documented divergence test),
     /// Swift's `Date.ISO8601FormatStyle` flatly rejects `"2024-01-15"`
     /// (confirmed empirically: both the fractional- and
-    /// non-fractional-seconds style variants fail to parse it), so on this
-    /// platform SQL and the assessor already agree with no exception needed:
-    /// both treat a date-only string as unrankable/non-activity-bearing.
+    /// non-fractional-seconds style variants fail to parse it). TS's
+    /// isCanonicalCursorIsoTimestamp grammar guard (see
+    /// agent-detection-policy.ts and agent-detection-parity.test.mjs) now
+    /// enforces the identical canonical-ISO-8601 grammar ahead of
+    /// parseCursorTimestamp, so on both platforms SQL and the assessor agree
+    /// with no exception needed: both treat a date-only string as
+    /// unrankable/non-activity-bearing.
     func testCursorSQLRecencyAndAssessorAgreeDateOnlyStringsAreUnrankable() throws {
         let now: Int64 = 1_786_449_620_000
         XCTAssertNil(parseISO8601ToMs("2024-01-15"), "Swift's ISO8601FormatStyle must reject a date-only string")

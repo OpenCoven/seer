@@ -33,6 +33,8 @@ import {
   cursorRelevantBubbleIds,
   friendlySessionLabel,
   humanizeProjectName,
+  isCanonicalCursorIsoTimestamp,
+  isDefinitelyOlderThanWindowLowerBound,
   isPlainCursorObject,
   isRecentTimestamp,
   malformedCursorAssessment,
@@ -428,6 +430,7 @@ type CursorWorkerMessage =
  */
 const CURSOR_WORKER_POLICY_FUNCTIONS = [
   isPlainCursorObject,
+  isCanonicalCursorIsoTimestamp,
   parseCursorTimestamp,
   validateOptionalString,
   validateCursorRecordFields,
@@ -440,6 +443,7 @@ const CURSOR_WORKER_POLICY_FUNCTIONS = [
   cursorHeaderGrouping,
   parseTimestamp,
   isRecentTimestamp,
+  isDefinitelyOlderThanWindowLowerBound,
   cursorRelevantBubbleIds,
   assessValidatedCursorComposerRecord,
   assessCursorComposerRecord,
@@ -615,22 +619,29 @@ if (db) {
         // Pure existence+recency sentinel, the (cap + 1)-th matching row:
         // never assessed, returned, or counted as inspected. Rows are
         // already ordered newest-first by validated JSON recency (rowid
-        // only breaks ties), so if even this cut-off candidate's own
-        // timestamp is too old (or absent/malformed) to plausibly still be
-        // active, every omitted row beyond it is provably no newer either
-        // — accept the newest maxInspectedRows instead of treating "more
-        // history exists" alone as a failure.
+        // only breaks ties), so truncation is only ever safe when this
+        // cut-off candidate's own timestamp is *definitively* older than
+        // the candidate window's lower bound — every omitted row beyond it
+        // is then provably no newer either, so the newest maxInspectedRows
+        // can be accepted instead of treating "more history exists" alone
+        // as a failure. A missing/unrankable, recent, OR too-far-future
+        // sentinel must all stay inconclusive ("rowLimit"): using
+        // isRecentTimestamp here (and trusting its "not recent" result as
+        // "safe") would be wrong specifically for a far-future sentinel —
+        // isRecentTimestamp reports a far-future timestamp as not recent
+        // too, which would wrongly bless truncation as safe even though a
+        // corrupt/adversarial far-future recency value could rank ahead of,
+        // and thereby hide, a genuinely active composer beyond the cap.
         const sentinelRecencyMs = typeof row.recencyMs === "number" ? row.recencyMs : null;
-        if (
+        const sentinelDefinitelyOld =
           sentinelRecencyMs !== null &&
-          isRecentTimestamp(
+          isDefinitelyOlderThanWindowLowerBound(
             sentinelRecencyMs,
             workerData.now,
             workerData.sessionCandidateWindowMs,
-            workerData.timestampFutureSkewMs,
             workerData.maxSupportedTimestampMs,
-          )
-        ) {
+          );
+        if (!sentinelDefinitelyOld) {
           stopReason = "rowLimit";
         }
         break;

@@ -411,6 +411,57 @@ test("Cursor row limit still throws when the cut-off candidate could plausibly s
   });
 });
 
+// MARK: - Cursor row limit: overflow-safe lower-bound comparison
+// (`isDefinitelyOlderThanWindowLowerBound`), not `isRecentTimestamp`.
+//
+// `isRecentTimestamp` reports a far-future timestamp as "not recent" too
+// (its future-skew tolerance rejects anything more than a few seconds
+// ahead of `now`), which is a completely different claim from "this
+// candidate is definitively older than the window's lower bound". Treating
+// "not recent" as "safe to truncate" is exactly the bug: a corrupt or
+// adversarial far-future recency value ranks *ahead* of a genuinely active,
+// present-day composer (SQL `ORDER BY recencyMs DESC` puts the larger,
+// future value first), pushing the real composer past
+// `CURSOR_MAX_INSPECTED_ROWS` — and then the future-dated sentinel would
+// wrongly bless the truncation as safe, permanently and silently dropping
+// the only genuinely active row in the whole table.
+
+test("Cursor row limit still throws (never silently drops a hidden active composer) when 2000+ rows carry a far-future recency", async () => {
+  await withDatabase(async (database) => {
+    // Comfortably more than CURSOR_MAX_INSPECTED_ROWS, every one a
+    // "completed" (never itself active) composer with its own unique
+    // far-future timestamp — about a year ahead of `now`, well beyond both
+    // TIMESTAMP_FUTURE_SKEW_MS and SESSION_CANDIDATE_WINDOW_MS in the
+    // future direction. Ordered newest-first by recency, every one of
+    // these ranks ahead of a real "now"-timestamped composer.
+    const farFutureMs = now + 365 * 24 * 60 * 60 * 1000;
+    const totalRows = CURSOR_MAX_INSPECTED_ROWS + 50;
+    const rows = Array.from({ length: totalRows }, (_, index) => ({
+      key: `composerData:future-${String(index).padStart(5, "0")}`,
+      value: `{"status":"completed","lastUpdatedAt":${farFutureMs + index}}`,
+    }));
+    // A hidden, genuinely active composer: a real, current "now" timestamp.
+    // Its recency is strictly smaller than every future-dated filler row
+    // above, so it necessarily sorts behind all of them and falls beyond
+    // CURSOR_MAX_INSPECTED_ROWS — exactly the scenario a truncation-safety
+    // check must never wave through as safe.
+    rows.push({
+      key: "composerData:hidden-active",
+      value: `{"status":"generating","lastUpdatedAt":${now}}`,
+    });
+    insertManyRowsFast(database, rows);
+
+    await assert.rejects(
+      () => detectCursorComposerActivity(now, database),
+      (error: unknown) => {
+        assert.ok(error instanceof CursorSessionScanError);
+        assert.equal(error.reason, "rowLimit");
+        return true;
+      },
+    );
+  });
+});
+
 test("Cursor recency ordering ranks an updated old-rowid composer above stale high-rowid composers", async () => {
   await withDatabase(async (database) => {
     // "target" gets the lowest rowid (inserted first) with an old value.
@@ -586,6 +637,70 @@ test("Cursor row limit recovers when thousands of old rows carry only header-der
     const active = await detectCursorComposerActivity(now, database);
 
     assert.deepEqual(active.map(({ identity }) => identity), ["z-active"]);
+  });
+});
+
+// MARK: - Cursor row limit + canonical ISO-8601 grammar: previously-lenient
+// string timestamp shapes (issue: `parseCursorTimestamp` used unrestricted
+// `Date.parse`, so a lower-case `t`/`z`, date-only, space-separated, or
+// no-seconds string could make the TS assessor call a composer "active"
+// even though `cursorRecencySqlExpression`'s SQL shape guard (and Swift's
+// `Date.ISO8601FormatStyle`) already rejected the exact same value as
+// unrankable) must never surface as an active composer, while a genuinely
+// canonical ISO string timestamp remains detected in the very same scan.
+
+test("Cursor row limit: previously-lenient ISO string timestamps never surface as an active composer, and a canonical ISO string root timestamp is still detected among 2000+ older rows", async () => {
+  await withDatabase(async (database) => {
+    const isoNow = new Date(now).toISOString();
+    assert.match(isoNow, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+
+    // Every one of these previously parsed successfully (to exactly `now`)
+    // under an unrestricted `Date.parse`-backed `parseCursorTimestamp` — an
+    // old, over-lenient parser would have called each of these composers
+    // "active". `isCanonicalCursorIsoTimestamp` now rejects all of them, so
+    // `validateCursorRecordFields` rejects the whole record as malformed
+    // before "generating" status is ever consulted. Inserted first (lowest
+    // rowid) so rowid ordering cannot accidentally save any of them either.
+    insertRows(database, [
+      {
+        key: "composerData:lenient-lowercase-z",
+        value: JSON.stringify({ status: "generating", lastUpdatedAt: isoNow.replace("Z", "z") }),
+      },
+      {
+        key: "composerData:lenient-lowercase-t",
+        value: JSON.stringify({ status: "generating", lastUpdatedAt: isoNow.replace("T", "t") }),
+      },
+      {
+        key: "composerData:lenient-space-separated",
+        value: JSON.stringify({ status: "generating", lastUpdatedAt: isoNow.replace("T", " ") }),
+      },
+      {
+        key: "composerData:lenient-date-only",
+        value: JSON.stringify({ status: "generating", lastUpdatedAt: isoNow.slice(0, 10) }),
+      },
+      {
+        key: "composerData:lenient-no-seconds",
+        value: JSON.stringify({ status: "generating", lastUpdatedAt: `${isoNow.slice(0, 16)}Z` }),
+      },
+      // A genuinely canonical ISO string root timestamp — the one shape
+      // this grammar DOES accept — must still be found despite sharing the
+      // same scan with the rejected shapes above and 2000+ older rows below.
+      {
+        key: "composerData:canonical-string-active",
+        value: JSON.stringify({ status: "generating", lastUpdatedAt: isoNow }),
+      },
+    ]);
+
+    const totalRows = CURSOR_MAX_INSPECTED_ROWS + 50;
+    const filler = Array.from({ length: totalRows }, (_, index) => ({
+      key: `composerData:old-${String(index).padStart(5, "0")}`,
+      value: '{"status":"completed","lastUpdatedAt":0}',
+    }));
+    insertManyRowsFast(database, filler);
+
+    const active = await detectCursorComposerActivity(now, database);
+
+    assert.deepEqual(active.map(({ identity }) => identity), ["canonical-string-active"]);
   });
 });
 

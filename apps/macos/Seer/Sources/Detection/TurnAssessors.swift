@@ -105,6 +105,31 @@ public func isRecentTimestamp(_ timestampMs: Int64, now: Int64, within graceMs: 
     return age >= -timestampFutureSkewMs && age <= graceMs
 }
 
+/// Overflow-safe "definitely older than the candidate window's lower
+/// bound" predicate — deliberately distinct from `isRecentTimestamp` above,
+/// and *not* its logical negation. A row-limit truncation sentinel (the
+/// (cap + 1)-th row, ordered newest-first by recency, that a bounded scan
+/// peeks at without ever assessing) is only safe to treat as proof every
+/// omitted row beyond it is no newer when this sentinel's own timestamp is
+/// conclusively older than `now - windowMs`. A missing/unrankable, recent,
+/// or too-far-future sentinel must all stay inconclusive (return `false`):
+/// `isRecentTimestamp` itself reports a far-future timestamp as **not**
+/// recent (its `age >= -timestampFutureSkewMs` check fails for `age` far
+/// below zero), so naively treating "not recent" as "safe to truncate"
+/// would let a corrupt/adversarial far-future recency value rank ahead of,
+/// and thereby hide, a genuinely active composer beyond the cap. This
+/// function requires the sentinel to be on the *old* side of the window's
+/// lower bound specifically, not merely "not recent" by any other
+/// definition. `now - windowMs` is computed with the same saturating
+/// subtraction used elsewhere in this file so an extreme `now`/`windowMs`
+/// degrades to a sensible (never-crossable, so `false`-yielding) bound
+/// rather than trapping.
+public func isDefinitelyOlderThanWindowLowerBound(_ timestampMs: Int64, now: Int64, within windowMs: Int64) -> Bool {
+    guard windowMs >= 0 else { return false }
+    let lowerBoundMs = saturatingSubtract(now, windowMs)
+    return timestampMs < lowerBoundMs
+}
+
 struct ISO8601TimestampParser: Sendable {
     typealias StrategyFactory = @Sendable (Bool) -> Date.ISO8601FormatStyle
 
