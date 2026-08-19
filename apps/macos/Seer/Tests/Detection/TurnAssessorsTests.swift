@@ -1548,14 +1548,14 @@ final class TurnAssessorsTests: XCTestCase {
         // this particular shape, so it is listed separately rather than
         // asserted as "Foundation accepts this".
         // Mirrors `tests/agent-detection-parity.test.mjs`'s exact two
-        // Unicode-decimal-digit fixtures (fullwidth and Devanagari-ish) byte
+        // Unicode-decimal-digit fixtures (fullwidth and Devanagari) byte
         // for byte, so both suites test the identical `\d`-vs-`Nd` gate
         // divergence rather than each asserting a differently-shaped
         // "some Unicode digit" case that could pass here while a
         // genuinely-differently-behaving codepoint slipped through on the
         // other platform.
         let unicodeDigitYear = "\u{FF12}\u{FF10}\u{FF12}\u{FF14}-01-15T10:20:30Z" // fullwidth "2024"
-        let devanagariDigitYear = "\u{0966}\u{0968}\u{0970}\u{096A}-01-15T10:20:30Z" // Devanagari-ish digits
+        let devanagariDigitYear = "\u{0966}\u{0968}\u{0969}\u{096A}-01-15T10:20:30Z" // Devanagari digits
 
         let allInvalidCases =
             acceptedByFoundationAlone + alreadyRejectedByFoundation + [unicodeDigitYear, devanagariDigitYear]

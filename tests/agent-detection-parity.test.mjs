@@ -1045,7 +1045,7 @@ test("Cursor canonical ISO grammar rejects every invalid calendar/range componen
     // 0-9. This is the exact `NSRegularExpression`/ICU `\d` divergence:
     // `\d` in that engine matches any Unicode `Nd`-category code point.
     "\uFF12\uFF10\uFF12\uFF14-01-15T10:20:30Z", // fullwidth "2024"
-    "\u0966\u0968\u0970\u096A-01-15T10:20:30Z", // Devanagari-ish digits
+    "\u0966\u0968\u0969\u096A-01-15T10:20:30Z", // Devanagari digits
     // Case-sensitivity: only upper-case "T"/"Z" are canonical.
     "2024-01-15t10:20:30Z",
     "2024-01-15T10:20:30z",
