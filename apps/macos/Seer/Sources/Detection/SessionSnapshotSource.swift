@@ -825,12 +825,18 @@ enum SessionSnapshotSource {
             guard let newline = completeLines.firstIndex(of: 0x0A) else { return [] }
             completeLines = completeLines.subdata(in: completeLines.index(after: newline)..<completeLines.endIndex)
         }
-        guard let text = String(data: completeLines, encoding: .utf8) else { return [] }
+        let text = String(decoding: completeLines, as: UTF8.self)
         let lines = text.components(separatedBy: "\n")
+        // ECMAScript WhiteSpace + LineTerminator, kept exact for TS parity.
+        let javascriptTrimCharacters = CharacterSet(
+            charactersIn: "\u{0009}\u{000A}\u{000B}\u{000C}\u{000D}\u{0020}\u{00A0}\u{1680}"
+                + "\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200A}"
+                + "\u{2028}\u{2029}\u{202F}\u{205F}\u{3000}\u{FEFF}"
+        )
 
         var events: [JSONObject] = []
         for line in lines {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            let trimmed = line.trimmingCharacters(in: javascriptTrimCharacters)
             guard trimmed.hasPrefix("{") else { continue }
             guard let lineData = trimmed.data(using: .utf8) else { continue }
             guard let object = (try? JSONSerialization.jsonObject(with: lineData)) as? JSONObject else { continue }

@@ -441,6 +441,56 @@ final class SessionSnapshotSourceTests: XCTestCase {
         XCTAssertEqual(events.first?["kept"] as? String, "🧙 café €")
     }
 
+    func testParseTailLinesKeepsValidEventsAroundInvalidUTF8Line() {
+        var data = Data("{\"before\":1}\n".utf8)
+        data.append(contentsOf: [0xFF, 0xFE, 0x0A])
+        data.append(Data("{\"after\":2}\n".utf8))
+
+        let events = SessionSnapshotSource.parseTailLines(data, droppedPartialFirstLine: false)
+
+        XCTAssertEqual(events.count, 2)
+        XCTAssertEqual(events[0]["before"] as? Int, 1)
+        XCTAssertEqual(events[1]["after"] as? Int, 2)
+    }
+
+    func testParseTailLinesKeepsCompleteEventBeforeIncompleteUTF8AtEOF() {
+        for incompleteScalar in [[UInt8](arrayLiteral: 0xC3), [0xE2, 0x82], [0xF0, 0x9F, 0xA7]] {
+            var data = Data("{\"kept\":1}\n{\"partial\":\"".utf8)
+            data.append(contentsOf: incompleteScalar)
+
+            let events = SessionSnapshotSource.parseTailLines(data, droppedPartialFirstLine: false)
+
+            XCTAssertEqual(events.count, 1)
+            XCTAssertEqual(events.first?["kept"] as? Int, 1)
+        }
+    }
+
+    func testParseTailLinesMatchesLenientUTF8ReplacementInsideJSONString() {
+        var data = Data("{\"message\":\"before ".utf8)
+        data.append(0xFF)
+        data.append(Data(" after\"}\n".utf8))
+
+        let events = SessionSnapshotSource.parseTailLines(data, droppedPartialFirstLine: false)
+
+        XCTAssertEqual(events.first?["message"] as? String, "before \u{FFFD} after")
+    }
+
+    func testParseTailLinesTrimsJavaScriptBOMWhitespace() {
+        let data = Data("\u{FEFF}  {\"kept\":1}\u{FEFF}\n".utf8)
+
+        let events = SessionSnapshotSource.parseTailLines(data, droppedPartialFirstLine: false)
+
+        XCTAssertEqual(events.first?["kept"] as? Int, 1)
+    }
+
+    func testParseTailLinesDoesNotTrimNELThatJavaScriptTrimRejects() {
+        let data = Data("\u{0085}{\"mustNotParse\":1}\n".utf8)
+
+        let events = SessionSnapshotSource.parseTailLines(data, droppedPartialFirstLine: false)
+
+        XCTAssertTrue(events.isEmpty)
+    }
+
     func testReadHeadIsBoundedAndExtractsCodexCwd() throws {
         let base = makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: base) }
