@@ -146,7 +146,37 @@ func cursorCanonicalIsoToEpochMsXFunc(
         sqlite3_result_null(context)
         return
     }
-    let value = String(cString: textPointer)
+    // `String(cString:)` stops at the first NUL byte (`strlen` semantics),
+    // silently discarding an embedded NUL *and every byte after it* — a
+    // JSON string like `"2024-01-15T10:20:30Z\u0000malicious-suffix"`
+    // (a real, common shape: any JSON string may legally embed `\u0000`)
+    // would decode to just `"2024-01-15T10:20:30Z"`, a value the grammar
+    // considers perfectly valid, even though the *actual* SQLite text this
+    // callback received is longer and the trailing bytes were never
+    // inspected at all. TS/`node:sqlite` never has this problem (JS
+    // strings preserve embedded NULs natively), so this truncation was a
+    // genuine Swift-only divergence from the "reject anything the parser
+    // would reject" contract every other case in this file already
+    // upholds. `sqlite3_value_bytes` reports the value's *exact* byte
+    // length (never NUL-terminated/`strlen`-based), so decoding through it
+    // instead — via `Data`, never `String(cString:)` — preserves every
+    // byte, including an embedded NUL and anything after it, and
+    // `String(decoding:as:)`'s siblings would silently replace invalid
+    // UTF-8 with U+FFFD rather than fail, so `String(bytes:encoding:)` is
+    // used instead: it returns `nil` (never a lossy/garbled string) for
+    // any byte sequence that is not valid UTF-8, letting that guard fall
+    // straight through to the same `sqlite3_result_null` as every other
+    // rejection here.
+    let byteCount = sqlite3_value_bytes(argv[0])
+    guard byteCount >= 0 else {
+        sqlite3_result_null(context)
+        return
+    }
+    let data = Data(bytes: textPointer, count: Int(byteCount))
+    guard let value = String(data: data, encoding: .utf8) else {
+        sqlite3_result_null(context)
+        return
+    }
     let minYear = Int(sqlite3_value_int64(argv[1]))
     let maxYear = Int(sqlite3_value_int64(argv[2]))
     let maxOffsetMinutes = Int(sqlite3_value_int64(argv[3]))

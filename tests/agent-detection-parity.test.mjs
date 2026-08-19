@@ -711,6 +711,38 @@ test("Cursor SQL recency is unrankable (NULL) for malformed/unparseable records,
   assert.equal(sqlRecencyForRawValue(""), null);
 });
 
+test("Cursor SQL recency and the assessor both reject a timestamp string carrying an embedded NUL (JSON's escaped \\u0000) suffix", () => {
+  // `JSON.stringify` always escapes an embedded U+0000 as the six
+  // characters `\u0000` in the raw JSON text — never a literal NUL byte —
+  // so the row this produces on the wire looks like ordinary JSON. Only
+  // after `json_extract` unescapes that sequence does the *extracted*
+  // SQLite text value contain a real embedded NUL byte followed by
+  // "malicious-suffix", exactly the shape a naive `strlen`/C-string-based
+  // decode (e.g. Swift's `String(cString:)`) would truncate at the NUL,
+  // silently handing the *truncated-but-otherwise-valid* prefix
+  // "2024-01-15T10:20:30Z" to the parser instead of the real, longer,
+  // ungrammatical value — this is the exact defect
+  // `cursorCanonicalIsoToEpochMsXFunc` (Swift) must not have: it must
+  // decode via `sqlite3_value_bytes`'s explicit length into `Data`/`String`,
+  // never `String(cString:)`, so the embedded NUL and every suffix byte
+  // survive to the grammar's whole-string `$` anchor and get rejected.
+  // TS never had this failure mode (JS strings preserve embedded NULs
+  // natively, and the regex's `$` anchor with no `/m` flag already refuses
+  // any trailing content), but this case is asserted here too so both
+  // suites share one proven fixture rather than TS's safety being assumed
+  // rather than tested.
+  const embeddedNulValue = "2024-01-15T10:20:30Z\u0000malicious-suffix";
+  assert.equal(isCanonicalCursorIsoTimestamp(embeddedNulValue), false);
+  assert.equal(parseCursorTimestamp(embeddedNulValue), null);
+  assert.equal(parseCanonicalCursorIsoComponents(embeddedNulValue), null);
+
+  const record = { status: "generating", lastUpdatedAt: embeddedNulValue };
+  const raw = JSON.stringify(record);
+  assert.ok(raw.includes("\\u0000"), "fixture assumption: JSON.stringify must escape the embedded NUL as \\u0000 text, never a literal byte");
+  assert.equal(sqlRecencyFor(record), null, raw);
+  assert.equal(assessedLastActivityAt(record), 0, raw);
+});
+
 test("Cursor SQL recency matches the assessor for a future-skewed timestamp, and is unrankable (not a defaulted 0) for one beyond the supported bound", () => {
   for (const futureMs of [now + 60_000, now + 86_400_000, MAX_SUPPORTED_TIMESTAMP_MS - 1]) {
     // lastActivityAt itself is never clamped by "is this in the future" —

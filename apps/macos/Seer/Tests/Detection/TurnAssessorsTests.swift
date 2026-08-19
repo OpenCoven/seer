@@ -1547,9 +1547,18 @@ final class TurnAssessorsTests: XCTestCase {
         // but Foundation's own downstream parse happens to still reject
         // this particular shape, so it is listed separately rather than
         // asserted as "Foundation accepts this".
+        // Mirrors `tests/agent-detection-parity.test.mjs`'s exact two
+        // Unicode-decimal-digit fixtures (fullwidth and Devanagari-ish) byte
+        // for byte, so both suites test the identical `\d`-vs-`Nd` gate
+        // divergence rather than each asserting a differently-shaped
+        // "some Unicode digit" case that could pass here while a
+        // genuinely-differently-behaving codepoint slipped through on the
+        // other platform.
         let unicodeDigitYear = "\u{FF12}\u{FF10}\u{FF12}\u{FF14}-01-15T10:20:30Z" // fullwidth "2024"
+        let devanagariDigitYear = "\u{0966}\u{0968}\u{0970}\u{096A}-01-15T10:20:30Z" // Devanagari-ish digits
 
-        let allInvalidCases = acceptedByFoundationAlone + alreadyRejectedByFoundation + [unicodeDigitYear]
+        let allInvalidCases =
+            acceptedByFoundationAlone + alreadyRejectedByFoundation + [unicodeDigitYear, devanagariDigitYear]
         for value in allInvalidCases {
             XCTAssertFalse(isCanonicalCursorIsoTimestamp(value), value)
             XCTAssertNil(parseCanonicalCursorIsoComponents(value), value)
@@ -1590,6 +1599,38 @@ final class TurnAssessorsTests: XCTestCase {
             let assessed = try assessedLastActivityAt(forValueJSON: valueJSON, now: testCase.expectedMs)
             XCTAssertEqual(assessed, testCase.expectedMs, testCase.label)
         }
+    }
+
+    /// Mirrors `tests/agent-detection-parity.test.mjs`'s "Cursor SQL recency
+    /// and the assessor both reject a timestamp string carrying an embedded
+    /// NUL (JSON's escaped `\u0000`) suffix" case. A JS/JSON `\u0000`
+    /// escape always denotes a real embedded NUL *codepoint*, never a
+    /// literal 6-character sequence in the parsed string, so `valueJSON`
+    /// below spells that escape out literally (`\u0000`, not Swift's own
+    /// `\u{0000}` interpolation) — exactly the bytes `JSON.stringify` would
+    /// have produced on the wire — while `embeddedNulValue` (fed directly
+    /// to the Swift-native parser functions) uses Swift's own `\u{0000}`
+    /// escape to construct the equivalent in-memory `String` with a real
+    /// embedded NUL, the twin of the TS test's JS string literal.
+    ///
+    /// This is the exact case `cursorCanonicalIsoToEpochMsXFunc` must get
+    /// right by decoding via `sqlite3_value_bytes`'s explicit length into
+    /// `Data`/`String` rather than `String(cString:)`: after `json_extract`
+    /// unescapes `\u0000` back into a real NUL byte, a `strlen`-based
+    /// decode would silently truncate to the valid-looking prefix
+    /// "2024-01-15T10:20:30Z" and accept it, instead of seeing the full,
+    /// ungrammatical value (with "malicious-suffix" trailing the NUL) the
+    /// byte-level parser and TS/SQL both correctly reject.
+    func testCursorCanonicalIsoGrammarRejectsEmbeddedNulSuffix() throws {
+        let embeddedNulValue = "2024-01-15T10:20:30Z\u{0000}malicious-suffix"
+        XCTAssertFalse(isCanonicalCursorIsoTimestamp(embeddedNulValue))
+        XCTAssertNil(parseCanonicalCursorIsoComponents(embeddedNulValue))
+
+        let valueJSON =
+            #"{"status":"generating","lastUpdatedAt":"2024-01-15T10:20:30Z\u0000malicious-suffix"}"#
+        XCTAssertNil(sqlRecency(forValueJSON: valueJSON))
+        let assessed = try assessedLastActivityAt(forValueJSON: valueJSON, now: 1_705_314_030_000)
+        XCTAssertEqual(assessed, 0)
     }
 
     // MARK: - Cursor row-limit truncation safety at the exact window
