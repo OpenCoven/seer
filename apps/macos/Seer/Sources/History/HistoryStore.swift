@@ -491,6 +491,8 @@ public actor HistoryStore {
                 if delta > 0 {
                     applyDelta(delta, state: state, now: now)
                     await scheduleSaveIfNeeded()
+                } else if current?.mode != state.keepAwakeMode {
+                    current?.mode = state.keepAwakeMode
                 }
             }
         } else if current != nil {

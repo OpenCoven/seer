@@ -279,10 +279,54 @@ final class AppSnapshotCoordinatorTests: XCTestCase {
         await coordinator.applyScanFailure(occurredAt: clock.now)
 
         XCTAssertFalse(coordinator.snapshot.monitor.active)
-        XCTAssertTrue(coordinator.snapshot.monitor.keepingAwake)
+        XCTAssertFalse(coordinator.snapshot.monitor.keepingAwake)
         XCTAssertEqual(coordinator.snapshot.history.totalAwakeMs, 5_000)
-        XCTAssertEqual(coordinator.snapshot.history.currentSession?.durationMs, 5_000)
-        XCTAssertEqual(powerBackend.releasedIDs, [1], "a failed scan must not retry or replace the retained assertion")
+        XCTAssertNil(coordinator.snapshot.history.currentSession)
+        XCTAssertEqual(coordinator.snapshot.history.recentSessions.first?.durationMs, 5_000)
+        XCTAssertEqual(powerBackend.releasedIDs, [1, 1], "a failed scan retries the retained desired inactive state")
+        XCTAssertFalse(coordinator.snapshot.diagnostics.contains { $0.id == PowerDiagnosticID.assertionFailed })
+    }
+
+    func testFailedScanRetriesMissingAssertionForRetainedActiveAgents() async {
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let powerBackend = CoordinatorFakePowerBackend()
+        powerBackend.createResults = [.failure(.createFailed(ioReturnCode: -1))]
+        let (coordinator, _, _) = await makeCoordinator(clock: clock, powerBackend: powerBackend)
+
+        await coordinator.applyScan([activeAgent()], scannedAt: clock.now)
+        XCTAssertTrue(coordinator.snapshot.monitor.active)
+        XCTAssertFalse(coordinator.snapshot.monitor.keepingAwake)
+
+        clock.now += 3_000
+        await coordinator.applyScanFailure(occurredAt: clock.now)
+
+        XCTAssertTrue(coordinator.snapshot.monitor.active)
+        XCTAssertTrue(coordinator.snapshot.monitor.keepingAwake)
+        XCTAssertEqual(powerBackend.createdModes, [.system, .system])
+        XCTAssertNotNil(coordinator.snapshot.history.currentSession)
+        XCTAssertEqual(coordinator.snapshot.history.totalAwakeMs, 0)
+        XCTAssertFalse(coordinator.snapshot.diagnostics.contains { $0.id == PowerDiagnosticID.assertionFailed })
+        XCTAssertTrue(coordinator.snapshot.diagnostics.contains { $0.id == AgentMonitorDiagnosticID.scanFailed })
+    }
+
+    func testFailedScanModeRetryUpdatesCurrentHistoryModeWithoutDoubleCounting() async throws {
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let powerBackend = CoordinatorFakePowerBackend()
+        let (coordinator, _, _) = await makeCoordinator(clock: clock, powerBackend: powerBackend)
+
+        await coordinator.applyScan([activeAgent()], scannedAt: clock.now)
+        powerBackend.createResults = [.failure(.createFailed(ioReturnCode: -1))]
+        try await coordinator.setKeepAwakeMode(.display)
+        XCTAssertEqual(coordinator.snapshot.monitor.keepAwakeMode, .system)
+
+        clock.now += 2_000
+        await coordinator.applyScanFailure(occurredAt: clock.now)
+
+        XCTAssertEqual(coordinator.snapshot.monitor.keepAwakeMode, .display)
+        XCTAssertEqual(coordinator.snapshot.history.currentSession?.mode, .display)
+        XCTAssertEqual(coordinator.snapshot.history.currentSession?.durationMs, 2_000)
+        XCTAssertEqual(coordinator.snapshot.history.totalAwakeMs, 2_000)
+        XCTAssertFalse(coordinator.snapshot.diagnostics.contains { $0.id == PowerDiagnosticID.assertionFailed })
     }
 
     func testSuccessfulRecoveryAfterFailedTickDoesNotDoubleCountIt() async {

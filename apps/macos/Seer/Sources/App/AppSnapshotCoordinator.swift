@@ -668,12 +668,11 @@ public final class AppSnapshotCoordinator {
     /// misinterpreted as "zero agents active," which would falsely
     /// deactivate the power assertion and close the current history
     /// session. If the retained monitor state is still keeping the machine
-    /// awake (including an inactive state whose assertion release is
-    /// uncertain), records it as one ordinary bounded history tick so
-    /// repeated detector failures do not silently discard known-awake
-    /// time, then adds/refreshes the
-    /// `monitor.scan.failed` diagnostic. The next successful `applyScan`
-    /// clears it.
+    /// awake, records it as one ordinary bounded history tick before
+    /// retrying the retained desired power state. This preserves known-
+    /// awake time while still allowing a transient assertion creation or
+    /// release failure to recover even when detection remains unavailable.
+    /// The scan diagnostic remains until the next successful `applyScan`.
     public func applyScanFailure(occurredAt: Int64) async {
         await gate.acquire()
         await performApplyScanFailure(occurredAt: occurredAt)
@@ -693,11 +692,33 @@ public final class AppSnapshotCoordinator {
 
         if retainedMonitor.keepingAwake {
             await historyStore.record(retainedMonitor)
+        }
+
+        let requestedMode = await settingsStore.current.keepAwakeMode
+        let (keepingAwake, effectiveMode) = applyDesiredPowerState(
+            active: retainedMonitor.active,
+            mode: requestedMode,
+            occurredAt: occurredAt,
+            idsToClear: &idsToClear,
+            upserts: &upserts
+        )
+        let reconciledMonitor = AgentMonitorState(
+            active: retainedMonitor.active,
+            keepingAwake: keepingAwake,
+            keepAwakeMode: effectiveMode,
+            agents: retainedMonitor.agents,
+            lastScanAt: retainedMonitor.lastScanAt
+        )
+
+        if keepingAwake != retainedMonitor.keepingAwake || effectiveMode != retainedMonitor.keepAwakeMode {
+            await historyStore.record(reconciledMonitor)
+        }
+        if retainedMonitor.keepingAwake || keepingAwake {
             await reconcileHistoryDiagnostic(idsToClear: &idsToClear, upserts: &upserts)
             historyStats = await historyStore.stats()
         }
 
-        publish(monitor: retainedMonitor, history: historyStats, clearing: idsToClear, upserting: upserts)
+        publish(monitor: reconciledMonitor, history: historyStats, clearing: idsToClear, upserting: upserts)
     }
 
     // MARK: - Mode changes
