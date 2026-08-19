@@ -667,21 +667,37 @@ public final class AppSnapshotCoordinator {
     /// `lastScanAt`) untouched — a scan failure must never be
     /// misinterpreted as "zero agents active," which would falsely
     /// deactivate the power assertion and close the current history
-    /// session — and adds/refreshes the `monitor.scan.failed` diagnostic.
-    /// The next successful `applyScan` clears it.
+    /// session. If the retained monitor state is still keeping the machine
+    /// awake (including an inactive state whose assertion release is
+    /// uncertain), records it as one ordinary bounded history tick so
+    /// repeated detector failures do not silently discard known-awake
+    /// time, then adds/refreshes the
+    /// `monitor.scan.failed` diagnostic. The next successful `applyScan`
+    /// clears it.
     public func applyScanFailure(occurredAt: Int64) async {
         await gate.acquire()
-        performApplyScanFailure(occurredAt: occurredAt)
+        await performApplyScanFailure(occurredAt: occurredAt)
         await gate.release()
     }
 
-    private func performApplyScanFailure(occurredAt: Int64) {
+    private func performApplyScanFailure(occurredAt: Int64) async {
         let diagnostic = Diagnostic(
             id: AgentMonitorDiagnosticID.scanFailed,
             message: "Agent scan failed; retaining the last known agent state.",
             occurredAt: occurredAt
         )
-        publish(monitor: snapshot.monitor, history: snapshot.history, clearing: [], upserting: [diagnostic])
+        let retainedMonitor = snapshot.monitor
+        var historyStats = snapshot.history
+        var idsToClear: Set<String> = []
+        var upserts = [diagnostic]
+
+        if retainedMonitor.keepingAwake {
+            await historyStore.record(retainedMonitor)
+            await reconcileHistoryDiagnostic(idsToClear: &idsToClear, upserts: &upserts)
+            historyStats = await historyStore.stats()
+        }
+
+        publish(monitor: retainedMonitor, history: historyStats, clearing: idsToClear, upserting: upserts)
     }
 
     // MARK: - Mode changes

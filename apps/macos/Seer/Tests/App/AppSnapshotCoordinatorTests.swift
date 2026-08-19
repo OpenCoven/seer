@@ -232,6 +232,96 @@ final class AppSnapshotCoordinatorTests: XCTestCase {
         XCTAssertEqual(renderer.emittedSnapshots.count, 3)
     }
 
+    func testFailedActiveScanRecordsOneCappedHistoryTickWithoutTouchingPower() async {
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let (coordinator, renderer, powerBackend) = await makeCoordinator(clock: clock)
+        let agent = activeAgent()
+
+        await coordinator.applyScan([agent], scannedAt: clock.now)
+        clock.now += 30_000
+
+        await coordinator.applyScanFailure(occurredAt: clock.now)
+
+        XCTAssertEqual(coordinator.snapshot.history.totalAwakeMs, HistoryStore.maxTickDeltaMs)
+        XCTAssertEqual(coordinator.snapshot.history.currentSession?.durationMs, HistoryStore.maxTickDeltaMs)
+        XCTAssertEqual(coordinator.snapshot.history.currentSession?.agents.first?.id, agent.id)
+        XCTAssertTrue(coordinator.snapshot.monitor.active)
+        XCTAssertTrue(coordinator.snapshot.monitor.keepingAwake)
+        XCTAssertEqual(powerBackend.createdModes.count, 1)
+        XCTAssertEqual(powerBackend.releasedIDs, [])
+        XCTAssertEqual(renderer.emittedSnapshots.count, 2)
+
+        clock.now += 30_000
+        await coordinator.applyScanFailure(occurredAt: clock.now)
+
+        XCTAssertEqual(coordinator.snapshot.history.totalAwakeMs, HistoryStore.maxTickDeltaMs * 2)
+        XCTAssertEqual(coordinator.snapshot.history.currentSession?.durationMs, HistoryStore.maxTickDeltaMs * 2)
+        XCTAssertEqual(powerBackend.createdModes.count, 1)
+        XCTAssertEqual(powerBackend.releasedIDs, [])
+        XCTAssertEqual(renderer.emittedSnapshots.count, 3)
+    }
+
+    func testFailedScanRecordsRetainedOrphanAssertionTimeWhileMonitorIsInactive() async {
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let powerBackend = CoordinatorFakePowerBackend()
+        let (coordinator, _, _) = await makeCoordinator(clock: clock, powerBackend: powerBackend)
+
+        await coordinator.applyScan([activeAgent()], scannedAt: clock.now)
+        powerBackend.releaseFailuresByID[1] = .releaseFailed(ioReturnCode: -1)
+        clock.now += 2_000
+        await coordinator.applyScan([], scannedAt: clock.now)
+
+        XCTAssertFalse(coordinator.snapshot.monitor.active)
+        XCTAssertTrue(coordinator.snapshot.monitor.keepingAwake)
+        XCTAssertEqual(coordinator.snapshot.history.totalAwakeMs, 2_000)
+
+        clock.now += 3_000
+        await coordinator.applyScanFailure(occurredAt: clock.now)
+
+        XCTAssertFalse(coordinator.snapshot.monitor.active)
+        XCTAssertTrue(coordinator.snapshot.monitor.keepingAwake)
+        XCTAssertEqual(coordinator.snapshot.history.totalAwakeMs, 5_000)
+        XCTAssertEqual(coordinator.snapshot.history.currentSession?.durationMs, 5_000)
+        XCTAssertEqual(powerBackend.releasedIDs, [1], "a failed scan must not retry or replace the retained assertion")
+    }
+
+    func testSuccessfulRecoveryAfterFailedTickDoesNotDoubleCountIt() async {
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let (coordinator, _, _) = await makeCoordinator(clock: clock)
+        let agent = activeAgent()
+
+        await coordinator.applyScan([agent], scannedAt: clock.now)
+        clock.now += 30_000
+        await coordinator.applyScanFailure(occurredAt: clock.now)
+        clock.now += 5_000
+
+        await coordinator.applyScan([agent], scannedAt: clock.now)
+
+        XCTAssertEqual(coordinator.snapshot.history.totalAwakeMs, HistoryStore.maxTickDeltaMs + 5_000)
+        XCTAssertEqual(coordinator.snapshot.history.currentSession?.durationMs, HistoryStore.maxTickDeltaMs + 5_000)
+        XCTAssertFalse(coordinator.snapshot.diagnostics.contains { $0.id == AgentMonitorDiagnosticID.scanFailed })
+    }
+
+    func testIdleTransitionAfterFailedTickClosesSessionWithoutDoubleCounting() async {
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let (coordinator, _, powerBackend) = await makeCoordinator(clock: clock)
+        let agent = activeAgent()
+
+        await coordinator.applyScan([agent], scannedAt: clock.now)
+        clock.now += 30_000
+        await coordinator.applyScanFailure(occurredAt: clock.now)
+        clock.now += 5_000
+
+        await coordinator.applyScan([], scannedAt: clock.now)
+
+        XCTAssertEqual(coordinator.snapshot.history.totalAwakeMs, HistoryStore.maxTickDeltaMs)
+        XCTAssertNil(coordinator.snapshot.history.currentSession)
+        XCTAssertEqual(coordinator.snapshot.history.recentSessions.first?.durationMs, HistoryStore.maxTickDeltaMs)
+        XCTAssertFalse(coordinator.snapshot.monitor.active)
+        XCTAssertFalse(coordinator.snapshot.monitor.keepingAwake)
+        XCTAssertEqual(powerBackend.releasedIDs, [1])
+    }
+
     // MARK: - Startup diagnostics: mapped and deduplicated
 
     func testStartupDiagnosticsAreMappedAndDeduplicated() async {
@@ -618,6 +708,41 @@ final class AppSnapshotCoordinatorTests: XCTestCase {
         XCTAssertTrue(
             coordinator.snapshot.diagnostics.contains { $0.id == HistoryDiagnosticID.persistFailed },
             "an earlier debounced save's failure must become visible on the very next applyScan"
+        )
+    }
+
+    func testFailedScanReconcilesAndDeduplicatesPendingHistoryDiagnostic() async throws {
+        let clock = MutableClock(now: 1_700_000_000_000)
+        let historyFS = InMemorySettingsFileSystem()
+        let scheduler = ManualHistoryScheduler()
+        let (coordinator, _, _) = await makeCoordinator(
+            historyFileSystem: historyFS,
+            historyScheduler: scheduler,
+            clock: clock
+        )
+        let agent = activeAgent()
+
+        await coordinator.applyScan([agent], scannedAt: clock.now)
+        clock.now += 2_000
+        await coordinator.applyScan([agent], scannedAt: clock.now)
+        await historyFS.setFailNextWrite(SettingsFileSystemError.other("disk full"))
+        await scheduler.fireAllPending()
+
+        clock.now += 100
+        await coordinator.applyScanFailure(occurredAt: clock.now)
+        clock.now += 100
+        await coordinator.applyScanFailure(occurredAt: clock.now)
+
+        XCTAssertEqual(coordinator.snapshot.history.totalAwakeMs, 2_200)
+        XCTAssertEqual(
+            coordinator.snapshot.diagnostics.filter { $0.id == HistoryDiagnosticID.persistFailed }.count,
+            1,
+            "repeated failed scans must refresh rather than duplicate the pending history diagnostic"
+        )
+        XCTAssertEqual(
+            coordinator.snapshot.diagnostics.filter { $0.id == AgentMonitorDiagnosticID.scanFailed }.count,
+            1,
+            "repeated failed scans must refresh rather than duplicate their own diagnostic"
         )
     }
 
