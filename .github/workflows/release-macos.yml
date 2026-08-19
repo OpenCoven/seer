@@ -3,12 +3,17 @@ name: Release standalone macOS app
 # This workflow runs only in the private OpenCoven/seer source repository.
 # Maintainers separately create the public OpenCoven/seer-releases repository,
 # its fine-grained RELEASES_REPO_TOKEN, immutable-releases protection, and the
-# protected macos-release environment with exact release-writer identity
-# variables, required reviewers, and Apple signing/notarization secrets.
+# protected macos-release environment with required reviewers, protected
+# release-writer/signing-identity configuration secrets, and sensitive
+# signing/notarization credential secrets.
 # This workflow never creates or configures those protected resources.
 # GitHub's release PATCH API has no supported compare-and-swap precondition.
-# Exclusivity is enforced by this workflow group plus an atomic tag-scoped lock
-# ref in the release repository; the lock is verified around every mutation.
+# Cross-version exclusivity is enforced by this repository-wide queue:max
+# workflow group plus an atomic tag-scoped lock ref in the release repository;
+# the lock is verified around every mutation. The same queue serializes the
+# authenticated exhaustive release inventory and latest snapshot, explicit
+# global-maximum decision, publication PATCH, post-publication inventory/latest
+# verification, and each retry's independent published-reconciliation snapshot.
 on:
   push:
     tags:
@@ -19,8 +24,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-macos-OpenCoven-seer-releases-${{ github.ref_name }}
+  group: release-macos-OpenCoven-seer-releases
   cancel-in-progress: false
+  queue: max
 
 jobs:
   prepare:
@@ -262,13 +268,15 @@ jobs:
       labels: macos-14-xlarge
     environment: macos-release
     steps:
-      - name: Enforce protected release gates before any secret
+      - name: Enforce protected release gates before any credential
         env:
-          BINARY_DISTRIBUTION_APPROVED: ${{ vars.BINARY_DISTRIBUTION_APPROVED }}
-          PARITY_MATRIX_APPROVED: ${{ vars.PARITY_MATRIX_APPROVED }}
-          CLEAN_MACHINE_VERIFIED_COMMIT: ${{ vars.CLEAN_MACHINE_VERIFIED_COMMIT }}
-          RELEASE_WRITER_LOGIN: ${{ vars.RELEASE_WRITER_LOGIN }}
-          RELEASE_WRITER_ID: ${{ vars.RELEASE_WRITER_ID }}
+          BINARY_DISTRIBUTION_APPROVED: ${{ secrets.BINARY_DISTRIBUTION_APPROVED }}
+          PARITY_MATRIX_APPROVED: ${{ secrets.PARITY_MATRIX_APPROVED }}
+          CLEAN_MACHINE_VERIFIED_COMMIT: ${{ secrets.CLEAN_MACHINE_VERIFIED_COMMIT }}
+          RELEASE_WRITER_LOGIN: ${{ secrets.RELEASE_WRITER_LOGIN }}
+          RELEASE_WRITER_ID: ${{ secrets.RELEASE_WRITER_ID }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           SOURCE_REPOSITORY: ${{ github.repository }}
           SOURCE_REPOSITORY_PRIVATE: ${{ github.event.repository.private }}
           BUILD_NUMBER: ${{ github.run_number }}
@@ -299,6 +307,22 @@ jobs:
           }
           [[ "${RELEASE_WRITER_ID}" =~ ^[1-9][0-9]*$ ]] || {
             echo "error: RELEASE_WRITER_ID must be a positive canonical GitHub user ID" >&2
+            exit 1
+          }
+          [[ "${APPLE_TEAM_ID}" =~ ^[A-Z0-9]{10}$ ]] || {
+            echo "error: APPLE_TEAM_ID must be a 10-character uppercase Apple team identifier" >&2
+            exit 1
+          }
+          [[ -n "${APPLE_SIGNING_IDENTITY}" ]] || {
+            echo "error: APPLE_SIGNING_IDENTITY is required" >&2
+            exit 1
+          }
+          [[ "${APPLE_SIGNING_IDENTITY}" != *$'\n'* && "${APPLE_SIGNING_IDENTITY}" != *$'\r'* ]] || {
+            echo "error: APPLE_SIGNING_IDENTITY must not contain CR or LF" >&2
+            exit 1
+          }
+          [[ "${APPLE_SIGNING_IDENTITY}" =~ ^Developer\ ID\ Application:\ .+\ \(${APPLE_TEAM_ID}\)$ ]] || {
+            echo "error: APPLE_SIGNING_IDENTITY must be the exact Developer ID Application authority for APPLE_TEAM_ID" >&2
             exit 1
           }
           [[ "${SOURCE_REPOSITORY}" == "OpenCoven/seer" && "${SOURCE_REPOSITORY_PRIVATE}" == "true" ]] || {
@@ -378,8 +402,8 @@ jobs:
           GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
           SOURCE_GITHUB_TOKEN: ${{ github.token }}
           GH_REPO: OpenCoven/seer-releases
-          RELEASE_WRITER_LOGIN: ${{ vars.RELEASE_WRITER_LOGIN }}
-          RELEASE_WRITER_ID: ${{ vars.RELEASE_WRITER_ID }}
+          RELEASE_WRITER_LOGIN: ${{ secrets.RELEASE_WRITER_LOGIN }}
+          RELEASE_WRITER_ID: ${{ secrets.RELEASE_WRITER_ID }}
           SOURCE_REPOSITORY: ${{ github.repository }}
           SOURCE_COMMIT: ${{ github.sha }}
           SOURCE_TAG: ${{ github.ref_name }}
@@ -405,8 +429,8 @@ jobs:
           GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
           SOURCE_GITHUB_TOKEN: ${{ github.token }}
           GH_REPO: OpenCoven/seer-releases
-          RELEASE_WRITER_LOGIN: ${{ vars.RELEASE_WRITER_LOGIN }}
-          RELEASE_WRITER_ID: ${{ vars.RELEASE_WRITER_ID }}
+          RELEASE_WRITER_LOGIN: ${{ secrets.RELEASE_WRITER_LOGIN }}
+          RELEASE_WRITER_ID: ${{ secrets.RELEASE_WRITER_ID }}
           SOURCE_REPOSITORY: ${{ github.repository }}
           SOURCE_COMMIT: ${{ github.sha }}
           SOURCE_TAG: ${{ github.ref_name }}
@@ -414,6 +438,9 @@ jobs:
           WORKFLOW_RUN: ${{ github.run_id }}
           WORKFLOW_ATTEMPT: ${{ github.run_attempt }}
           VERSION: ${{ needs.prepare.outputs.version }}
+          BUILD_NUMBER: ${{ github.run_number }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           STATE_WORK_DIR: ${{ steps.published-reconciliation-state.outputs.directory }}
         run: bash scripts/release-macos-draft.sh reconcile-published
 
@@ -422,8 +449,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
           GH_REPO: OpenCoven/seer-releases
-          RELEASE_WRITER_LOGIN: ${{ vars.RELEASE_WRITER_LOGIN }}
-          RELEASE_WRITER_ID: ${{ vars.RELEASE_WRITER_ID }}
+          RELEASE_WRITER_LOGIN: ${{ secrets.RELEASE_WRITER_LOGIN }}
+          RELEASE_WRITER_ID: ${{ secrets.RELEASE_WRITER_ID }}
           SOURCE_REPOSITORY: ${{ github.repository }}
           SOURCE_COMMIT: ${{ github.sha }}
           SOURCE_TAG: ${{ github.ref_name }}
@@ -497,8 +524,8 @@ jobs:
         env:
           SOURCE_GITHUB_TOKEN: ${{ github.token }}
           GH_REPO: OpenCoven/seer-releases
-          RELEASE_WRITER_LOGIN: ${{ vars.RELEASE_WRITER_LOGIN }}
-          RELEASE_WRITER_ID: ${{ vars.RELEASE_WRITER_ID }}
+          RELEASE_WRITER_LOGIN: ${{ secrets.RELEASE_WRITER_LOGIN }}
+          RELEASE_WRITER_ID: ${{ secrets.RELEASE_WRITER_ID }}
           VERSION: ${{ needs.prepare.outputs.version }}
           SOURCE_REPOSITORY: ${{ github.repository }}
           SOURCE_COMMIT: ${{ github.sha }}
@@ -593,8 +620,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
           GH_REPO: OpenCoven/seer-releases
-          RELEASE_WRITER_LOGIN: ${{ vars.RELEASE_WRITER_LOGIN }}
-          RELEASE_WRITER_ID: ${{ vars.RELEASE_WRITER_ID }}
+          RELEASE_WRITER_LOGIN: ${{ secrets.RELEASE_WRITER_LOGIN }}
+          RELEASE_WRITER_ID: ${{ secrets.RELEASE_WRITER_ID }}
           VERSION: ${{ needs.prepare.outputs.version }}
           SOURCE_REPOSITORY: ${{ github.repository }}
           SOURCE_COMMIT: ${{ github.sha }}
@@ -709,8 +736,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
           GH_REPO: OpenCoven/seer-releases
-          RELEASE_WRITER_LOGIN: ${{ vars.RELEASE_WRITER_LOGIN }}
-          RELEASE_WRITER_ID: ${{ vars.RELEASE_WRITER_ID }}
+          RELEASE_WRITER_LOGIN: ${{ secrets.RELEASE_WRITER_LOGIN }}
+          RELEASE_WRITER_ID: ${{ secrets.RELEASE_WRITER_ID }}
           VERSION: ${{ needs.prepare.outputs.version }}
           SOURCE_REPOSITORY: ${{ github.repository }}
           SOURCE_COMMIT: ${{ github.sha }}
@@ -730,8 +757,8 @@ jobs:
           GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
           SOURCE_GITHUB_TOKEN: ${{ github.token }}
           GH_REPO: OpenCoven/seer-releases
-          RELEASE_WRITER_LOGIN: ${{ vars.RELEASE_WRITER_LOGIN }}
-          RELEASE_WRITER_ID: ${{ vars.RELEASE_WRITER_ID }}
+          RELEASE_WRITER_LOGIN: ${{ secrets.RELEASE_WRITER_LOGIN }}
+          RELEASE_WRITER_ID: ${{ secrets.RELEASE_WRITER_ID }}
           VERSION: ${{ needs.prepare.outputs.version }}
           SOURCE_REPOSITORY: ${{ github.repository }}
           SOURCE_COMMIT: ${{ github.sha }}
@@ -750,8 +777,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
           GH_REPO: OpenCoven/seer-releases
-          RELEASE_WRITER_LOGIN: ${{ vars.RELEASE_WRITER_LOGIN }}
-          RELEASE_WRITER_ID: ${{ vars.RELEASE_WRITER_ID }}
+          RELEASE_WRITER_LOGIN: ${{ secrets.RELEASE_WRITER_LOGIN }}
+          RELEASE_WRITER_ID: ${{ secrets.RELEASE_WRITER_ID }}
           SOURCE_REPOSITORY: ${{ github.repository }}
           SOURCE_COMMIT: ${{ github.sha }}
           SOURCE_TAG: ${{ github.ref_name }}

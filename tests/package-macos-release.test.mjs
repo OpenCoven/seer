@@ -633,6 +633,47 @@ test("version and build number are validated before credentials or side effects"
   }
 });
 
+test("signing identity must be nonempty, single-line, and the exact Developer ID Application authority for its team", () => {
+  const signing = completeSigningEnvironment({
+    APPLE_API_ISSUER: apiIssuer,
+    APPLE_API_KEY: apiKeyId,
+    APPLE_API_KEY_BASE64: credentialValues[6],
+  });
+  const invalidCases = [
+    [
+      { APPLE_SIGNING_IDENTITY: "" },
+      /missing required signing variable APPLE_SIGNING_IDENTITY/,
+    ],
+    [
+      { APPLE_SIGNING_IDENTITY: `${signingIdentity}\nignored` },
+      /APPLE_SIGNING_IDENTITY must not contain CR or LF/,
+    ],
+    [
+      { APPLE_SIGNING_IDENTITY: `${signingIdentity}\rignored` },
+      /APPLE_SIGNING_IDENTITY must not contain CR or LF/,
+    ],
+    [
+      { APPLE_SIGNING_IDENTITY: "Apple Development: OpenCoven (ABCDEFGHIJ)" },
+      /exact Developer ID Application authority for APPLE_TEAM_ID/,
+    ],
+    [
+      { APPLE_SIGNING_IDENTITY: "Developer ID Application: OpenCoven (ZZZZZZZZZZ)" },
+      /exact Developer ID Application authority for APPLE_TEAM_ID/,
+    ],
+    [
+      { APPLE_TEAM_ID: "abcdefghij" },
+      /APPLE_TEAM_ID must be a 10-character uppercase Apple team identifier/,
+    ],
+  ];
+
+  for (const [identity, pattern] of invalidCases) {
+    const result = runPackage({ ...signing, ...identity });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, pattern);
+    assertNoPackagingLeaves();
+  }
+});
+
 test("notarization credential sets reject none, every partial set, and both complete sets", () => {
   const signing = completeSigningEnvironment();
   const invalidCases = [

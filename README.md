@@ -124,20 +124,37 @@ release interface. It has two intentionally separate runner contracts:
    `SOURCE_COMMIT`, `WORKFLOW_RUN`, distinct `PREPARE_RUNNER_ID` and
    `SIGNING_RUNNER_ID`, `UNSIGNED_APP_ARCHIVE`,
    `UNSIGNED_APP_ATTESTATION`, `UNSIGNED_APP_SHA256`, and
-   `UNSIGNED_APP_ATTESTATION_SHA256`.
+   `UNSIGNED_APP_ATTESTATION_SHA256`. The protected environment supplies all
+   approval-critical release configuration through environment secrets.
 
-Configure these secret *names* in `macos-release`; never put their values in
-source, logs, artifacts, or documentation:
+Configure these sensitive secret *names* in `macos-release`; never put their
+values in source, logs, artifacts, or documentation:
 
-- Signing: `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`,
-  `APPLE_SIGNING_IDENTITY`, and `APPLE_TEAM_ID`
+- Signing: `APPLE_CERTIFICATE` and `APPLE_CERTIFICATE_PASSWORD`
 - Notarization: exactly one complete set — `APPLE_API_ISSUER`,
   `APPLE_API_KEY`, and `APPLE_API_KEY_BASE64`; or the fallback `APPLE_ID` and
-  `APPLE_PASSWORD` (with `APPLE_TEAM_ID`)
+  `APPLE_PASSWORD`
 - Publication: `RELEASES_REPO_TOKEN`, a fine-grained token restricted to
   contents/release writes and read-only immutable-release configuration in
   `OpenCoven/seer-releases`, with no private-source access. That protected token
   identity must be the repository's sole release writer.
+
+The following semantically non-sensitive protected configuration values must
+be stored as `macos-release` environment secrets:
+`BINARY_DISTRIBUTION_APPROVED`, `PARITY_MATRIX_APPROVED`,
+`CLEAN_MACHINE_VERIFIED_COMMIT`, `RELEASE_WRITER_LOGIN`, `RELEASE_WRITER_ID`,
+`APPLE_SIGNING_IDENTITY`, and `APPLE_TEAM_ID`. Do not store them as Actions
+variables. Secret storage deliberately gives the environment copy precedence
+over repository and organization secrets and binds it to environment approval.
+Provision each of these seven names with
+`gh secret set <NAME> --repo OpenCoven/seer --env macos-release`. Together with
+the eight possible sensitive names above, they form the authoritative 15-name
+union audit set; the active environment still contains exactly one notarization
+method, never both. Same-named repository secrets must be absent, and
+organization secrets must be absent or restricted so `OpenCoven/seer` cannot
+access them. Verify only names and timestamps with the environment-scoped
+`gh secret list --json name,updatedAt` command; never print values, including
+the non-sensitive configuration.
 
 The protected environment must require reviewers and define these release
 gates and exact writer bindings:
@@ -148,15 +165,58 @@ gates and exact writer bindings:
   commit and must equal the workflow's `GITHUB_SHA`
 - `RELEASE_WRITER_LOGIN` and `RELEASE_WRITER_ID` must exactly identify the
   fine-grained token owner returned by GitHub's API
+- `APPLE_SIGNING_IDENTITY` must be the exact Developer ID Application authority,
+  and `APPLE_TEAM_ID` must be its 10-character Apple team identifier
 
 `OpenCoven/seer-releases` must have GitHub immutable releases enabled. The
 workflow verifies that repository setting before release work and verifies the
 published release is immutable. GitHub does not support `If-Match` compare and
-swap for release `PATCH`: workflow concurrency and an atomically created,
-tag-scoped remote lock ref serialize cooperative runs instead. The annotated
-lock binds the source tag, commit, workflow run, and attempt to an existing
-release-repository commit; every mutating phase revalidates it, and an
-`always()` step deletes only that exact owned lock ref.
+swap for release `PATCH`: one repository-wide workflow concurrency group and an
+atomically created, tag-scoped remote lock ref serialize cooperative runs. The
+workflow twice exhaustively paginates the authenticated release list before the
+first publication `PATCH` and requires the two normalized inventories to match.
+Each bounded scan stops only on a short page; reaching the configured maximum
+with a full page fails rather than silently truncating. Among all authenticated
+stable published releases, every candidate must have a positive safe ID,
+`draft=false`, `prerelease=false`, `immutable=true`, and one unique bounded
+canonical `vMAJOR.MINOR.PATCH` tag. Each stable candidate and the authenticated
+`/releases/latest` response must also have the exact protected release writer
+as author and exactly its versioned three-name public asset allowlist, with
+every uploader equal to that writer. Inventory validation uses metadata only;
+it does not download historical assets. Drafts and prereleases cannot affect
+the maximum, while the current draft must have its exact verified ID and tag in
+the inventory. The authenticated `/releases/latest` identity must equal that
+fully trusted global semantic-version maximum, or return the canonical 404 when
+the stable set is empty. Only then does a strictly newer or first release use
+explicit `make_latest: "true"`; a lower backport uses `make_latest: "false"`,
+and a same version fails.
+
+Inventory and `/releases/latest` selection finish before final draft
+verification. The workflow then refetches the selected draft metadata and
+freshly downloads the exact asset IDs, compares metadata, local notes,
+uploaders, digests, and bytes with the captured verified state, and finally
+rechecks the source tag, destination anchor/tag, and remote lock immediately
+before `PATCH`. GitHub release `PATCH` has no supported `If-Match`
+compare-and-swap, so an unavoidable non-atomic API boundary remains after the
+final draft comparison. It contains only the required source-tag, destination,
+and lock reads followed by `PATCH`; after the final remote-lock response,
+`PATCH` is the immediate request. No scan, download, build, or other
+long-running work occurs in that narrow boundary.
+
+Post-publication verification refetches a fresh exhaustive inventory and
+`/releases/latest`, requires the current release to appear as stable and
+immutable, and proves that the pointer equals the fresh global maximum rather
+than reusing the earlier decision. Published reconciliation on a retry likewise
+refetches a fresh inventory and authenticated `/releases/latest` without an
+earlier decision file. The current published release must appear exactly in the
+inventory; an intervening higher release is accepted only when it is genuinely
+the global maximum and `/releases/latest` has its exact ID and tag. Malformed or
+duplicate stable entries, list mutation, truncation, pointer mismatch, ambiguous
+responses, or API errors fail before `published=true`; reconciliation never
+mutates immutable metadata. The annotated lock binds the source tag, commit,
+workflow run, and attempt to an existing release-repository commit; every
+mutating phase revalidates it, and an `always()` step deletes only that exact
+owned lock ref.
 
 Only these public asset names are allowed:
 
@@ -177,8 +237,9 @@ deleting the release.
 
 Three external administrative actions each require a separate, explicit
 approval: (1) create the public `OpenCoven/seer-releases` repository, (2)
-configure the protected `macos-release` environment, reviewers, variables,
-secrets, and fine-grained token, and (3) publish the first public binary.
+configure the protected `macos-release` environment, required reviewers, and
+its protected configuration and credential secrets (including the fine-grained
+token), and (3) publish the first public binary.
 Repository automation does not create or configure those resources, and
 approval of one action does not approve either of the others.
 

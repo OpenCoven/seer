@@ -134,6 +134,7 @@ RELEASE_WRITER_ID="${RELEASE_WRITER_ID:-}"
 [[ "${RELEASE_WRITER_ID}" =~ ^[1-9][0-9]*$ ]] ||
   fail "protected release writer ID is invalid"
 EXPECTED_ASSETS=("Seer-v${VERSION}-arm64.dmg" "SHA256SUMS" "release-manifest.json")
+EXPECTED_BUNDLE_IDENTIFIER="ai.opencoven.seer"
 # GitHub's "get a release by tag name" endpoint only returns published releases;
 # it 404s for drafts even with push access. Release discovery must instead use the
 # authenticated release *listing* endpoint (which does include drafts) with exact
@@ -165,6 +166,10 @@ RELEASE_ASSET_COUNT=0
 RELEASE_ASSETS_COMPLETE=""
 DEFAULT_BRANCH=""
 DESTINATION_ANCHOR_COMMIT=""
+LATEST_RESPONSE_PATH=""
+LATEST_HTTP_STATUS=""
+RELEASE_INVENTORY_PATH=""
+RELEASE_INVENTORY_PASS_PATH=""
 
 api() {
   gh api --header "X-GitHub-Api-Version: ${GH_API_VERSION}" "$@"
@@ -234,6 +239,10 @@ verify_remote_lock() {
   commit_sha="$(printf '%s\n' "${summary}" | /usr/bin/sed -n '2s/^commitSha=//p')"
   [[ "${current}" == "true" && "${commit_sha}" =~ ^[0-9a-f]{40}$ ]] ||
     fail "release lock is not owned by this exact workflow attempt"
+  if [[ -n "${DESTINATION_ANCHOR_COMMIT}" &&
+    "${commit_sha}" != "${DESTINATION_ANCHOR_COMMIT}" ]]; then
+    fail "release lock destination anchor changed after it was captured"
+  fi
   verify_commit_exists "${commit_sha}"
   DESTINATION_ANCHOR_COMMIT="${commit_sha}"
   export DESTINATION_ANCHOR_COMMIT
@@ -478,6 +487,13 @@ verify_destination_tag() {
     fail "published release destination tag does not resolve to the exact captured anchor commit"
 }
 
+verify_destination_anchor_and_tag() {
+  [[ "${DESTINATION_ANCHOR_COMMIT}" =~ ^[0-9a-f]{40}$ ]] ||
+    fail "destination anchor commit is unavailable"
+  verify_commit_exists "${DESTINATION_ANCHOR_COMMIT}"
+  verify_destination_tag
+}
+
 require_complete_remote_assets() {
   [[ "${RELEASE_ASSET_COUNT}" -eq "${#EXPECTED_ASSETS[@]}" &&
     "${RELEASE_ASSETS_COMPLETE}" == "true" ]] ||
@@ -535,6 +551,104 @@ rest_get_release() {
   printf '%s\n' "${metadata}"
 }
 
+fetch_latest_release() {
+  local prefix="$1"
+  local curl_status
+  LATEST_RESPONSE_PATH="${prefix}.json"
+  LATEST_HTTP_STATUS=""
+  [[ ! -e "${LATEST_RESPONSE_PATH}" && ! -L "${LATEST_RESPONSE_PATH}" ]] ||
+    fail "latest release response path must not preexist"
+
+  set +e
+  LATEST_HTTP_STATUS="$(
+    curl --fail-with-body --silent --show-error \
+      --request GET \
+      --header "Accept: application/vnd.github+json" \
+      --header "Authorization: Bearer ${GH_TOKEN}" \
+      --header "X-GitHub-Api-Version: ${GH_API_VERSION}" \
+      --output "${LATEST_RESPONSE_PATH}" \
+      --write-out '%{http_code}' \
+      "${GITHUB_API_URL:-https://api.github.com}/repos/${GH_REPO}/releases/latest"
+  )"
+  curl_status=$?
+  set -e
+
+  [[ "${LATEST_HTTP_STATUS}" =~ ^[0-9]{3}$ ]] ||
+    fail "latest release request did not return a canonical HTTP status"
+  case "${LATEST_HTTP_STATUS}" in
+    200)
+      [[ "${curl_status}" -eq 0 ]] ||
+        fail "latest release request failed despite an HTTP 200 response"
+      ;;
+    404)
+      [[ "${curl_status}" -eq 22 ]] ||
+        fail "latest release 404 did not use curl's expected HTTP failure status"
+      ;;
+    *)
+      [[ "${curl_status}" -eq 0 || "${curl_status}" -eq 22 ]] ||
+        fail "latest release request failed before receiving a usable API response"
+      ;;
+  esac
+}
+
+fetch_release_inventory_pass() {
+  local prefix="$1"
+  local pages_directory="${prefix}-pages"
+  local inventory_path="${prefix}.json"
+  local page=1
+  local page_path
+  local page_count
+
+  [[ ! -e "${pages_directory}" && ! -L "${pages_directory}" &&
+    ! -e "${inventory_path}" && ! -L "${inventory_path}" ]] ||
+    fail "release inventory pass paths must not preexist"
+  /bin/mkdir "${pages_directory}"
+
+  while :; do
+    page_path="${pages_directory}/page-$(printf '%04d' "${page}").json"
+    [[ ! -e "${page_path}" && ! -L "${page_path}" ]] ||
+      fail "release inventory page path must not preexist"
+    api \
+      "repos/${GH_REPO}/releases?per_page=${RELEASE_LIST_PAGE_SIZE}&page=${page}" \
+      > "${page_path}" ||
+      fail "authenticated release inventory API request failed on page ${page}"
+    page_count="$(
+      node "${STATE_HELPER}" inventory-page "${page_path}" "${RELEASE_LIST_PAGE_SIZE}"
+    )" || fail "authenticated release inventory page ${page} is malformed"
+    [[ "${page_count}" =~ ^[0-9]+$ && "${page_count}" -le "${RELEASE_LIST_PAGE_SIZE}" ]] ||
+      fail "authenticated release inventory page count is invalid"
+
+    if [[ "${page_count}" -lt "${RELEASE_LIST_PAGE_SIZE}" ]]; then
+      break
+    fi
+    if [[ "${page}" -eq "${RELEASE_LIST_MAX_PAGES}" ]]; then
+      fail "release inventory reached the maximum bounded page count with a full page; refusing truncation"
+    fi
+    page=$((page + 1))
+  done
+
+  node "${STATE_HELPER}" build-inventory \
+    "${pages_directory}" "${page}" "${RELEASE_LIST_PAGE_SIZE}" "${inventory_path}"
+  RELEASE_INVENTORY_PASS_PATH="${inventory_path}"
+}
+
+fetch_release_inventory() {
+  local prefix="$1"
+  local first_inventory
+  local confirming_inventory
+  local bound_inventory="${prefix}.json"
+  [[ ! -e "${bound_inventory}" && ! -L "${bound_inventory}" ]] ||
+    fail "bound release inventory path must not preexist"
+
+  fetch_release_inventory_pass "${prefix}-first"
+  first_inventory="${RELEASE_INVENTORY_PASS_PATH}"
+  fetch_release_inventory_pass "${prefix}-confirm"
+  confirming_inventory="${RELEASE_INVENTORY_PASS_PATH}"
+  node "${STATE_HELPER}" bind-inventories \
+    "${first_inventory}" "${confirming_inventory}" "${bound_inventory}"
+  RELEASE_INVENTORY_PATH="${bound_inventory}"
+}
+
 download_assets() {
   local metadata="$1"
   local prefix="$2"
@@ -564,9 +678,69 @@ download_assets() {
 verify_published_platform() {
   local directory="$1"
   local dmg="${directory}/Seer-v${VERSION}-arm64.dmg"
+  APPLE_SIGNING_IDENTITY="${APPLE_SIGNING_IDENTITY:-}"
+  APPLE_TEAM_ID="${APPLE_TEAM_ID:-}"
+  BUILD_NUMBER="${BUILD_NUMBER:-}"
+  [[ -n "${APPLE_SIGNING_IDENTITY}" ]] ||
+    fail "APPLE_SIGNING_IDENTITY is required for published release reconciliation"
+  [[ "${APPLE_SIGNING_IDENTITY}" != *$'\n'* && "${APPLE_SIGNING_IDENTITY}" != *$'\r'* ]] ||
+    fail "APPLE_SIGNING_IDENTITY must not contain CR or LF"
+  [[ "${APPLE_TEAM_ID}" =~ ^[A-Z0-9]{10}$ ]] ||
+    fail "APPLE_TEAM_ID must be a 10-character uppercase Apple team identifier"
+  [[ "${APPLE_SIGNING_IDENTITY}" =~ ^Developer\ ID\ Application:\ .+\ \(${APPLE_TEAM_ID}\)$ ]] ||
+    fail "APPLE_SIGNING_IDENTITY must be the exact Developer ID Application authority for APPLE_TEAM_ID"
+  [[ "${BUILD_NUMBER}" =~ ^[1-9][0-9]*$ ]] ||
+    fail "BUILD_NUMBER must be a positive integer without leading zeros"
+
+  verify_published_signature_identity() {
+    local target="$1"
+    local signature_details="$2"
+    case $'\n'"${signature_details}"$'\n' in
+      *$'\nAuthority='"${APPLE_SIGNING_IDENTITY}"$'\n'*) ;;
+      *) fail "published ${target} authority does not match APPLE_SIGNING_IDENTITY" ;;
+    esac
+    case $'\n'"${signature_details}"$'\n' in
+      *$'\nTeamIdentifier='"${APPLE_TEAM_ID}"$'\n'*) ;;
+      *) fail "published ${target} team identifier does not match APPLE_TEAM_ID" ;;
+    esac
+  }
+
+  verify_published_app_metadata() {
+    local bundle_identifier="$1"
+    local marketing_version="$2"
+    local build_number="$3"
+    [[ "${bundle_identifier}" == "${EXPECTED_BUNDLE_IDENTIFIER}" ]] ||
+      fail "published app bundle identifier is not ${EXPECTED_BUNDLE_IDENTIFIER}"
+    [[ "${marketing_version}" == "${VERSION}" ]] ||
+      fail "published app CFBundleShortVersionString does not match VERSION"
+    [[ "${build_number}" == "${BUILD_NUMBER}" ]] ||
+      fail "published app CFBundleVersion does not match BUILD_NUMBER"
+  }
+
   if [[ "${SEER_RELEASE_TEST_MODE:-0}" == "1" ]]; then
-    node "${SEER_RELEASE_TEST_PLATFORM_VERIFIER}" "${directory}" "${dmg}" ||
+    local report
+    report="$(node "${SEER_RELEASE_TEST_PLATFORM_VERIFIER}" "${directory}" "${dmg}")" ||
       fail "Apple signature or notarization validation failed"
+    local report_line_count
+    report_line_count="$(
+      printf '%s\n' "${report}" |
+        /usr/bin/wc -l |
+        /usr/bin/tr -d ' '
+    )"
+    [[ "${report_line_count}" == "7" ]] ||
+      fail "test platform verifier returned an invalid inspection report"
+    local dmg_signature_details
+    local app_signature_details
+    dmg_signature_details="Authority=$(printf '%s\n' "${report}" | /usr/bin/sed -n '1p')"$'\n'
+    dmg_signature_details+="TeamIdentifier=$(printf '%s\n' "${report}" | /usr/bin/sed -n '2p')"
+    app_signature_details="Authority=$(printf '%s\n' "${report}" | /usr/bin/sed -n '3p')"$'\n'
+    app_signature_details+="TeamIdentifier=$(printf '%s\n' "${report}" | /usr/bin/sed -n '4p')"
+    verify_published_signature_identity "DMG" "${dmg_signature_details}"
+    verify_published_signature_identity "app" "${app_signature_details}"
+    verify_published_app_metadata \
+      "$(printf '%s\n' "${report}" | /usr/bin/sed -n '5p')" \
+      "$(printf '%s\n' "${report}" | /usr/bin/sed -n '6p')" \
+      "$(printf '%s\n' "${report}" | /usr/bin/sed -n '7p')"
     return
   fi
 
@@ -592,6 +766,11 @@ verify_published_platform() {
     /usr/bin/codesign --verify --strict --verbose=2 "${dmg}"
     /usr/bin/xcrun stapler validate "${dmg}"
     /usr/sbin/spctl --assess --type open --context context:primary-signature --verbose=4 "${dmg}"
+    local dmg_signature_details
+    if ! dmg_signature_details="$(/usr/bin/codesign -d --verbose=4 "${dmg}" 2>&1)"; then
+      fail "unable to inspect published DMG signing identity"
+    fi
+    verify_published_signature_identity "DMG" "${dmg_signature_details}"
 
     [[ ! -e "${mount_point}" && ! -L "${mount_point}" ]]
     /bin/mkdir "${mount_point}"
@@ -611,6 +790,25 @@ verify_published_platform() {
     /usr/bin/xcrun stapler validate "${app}"
     /usr/sbin/spctl --assess --type execute --verbose=4 "${app}"
     [[ "$(/usr/bin/lipo -archs "${app}/Contents/MacOS/Seer")" == "arm64" ]]
+    local app_signature_details
+    if ! app_signature_details="$(/usr/bin/codesign -d --verbose=4 "${app}" 2>&1)"; then
+      fail "unable to inspect published app signing identity"
+    fi
+    verify_published_signature_identity "app" "${app_signature_details}"
+    local info_plist="${app}/Contents/Info.plist"
+    local bundle_identifier
+    local marketing_version
+    local build_number
+    bundle_identifier="$(
+      /usr/bin/plutil -extract CFBundleIdentifier raw -o - "${info_plist}"
+    )" || fail "unable to inspect published app bundle identifier"
+    marketing_version="$(
+      /usr/bin/plutil -extract CFBundleShortVersionString raw -o - "${info_plist}"
+    )" || fail "unable to inspect published app marketing version"
+    build_number="$(
+      /usr/bin/plutil -extract CFBundleVersion raw -o - "${info_plist}"
+    )" || fail "unable to inspect published app build number"
+    verify_published_app_metadata "${bundle_identifier}" "${marketing_version}" "${build_number}"
 
     /usr/bin/hdiutil detach "${mount_point}"
     mounted=0
@@ -658,6 +856,13 @@ reconcile_published() {
   final_downloads="$(download_assets "${final_metadata}" "${STATE_WORK_DIR}/existing-published-final")"
   node "${STATE_HELPER}" capture-existing-published \
     "${final_metadata}" "" "${published_dir}" "" "${evidence}" "${final_downloads}"
+  verify_remote_lock
+  verify_source_tag
+  fetch_release_inventory "${STATE_WORK_DIR}/existing-published-inventory"
+  local published_inventory="${RELEASE_INVENTORY_PATH}"
+  fetch_latest_release "${STATE_WORK_DIR}/existing-published-latest"
+  node "${STATE_HELPER}" reconcile-published-latest \
+    "${published_inventory}" "${LATEST_RESPONSE_PATH}" "${LATEST_HTTP_STATUS}" "${RELEASE_ID}"
   verify_remote_lock
   verify_source_tag
 
@@ -779,34 +984,61 @@ case "${MODE}" in
     [[ -f "${VERIFIED_STATE}" && ! -L "${VERIFIED_STATE}" ]] ||
       fail "verified release state is missing or unsafe"
 
-    verify_remote_lock
-    response_metadata="$(rest_get_release "${STATE_WORK_DIR}/publish" "${RELEASE_ID}")"
-    downloads_dir="$(download_assets "${response_metadata}" "${STATE_WORK_DIR}/publish")"
+    release_id="${RELEASE_ID}"
+    [[ "${release_id}" =~ ^[1-9][0-9]*$ ]] ||
+      fail "selected release binding has an invalid shape"
+
+    latest_decision_state="${STATE_WORK_DIR}/latest-release-decision.json"
+    [[ ! -e "${latest_decision_state}" && ! -L "${latest_decision_state}" ]] ||
+      fail "latest release decision path must not preexist"
+    patch_response="${STATE_WORK_DIR}/publish-patch.json"
+    [[ ! -e "${patch_response}" && ! -L "${patch_response}" ]] ||
+      fail "publish response path must not preexist"
+
+    fetch_release_inventory "${STATE_WORK_DIR}/pre-publish-inventory"
+    pre_publish_inventory="${RELEASE_INVENTORY_PATH}"
+    fetch_latest_release "${STATE_WORK_DIR}/pre-publish-latest"
+    make_latest="$(
+      node "${STATE_HELPER}" latest-decision \
+        "${pre_publish_inventory}" "${LATEST_RESPONSE_PATH}" "${LATEST_HTTP_STATUS}" \
+        "${release_id}" "${latest_decision_state}"
+    )"
+    [[ "${make_latest}" =~ ^(true|false)$ ]] ||
+      fail "latest release decision helper returned an invalid PATCH value"
+
+    final_metadata="$(
+      rest_get_release "${STATE_WORK_DIR}/publish-final-draft" "${release_id}"
+    )"
+    final_downloads="$(
+      download_assets "${final_metadata}" "${STATE_WORK_DIR}/publish-final-draft"
+    )"
     set +e
-    release_id="$(
+    verified_release_id="$(
       node "${STATE_HELPER}" compare \
-        "${response_metadata}" "" \
-        "${RELEASE_DIR}" "${RELEASE_BODY}" "${VERIFIED_STATE}" "${downloads_dir}" 2>&1
+        "${final_metadata}" "" \
+        "${RELEASE_DIR}" "${RELEASE_BODY}" "${VERIFIED_STATE}" "${final_downloads}" 2>&1
     )"
     compare_status=$?
     set -e
     if [[ "${compare_status}" -ne 0 ]]; then
-      fail "release is not the exact verified draft; independently validated existing-published-state evidence is required for an immutable published release: ${release_id}"
+      fail "release is not the exact verified draft; independently validated existing-published-state evidence is required for an immutable published release: ${verified_release_id}"
     fi
-    [[ "${release_id}" =~ ^[1-9][0-9]*$ ]] ||
-      fail "verified release binding has an invalid shape"
+    [[ "${verified_release_id}" == "${release_id}" ]] ||
+      fail "final verified release binding does not match the inventory selection"
 
+    # GitHub release PATCH does not support If-Match. After the final draft
+    # compare, keep the unavoidable API boundary to required reference/lock
+    # reads, then issue PATCH immediately after the last lock response.
     verify_source_tag
-    patch_response="${STATE_WORK_DIR}/publish-patch.json"
-    [[ ! -e "${patch_response}" && ! -L "${patch_response}" ]] ||
-      fail "publish response path must not preexist"
+    verify_destination_anchor_and_tag
+    verify_remote_lock
     set +e
     curl --fail-with-body --silent --show-error \
       --request PATCH \
       --header "Accept: application/vnd.github+json" \
       --header "Authorization: Bearer ${GH_TOKEN}" \
       --header "X-GitHub-Api-Version: ${GH_API_VERSION}" \
-      --data '{"draft":false,"prerelease":false}' \
+      --data "{\"draft\":false,\"prerelease\":false,\"make_latest\":\"${make_latest}\"}" \
       --output "${patch_response}" \
       "${GITHUB_API_URL:-https://api.github.com}/repos/${GH_REPO}/releases/${release_id}"
     patch_status=$?
@@ -823,6 +1055,12 @@ case "${MODE}" in
     published_status=$?
     set -e
     if [[ "${published_status}" -eq 0 ]]; then
+      fetch_release_inventory "${STATE_WORK_DIR}/post-publish-inventory"
+      post_publish_inventory="${RELEASE_INVENTORY_PATH}"
+      fetch_latest_release "${STATE_WORK_DIR}/post-publish-latest"
+      node "${STATE_HELPER}" verify-global-latest \
+        "${post_publish_inventory}" "${LATEST_RESPONSE_PATH}" "${LATEST_HTTP_STATUS}" \
+        "${release_id}" "${latest_decision_state}" "${pre_publish_inventory}"
       verify_remote_lock
       exit 0
     fi

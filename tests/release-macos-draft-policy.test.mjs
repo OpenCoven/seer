@@ -1,5 +1,13 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -17,6 +25,9 @@ const workflowRef = `${sourceRepository}/.github/workflows/release-macos.yml@ref
 const workflowRun = "123";
 const workflowAttempt = "1";
 const releaseWriter = { id: 7, login: "release-writer" };
+const signingIdentity = "Developer ID Application: OpenCoven (ABCDEFGHIJ)";
+const teamID = "ABCDEFGHIJ";
+const buildNumber = "42";
 const releaseRepoCommit = "c".repeat(40);
 const lockTagObjectSHA = "d".repeat(40);
 const lockRef = `refs/tags/seer-release-lock-${sourceTag}`;
@@ -90,6 +101,27 @@ function matchingRelease(overrides = {}) {
   };
 }
 
+function stableAssetNames(tag) {
+  return [`Seer-${tag}-arm64.dmg`, "SHA256SUMS", "release-manifest.json"];
+}
+
+function latestRelease(tag = "v1.2.2", id = 41, overrides = {}) {
+  return {
+    id,
+    draft: false,
+    prerelease: false,
+    immutable: true,
+    tag,
+    title: `Seer ${tag.slice(1)}`,
+    body: `previous release ${tag}\n`,
+    target: releaseRepoCommit,
+    updatedAt: "2026-08-14T18:00:00Z",
+    author: releaseWriter,
+    assets: stableAssetNames(tag).map((name, index) => asset(name, 300 + index)),
+    ...overrides,
+  };
+}
+
 function publishedAssets({
   dmgContents = "signed-and-notarized-dmg-generated-at-2026-08-15T18:02:00Z\n",
   manifestOverrides = {},
@@ -141,18 +173,18 @@ const fail404 = () => {
   process.exit(1);
 };
 const endpoint = args.find((arg) => arg.startsWith("repos/"));
-const releaseJSON = () => ({
-  id: state.release.id,
-  draft: state.release.draft,
-  prerelease: state.release.prerelease,
-  tag_name: state.release.tag,
-  name: state.release.title,
-  body: state.release.body,
-  target_commitish: state.release.target,
-  updated_at: state.release.updatedAt,
-  immutable: state.release.immutable,
-  author: state.release.author,
-  assets: state.release.assets.map(({ id, name, size, digest, uploader }) => ({
+const releaseJSON = (release = state.release) => ({
+  id: release.id,
+  draft: release.draft,
+  prerelease: release.prerelease,
+  tag_name: release.tag,
+  name: release.title,
+  body: release.body,
+  target_commitish: release.target,
+  updated_at: release.updatedAt,
+  immutable: release.immutable,
+  author: release.author,
+  assets: (release.assets ?? []).map(({ id, name, size, digest, uploader }) => ({
     id, name, size, digest, uploader
   })),
 });
@@ -282,18 +314,80 @@ if (args[0] === "api" && args.includes("user")) {
   const page = Number(query.get("page"));
   state.releaseListRequests = state.releaseListRequests || [];
   state.releaseListRequests.push({ perPage, page });
+  if (page === 1) state.releaseListScanCount += 1;
+  if (
+    page === 1 &&
+    state.mutateDraftAtReleaseListScan !== null &&
+    state.releaseListScanCount >= state.mutateDraftAtReleaseListScan &&
+    !state.draftInventoryMutationApplied
+  ) {
+    const original = state.release.assets[0].contents;
+    state.release.assets[0].contents = original.replace(/^./, original[0] === "X" ? "Y" : "X");
+    state.draftInventoryMutationApplied = true;
+  }
+  if (
+    page === 1 &&
+    state.moveSourceTagAtReleaseListScan !== null &&
+    state.releaseListScanCount >= state.moveSourceTagAtReleaseListScan
+  ) {
+    state.sourceTagRef.object.sha = "b".repeat(40);
+  }
+  if (
+    page === 1 &&
+    state.moveDestinationTagAtReleaseListScan !== null &&
+    state.releaseListScanCount >= state.moveDestinationTagAtReleaseListScan
+  ) {
+    state.destinationTagRef.object.sha = "b".repeat(40);
+  }
+  if (
+    page === 1 &&
+    state.moveLockAnchorAtReleaseListScan !== null &&
+    state.releaseListScanCount >= state.moveLockAnchorAtReleaseListScan
+  ) {
+    state.lock.tagObject.object.sha = "b".repeat(40);
+  }
+  const releaseListFailurePage =
+    state.release?.draft === false && state.postReleaseListFailurePage !== null
+      ? state.postReleaseListFailurePage
+      : state.releaseListFailurePage;
+  if (releaseListFailurePage === page) {
+    save();
+    console.error("gh: simulated authenticated release-list API failure");
+    process.exit(1);
+  }
   const targetPage = state.releaseListPage ?? 1;
-  const items = [];
-  if (page === targetPage) {
-    if (state.release) items.push(releaseJSON());
-    if (state.releaseListDuplicateOnMatchPage && state.release) {
-      items.push({ ...releaseJSON(), id: state.release.id + 1 });
-    }
-  } else if (page < targetPage) {
-    for (let i = 0; i < perPage; i++) {
-      items.push({ id: 500000 + page * 1000 + i, tag_name: \`other-tag-page-\${page}-\${i}\` });
+  const fillers = Array.from({ length: Math.max(0, targetPage - 1) * perPage }, (_, index) => ({
+    id: 500000 + index,
+    draft: true,
+    prerelease: false,
+    immutable: false,
+    tag: \`other-tag-\${index}\`,
+    title: \`Other draft \${index}\`,
+    body: "unrelated draft\\n",
+    target: state.releaseRepoCommit,
+    updatedAt: "2026-08-13T18:00:00Z",
+    author: state.tokenUser,
+    assets: [],
+  }));
+  const listed = [...fillers];
+  if (state.release) {
+    listed.push(state.release);
+    if (state.releaseListDuplicateOnMatchPage) {
+      listed.push({ ...state.release, id: state.release.id + 1 });
     }
   }
+  let additional = state.release?.draft === false && state.postInventoryReleases !== null
+    ? state.postInventoryReleases
+    : state.inventoryReleases;
+  if (
+    state.releaseListMutationAfterScan !== null &&
+    state.releaseListScanCount >= state.releaseListMutationAfterScan
+  ) {
+    additional = state.mutatedInventoryReleases;
+  }
+  listed.push(...additional);
+  const start = (page - 1) * perPage;
+  const items = listed.slice(start, start + perPage).map((release) => releaseJSON(release));
   save();
   console.log(JSON.stringify(items));
 } else if (args[0] === "api" && endpoint?.includes("/releases/tags/")) {
@@ -364,6 +458,7 @@ function writeFakeCurl(scratch, bin) {
   writeFileSync(
     script,
     `import { writeFileSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 const statePath = process.env.FAKE_RELEASE_STATE;
 const state = JSON.parse(readFileSync(statePath, "utf8"));
@@ -379,6 +474,7 @@ const valueAfter = (name) => {
 const headers = args.flatMap((arg, index) => (arg === "--header" || arg === "-H" ? [args[index + 1]] : []));
 const output = valueAfter("--output") ?? valueAfter("-o");
 const headerPath = valueAfter("--dump-header") ?? valueAfter("-D");
+const writeOut = valueAfter("--write-out") ?? valueAfter("-w");
 const method = valueAfter("--request") ?? valueAfter("-X") ?? "GET";
 const url = args.findLast((arg) => /^https?:/.test(arg));
 const save = () => writeFileSync(statePath, JSON.stringify(state));
@@ -392,26 +488,56 @@ state.authenticatedRequests.push({ method, url });
 const writeResponse = (status, body, etag = state.etag) => {
   if (headerPath) writeFileSync(headerPath, \`HTTP/2 \${status}\\r\\netag: \${etag}\\r\\n\\r\\n\`);
   if (output) writeFileSync(output, body);
+  if (writeOut !== null) {
+    if (writeOut !== "%{http_code}") {
+      save();
+      console.error("curl: unsupported write-out format");
+      process.exit(98);
+    }
+    process.stdout.write(String(status));
+  }
 };
-const releaseJSON = () => JSON.stringify({
-  id: state.release.id,
-  draft: state.release.draft,
-  prerelease: state.release.prerelease,
-  tag_name: state.release.tag,
-  name: state.release.title,
-  body: state.release.body,
-  target_commitish: state.release.target,
-  updated_at: state.release.updatedAt,
-  immutable: state.release.immutable,
-  author: state.release.author,
-  assets: state.release.assets.map(({ id, name, size, digest, uploader }) => ({
+const releaseJSON = (release = state.release) => JSON.stringify({
+  id: release.id,
+  draft: release.draft,
+  prerelease: release.prerelease,
+  tag_name: release.tag,
+  name: release.title,
+  body: release.body,
+  target_commitish: release.target,
+  updated_at: release.updatedAt,
+  immutable: release.immutable,
+  author: release.author,
+  assets: (release.assets ?? []).map(({ id, name, size, digest, uploader }) => ({
     id, name, size, digest, uploader
   })),
 });
 const assetBytes = (item) =>
   item.contentsEncoding === "base64" ? Buffer.from(item.contents, "base64") : Buffer.from(item.contents);
 
-if (method === "GET" && url?.includes("/releases/tags/")) {
+if (method === "GET" && url?.endsWith("/releases/latest")) {
+  state.latestGetCount += 1;
+  const afterPatch = state.latestGetCount > 1 && state.release?.draft === false;
+  const latest = afterPatch && Object.hasOwn(state, "postLatestRelease")
+    ? state.postLatestRelease
+    : state.latestRelease;
+  const configuredStatus = afterPatch && state.postLatestResponseStatus !== null
+    ? state.postLatestResponseStatus
+    : state.latestResponseStatus;
+  const status = configuredStatus ?? (latest ? 200 : 404);
+  if (status !== 200) {
+    writeResponse(
+      status,
+      state.latestResponseBody ?? JSON.stringify({
+        message: status === 404 ? "Not Found" : "simulated latest release API failure",
+      }),
+    );
+    save();
+    process.exit(22);
+  }
+  writeResponse(200, state.latestResponseBody ?? releaseJSON(latest));
+  save();
+} else if (method === "GET" && url?.includes("/releases/tags/")) {
   // Real GitHub only returns a *published* release from this endpoint; it 404s
   // for drafts even for authenticated users with push access.
   if (!state.release || state.release.draft) {
@@ -447,6 +573,12 @@ if (method === "GET" && url?.includes("/releases/tags/")) {
     console.error("curl: response lost before apply");
     process.exit(28);
   }
+  const patchPayload = JSON.parse(valueAfter("--data"));
+  if (!["true", "false"].includes(patchPayload.make_latest)) {
+    save();
+    console.error("curl: make_latest must be explicit");
+    process.exit(98);
+  }
   state.release.draft = false;
   state.release.prerelease = false;
   state.release.immutable = state.immutableReleases;
@@ -455,6 +587,15 @@ if (method === "GET" && url?.includes("/releases/tags/")) {
   if (state.postPublishMutation === "asset-id") state.release.assets[0].id += 1000;
   if (state.postPublishMutation === "prerelease") state.release.prerelease = true;
   if (state.patchOutcome === "lost-mutated") state.release.title += " foreign";
+  if (state.tamperDecisionFingerprint) {
+    const decisionPath = join(dirname(process.env.VERIFIED_STATE), "latest-release-decision.json");
+    const decision = JSON.parse(readFileSync(decisionPath, "utf8"));
+    decision.inventory.fingerprint = "f".repeat(64);
+    writeFileSync(decisionPath, JSON.stringify(decision));
+  }
+  if (patchPayload.make_latest === "true") {
+    state.latestRelease = structuredClone(state.release);
+  }
   if (state.patchOutcome === "lost-applied" || state.patchOutcome === "lost-mutated") {
     save();
     console.error("curl: response lost after apply");
@@ -498,9 +639,30 @@ if (process.env.FAKE_PLATFORM_RESULT === "fail") {
   console.error("stub: Apple signature or notarization validation failed");
   process.exit(1);
 }
+const report = [
+  process.env.FAKE_PUBLISHED_DMG_AUTHORITY ?? process.env.APPLE_SIGNING_IDENTITY,
+  process.env.FAKE_PUBLISHED_DMG_TEAM_ID ?? process.env.APPLE_TEAM_ID,
+  process.env.FAKE_PUBLISHED_APP_AUTHORITY ?? process.env.APPLE_SIGNING_IDENTITY,
+  process.env.FAKE_PUBLISHED_APP_TEAM_ID ?? process.env.APPLE_TEAM_ID,
+  process.env.FAKE_PUBLISHED_BUNDLE_IDENTIFIER ?? "ai.opencoven.seer",
+  process.env.FAKE_PUBLISHED_MARKETING_VERSION ?? process.env.VERSION,
+  process.env.FAKE_PUBLISHED_BUILD_NUMBER ?? process.env.BUILD_NUMBER,
+];
+process.stdout.write(\`\${report.join("\\n")}\\n\`);
 `,
     );
     chmodSync(platformVerifier, 0o755);
+    const initialRelease = options.release === undefined ? matchingRelease() : options.release;
+    const initialLatestRelease = Object.hasOwn(options, "latestRelease")
+      ? options.latestRelease
+      : initialRelease?.draft === false
+        ? structuredClone(initialRelease)
+        : null;
+    const initialInventoryReleases =
+      options.inventoryReleases ??
+      (initialLatestRelease && initialLatestRelease.id !== initialRelease?.id
+        ? [structuredClone(initialLatestRelease)]
+        : []);
     writeFileSync(
       statePath,
       JSON.stringify({
@@ -539,16 +701,37 @@ if (process.env.FAKE_PLATFORM_RESULT === "fail") {
             }
           : options.destinationTagRef,
         destinationTagObjects: options.destinationTagObjects ?? {},
-        release: options.release === undefined ? matchingRelease() : options.release,
+        release: initialRelease,
         releaseListPage: options.releaseListPage ?? 1,
         releaseListDuplicateOnMatchPage: options.releaseListDuplicateOnMatchPage ?? false,
+        releaseListFailurePage: options.releaseListFailurePage ?? null,
+        postReleaseListFailurePage: options.postReleaseListFailurePage ?? null,
+        inventoryReleases: initialInventoryReleases,
+        postInventoryReleases: options.postInventoryReleases ?? null,
+        latestRelease: initialLatestRelease,
+        latestResponseStatus: options.latestResponseStatus ?? null,
+        latestResponseBody: options.latestResponseBody ?? null,
+        postLatestResponseStatus: options.postLatestResponseStatus ?? null,
+        ...(Object.hasOwn(options, "postLatestRelease")
+          ? { postLatestRelease: options.postLatestRelease }
+          : {}),
+        latestGetCount: 0,
         etag: options.etag ?? '"draft-etag"',
         postPublishMutation: null,
+        tamperDecisionFingerprint: options.tamperDecisionFingerprint ?? false,
         patchOutcome: options.patchOutcome ?? "normal",
         nextAssetID: 200,
         calls: [],
         authenticatedRequests: [],
         releaseListRequests: [],
+        releaseListScanCount: 0,
+        releaseListMutationAfterScan: options.releaseListMutationAfterScan ?? null,
+        mutatedInventoryReleases: options.mutatedInventoryReleases ?? [],
+        mutateDraftAtReleaseListScan: options.mutateDraftAtReleaseListScan ?? null,
+        draftInventoryMutationApplied: false,
+        moveSourceTagAtReleaseListScan: options.moveSourceTagAtReleaseListScan ?? null,
+        moveDestinationTagAtReleaseListScan: options.moveDestinationTagAtReleaseListScan ?? null,
+        moveLockAnchorAtReleaseListScan: options.moveLockAnchorAtReleaseListScan ?? null,
       }),
     );
 
@@ -578,6 +761,9 @@ if (process.env.FAKE_PLATFORM_RESULT === "fail") {
           WORKFLOW_RUN: workflowRun,
           WORKFLOW_ATTEMPT: workflowAttempt,
           VERSION: version,
+          BUILD_NUMBER: buildNumber,
+          APPLE_SIGNING_IDENTITY: signingIdentity,
+          APPLE_TEAM_ID: teamID,
           RELEASE_WRITER_LOGIN: releaseWriter.login,
           RELEASE_WRITER_ID: String(releaseWriter.id),
           RELEASE_DIR: releaseDir,
@@ -587,6 +773,7 @@ if (process.env.FAKE_PLATFORM_RESULT === "fail") {
           GITHUB_OUTPUT: githubOutput,
           SEER_RELEASE_TEST_MODE: "1",
           SEER_RELEASE_TEST_PLATFORM_VERIFIER: platformVerifier,
+          GITHUB_ACTIONS: "false",
           FAKE_PLATFORM_LOG: platformLog,
           ...env,
         },
@@ -607,6 +794,15 @@ if (process.env.FAKE_PLATFORM_RESULT === "fail") {
     rmSync(scratch, { recursive: true, force: true });
   }
 }
+
+test("test-mode verifier hooks are rejected inside GitHub Actions", () => {
+  withHarness(({ run, readState }) => {
+    const result = run("preflight", { GITHUB_ACTIONS: "true" });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /SEER_RELEASE_TEST_MODE is forbidden when GITHUB_ACTIONS=true/);
+    assert.deepEqual(readState().calls, []);
+  });
+});
 
 test("newly-created and resumable draft releases are discovered via authenticated listing while the tag-lookup endpoint only exposes published releases", () => {
   // Case 1: no release exists yet. `upload` must create the draft and then
@@ -1090,7 +1286,7 @@ test("post-publish mismatch fails loudly without deleting the release", () => {
   }
 });
 
-test("exact captured state publishes by release ID with supported REST PATCH and refetch", () => {
+test("exact captured state with no prior latest publishes by release ID and explicitly becomes latest", () => {
   withHarness(({ run, readState }) => {
     assert.equal(run("capture").status, 0);
     const result = run("publish");
@@ -1102,18 +1298,569 @@ test("exact captured state publishes by release ID with supported REST PATCH and
     assert.ok(patch.some((arg) => arg.endsWith("/releases/42")));
     assert.ok(!patch.some((arg) => arg.startsWith("If-Match:")));
     assert.ok(patch.includes("Authorization: [REDACTED]"));
+    const payloadIndex = patch.indexOf("--data");
+    assert.notEqual(payloadIndex, -1);
+    assert.deepEqual(JSON.parse(patch[payloadIndex + 1]), {
+      draft: false,
+      prerelease: false,
+      make_latest: "true",
+    });
     assert.equal(state.authenticatedRequests.filter(({ method }) => method === "PATCH").length, 1);
+    assert.equal(
+      state.authenticatedRequests.filter(
+        ({ method, url }) => method === "GET" && url.endsWith("/releases/latest"),
+      ).length,
+      2,
+    );
     assert.equal(
       state.authenticatedRequests.filter(
         ({ method, url }) => method === "GET" && /\/releases\/[0-9]+$/.test(url),
       ).length,
       3,
     );
+    assert.equal(state.latestRelease.id, state.release.id);
+    assert.equal(state.latestRelease.tag, sourceTag);
     assert.equal(state.release.immutable, true);
-    assert.doesNotMatch(`${result.stdout}\n${result.stderr}\n${JSON.stringify(state)}`, /test-token/);
-    assert.ok(!state.calls.some((call) => call[0] === "gh" && call[1] === "release" && call[2] === "edit"));
+    const patchCallIndex = state.calls.findIndex(
+      (call) => call[0] === "curl" && call.includes("PATCH"),
+    );
+    const callEndpoint = (call) =>
+      call.find((argument) => typeof argument === "string" && argument.startsWith("repos/")) ??
+      call.find((argument) => /^https?:/.test(argument));
+    assert.deepEqual(state.calls.slice(patchCallIndex - 6, patchCallIndex + 1).map(callEndpoint), [
+      `repos/${sourceRepository}/git/ref/tags/${sourceTag}`,
+      `repos/${destinationRepository}/git/commits/${releaseRepoCommit}`,
+      `repos/${destinationRepository}/git/ref/tags/${sourceTag}`,
+      `repos/${destinationRepository}/git/ref/tags/seer-release-lock-${sourceTag}`,
+      `repos/${destinationRepository}/git/tags/${lockTagObjectSHA}`,
+      `repos/${destinationRepository}/git/commits/${releaseRepoCommit}`,
+      `https://api.github.test/repos/${destinationRepository}/releases/42`,
+    ]);
+    const finalDraftMetadataIndex = state.calls.findLastIndex(
+      (call, index) =>
+        index < patchCallIndex &&
+        call[0] === "curl" &&
+        call.includes("GET") &&
+        call.some((argument) => argument.endsWith("/releases/42")),
+    );
+    const finalAssetIndexes = state.calls
+      .map((call, index) => ({ call, index }))
+      .filter(
+        ({ call, index }) =>
+          index < patchCallIndex &&
+          call[0] === "curl" &&
+          call.includes("GET") &&
+          call.some((argument) => argument.includes("/releases/assets/")),
+      )
+      .slice(-expectedAssets.length)
+      .map(({ index }) => index);
+    const latestDecisionIndex = state.calls.findLastIndex(
+      (call, index) =>
+        index < finalDraftMetadataIndex &&
+        call[0] === "curl" &&
+        call.some((argument) => argument.endsWith("/releases/latest")),
+    );
+    const finalSourceTagIndex = patchCallIndex - 6;
+    assert.ok(latestDecisionIndex < finalDraftMetadataIndex);
+    assert.deepEqual(finalAssetIndexes, [
+      finalDraftMetadataIndex + 1,
+      finalDraftMetadataIndex + 2,
+      finalDraftMetadataIndex + 3,
+    ]);
+    assert.equal(finalAssetIndexes.at(-1) + 1, finalSourceTagIndex);
+    assert.doesNotMatch(
+      `${result.stdout}\n${result.stderr}\n${JSON.stringify(state)}`,
+      /test-token/,
+    );
+    assert.ok(
+      !state.calls.some((call) => call[0] === "gh" && call[1] === "release" && call[2] === "edit"),
+    );
     assert.ok(!state.calls.some((call) => call.includes("delete") || call.includes("DELETE")));
   });
+});
+
+test("a higher semantic version explicitly replaces the authenticated prior latest release", () => {
+  withHarness(
+    ({ run, readState, scratch }) => {
+      assert.equal(run("capture").status, 0);
+      const result = run("publish");
+      assert.equal(result.status, 0, result.stderr);
+
+      const state = readState();
+      const patch = state.calls.find((call) => call[0] === "curl" && call.includes("PATCH"));
+      const payloadIndex = patch.indexOf("--data");
+      assert.equal(JSON.parse(patch[payloadIndex + 1]).make_latest, "true");
+      assert.equal(state.latestRelease.id, state.release.id);
+      assert.equal(state.latestRelease.tag, sourceTag);
+      const inventory = JSON.parse(
+        readFileSync(join(scratch, "pre-publish-inventory.json"), "utf8"),
+      );
+      const stable = inventory.releases.find(({ id }) => id === 41);
+      assert.deepEqual(stable.author, releaseWriter);
+      assert.deepEqual(
+        stable.assets.map(({ name, uploader }) => ({ name, uploader })),
+        stableAssetNames("v1.2.2").map((name) => ({ name, uploader: releaseWriter })),
+      );
+      assert.ok(
+        !state.authenticatedRequests.some(({ url }) =>
+          stable.assets.some(({ id }) => url.endsWith(`/releases/assets/${id}`)),
+        ),
+        "historical stable assets must be trusted from metadata without downloading bytes",
+      );
+    },
+    { latestRelease: latestRelease("v1.2.2") },
+  );
+});
+
+test("a lower backport publishes with make_latest false and preserves exact prior latest identity", () => {
+  const priorLatest = latestRelease("v2.0.0", 84);
+  withHarness(
+    ({ run, readState }) => {
+      assert.equal(run("capture").status, 0);
+      const result = run("publish");
+      assert.equal(result.status, 0, result.stderr);
+
+      const state = readState();
+      const patch = state.calls.find((call) => call[0] === "curl" && call.includes("PATCH"));
+      const payloadIndex = patch.indexOf("--data");
+      assert.equal(JSON.parse(patch[payloadIndex + 1]).make_latest, "false");
+      assert.equal(state.release.draft, false);
+      assert.equal(state.latestRelease.id, priorLatest.id);
+      assert.equal(state.latestRelease.tag, priorLatest.tag);
+    },
+    { latestRelease: priorLatest },
+  );
+});
+
+test("global release inventory exhausts multiple pages and excludes drafts and prereleases from the maximum", () => {
+  const stableMaximum = latestRelease("v2.0.0", 84);
+  withHarness(
+    ({ run, readState }) => {
+      assert.equal(run("capture").status, 0);
+      const result = run("publish", {
+        SEER_RELEASE_TEST_LIST_PAGE_SIZE: "2",
+        SEER_RELEASE_TEST_LIST_MAX_PAGES: "5",
+      });
+      assert.equal(result.status, 0, result.stderr);
+
+      const state = readState();
+      const patch = state.calls.find((call) => call[0] === "curl" && call.includes("PATCH"));
+      assert.equal(JSON.parse(patch[patch.indexOf("--data") + 1]).make_latest, "false");
+      assert.ok(
+        state.releaseListRequests.filter(({ page }) => page === 3).length >= 2,
+        "pre- and post-publication inventory scans must reach the terminal third page",
+      );
+      assert.equal(state.latestRelease.id, stableMaximum.id);
+    },
+    {
+      latestRelease: stableMaximum,
+      inventoryReleases: [
+        latestRelease("v99.0.0", 85, { draft: true, immutable: false }),
+        latestRelease("v100.0.0", 86, { prerelease: true }),
+        stableMaximum,
+      ],
+    },
+  );
+});
+
+test("global release inventory fails closed when its configured final page is full", () => {
+  const stableMaximum = latestRelease("v2.0.0", 84);
+  withHarness(
+    ({ run, readState }) => {
+      assert.equal(run("capture").status, 0);
+      const result = run("publish", {
+        SEER_RELEASE_TEST_LIST_PAGE_SIZE: "2",
+        SEER_RELEASE_TEST_LIST_MAX_PAGES: "2",
+      });
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /maximum|bounded|full page|truncat/i);
+      assert.ok(!readState().authenticatedRequests.some(({ method }) => method === "PATCH"));
+    },
+    {
+      latestRelease: stableMaximum,
+      inventoryReleases: [
+        stableMaximum,
+        latestRelease("v99.0.0", 85, { draft: true, immutable: false }),
+        latestRelease("v100.0.0", 86, { prerelease: true }),
+      ],
+    },
+  );
+});
+
+test("malformed stable published inventory entries fail before publication", () => {
+  const stableMaximum = latestRelease("v2.0.0", 84);
+  const malformed = [
+    latestRelease("2.1.0", 85),
+    latestRelease("v02.1.0", 85),
+    latestRelease("v9007199254740992.0.0", 85),
+    latestRelease("v2.1.0", 85, { immutable: false }),
+    latestRelease("v2.1.0", 0),
+  ];
+  for (const entry of malformed) {
+    withHarness(
+      ({ run, readState }) => {
+        assert.equal(run("capture").status, 0);
+        const result = run("publish");
+        assert.notEqual(result.status, 0, `${entry.tag}/${entry.id} must fail`);
+        assert.match(
+          result.stderr,
+          /inventory|stable published|canonical|oversized|immutable|positive safe/i,
+        );
+        assert.ok(!readState().authenticatedRequests.some(({ method }) => method === "PATCH"));
+      },
+      {
+        latestRelease: stableMaximum,
+        inventoryReleases: [stableMaximum, entry],
+      },
+    );
+  }
+});
+
+test("stable inventory rejects foreign authors and uploaders plus missing or extra assets", () => {
+  const trusted = latestRelease("v2.0.0", 84);
+  const foreign = { id: 99, login: "foreign-writer" };
+  const cases = [
+    ["foreign author", latestRelease("v2.0.0", 84, { author: foreign })],
+    [
+      "foreign uploader",
+      latestRelease("v2.0.0", 84, {
+        assets: trusted.assets.map((item, index) => ({
+          ...item,
+          ...(index === 0 ? { uploader: foreign } : {}),
+        })),
+      }),
+    ],
+    ["missing asset", latestRelease("v2.0.0", 84, { assets: trusted.assets.slice(1) })],
+    [
+      "extra asset",
+      latestRelease("v2.0.0", 84, {
+        assets: [...trusted.assets, asset("foreign-debug-symbols.zip", 999)],
+      }),
+    ],
+  ];
+
+  for (const [name, untrusted] of cases) {
+    withHarness(
+      ({ run, readState }) => {
+        assert.equal(run("capture").status, 0);
+        const result = run("publish");
+        assert.notEqual(result.status, 0, `${name} must fail`);
+        assert.match(result.stderr, /stable|author|uploader|asset|writer|allowlist/i);
+        assert.ok(!readState().authenticatedRequests.some(({ method }) => method === "PATCH"));
+      },
+      {
+        latestRelease: trusted,
+        inventoryReleases: [untrusted],
+      },
+    );
+  }
+});
+
+test("latest endpoint rejects foreign authors and uploaders plus missing or extra assets", () => {
+  const trusted = latestRelease("v2.0.0", 84);
+  const foreign = { id: 99, login: "foreign-writer" };
+  const cases = [
+    ["foreign author", latestRelease("v2.0.0", 84, { author: foreign })],
+    [
+      "foreign uploader",
+      latestRelease("v2.0.0", 84, {
+        assets: trusted.assets.map((item, index) => ({
+          ...item,
+          ...(index === 0 ? { uploader: foreign } : {}),
+        })),
+      }),
+    ],
+    ["missing asset", latestRelease("v2.0.0", 84, { assets: trusted.assets.slice(1) })],
+    [
+      "extra asset",
+      latestRelease("v2.0.0", 84, {
+        assets: [...trusted.assets, asset("foreign-debug-symbols.zip", 999)],
+      }),
+    ],
+  ];
+
+  for (const [name, untrusted] of cases) {
+    withHarness(
+      ({ run, readState }) => {
+        assert.equal(run("capture").status, 0);
+        const result = run("publish");
+        assert.notEqual(result.status, 0, `${name} must fail`);
+        assert.match(result.stderr, /latest|author|uploader|asset|writer|allowlist/i);
+        assert.ok(!readState().authenticatedRequests.some(({ method }) => method === "PATCH"));
+      },
+      {
+        latestRelease: untrusted,
+        inventoryReleases: [trusted],
+      },
+    );
+  }
+});
+
+test("duplicate canonical stable versions and duplicate list identities fail closed", () => {
+  const stableMaximum = latestRelease("v2.0.0", 84);
+  for (const duplicate of [latestRelease("v2.0.0", 85), structuredClone(stableMaximum)]) {
+    withHarness(
+      ({ run, readState }) => {
+        assert.equal(run("capture").status, 0);
+        const result = run("publish", {
+          SEER_RELEASE_TEST_LIST_PAGE_SIZE: "2",
+          SEER_RELEASE_TEST_LIST_MAX_PAGES: "5",
+        });
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, /duplicate|semantic version|list mutation|ambiguous/i);
+        assert.ok(!readState().authenticatedRequests.some(({ method }) => method === "PATCH"));
+      },
+      {
+        latestRelease: stableMaximum,
+        inventoryReleases: [stableMaximum, duplicate],
+      },
+    );
+  }
+});
+
+test("release inventory mutation between exhaustive confirmation scans fails closed", () => {
+  const stableMaximum = latestRelease("v2.0.0", 84);
+  withHarness(
+    ({ run, readState }) => {
+      assert.equal(run("capture").status, 0);
+      const result = run("publish");
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /inventory|list.*mutat|changed between/i);
+      assert.ok(!readState().authenticatedRequests.some(({ method }) => method === "PATCH"));
+    },
+    {
+      latestRelease: stableMaximum,
+      inventoryReleases: [stableMaximum],
+      releaseListMutationAfterScan: 4,
+      mutatedInventoryReleases: [
+        stableMaximum,
+        latestRelease("v99.0.0", 85, { draft: true, immutable: false }),
+      ],
+    },
+  );
+});
+
+test("inventory rejects reuse of the current draft ID by another listed release", () => {
+  const stableMaximum = latestRelease("v2.0.0", 84);
+  withHarness(
+    ({ run, readState }) => {
+      assert.equal(run("capture").status, 0);
+      const result = run("publish");
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /current draft|duplicate release ID|list mutation|reuse/i);
+      assert.ok(!readState().authenticatedRequests.some(({ method }) => method === "PATCH"));
+    },
+    {
+      latestRelease: stableMaximum,
+      inventoryReleases: [stableMaximum, latestRelease("v3.0.0", 42)],
+    },
+  );
+});
+
+test("publication rejects a pre-existing latest pointer that is not the inventory maximum", () => {
+  const staleLatest = latestRelease("v2.0.0", 84);
+  const actualMaximum = latestRelease("v3.0.0", 85);
+  withHarness(
+    ({ run, readState }) => {
+      assert.equal(run("capture").status, 0);
+      const result = run("publish");
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /latest.*global maximum|inventory maximum|invariant|mismatch/i);
+      assert.ok(!readState().authenticatedRequests.some(({ method }) => method === "PATCH"));
+    },
+    {
+      latestRelease: staleLatest,
+      inventoryReleases: [staleLatest, actualMaximum],
+    },
+  );
+});
+
+test("post-publication verification uses a fresh inventory maximum rather than the prior decision", () => {
+  const priorLatest = latestRelease("v1.2.2", 41);
+  const interveningMaximum = latestRelease("v9.9.9", 99);
+  withHarness(
+    ({ run, readState }) => {
+      assert.equal(run("capture").status, 0);
+      const result = run("publish");
+      assert.notEqual(result.status, 0);
+      assert.match(
+        result.stderr,
+        /post-publish|post-publication|global maximum|invariant|mismatch/i,
+      );
+
+      const state = readState();
+      assert.equal(state.release.draft, false);
+      assert.equal(
+        state.authenticatedRequests.filter(({ method }) => method === "PATCH").length,
+        1,
+      );
+    },
+    {
+      latestRelease: priorLatest,
+      inventoryReleases: [priorLatest],
+      postInventoryReleases: [priorLatest, interveningMaximum],
+    },
+  );
+});
+
+test("post-publication verification binds the decision to its exact pre-publication inventory", () => {
+  withHarness(
+    ({ run, readState }) => {
+      assert.equal(run("capture").status, 0);
+      const result = run("publish");
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /decision.*inventory|inventory.*binding|fingerprint/i);
+      assert.equal(readState().release.draft, false);
+    },
+    { tamperDecisionFingerprint: true },
+  );
+});
+
+test("post-publication latest API failure cannot be mistaken for a verified pointer", () => {
+  withHarness(
+    ({ run, readState }) => {
+      assert.equal(run("capture").status, 0);
+      const result = run("publish");
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /latest release.*(?:HTTP|status|request)/i);
+      assert.equal(readState().release.draft, false);
+    },
+    { postLatestResponseStatus: 500 },
+  );
+});
+
+test("authenticated inventory API failures stop both pre- and post-publication verification", () => {
+  const stableMaximum = latestRelease("v2.0.0", 84);
+  for (const [phase, options, expectedDraft] of [
+    ["pre-publication", { releaseListFailurePage: 2 }, true],
+    ["post-publication", { postReleaseListFailurePage: 2 }, false],
+  ]) {
+    withHarness(
+      ({ run, readState }) => {
+        assert.equal(run("capture").status, 0);
+        const result = run("publish", {
+          SEER_RELEASE_TEST_LIST_PAGE_SIZE: "2",
+          SEER_RELEASE_TEST_LIST_MAX_PAGES: "5",
+        });
+        assert.notEqual(result.status, 0, `${phase} failure must stop publication verification`);
+        assert.match(result.stderr, /release.*(?:inventory|list).*(?:API|request|fail)/i);
+        assert.equal(readState().release.draft, expectedDraft);
+      },
+      {
+        latestRelease: stableMaximum,
+        inventoryReleases: [
+          stableMaximum,
+          latestRelease("v99.0.0", 85, { draft: true, immutable: false }),
+        ],
+        ...options,
+      },
+    );
+  }
+});
+
+test("malformed, noncanonical, and oversized latest semantic-version tags fail closed", () => {
+  for (const tag of ["1.2.2", "v01.2.2", "v9007199254740992.0.0"]) {
+    withHarness(
+      ({ run, readState }) => {
+        assert.equal(run("capture").status, 0);
+        const result = run("publish");
+        assert.notEqual(result.status, 0, `${tag} must fail`);
+        assert.match(result.stderr, /latest release tag|canonical|semantic version|oversized/i);
+        const state = readState();
+        assert.equal(state.release.draft, true);
+        assert.ok(!state.authenticatedRequests.some(({ method }) => method === "PATCH"));
+      },
+      { latestRelease: latestRelease(tag) },
+    );
+  }
+});
+
+test("unacceptable latest release state fails closed before publication", () => {
+  for (const overrides of [{ prerelease: true }, { immutable: false }, { draft: true }]) {
+    withHarness(
+      ({ run, readState }) => {
+        assert.equal(run("capture").status, 0);
+        const result = run("publish");
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, /latest release state|stable|published|immutable/i);
+        assert.equal(readState().release.draft, true);
+        assert.ok(!readState().authenticatedRequests.some(({ method }) => method === "PATCH"));
+      },
+      { latestRelease: latestRelease("v1.2.2", 41, overrides) },
+    );
+  }
+});
+
+test("latest release API failure stops publication without treating it as no releases", () => {
+  withHarness(
+    ({ run, readState }) => {
+      assert.equal(run("capture").status, 0);
+      const result = run("publish");
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /latest release.*(?:HTTP|status|request)/i);
+      const state = readState();
+      assert.equal(state.release.draft, true);
+      assert.ok(!state.authenticatedRequests.some(({ method }) => method === "PATCH"));
+    },
+    { latestResponseStatus: 500 },
+  );
+});
+
+test("same-version prior latest with a different release identity is ambiguous and fails closed", () => {
+  withHarness(
+    ({ run, readState }) => {
+      const result = run("capture");
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /multiple releases match|same semantic version|ambiguous/i);
+      assert.equal(readState().release.draft, true);
+      assert.ok(!readState().authenticatedRequests.some(({ method }) => method === "PATCH"));
+    },
+    { latestRelease: latestRelease(sourceTag, 84) },
+  );
+});
+
+for (const tag of ["v1.2.2", "v2.0.0"]) {
+  test(`latest decision rejects current draft release ID reuse by prior latest ${tag}`, () => {
+    withHarness(
+      ({ run, readState }) => {
+        assert.equal(run("capture").status, 0);
+        const result = run("publish");
+
+        assert.notEqual(result.status, 0, `${tag} must fail`);
+        assert.match(
+          result.stderr,
+          /current draft release ID|canonical 404|global maximum|malformed/i,
+        );
+        const state = readState();
+        assert.equal(state.release.draft, true);
+        assert.ok(!state.authenticatedRequests.some(({ method }) => method === "PATCH"));
+      },
+      { latestRelease: latestRelease(tag, 42) },
+    );
+  });
+}
+
+test("post-publish latest mismatch fails after exact immutable publication verification", () => {
+  withHarness(
+    ({ run, readState }) => {
+      assert.equal(run("capture").status, 0);
+      const result = run("publish");
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /post-publish|post-publication.*latest release|global maximum/i);
+
+      const state = readState();
+      assert.equal(state.release.draft, false);
+      assert.equal(state.release.immutable, true);
+      assert.equal(
+        state.authenticatedRequests.filter(({ method }) => method === "PATCH").length,
+        1,
+      );
+    },
+    {
+      latestRelease: latestRelease("v1.2.2"),
+      postLatestRelease: latestRelease("v9.9.9", 99),
+    },
+  );
 });
 
 test("ambiguous publish responses are reconciled against exact post-request state", () => {
@@ -1122,18 +1869,21 @@ test("ambiguous publish responses are reconciled against exact post-request stat
     ["lost-unchanged", 1, true],
     ["lost-mutated", 1, false],
   ]) {
-    withHarness(({ run, readState }) => {
-      assert.equal(run("capture").status, 0);
-      const result = run("publish");
-      assert.equal(result.status === 0 ? 0 : 1, expectedStatus, `${outcome}: ${result.stderr}`);
-      assert.equal(readState().release.draft, expectedDraft);
-      assert.equal(
-        readState().authenticatedRequests.filter(({ method }) => method === "PATCH").length,
-        1,
-      );
-      if (outcome === "lost-unchanged") assert.match(result.stderr, /draft.*unchanged|retry/i);
-      if (outcome === "lost-mutated") assert.match(result.stderr, /differs|canonical|mismatch/i);
-    }, { patchOutcome: outcome });
+    withHarness(
+      ({ run, readState }) => {
+        assert.equal(run("capture").status, 0);
+        const result = run("publish");
+        assert.equal(result.status === 0 ? 0 : 1, expectedStatus, `${outcome}: ${result.stderr}`);
+        assert.equal(readState().release.draft, expectedDraft);
+        assert.equal(
+          readState().authenticatedRequests.filter(({ method }) => method === "PATCH").length,
+          1,
+        );
+        if (outcome === "lost-unchanged") assert.match(result.stderr, /draft.*unchanged|retry/i);
+        if (outcome === "lost-mutated") assert.match(result.stderr, /differs|canonical|mismatch/i);
+      },
+      { patchOutcome: outcome },
+    );
   }
 });
 
@@ -1155,28 +1905,231 @@ test("publish requires independent evidence for a preexisting immutable release"
 });
 
 test("upload never clobbers an immutable published release", () => {
-  withHarness(({ run, readState }) => {
-    assert.equal(run("preflight").status, 0);
-    const result = run("upload");
+  withHarness(
+    ({ run, readState }) => {
+      assert.equal(run("preflight").status, 0);
+      const result = run("upload");
 
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /reconciled|refusing to overwrite/i);
-    assert.ok(!readState().calls.some(
-      (call) => call[0] === "gh" && call[1] === "release" && call[2] === "upload",
-    ));
-    assert.ok(!readState().authenticatedRequests.some(({ method }) => method === "PATCH"));
-  }, {
-    release: matchingRelease({
-      draft: false,
-      immutable: true,
-      updatedAt: "2026-08-15T18:02:00Z",
-    }),
-  });
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /reconciled|refusing to overwrite/i);
+      assert.ok(
+        !readState().calls.some(
+          (call) => call[0] === "gh" && call[1] === "release" && call[2] === "upload",
+        ),
+      );
+      assert.ok(!readState().authenticatedRequests.some(({ method }) => method === "PATCH"));
+    },
+    {
+      release: matchingRelease({
+        draft: false,
+        immutable: true,
+        updatedAt: "2026-08-15T18:02:00Z",
+      }),
+    },
+  );
 });
 
+test("published retry accepts the current release only when fresh latest has its exact identity", () => {
+  const release = matchingRelease({
+    draft: false,
+    immutable: true,
+    updatedAt: "2026-08-15T18:02:00Z",
+    assets: publishedAssets(),
+  });
+  withHarness(
+    ({ run, readState, githubOutput }) => {
+      const result = run("reconcile-published");
+
+      assert.equal(result.status, 0, result.stderr);
+      assert.match(readFileSync(githubOutput, "utf8"), /^published=true$/m);
+      const state = readState();
+      assert.equal(
+        state.authenticatedRequests.filter(
+          ({ method, url }) => method === "GET" && url.endsWith("/releases/latest"),
+        ).length,
+        1,
+      );
+      assert.ok(!state.authenticatedRequests.some(({ method }) => method === "PATCH"));
+    },
+    { release, latestRelease: structuredClone(release) },
+  );
+});
+
+test("published backport retry accepts an intervening higher release only as the fresh global maximum", () => {
+  const higherLatest = latestRelease("v2.0.0", 84);
+  withHarness(
+    ({ run, readState, githubOutput }) => {
+      const result = run("reconcile-published");
+
+      assert.equal(result.status, 0, result.stderr);
+      assert.match(readFileSync(githubOutput, "utf8"), /^published=true$/m);
+      const state = readState();
+      assert.equal(state.latestRelease.id, higherLatest.id);
+      assert.equal(
+        state.authenticatedRequests.filter(
+          ({ method, url }) => method === "GET" && url.endsWith("/releases/latest"),
+        ).length,
+        1,
+      );
+      assert.ok(!state.authenticatedRequests.some(({ method }) => method === "PATCH"));
+    },
+    {
+      release: matchingRelease({
+        draft: false,
+        immutable: true,
+        updatedAt: "2026-08-15T18:02:00Z",
+        assets: publishedAssets(),
+      }),
+      latestRelease: higherLatest,
+    },
+  );
+});
+
+test("published retry fails when latest is not the fresh inventory maximum", () => {
+  const staleLatest = latestRelease("v2.0.0", 84);
+  const interveningMaximum = latestRelease("v3.0.0", 85);
+  withHarness(
+    ({ run, readState, githubOutput }) => {
+      const result = run("reconcile-published");
+
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /latest.*global maximum|inventory maximum|invariant|mismatch/i);
+      assert.equal(existsSync(githubOutput), false);
+      assert.ok(!readState().authenticatedRequests.some(({ method }) => method === "PATCH"));
+    },
+    {
+      release: matchingRelease({
+        draft: false,
+        immutable: true,
+        updatedAt: "2026-08-15T18:02:00Z",
+        assets: publishedAssets(),
+      }),
+      latestRelease: staleLatest,
+      inventoryReleases: [staleLatest, interveningMaximum],
+    },
+  );
+});
+
+test("published retry rejects a lower latest because the current release should be latest", () => {
+  withHarness(
+    ({ run, readState, githubOutput }) => {
+      const result = run("reconcile-published");
+
+      assert.notEqual(result.status, 0);
+      assert.match(
+        result.stderr,
+        /global maximum|current published release.*should be latest|lower latest/i,
+      );
+      assert.equal(existsSync(githubOutput), false);
+      assert.ok(!readState().authenticatedRequests.some(({ method }) => method === "PATCH"));
+    },
+    {
+      release: matchingRelease({
+        draft: false,
+        immutable: true,
+        updatedAt: "2026-08-15T18:02:00Z",
+        assets: publishedAssets(),
+      }),
+      latestRelease: latestRelease("v1.2.2", 41),
+    },
+  );
+});
+
+test("published retry rejects a same-version latest release with a different ID", () => {
+  withHarness(
+    ({ run, readState, githubOutput }) => {
+      const result = run("reconcile-published");
+
+      assert.notEqual(result.status, 0);
+      assert.match(
+        result.stderr,
+        /multiple releases match|same semantic version|exact release identity|release ID/i,
+      );
+      assert.equal(existsSync(githubOutput), false);
+      assert.ok(!readState().authenticatedRequests.some(({ method }) => method === "PATCH"));
+    },
+    {
+      release: matchingRelease({
+        draft: false,
+        immutable: true,
+        updatedAt: "2026-08-15T18:02:00Z",
+        assets: publishedAssets(),
+      }),
+      latestRelease: latestRelease(sourceTag, 84),
+    },
+  );
+});
+
+test("published retry rejects the current release ID paired with a different latest tag", () => {
+  withHarness(
+    ({ run, readState, githubOutput }) => {
+      const result = run("reconcile-published");
+
+      assert.notEqual(result.status, 0);
+      assert.match(
+        result.stderr,
+        /global maximum|current release ID.*different tag|identity.*malformed/i,
+      );
+      assert.equal(existsSync(githubOutput), false);
+      assert.ok(!readState().authenticatedRequests.some(({ method }) => method === "PATCH"));
+    },
+    {
+      release: matchingRelease({
+        draft: false,
+        immutable: true,
+        updatedAt: "2026-08-15T18:02:00Z",
+        assets: publishedAssets(),
+      }),
+      latestRelease: latestRelease("v2.0.0", 42),
+    },
+  );
+});
+
+for (const entry of [
+  {
+    name: "absent",
+    options: { latestRelease: null },
+    pattern:
+      /global maximum|canonical 404|latest release endpoint returned no release|published release.*latest/i,
+  },
+  {
+    name: "malformed",
+    options: { latestResponseBody: JSON.stringify({ id: 42, tag_name: sourceTag }) },
+    pattern: /latest release response.*invalid shape|latest release state/i,
+  },
+  {
+    name: "API error",
+    options: { latestResponseStatus: 500 },
+    pattern: /latest release.*(?:HTTP|status|request)/i,
+  },
+]) {
+  test(`published retry fails closed when latest is ${entry.name}`, () => {
+    withHarness(
+      ({ run, readState, githubOutput }) => {
+        const result = run("reconcile-published");
+
+        assert.notEqual(result.status, 0, `${entry.name} must fail`);
+        assert.match(result.stderr, entry.pattern);
+        assert.equal(existsSync(githubOutput), false);
+        assert.ok(!readState().authenticatedRequests.some(({ method }) => method === "PATCH"));
+      },
+      {
+        release: matchingRelease({
+          draft: false,
+          immutable: true,
+          updatedAt: "2026-08-15T18:02:00Z",
+          assets: publishedAssets(),
+        }),
+        ...entry.options,
+      },
+    );
+  });
+}
+
 test("published reconciliation validates remote timestamped assets without comparing rebuilt bytes", () => {
-    const remoteAssets = publishedAssets();
-    withHarness(({ run, readState, releaseDir, githubOutput, platformLog, scratch }) => {
+  const remoteAssets = publishedAssets();
+  withHarness(
+    ({ run, readState, releaseDir, githubOutput, platformLog, scratch }) => {
       assert.notEqual(
         readFileSync(join(releaseDir, expectedAssets[0])),
         remoteAssets[0].contents,
@@ -1191,90 +2144,219 @@ test("published reconciliation validates remote timestamped assets without compa
       assert.match(outputs, /^existing-published-state=.+$/m);
       assert.match(outputs, /^release-directory=.+$/m);
       assert.equal(readFileSync(platformLog, "utf8").trim().split("\n").length, 1);
-      assert.ok(!readState().calls.some(
-        (call) => call[0] === "gh" && call[1] === "release" && call[2] === "upload",
-      ));
+      assert.ok(
+        !readState().calls.some(
+          (call) => call[0] === "gh" && call[1] === "release" && call[2] === "upload",
+        ),
+      );
       assert.ok(!readState().authenticatedRequests.some(({ method }) => method === "PATCH"));
-      assert.ok(readFileSync(join(scratch, "existing-published-state.json"), "utf8").includes(
-        '"kind": "existing-published-state"',
-      ));
-    }, {
+      assert.ok(
+        readFileSync(join(scratch, "existing-published-state.json"), "utf8").includes(
+          '"kind": "existing-published-state"',
+        ),
+      );
+    },
+    {
       release: matchingRelease({
         draft: false,
         immutable: true,
         updatedAt: "2026-08-15T18:02:00Z",
         assets: remoteAssets,
       }),
-    });
+    },
+  );
 });
 
-test("published reconciliation fails closed on source, manifest, hash, or signature mismatch", () => {
-    const cases = [
-      {
-        name: "source",
-        release: matchingRelease({
-          draft: false,
-          immutable: true,
-          body: canonicalBody.replace(sourceCommit, "b".repeat(40)),
-          assets: publishedAssets(),
-        }),
-        env: {},
-        pattern: /provenance|source/i,
-      },
-      {
-        name: "manifest",
-        release: matchingRelease({
-          draft: false,
-          immutable: true,
-          assets: publishedAssets({ manifestOverrides: { sourceCommit: "b".repeat(40) } }),
-        }),
-        env: {},
-        pattern: /manifest.*source commit/i,
-      },
-      {
-        name: "hash",
-        release: matchingRelease({
-          draft: false,
-          immutable: true,
-          assets: publishedAssets({ checksumDigest: "f".repeat(64) }),
-        }),
-        env: {},
-        pattern: /SHA256SUMS|checksum|DMG hash/i,
-      },
-      {
-        name: "signature",
-        release: matchingRelease({
-          draft: false,
-          immutable: true,
-          assets: publishedAssets(),
-        }),
-        env: { FAKE_PLATFORM_RESULT: "fail" },
-        pattern: /signature|notarization/i,
-      },
-    ];
+test("published reconciliation rejects exact DMG/app identity and mounted app metadata mismatches", () => {
+  const cases = [
+    {
+      name: "DMG signer authority",
+      env: { FAKE_PUBLISHED_DMG_AUTHORITY: "Developer ID Application: Other (ABCDEFGHIJ)" },
+      pattern: /published DMG authority does not match APPLE_SIGNING_IDENTITY/i,
+    },
+    {
+      name: "DMG Team ID",
+      env: { FAKE_PUBLISHED_DMG_TEAM_ID: "ZZZZZZZZZZ" },
+      pattern: /published DMG team identifier does not match APPLE_TEAM_ID/i,
+    },
+    {
+      name: "app signer authority",
+      env: { FAKE_PUBLISHED_APP_AUTHORITY: "Developer ID Application: Other (ABCDEFGHIJ)" },
+      pattern: /published app authority does not match APPLE_SIGNING_IDENTITY/i,
+    },
+    {
+      name: "app Team ID",
+      env: { FAKE_PUBLISHED_APP_TEAM_ID: "ZZZZZZZZZZ" },
+      pattern: /published app team identifier does not match APPLE_TEAM_ID/i,
+    },
+    {
+      name: "bundle identifier",
+      env: { FAKE_PUBLISHED_BUNDLE_IDENTIFIER: "example.invalid.seer" },
+      pattern: /published app bundle identifier is not ai\.opencoven\.seer/i,
+    },
+    {
+      name: "marketing version",
+      env: { FAKE_PUBLISHED_MARKETING_VERSION: "9.9.9" },
+      pattern: /published app CFBundleShortVersionString does not match VERSION/i,
+    },
+    {
+      name: "build number",
+      env: { FAKE_PUBLISHED_BUILD_NUMBER: "999" },
+      pattern: /published app CFBundleVersion does not match BUILD_NUMBER/i,
+    },
+  ];
 
-    for (const entry of cases) {
-      withHarness(({ run, readState }) => {
+  for (const entry of cases) {
+    withHarness(
+      ({ run, readState }) => {
         const result = run("reconcile-published", entry.env);
         assert.notEqual(result.status, 0, `${entry.name} mismatch must fail`);
         assert.match(result.stderr, entry.pattern);
         assert.ok(!readState().authenticatedRequests.some(({ method }) => method === "PATCH"));
-        assert.ok(!readState().calls.some(
-          (call) => call[0] === "gh" && call[1] === "release" && call[2] === "upload",
-        ));
-      }, { release: entry.release });
-    }
+      },
+      {
+        release: matchingRelease({
+          draft: false,
+          immutable: true,
+          updatedAt: "2026-08-15T18:02:00Z",
+          assets: publishedAssets(),
+        }),
+      },
+    );
+  }
+});
+
+test("published reconciliation rejects unsafe expected signing identities before platform verification", () => {
+  const cases = [
+    {
+      name: "empty identity",
+      env: { APPLE_SIGNING_IDENTITY: "" },
+      pattern: /APPLE_SIGNING_IDENTITY is required/i,
+    },
+    {
+      name: "line feed",
+      env: { APPLE_SIGNING_IDENTITY: `${signingIdentity}\nignored` },
+      pattern: /APPLE_SIGNING_IDENTITY must not contain CR or LF/i,
+    },
+    {
+      name: "carriage return",
+      env: { APPLE_SIGNING_IDENTITY: `${signingIdentity}\rignored` },
+      pattern: /APPLE_SIGNING_IDENTITY must not contain CR or LF/i,
+    },
+    {
+      name: "wrong authority kind",
+      env: { APPLE_SIGNING_IDENTITY: "Apple Development: OpenCoven (ABCDEFGHIJ)" },
+      pattern: /exact Developer ID Application authority for APPLE_TEAM_ID/i,
+    },
+    {
+      name: "wrong authority team",
+      env: { APPLE_SIGNING_IDENTITY: "Developer ID Application: OpenCoven (ZZZZZZZZZZ)" },
+      pattern: /exact Developer ID Application authority for APPLE_TEAM_ID/i,
+    },
+    {
+      name: "invalid expected team",
+      env: { APPLE_TEAM_ID: "abcdefghij" },
+      pattern: /APPLE_TEAM_ID must be a 10-character uppercase Apple team identifier/i,
+    },
+  ];
+
+  for (const entry of cases) {
+    withHarness(
+      ({ run, readState, platformLog }) => {
+        const result = run("reconcile-published", entry.env);
+        assert.notEqual(result.status, 0, `${entry.name} must fail`);
+        assert.match(result.stderr, entry.pattern);
+        assert.ok(!readState().authenticatedRequests.some(({ method }) => method === "PATCH"));
+        assert.equal(existsSync(platformLog), false);
+      },
+      {
+        release: matchingRelease({
+          draft: false,
+          immutable: true,
+          updatedAt: "2026-08-15T18:02:00Z",
+          assets: publishedAssets(),
+        }),
+      },
+    );
+  }
+});
+
+test("published reconciliation fails closed on source, manifest, hash, or signature mismatch", () => {
+  const cases = [
+    {
+      name: "source",
+      release: matchingRelease({
+        draft: false,
+        immutable: true,
+        body: canonicalBody.replace(sourceCommit, "b".repeat(40)),
+        assets: publishedAssets(),
+      }),
+      env: {},
+      pattern: /provenance|source/i,
+    },
+    {
+      name: "manifest",
+      release: matchingRelease({
+        draft: false,
+        immutable: true,
+        assets: publishedAssets({ manifestOverrides: { sourceCommit: "b".repeat(40) } }),
+      }),
+      env: {},
+      pattern: /manifest.*source commit/i,
+    },
+    {
+      name: "hash",
+      release: matchingRelease({
+        draft: false,
+        immutable: true,
+        assets: publishedAssets({ checksumDigest: "f".repeat(64) }),
+      }),
+      env: {},
+      pattern: /SHA256SUMS|checksum|DMG hash/i,
+    },
+    {
+      name: "signature",
+      release: matchingRelease({
+        draft: false,
+        immutable: true,
+        assets: publishedAssets(),
+      }),
+      env: { FAKE_PLATFORM_RESULT: "fail" },
+      pattern: /signature|notarization/i,
+    },
+  ];
+
+  for (const entry of cases) {
+    withHarness(
+      ({ run, readState }) => {
+        const result = run("reconcile-published", entry.env);
+        assert.notEqual(result.status, 0, `${entry.name} mismatch must fail`);
+        assert.match(result.stderr, entry.pattern);
+        assert.ok(!readState().authenticatedRequests.some(({ method }) => method === "PATCH"));
+        assert.ok(
+          !readState().calls.some(
+            (call) => call[0] === "gh" && call[1] === "release" && call[2] === "upload",
+          ),
+        );
+      },
+      { release: entry.release },
+    );
+  }
 });
 
 test("published reconciliation rejects foreign assets and never mutates the release", () => {
-    withHarness(({ run, readState }) => {
+  withHarness(
+    ({ run, readState }) => {
       const result = run("reconcile-published");
       assert.notEqual(result.status, 0);
       assert.match(result.stderr, /foreign release asset/);
-      assert.ok(!readState().calls.some(
-        (call) => call.includes("DELETE") || call.includes("PATCH") || call.includes("upload"),
-      ));
-    }, {
+      assert.ok(
+        !readState().calls.some(
+          (call) => call.includes("DELETE") || call.includes("PATCH") || call.includes("upload"),
+        ),
+      );
+    },
+    {
       release: matchingRelease({
         draft: false,
         immutable: true,
@@ -1366,6 +2448,56 @@ test("publish re-resolves the source tag after capture and before PATCH", () => 
     assert.match(result.stderr, /source tag moved/i);
     assert.ok(!readState().authenticatedRequests.some(({ method }) => method === "PATCH"));
   });
+});
+
+test("draft mutation during inventory is caught by final byte verification before PATCH", () => {
+  withHarness(
+    ({ run, readState }) => {
+      assert.equal(run("capture").status, 0);
+      const result = run("publish");
+
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /fresh download|verified bytes|release asset/i);
+      const state = readState();
+      assert.equal(state.draftInventoryMutationApplied, true);
+      assert.equal(state.release.draft, true);
+      assert.ok(!state.authenticatedRequests.some(({ method }) => method === "PATCH"));
+      const latestIndex = state.calls.findLastIndex(
+        (call) =>
+          call[0] === "curl" && call.some((argument) => argument.endsWith("/releases/latest")),
+      );
+      const finalAssetIndex = state.calls.findLastIndex(
+        (call) =>
+          call[0] === "curl" && call.some((argument) => argument.includes("/releases/assets/")),
+      );
+      assert.ok(
+        finalAssetIndex > latestIndex,
+        "fresh byte verification must run after inventory/latest",
+      );
+    },
+    { mutateDraftAtReleaseListScan: 3 },
+  );
+});
+
+test("source tag, destination tag, and destination anchor movement during inventory fail in final pre-PATCH checks", () => {
+  for (const [name, option, pattern] of [
+    ["source", "moveSourceTagAtReleaseListScan", /source tag moved/i],
+    ["destination", "moveDestinationTagAtReleaseListScan", /destination tag|anchor/i],
+    ["anchor", "moveLockAnchorAtReleaseListScan", /lock destination anchor changed/i],
+  ]) {
+    withHarness(
+      ({ run, readState }) => {
+        assert.equal(run("capture").status, 0);
+        const result = run("publish");
+
+        assert.notEqual(result.status, 0, `${name} tag movement must fail`);
+        assert.match(result.stderr, pattern);
+        assert.equal(readState().release.draft, true);
+        assert.ok(!readState().authenticatedRequests.some(({ method }) => method === "PATCH"));
+      },
+      { [option]: 3 },
+    );
+  }
 });
 
 test("destination tag is atomically anchored before draft creation and exact on retry", () => {

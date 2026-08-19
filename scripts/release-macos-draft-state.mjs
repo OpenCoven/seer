@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { createHash } from "node:crypto";
-import { readFileSync, statSync, writeFileSync } from "node:fs";
+import { readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 
 const [
   command,
@@ -38,9 +38,11 @@ const expectedMarker =
   `<!-- seer-release-provenance:{"schema":1,"sourceRepository":"${sourceRepository}",` +
   `"sourceCommit":"${sourceCommit}","sourceTag":"${sourceTag}","workflowRef":"${workflowRef}",` +
   `"workflowRun":"${workflowRun}"} -->`;
-const expectedBody =
-  `${expectedMarker}\n\nSeer ${version} for Apple Silicon Macs running macOS 14 or later.\n`;
-const expectedNames = [`Seer-v${version}-arm64.dmg`, "SHA256SUMS", "release-manifest.json"];
+const expectedBody = `${expectedMarker}\n\nSeer ${version} for Apple Silicon Macs running macOS 14 or later.\n`;
+function expectedAssetNames(tagName) {
+  return [`Seer-${tagName}-arm64.dmg`, "SHA256SUMS", "release-manifest.json"];
+}
+const expectedNames = expectedAssetNames(sourceTag);
 const expectedLockMetadata = {
   lockSchema: 1,
   sourceRepository,
@@ -89,6 +91,52 @@ function validateUser(value, description) {
     fail(`${description} does not match the exact protected release writer identity`);
   }
   return { id: value.id, login: value.login };
+}
+
+function normalizeReleaseAssets(assets, allowedNames, description, requireComplete) {
+  if (!Array.isArray(assets)) fail(`${description} asset metadata has an invalid shape`);
+  const seenNames = new Set();
+  const seenIDs = new Set();
+  const normalizedAssets = assets.map((item) => {
+    if (
+      !item ||
+      typeof item !== "object" ||
+      !Number.isSafeInteger(item.id) ||
+      item.id <= 0 ||
+      typeof item.name !== "string" ||
+      !Number.isSafeInteger(item.size) ||
+      item.size < 0 ||
+      !(item.digest === null || item.digest === undefined || typeof item.digest === "string")
+    ) {
+      fail(`${description} asset metadata has an invalid shape`);
+    }
+    if (!allowedNames.includes(item.name)) {
+      fail(`${description} contains a foreign release asset`);
+    }
+    if (seenNames.has(item.name) || seenIDs.has(item.id)) {
+      fail(`${description} contains duplicate release asset metadata`);
+    }
+    seenNames.add(item.name);
+    seenIDs.add(item.id);
+    if (typeof item.digest === "string" && !/^sha256:[0-9a-f]{64}$/.test(item.digest)) {
+      fail(`${description} asset ${item.name} has an invalid digest`);
+    }
+    return {
+      id: item.id,
+      name: item.name,
+      size: item.size,
+      serverDigest: item.digest ?? null,
+      uploader: validateUser(item.uploader, `${description} asset uploader for ${item.name}`),
+    };
+  });
+  const complete =
+    allowedNames.every((name) => seenNames.has(name)) &&
+    normalizedAssets.length === allowedNames.length;
+  if (requireComplete && !complete) {
+    fail(`${description} does not contain the complete public asset allowlist`);
+  }
+  normalizedAssets.sort((a, b) => allowedNames.indexOf(a.name) - allowedNames.indexOf(b.name));
+  return { assets: normalizedAssets, complete };
 }
 
 function parseMetadata(value, { requireComplete, expectedDraft }) {
@@ -143,46 +191,7 @@ function parseMetadata(value, { requireComplete, expectedDraft }) {
   if (body !== expectedBody) fail("release canonical body does not match exactly");
   const normalizedAuthor = validateUser(author, "release author");
 
-  const seenNames = new Set();
-  const seenIDs = new Set();
-  const normalizedAssets = assets.map((item) => {
-    if (
-      !item ||
-      typeof item !== "object" ||
-      !Number.isSafeInteger(item.id) ||
-      item.id <= 0 ||
-      typeof item.name !== "string" ||
-      !Number.isSafeInteger(item.size) ||
-      item.size < 0 ||
-      !(item.digest === null || item.digest === undefined || typeof item.digest === "string")
-    ) {
-      fail("release asset metadata has an invalid shape");
-    }
-    if (!expectedNames.includes(item.name)) fail("draft contains a foreign release asset");
-    if (seenNames.has(item.name) || seenIDs.has(item.id)) {
-      fail("draft contains duplicate release asset metadata");
-    }
-    seenNames.add(item.name);
-    seenIDs.add(item.id);
-    if (typeof item.digest === "string" && !/^sha256:[0-9a-f]{64}$/.test(item.digest)) {
-      fail(`release asset ${item.name} has an invalid digest`);
-    }
-    return {
-      id: item.id,
-      name: item.name,
-      size: item.size,
-      serverDigest: item.digest ?? null,
-      uploader: validateUser(item.uploader, `release asset uploader for ${item.name}`),
-    };
-  });
-
-  const complete =
-    expectedNames.every((name) => seenNames.has(name)) &&
-    normalizedAssets.length === expectedNames.length;
-  if (requireComplete && !complete) {
-    fail("draft release does not contain the complete public asset allowlist");
-  }
-  normalizedAssets.sort((a, b) => expectedNames.indexOf(a.name) - expectedNames.indexOf(b.name));
+  const normalized = normalizeReleaseAssets(assets, expectedNames, "draft", requireComplete);
   return {
     id,
     draft,
@@ -194,8 +203,8 @@ function parseMetadata(value, { requireComplete, expectedDraft }) {
     targetCommitish,
     updatedAt,
     author: normalizedAuthor,
-    assets: normalizedAssets,
-    complete,
+    assets: normalized.assets,
+    complete: normalized.complete,
   };
 }
 
@@ -221,6 +230,629 @@ function exactKeys(value, expected) {
     !Array.isArray(value) &&
     JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...expected].sort())
   );
+}
+
+// Canonical decimal strings keep ordering overflow-safe before any bounded conversion.
+const maximumSafeIntegerDecimal = "9007199254740991";
+
+function parseCanonicalSemverTag(tag, description) {
+  if (typeof tag !== "string" || tag.length > 51) {
+    fail(`${description} is not a canonical vMAJOR.MINOR.PATCH tag`);
+  }
+  const match = /^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.exec(tag);
+  if (!match) fail(`${description} is not a canonical vMAJOR.MINOR.PATCH tag`);
+  const components = match.slice(1);
+  for (const component of components) {
+    if (
+      component.length > maximumSafeIntegerDecimal.length ||
+      (component.length === maximumSafeIntegerDecimal.length &&
+        component > maximumSafeIntegerDecimal)
+    ) {
+      fail(`${description} contains an oversized semantic-version component`);
+    }
+  }
+  return components;
+}
+
+function currentSemver() {
+  if (sourceTag !== `v${version}`) {
+    fail("VERSION and SOURCE_TAG do not identify the same canonical semantic version");
+  }
+  return parseCanonicalSemverTag(sourceTag, "current release tag");
+}
+
+function compareCanonicalSemver(left, right) {
+  for (let index = 0; index < 3; index += 1) {
+    if (left[index].length !== right[index].length) {
+      return left[index].length < right[index].length ? -1 : 1;
+    }
+    if (left[index] !== right[index]) return left[index] < right[index] ? -1 : 1;
+  }
+  return 0;
+}
+
+function parseReleaseIDString(value, description) {
+  if (
+    typeof value !== "string" ||
+    !/^[1-9][0-9]*$/.test(value) ||
+    value.length > maximumSafeIntegerDecimal.length ||
+    (value.length === maximumSafeIntegerDecimal.length && value > maximumSafeIntegerDecimal)
+  ) {
+    fail(`${description} is not a positive safe canonical integer`);
+  }
+  return Number(value);
+}
+
+function parseReleaseIDNumber(value, description) {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    fail(`${description} is not a positive safe canonical integer`);
+  }
+  return value;
+}
+
+function parsePositiveIntegerString(value, description, maximum = Number.MAX_SAFE_INTEGER) {
+  const parsed = parseReleaseIDString(value, description);
+  if (parsed > maximum) fail(`${description} exceeds its supported bound`);
+  return parsed;
+}
+
+function compareReleaseIDs(left, right) {
+  if (left.id === right.id) return 0;
+  return left.id < right.id ? -1 : 1;
+}
+
+function normalizeStableReleaseTrust(value, tagName, description) {
+  const author = validateUser(value.author, `${description} author`);
+  const normalized = normalizeReleaseAssets(
+    value.assets,
+    expectedAssetNames(tagName),
+    description,
+    true,
+  );
+  return { author, assets: normalized.assets };
+}
+
+function stableReleaseIdentity(value) {
+  return {
+    id: value.id,
+    tagName: value.tagName,
+    author: value.author,
+    assets: value.assets,
+  };
+}
+
+function classifyInventoryEntries(values) {
+  const releases = [];
+  const stablePublished = [];
+  const seenIDs = new Set();
+  const seenTags = new Set();
+  const seenStableVersions = new Map();
+
+  for (const [index, value] of values.entries()) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      fail(`authenticated release inventory entry ${index + 1} has an invalid shape`);
+    }
+    const id = parseReleaseIDNumber(
+      value.id,
+      `authenticated release inventory entry ${index + 1} ID`,
+    );
+    const { draft, prerelease, immutable, tag_name: tagName } = value;
+    if (
+      typeof draft !== "boolean" ||
+      typeof prerelease !== "boolean" ||
+      typeof immutable !== "boolean" ||
+      typeof tagName !== "string" ||
+      tagName.length === 0
+    ) {
+      fail(`authenticated release inventory entry ${index + 1} has an invalid shape`);
+    }
+    if (seenIDs.has(id)) {
+      fail(
+        `authenticated release inventory contains duplicate release ID ${id}; ` +
+          "the paginated list is ambiguous or mutated during enumeration",
+      );
+    }
+    if (seenTags.has(tagName)) {
+      fail(
+        `authenticated release inventory contains duplicate release tag ${tagName}; ` +
+          "the paginated list is ambiguous or mutated during enumeration",
+      );
+    }
+    seenIDs.add(id);
+    seenTags.add(tagName);
+
+    const normalized = { id, tagName, draft, prerelease, immutable };
+    if (draft || prerelease) {
+      releases.push(normalized);
+      continue;
+    }
+    if (!immutable) {
+      fail(`stable published release ${tagName} (${id}) is not immutable`);
+    }
+    const semver = parseCanonicalSemverTag(tagName, `stable published release tag ${tagName}`);
+    Object.assign(
+      normalized,
+      normalizeStableReleaseTrust(value, tagName, `stable published release ${tagName} (${id})`),
+    );
+    releases.push(normalized);
+    const versionKey = semver.join(".");
+    const prior = seenStableVersions.get(versionKey);
+    if (prior) {
+      fail(
+        `duplicate canonical stable semantic version ${tagName} is published as ` +
+          `release IDs ${prior.id} and ${id}`,
+      );
+    }
+    const candidate = { id, tagName, semver };
+    seenStableVersions.set(versionKey, candidate);
+    stablePublished.push(candidate);
+  }
+
+  releases.sort(compareReleaseIDs);
+  stablePublished.sort((left, right) => {
+    const comparison = compareCanonicalSemver(left.semver, right.semver);
+    return comparison === 0 ? compareReleaseIDs(left, right) : comparison;
+  });
+  return {
+    releases,
+    stablePublished: stablePublished.map(({ id, tagName }) => ({ id, tagName })),
+    maximum:
+      stablePublished.length === 0
+        ? null
+        : {
+            id: stablePublished.at(-1).id,
+            tagName: stablePublished.at(-1).tagName,
+          },
+  };
+}
+
+function inventoryFingerprint(pageSize, pageCount, releases) {
+  return sha256(
+    Buffer.from(
+      JSON.stringify({
+        repository: destinationRepository,
+        pageSize,
+        pageCount,
+        releases,
+      }),
+      "utf8",
+    ),
+  );
+}
+
+function createInventoryState(values, pageSize, pageCount) {
+  const classified = classifyInventoryEntries(values);
+  return {
+    schema: 1,
+    kind: "authenticated-release-inventory",
+    repository: destinationRepository,
+    pageSize,
+    pageCount,
+    releaseCount: classified.releases.length,
+    stablePublishedCount: classified.stablePublished.length,
+    fingerprint: inventoryFingerprint(pageSize, pageCount, classified.releases),
+    releases: classified.releases,
+    stablePublished: classified.stablePublished,
+    maximum: classified.maximum,
+  };
+}
+
+function readInventory(path, description = "authenticated release inventory") {
+  const value = readJSON(path, description);
+  if (
+    !exactKeys(value, [
+      "schema",
+      "kind",
+      "repository",
+      "pageSize",
+      "pageCount",
+      "releaseCount",
+      "stablePublishedCount",
+      "fingerprint",
+      "releases",
+      "stablePublished",
+      "maximum",
+    ]) ||
+    value.schema !== 1 ||
+    value.kind !== "authenticated-release-inventory" ||
+    value.repository !== destinationRepository ||
+    !Number.isSafeInteger(value.pageSize) ||
+    value.pageSize <= 0 ||
+    value.pageSize > 100 ||
+    !Number.isSafeInteger(value.pageCount) ||
+    value.pageCount <= 0 ||
+    !Array.isArray(value.releases)
+  ) {
+    fail(`${description} has an invalid shape`);
+  }
+  const sourceValues = value.releases.map((release, index) => {
+    const stable = release?.draft === false && release?.prerelease === false;
+    const expectedKeys = ["id", "tagName", "draft", "prerelease", "immutable"];
+    if (stable) expectedKeys.push("author", "assets");
+    if (!exactKeys(release, expectedKeys)) {
+      fail(`${description} release entry ${index + 1} has an invalid shape`);
+    }
+    return {
+      id: release.id,
+      tag_name: release.tagName,
+      draft: release.draft,
+      prerelease: release.prerelease,
+      immutable: release.immutable,
+      ...(stable
+        ? {
+            author: release.author,
+            assets: Array.isArray(release.assets)
+              ? release.assets.map((asset) => ({
+                  id: asset?.id,
+                  name: asset?.name,
+                  size: asset?.size,
+                  digest: asset?.serverDigest,
+                  uploader: asset?.uploader,
+                }))
+              : release.assets,
+          }
+        : {}),
+    };
+  });
+  const rebuilt = createInventoryState(sourceValues, value.pageSize, value.pageCount);
+  if (JSON.stringify(value) !== JSON.stringify(rebuilt)) {
+    fail(`${description} bindings are malformed or inconsistent`);
+  }
+  return value;
+}
+
+function inventoryPage(path, pageSize) {
+  const page = readJSON(path, "authenticated release inventory page");
+  if (!Array.isArray(page) || page.length > pageSize) {
+    fail("authenticated release inventory page has an invalid shape or exceeds the page size");
+  }
+  return page;
+}
+
+function runInventoryPage() {
+  const pageSize = parsePositiveIntegerString(_headersPath, "release inventory page size", 100);
+  process.stdout.write(`${inventoryPage(metadataPath, pageSize).length}\n`);
+}
+
+function runBuildInventory() {
+  const pageCount = parsePositiveIntegerString(_headersPath, "release inventory page count");
+  const pageSize = parsePositiveIntegerString(releaseDir, "release inventory page size", 100);
+  let names;
+  try {
+    names = readdirSync(metadataPath).sort();
+  } catch {
+    fail("release inventory page directory is missing or unreadable");
+  }
+  const expectedNames = Array.from(
+    { length: pageCount },
+    (_, index) => `page-${String(index + 1).padStart(4, "0")}.json`,
+  );
+  if (JSON.stringify(names) !== JSON.stringify(expectedNames)) {
+    fail("release inventory page directory does not contain the exact bounded page set");
+  }
+
+  const values = [];
+  for (let pageNumber = 1; pageNumber <= pageCount; pageNumber += 1) {
+    const page = inventoryPage(
+      `${metadataPath}/page-${String(pageNumber).padStart(4, "0")}.json`,
+      pageSize,
+    );
+    if (pageNumber < pageCount && page.length !== pageSize) {
+      fail("release inventory contains a short page before its terminal page");
+    }
+    if (pageNumber === pageCount && page.length === pageSize) {
+      fail("release inventory terminal page is full and may be truncated");
+    }
+    values.push(...page);
+  }
+
+  writeFileSync(
+    notesPath,
+    `${JSON.stringify(createInventoryState(values, pageSize, pageCount), null, 2)}\n`,
+    {
+      flag: "wx",
+      mode: 0o600,
+    },
+  );
+}
+
+function runBindInventories() {
+  const first = readInventory(metadataPath, "first authenticated release inventory");
+  const second = readInventory(_headersPath, "confirming authenticated release inventory");
+  if (
+    first.pageSize !== second.pageSize ||
+    first.releaseCount !== second.releaseCount ||
+    first.fingerprint !== second.fingerprint ||
+    JSON.stringify(first.releases) !== JSON.stringify(second.releases)
+  ) {
+    fail("authenticated release inventory changed between exhaustive confirmation scans");
+  }
+  writeFileSync(releaseDir, `${JSON.stringify(second, null, 2)}\n`, {
+    flag: "wx",
+    mode: 0o600,
+  });
+}
+
+function parseLatestReleaseIdentity(value) {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    typeof value.tag_name !== "string"
+  ) {
+    fail("latest release response has an invalid shape");
+  }
+  if (value.draft !== false || value.prerelease !== false || value.immutable !== true) {
+    fail("latest release state is not a stable immutable published release");
+  }
+  const id = parseReleaseIDNumber(value.id, "latest release ID");
+  const tagName = value.tag_name;
+  const semver = parseCanonicalSemverTag(tagName, "latest release tag");
+  const trust = normalizeStableReleaseTrust(value, tagName, `latest release ${tagName} (${id})`);
+  return {
+    id,
+    tagName,
+    semver,
+    ...trust,
+  };
+}
+
+function readLatestReleaseResponse(path, httpStatus) {
+  if (!/^[0-9]{3}$/.test(httpStatus ?? "")) {
+    fail("latest release response has an invalid HTTP status");
+  }
+  const body = parseJSON(
+    regularFile(path, "latest release response").bytes.toString("utf8"),
+    "latest release response",
+  );
+  if (httpStatus === "404") {
+    if (
+      !body ||
+      typeof body !== "object" ||
+      Array.isArray(body) ||
+      body.message !== "Not Found" ||
+      "id" in body ||
+      "tag_name" in body ||
+      "draft" in body
+    ) {
+      fail("latest release 404 response does not unambiguously mean no releases");
+    }
+    return null;
+  }
+  if (httpStatus !== "200") {
+    fail(`latest release request returned unexpected HTTP status ${httpStatus}`);
+  }
+  return parseLatestReleaseIdentity(body);
+}
+
+function inventoryIdentity(value, description) {
+  if (
+    !exactKeys(value, ["id", "tagName"]) ||
+    !Number.isSafeInteger(value.id) ||
+    value.id <= 0 ||
+    typeof value.tagName !== "string"
+  ) {
+    fail(`${description} has an invalid release identity`);
+  }
+  parseCanonicalSemverTag(value.tagName, `${description} tag`);
+  return value;
+}
+
+function bindCurrentInventoryRelease(inventory, currentReleaseID, expectedDraft) {
+  const byID = inventory.releases.find((release) => release.id === currentReleaseID);
+  const byTag = inventory.releases.find((release) => release.tagName === sourceTag);
+  if (!byID && !byTag) {
+    fail(
+      `current ${expectedDraft ? "draft" : "published"} release is absent from the authenticated inventory`,
+    );
+  }
+  if (!byID || !byTag || byID !== byTag) {
+    fail(
+      `current ${expectedDraft ? "draft" : "published"} release ID/tag is reused by another inventory entry`,
+    );
+  }
+  if (expectedDraft) {
+    if (byID.draft !== true || byID.prerelease !== false) {
+      fail("current draft release inventory state is not the exact stable-channel draft");
+    }
+  } else if (byID.draft !== false || byID.prerelease !== false || byID.immutable !== true) {
+    fail("current published release inventory state is not stable and immutable");
+  }
+  return byID;
+}
+
+function verifyLatestGlobalMaximum(inventory, latest, context) {
+  if (inventory.maximum === null) {
+    if (latest !== null) {
+      fail(`${context} latest endpoint is not a canonical 404 for an empty stable inventory`);
+    }
+    return;
+  }
+  if (
+    latest === null ||
+    latest.id !== inventory.maximum.id ||
+    latest.tagName !== inventory.maximum.tagName
+  ) {
+    const expected = `${inventory.maximum.tagName} (${inventory.maximum.id})`;
+    const actual = latest === null ? "canonical 404" : `${latest.tagName} (${latest.id})`;
+    fail(
+      `${context} latest release does not equal the authenticated inventory global maximum: ` +
+        `expected ${expected}, received ${actual}`,
+    );
+  }
+  const inventoryMaximum = inventory.releases.find(
+    (release) =>
+      release.id === inventory.maximum.id && release.tagName === inventory.maximum.tagName,
+  );
+  if (
+    !inventoryMaximum ||
+    JSON.stringify(stableReleaseIdentity(latest)) !==
+      JSON.stringify(stableReleaseIdentity(inventoryMaximum))
+  ) {
+    fail(
+      `${context} latest release protected author or asset identity does not match ` +
+        "the authenticated inventory global maximum",
+    );
+  }
+}
+
+function decisionInventoryBinding(inventory) {
+  return {
+    fingerprint: inventory.fingerprint,
+    releaseCount: inventory.releaseCount,
+    stablePublishedCount: inventory.stablePublishedCount,
+    maximum: inventory.maximum,
+  };
+}
+
+function validateLatestDecisionState(value, currentReleaseID, boundInventory) {
+  if (
+    !exactKeys(value, [
+      "schema",
+      "kind",
+      "repository",
+      "currentRelease",
+      "inventory",
+      "observedLatest",
+      "makeLatest",
+    ]) ||
+    value.schema !== 2 ||
+    value.kind !== "latest-release-decision" ||
+    value.repository !== destinationRepository ||
+    !exactKeys(value.currentRelease, ["id", "tagName"]) ||
+    value.currentRelease.id !== currentReleaseID ||
+    value.currentRelease.tagName !== sourceTag ||
+    !exactKeys(value.inventory, [
+      "fingerprint",
+      "releaseCount",
+      "stablePublishedCount",
+      "maximum",
+    ]) ||
+    !/^[0-9a-f]{64}$/.test(value.inventory.fingerprint) ||
+    !Number.isSafeInteger(value.inventory.releaseCount) ||
+    value.inventory.releaseCount < 0 ||
+    !Number.isSafeInteger(value.inventory.stablePublishedCount) ||
+    value.inventory.stablePublishedCount < 0 ||
+    value.inventory.stablePublishedCount > value.inventory.releaseCount ||
+    !["true", "false"].includes(value.makeLatest)
+  ) {
+    fail("latest release decision state is malformed or does not match the current release");
+  }
+
+  const current = currentSemver();
+  if (boundInventory !== undefined) {
+    bindCurrentInventoryRelease(boundInventory, currentReleaseID, true);
+    if (
+      JSON.stringify(value.inventory) !== JSON.stringify(decisionInventoryBinding(boundInventory))
+    ) {
+      fail("latest release decision inventory binding does not match pre-publication state");
+    }
+  }
+  if (value.inventory.maximum === null) {
+    if (
+      value.inventory.stablePublishedCount !== 0 ||
+      value.observedLatest !== null ||
+      value.makeLatest !== "true"
+    ) {
+      fail("latest release decision is inconsistent with an empty stable inventory");
+    }
+    return value;
+  }
+  const maximum = inventoryIdentity(value.inventory.maximum, "recorded inventory maximum");
+  const observed = inventoryIdentity(value.observedLatest, "recorded latest release");
+  if (
+    value.inventory.stablePublishedCount === 0 ||
+    observed.id !== maximum.id ||
+    observed.tagName !== maximum.tagName
+  ) {
+    fail("latest release decision is not bound to the recorded inventory maximum");
+  }
+  if (maximum.id === currentReleaseID) {
+    fail("latest release decision reuses the current draft release ID as its inventory maximum");
+  }
+  const comparison = compareCanonicalSemver(
+    current,
+    parseCanonicalSemverTag(maximum.tagName, "recorded inventory maximum tag"),
+  );
+  if (comparison === 0) {
+    fail("latest release decision has the same semantic version as the inventory maximum");
+  }
+  if (
+    (comparison > 0 && value.makeLatest !== "true") ||
+    (comparison < 0 && value.makeLatest !== "false")
+  ) {
+    fail("latest release decision is inconsistent with the inventory global maximum");
+  }
+  return value;
+}
+
+function runLatestDecision() {
+  const inventory = readInventory(metadataPath);
+  const latest = readLatestReleaseResponse(_headersPath, releaseDir);
+  const currentReleaseID = parseReleaseIDString(notesPath, "current release ID");
+  bindCurrentInventoryRelease(inventory, currentReleaseID, true);
+  verifyLatestGlobalMaximum(inventory, latest, "pre-publication");
+
+  const current = currentSemver();
+  let makeLatest;
+  if (inventory.maximum === null) {
+    makeLatest = "true";
+  } else {
+    if (inventory.maximum.id === currentReleaseID) {
+      fail("inventory maximum impossibly reuses the current draft release ID");
+    }
+    const comparison = compareCanonicalSemver(
+      current,
+      parseCanonicalSemverTag(inventory.maximum.tagName, "inventory maximum tag"),
+    );
+    if (comparison === 0) {
+      fail("a stable published release has the current semantic version; publication is ambiguous");
+    }
+    makeLatest = comparison > 0 ? "true" : "false";
+  }
+
+  const state = {
+    schema: 2,
+    kind: "latest-release-decision",
+    repository: destinationRepository,
+    currentRelease: { id: currentReleaseID, tagName: sourceTag },
+    inventory: decisionInventoryBinding(inventory),
+    observedLatest: latest === null ? null : { id: latest.id, tagName: latest.tagName },
+    makeLatest,
+  };
+  writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, {
+    flag: "wx",
+    mode: 0o600,
+  });
+  process.stdout.write(`${makeLatest}\n`);
+}
+
+function runVerifyGlobalLatest() {
+  const inventory = readInventory(metadataPath, "post-publication authenticated release inventory");
+  const latest = readLatestReleaseResponse(_headersPath, releaseDir);
+  const currentReleaseID = parseReleaseIDString(notesPath, "current published release ID");
+  const prePublicationInventory = readInventory(
+    downloadsDir,
+    "pre-publication authenticated release inventory",
+  );
+  validateLatestDecisionState(
+    readJSON(statePath, "latest release decision state"),
+    currentReleaseID,
+    prePublicationInventory,
+  );
+  bindCurrentInventoryRelease(inventory, currentReleaseID, false);
+  verifyLatestGlobalMaximum(inventory, latest, "post-publication");
+}
+
+function runReconcilePublishedLatest() {
+  const inventory = readInventory(
+    metadataPath,
+    "published reconciliation authenticated release inventory",
+  );
+  const latest = readLatestReleaseResponse(_headersPath, releaseDir);
+  const currentReleaseID = parseReleaseIDString(notesPath, "current published release ID");
+  bindCurrentInventoryRelease(inventory, currentReleaseID, false);
+  verifyLatestGlobalMaximum(inventory, latest, "published reconciliation");
 }
 
 function validatePublishedDownloads(metadata, freshDownloads) {
@@ -803,6 +1435,24 @@ try {
     case "immutable":
       await runImmutable();
       break;
+    case "inventory-page":
+      runInventoryPage();
+      break;
+    case "build-inventory":
+      runBuildInventory();
+      break;
+    case "bind-inventories":
+      runBindInventories();
+      break;
+    case "latest-decision":
+      runLatestDecision();
+      break;
+    case "verify-global-latest":
+      runVerifyGlobalLatest();
+      break;
+    case "reconcile-published-latest":
+      runReconcilePublishedLatest();
+      break;
     case "ref":
       await runRef();
       break;
@@ -826,7 +1476,9 @@ try {
         "usage: release-macos-draft-state.mjs inspect|list-page|downloads|validate-notes|capture|" +
           "compare|compare-published|verify-published-local|materialize-published|" +
           "capture-existing-published|compare-existing-published|identity|repository|immutable|" +
-          "ref|tag-target|lock-tag|lock-owner|run-status|commit",
+          "inventory-page|build-inventory|bind-inventories|latest-decision|" +
+          "verify-global-latest|reconcile-published-latest|ref|tag-target|lock-tag|lock-owner|" +
+          "run-status|commit",
       );
   }
 } catch (error) {

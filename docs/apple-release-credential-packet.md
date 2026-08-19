@@ -23,8 +23,8 @@ Verified on 2026-08-12:
   feature branch. That branch is local only: it is unpushed and absent from
   `origin`, and is not yet merged to the default branch, pushed to a release
   tag, or deployed. Every remote resource and credential this packet
-  describes — `OpenCoven/seer-releases`, the `macos-release` environment, its
-  secrets, and its variables — remains unconfigured.
+  describes — `OpenCoven/seer-releases`, the `macos-release` environment, and
+  its protected configuration and credential secrets — remains unconfigured.
 
 Do not add credentials until the release workflow has merged and been reviewed
 on the repository's default branch.
@@ -211,10 +211,10 @@ Checklist for this prerequisite:
 Notarization has two mutually exclusive credential configurations: the App
 Store Connect API-key method and the Apple ID method. These are **not** a
 primary path with an optional fallback that can be layered on top of it —
-`.github/workflows/release-macos.yml` reads all nine `APPLE_*` secrets: 4
-signing secrets that are always required (`APPLE_CERTIFICATE`,
-`APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_TEAM_ID`) plus
-5 notarization-related secrets split across the two mutually exclusive
+`.github/workflows/release-macos.yml` reads nine `APPLE_*` environment
+secrets: 4 signing inputs that are always required (`APPLE_CERTIFICATE`,
+`APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, and `APPLE_TEAM_ID`)
+plus 5 notarization-related secrets split across the two mutually exclusive
 methods (3 API-key fields — `APPLE_API_ISSUER`, `APPLE_API_KEY`,
 `APPLE_API_KEY_BASE64` — and 2 Apple ID fields — `APPLE_ID`,
 `APPLE_PASSWORD`). All nine are read unconditionally and passed to
@@ -224,7 +224,7 @@ either method is only partially configured (1–2 of the 3 API-key fields, or
 1 of the 2 Apple ID fields), **and also fails the run if both methods are
 fully configured at once** — it does not attempt either method automatically
 as a fallback for the other. Configure exactly one complete notarization
-credential set (3 or 2 secrets, never both) as an environment secret, and
+credential set (3 or 2 secrets, never both) as environment secrets, and
 leave every secret belonging to the other method entirely absent (not empty)
 from `macos-release`. **Recommended: the App Store Connect API-key method.**
 A Developer ID Installer certificate is not required for a DMG release.
@@ -236,7 +236,12 @@ A Developer ID Installer certificate is not required for a DMG release.
 | `APPLE_CERTIFICATE` | Single-line base64 encoding of a Developer ID Application `.p12` containing its private key |
 | `APPLE_CERTIFICATE_PASSWORD` | Strong password chosen when exporting the `.p12` |
 | `APPLE_SIGNING_IDENTITY` | Exact Developer ID Application identity |
-| `APPLE_TEAM_ID` | Apple Developer team ID |
+| `APPLE_TEAM_ID` | 10-character Apple Developer team ID |
+
+`APPLE_SIGNING_IDENTITY` and `APPLE_TEAM_ID` are protected configuration, not
+confidential credentials. They are nevertheless stored as environment secrets
+so the `macos-release` value has environment-over-repository-over-organization
+precedence and cannot be used without the environment approval gate.
 
 ### Notarization method A: App Store Connect API key (recommended)
 
@@ -316,15 +321,17 @@ disable repository-administration state that it must not control.
 Do not grant organization administration, Administration write, Actions
 administration, source-repo write access, or access to other repositories.
 
-### Required release-writer identity variables
+### Required release-writer identity protected configuration
 
-`.github/workflows/release-macos.yml` reads `vars.RELEASE_WRITER_LOGIN` and
-`vars.RELEASE_WRITER_ID` from the `macos-release` environment. These are
-GitHub Actions **environment variables**, not secrets — set them with
-`gh variable set`, not `gh secret set`. The workflow rejects the run before any
-credential is used if either is missing or malformed:
+`.github/workflows/release-macos.yml` reads `secrets.RELEASE_WRITER_LOGIN` and
+`secrets.RELEASE_WRITER_ID` from the `macos-release` environment. Their values
+are semantically non-sensitive, but they are deliberately GitHub Actions
+**environment secrets** so environment precedence and required-reviewer
+protection cannot be bypassed by a same-named repository or organization
+setting. The workflow rejects the run before any credential is used if either
+is missing or malformed:
 
-| GitHub environment variable | Format | Purpose |
+| GitHub environment secret | Format | Purpose |
 | --- | --- | --- |
 | `RELEASE_WRITER_LOGIN` | Exact GitHub login of the `RELEASES_REPO_TOKEN` owner; must match `^[A-Za-z0-9]([A-Za-z0-9-]{0,38})$` | Pins the workflow to one specific token-owning account |
 | `RELEASE_WRITER_ID` | Exact numeric GitHub user ID of that same account; must match `^[1-9][0-9]*$` | Prevents a login rename or account substitution from silently changing the trusted release writer |
@@ -337,27 +344,23 @@ authenticates as any other account fails closed.
 
 Determine the two values from the account that will hold
 `RELEASES_REPO_TOKEN`, then set them once the `macos-release` environment
-exists:
+exists. Confirm the canonical login and numeric ID in a trusted administration
+session for that account, then enter each value at the hidden prompt; do not
+put it in a command-line argument:
 
 ```bash
-gh api user --jq '{login, id}'
+gh secret set RELEASE_WRITER_LOGIN --repo OpenCoven/seer --env macos-release
+gh secret set RELEASE_WRITER_ID --repo OpenCoven/seer --env macos-release
 ```
 
-```bash
-gh variable set RELEASE_WRITER_LOGIN --repo OpenCoven/seer --env macos-release \
-  --body "the-account-login"
-gh variable set RELEASE_WRITER_ID --repo OpenCoven/seer --env macos-release \
-  --body "123456"
-```
-
-Environment variables are visible in plaintext (they identify an account, not
-a credential), so verify them by reading their values directly instead of
-only checking presence:
+Even though these values identify an account rather than a credential, verify
+only their secret names and update timestamps. Do not retrieve, echo, or print
+their configured values:
 
 ```bash
-gh variable list --repo OpenCoven/seer --env macos-release
-gh variable get RELEASE_WRITER_LOGIN --repo OpenCoven/seer --env macos-release
-gh variable get RELEASE_WRITER_ID --repo OpenCoven/seer --env macos-release
+gh secret list --repo OpenCoven/seer --env macos-release \
+  --json name,updatedAt \
+  --jq '.[] | select(.name == "RELEASE_WRITER_LOGIN" or .name == "RELEASE_WRITER_ID")'
 ```
 
 ## Export the signing certificate
@@ -437,7 +440,8 @@ relying on this block to overwrite or clear them.
 
 The block below fails closed if shell xtrace is already enabled (checked
 first, before any other line runs), is Bash-only (`set -euo pipefail`), reads
-every sensitive value with `IFS= read -r -s ... < /dev/tty` — directly from
+every text environment-secret value with `IFS= read -r -s ... < /dev/tty` —
+directly from
 the controlling terminal (so it can't silently accept an empty value piped in
 from elsewhere) and with `IFS=` cleared (so leading/trailing whitespace in the
 entered value is preserved instead of being stripped by `read`) — rejects
@@ -515,9 +519,7 @@ set_text_secret() {
 P12_PATH="/secure/path/Seer-Developer-ID-Application.p12"
 set_file_secret APPLE_CERTIFICATE "${P12_PATH}"
 set_text_secret APPLE_CERTIFICATE_PASSWORD "APPLE_CERTIFICATE_PASSWORD"
-# Not secret, but sent the same way for consistency.
-printf '%s' "Developer ID Application: Soul Protocol LLC (9LR8Z8UQ9X)" |
-  gh secret set APPLE_SIGNING_IDENTITY --repo OpenCoven/seer --env macos-release
+set_text_secret APPLE_SIGNING_IDENTITY "APPLE_SIGNING_IDENTITY"
 set_text_secret APPLE_TEAM_ID "APPLE_TEAM_ID"
 
 # --- Notarization method A: App Store Connect API key (recommended) ---
@@ -554,13 +556,14 @@ initialized. Each `set_*_secret` call is independent and can be copied out of
 the block on its own once `require_safe_secret_file`, `set_file_secret`,
 `read_required_value`, and `set_text_secret` are defined in the same shell.
 
-### The authoritative sensitive-secret name set
+### The authoritative environment-secret name set
 
-Every audit and deletion command in this section and the two below it
-operates on the same fixed set of ten names — the nine `APPLE_*` secrets
-`.github/workflows/release-macos.yml` reads unconditionally (see "Required
-packet" above: 4 always-required signing secrets, 3 Method A notarization
-secrets, and 2 Method B notarization secrets) plus `RELEASES_REPO_TOKEN`:
+Every full-scope audit in this section and the two below it operates on the
+same fixed set of 15 names: eight sensitive credentials and seven
+approval-critical protected configuration values. The latter are semantically
+non-sensitive, but storing them in `macos-release` as environment secrets gives
+them environment-over-repository-over-organization precedence and
+required-reviewer protection:
 
 ```text
 APPLE_CERTIFICATE
@@ -573,21 +576,21 @@ APPLE_API_KEY_BASE64
 APPLE_ID
 APPLE_PASSWORD
 RELEASES_REPO_TOKEN
+BINARY_DISTRIBUTION_APPROVED
+PARITY_MATRIX_APPROVED
+CLEAN_MACHINE_VERIFIED_COMMIT
+RELEASE_WRITER_LOGIN
+RELEASE_WRITER_ID
 ```
 
-`APPLE_SIGNING_IDENTITY`'s value (a Developer ID Application identity
-string) is not itself confidential, but the release job reads it via
-`secrets.APPLE_SIGNING_IDENTITY`, so it is bound by the same
-`environment: macos-release` gate as the other nine names and must be
-included in every audit below — a repository- or organization-level
-`APPLE_SIGNING_IDENTITY` bypasses the approval gate exactly like a leaked
-signing secret would, even though the value alone needs no confidentiality.
-Audit **all ten** names at repository and organization scope every time —
-not only the currently-unused notarization method's names. A stray
-repository- or organization-level copy of the *active* method's names, or
-of a signing secret or `RELEASES_REPO_TOKEN`, is just as capable of
-silently shadowing this environment on some future rotation as a copy of
-the unused method's names is today.
+Audit **all 15** secret names at repository and organization scope every time
+— not only the currently-unused notarization method's names. A stray
+repository- or organization-level copy of an active credential or protected
+configuration is just as capable of bypassing the intended environment-only
+approval boundary or resurfacing during a future rotation as a copy of the
+unused method's names is today. Audits must inspect names, timestamps, and
+scope metadata only; never print any value, including the seven non-sensitive
+configuration values.
 
 ### Switching notarization methods safely
 
@@ -674,24 +677,24 @@ snapshot forward.
 
 #### 3. Remove or restrict lower-scope duplicates of the full name set
 
-Audit repository and organization scope for **all ten** names from "The
-authoritative sensitive-secret name set" above before deleting anything
+Audit repository and organization scope for **all 15** names from "The
+authoritative environment-secret name set" above before deleting anything
 from the `macos-release` environment. GitHub Actions resolves a same-named
 secret with `environment > repository > organization` precedence: if a
-repository-level or organization-level secret with one of these ten names
+repository-level or organization-level secret with one of these 15 names
 is visible to `OpenCoven/seer`, it becomes the effective value the moment a
 same-named environment secret is deleted — silently reviving the unused
-notarization method (or an old signing credential, or an old
-`RELEASES_REPO_TOKEN`) instead of leaving it absent. Use
+notarization method, an old credential, or unapproved protected configuration
+instead of leaving it absent. Use
 name/metadata-only commands that never print a secret value:
 
 ```bash
 # Repository-scope secrets (outside the macos-release environment)
-gh secret list --repo OpenCoven/seer
+gh secret list --repo OpenCoven/seer --json name,updatedAt
 
 # Organization secrets, with their visibility to member repositories
 gh secret list --org OpenCoven \
-  --json name,visibility,numSelectedRepos,selectedReposURL
+  --json name,updatedAt,visibility,numSelectedRepos,selectedReposURL
 
 # For any org secret above with visibility "selected", confirm whether
 # OpenCoven/seer is one of the selected repositories. --paginate is
@@ -709,7 +712,7 @@ packet must include `--paginate` for the same reason — never rely on a
 single unpaginated page to conclude `OpenCoven/seer` is absent from a
 "selected" secret's repository list.
 
-If `gh secret list --repo OpenCoven/seer` lists any of the ten names at
+If `gh secret list --repo OpenCoven/seer` lists any of the 15 names at
 repository scope, delete each one — a leftover repository-level secret is
 otherwise inert only for as long as the higher-precedence environment copy
 exists:
@@ -722,7 +725,7 @@ gh secret delete APPLE_PASSWORD --repo OpenCoven/seer
 ```
 
 Likewise, if `gh secret list --org OpenCoven` shows an organization secret
-with one of these ten names and its `visibility` field is `all`, or
+with one of these 15 names and its `visibility` field is `all`, or
 `private` and `OpenCoven/seer` is a private repository, or `selected` and
 `OpenCoven/seer` appears in that secret's repository list, remove
 `OpenCoven/seer`'s access to it before continuing — either by deleting the
@@ -740,13 +743,13 @@ Environment scope is intentional: repository-level secrets would be
 available to other workflows without the release approval gate. The
 release job must declare `environment: macos-release` before it can access
 these secrets. That intent holds only while no same-named repository- or
-organization-level secret among the ten names above is also visible to
+organization-level secret among the 15 names above is also visible to
 `OpenCoven/seer`.
 
 #### 4. Verify absence
 
-Re-run the three read-only commands in step 3 and confirm none of the ten
-names from "The authoritative sensitive-secret name set" remain visible to
+Re-run the three read-only commands in step 3 and confirm none of the 15
+names from "The authoritative environment-secret name set" remain visible to
 `OpenCoven/seer` at repository or organization scope. Do not proceed to
 step 5 until this is confirmed.
 
@@ -797,13 +800,20 @@ Configure:
 - deployment restrictions limited to semantic release tags
 - no bypass for administrators unless emergency policy explicitly requires it
 
-Initialize these environment variables:
+Initialize these approval-critical protected configuration values as
+`macos-release` environment secrets, never as Actions variables. All seven are
+semantically non-sensitive; secret storage is required for environment
+precedence and approval protection, not confidentiality:
 
-| Variable | Initial value |
+| Environment secret | Initial value |
 | --- | --- |
 | `BINARY_DISTRIBUTION_APPROVED` | `false` |
 | `PARITY_MATRIX_APPROVED` | `false` |
 | `CLEAN_MACHINE_VERIFIED_COMMIT` | `UNVERIFIED` |
+| `RELEASE_WRITER_LOGIN` | Exact login of the `RELEASES_REPO_TOKEN` owner |
+| `RELEASE_WRITER_ID` | Exact numeric user ID of the `RELEASES_REPO_TOKEN` owner |
+| `APPLE_SIGNING_IDENTITY` | Exact `Developer ID Application: … (TEAMID)` authority |
+| `APPLE_TEAM_ID` | Exact 10-character Apple team ID |
 
 They become releasable only when:
 
@@ -811,9 +821,18 @@ They become releasable only when:
 - every parity row passes
 - the exact release commit passes on a clean Apple Silicon macOS 14 machine
 
-At that point set both approval variables to `true` and set
+At that point set both approval secrets to `true` and set
 `CLEAN_MACHINE_VERIFIED_COMMIT` to the exact lowercase 40-character source
-commit. The workflow must reject any other value.
+commit. Use the hidden input prompt for each command so no value is printed or
+placed in shell history:
+
+```bash
+gh secret set BINARY_DISTRIBUTION_APPROVED --repo OpenCoven/seer --env macos-release
+gh secret set PARITY_MATRIX_APPROVED --repo OpenCoven/seer --env macos-release
+gh secret set CLEAN_MACHINE_VERIFIED_COMMIT --repo OpenCoven/seer --env macos-release
+```
+
+The workflow must reject any missing or invalid value.
 
 ## Enable and verify immutable releases in `OpenCoven/seer-releases`
 
@@ -855,22 +874,69 @@ immutability applies only to releases published from that point forward, and
 the workflow's own read of this endpoint fails the job closed if it is ever
 disabled or missing.
 
+The repository-global `queue: max` release concurrency group also serializes
+latest-release selection across versions. Immediately before publication,
+`RELEASES_REPO_TOKEN` twice exhaustively paginates the authenticated release
+list and requires both normalized inventories to match. A scan ends only on a
+short page; reaching the configured maximum with a full page fails as possible
+truncation. All authenticated stable published releases must have positive safe
+IDs, `draft=false`, `prerelease=false`, `immutable=true`, and unique bounded
+canonical `vMAJOR.MINOR.PATCH` tags. Each must also have the exact configured
+release writer as author and exactly its versioned public three-asset allowlist,
+with that writer as every asset uploader. This inventory check validates
+historical metadata without downloading historical assets. Drafts and
+prereleases do not contribute to the maximum, but the exact current draft ID and
+tag must appear in the inventory.
+
+The authenticated
+`GET /repos/OpenCoven/seer-releases/releases/latest` must identify that global
+semantic-version maximum and independently pass the same exact
+author/uploader/asset checks, or return the canonical 404 when the stable
+inventory is empty. Only after that invariant holds does overflow-safe
+comparison supply explicit `make_latest: "true"` for the first or a strictly
+newer release and `make_latest: "false"` for a lower backport; a same version
+fails.
+
+Inventory and latest selection occur before the final draft check. The workflow
+then refetches exact draft metadata, freshly downloads the selected asset IDs,
+and compares metadata, local notes, uploaders, digests, and bytes with captured
+verified state. It then re-resolves the source tag, verifies the destination
+anchor/tag, and revalidates the remote lock as the final operations immediately
+before `PATCH`. GitHub release `PATCH` has no supported `If-Match`
+compare-and-swap, so the non-atomic API boundary after the final draft comparison
+cannot be removed. It contains only the required source-tag, destination, and
+lock reads followed by `PATCH`; `PATCH` is the immediate request after the final
+lock response. No scan, download, build, or other long-running work occurs in
+that boundary.
+
+Post-publication verification refetches a fresh exhaustive inventory and
+`/releases/latest`, requires the current release to be stable and immutable in
+the inventory, and proves latest is the fresh global maximum. Published
+reconciliation on a retry independently refetches a fresh inventory of all
+authenticated stable published releases and authenticated `/releases/latest`
+without reusing first-attempt decision state. The current published release must
+appear exactly in that inventory. An intervening higher release is accepted only
+when it is genuinely the global maximum and latest has its exact ID and tag.
+Malformed or duplicate stable entries, list mutation, truncation, pointer
+mismatch, ambiguous responses, or API errors fail before `published=true`.
+Reconciliation never edits immutable published metadata.
+
 ## Verify configuration without reading secrets
 
 GitHub never returns secret values. Verify names and timestamps only:
 
 ```bash
-gh secret list --repo OpenCoven/seer --env macos-release
-gh variable list --repo OpenCoven/seer --env macos-release
+gh secret list --repo OpenCoven/seer --env macos-release \
+  --json name,updatedAt
 gh api repos/OpenCoven/seer/environments/macos-release \
   --jq '{name, protection_rules, deployment_branch_policy}'
 
 # Repository- and organization-scope secrets, checked for the same-name
 # precedence risk described in "Switching notarization methods safely" >
 # "Remove or restrict lower-scope duplicates of the full name set" above
-gh secret list --repo OpenCoven/seer
+gh secret list --repo OpenCoven/seer --json name,updatedAt
 gh secret list --org OpenCoven \
-  --json name,visibility,numSelectedRepos,selectedReposURL
+  --json name,updatedAt,visibility,numSelectedRepos,selectedReposURL
 
 # Read-only, exhaustively paginated REST enumeration: confirm no release
 # workflow run is queued, waiting, or in-progress (see "Switching
@@ -906,9 +972,14 @@ APPLE_API_KEY
 APPLE_API_KEY_BASE64
 APPLE_CERTIFICATE
 APPLE_CERTIFICATE_PASSWORD
+RELEASES_REPO_TOKEN
+BINARY_DISTRIBUTION_APPROVED
+PARITY_MATRIX_APPROVED
+CLEAN_MACHINE_VERIFIED_COMMIT
+RELEASE_WRITER_LOGIN
+RELEASE_WRITER_ID
 APPLE_SIGNING_IDENTITY
 APPLE_TEAM_ID
-RELEASES_REPO_TOKEN
 ```
 
 `APPLE_ID` and `APPLE_PASSWORD` must **not** appear in this listing. If they
@@ -931,9 +1002,14 @@ APPLE_CERTIFICATE
 APPLE_CERTIFICATE_PASSWORD
 APPLE_ID
 APPLE_PASSWORD
+RELEASES_REPO_TOKEN
+BINARY_DISTRIBUTION_APPROVED
+PARITY_MATRIX_APPROVED
+CLEAN_MACHINE_VERIFIED_COMMIT
+RELEASE_WRITER_LOGIN
+RELEASE_WRITER_ID
 APPLE_SIGNING_IDENTITY
 APPLE_TEAM_ID
-RELEASES_REPO_TOKEN
 ```
 
 `APPLE_API_ISSUER`, `APPLE_API_KEY`, and `APPLE_API_KEY_BASE64` must **not**
@@ -943,25 +1019,16 @@ secret list --repo OpenCoven/seer` (repository scope) and unreachable from
 `OpenCoven/seer` through any `OpenCoven` organization secret (per
 "Switching notarization methods safely" > "Remove or restrict lower-scope
 duplicates of the full name set" above), for the same precedence-fallback
-reason as the Method A check. Exactly one of these two lists — never a
-mix, and never neither — must match `gh secret list`'s output (aside from
-`RELEASES_REPO_TOKEN`, which is independent of the notarization method).
+reason as the Method A check. Exactly one of these two complete
+environment-secret name lists — never a mix, and never neither — must match
+the environment-scoped secret listing. The seven protected configuration
+names occur in both lists; their values must not be fetched or printed even
+though they are inherently non-sensitive.
 
-The expected environment variable names (not secrets — safe to display in
-full with `gh variable get`) are:
-
-```text
-BINARY_DISTRIBUTION_APPROVED
-CLEAN_MACHINE_VERIFIED_COMMIT
-PARITY_MATRIX_APPROVED
-RELEASE_WRITER_ID
-RELEASE_WRITER_LOGIN
-```
-
-Do not validate credentials by printing them, echoing them into logs, or
-running an unreviewed workflow. The first live validation happens in the
-protected release job after its credential-import and notarization steps have
-been reviewed.
+Do not validate any environment-secret value by printing it, echoing it into
+logs, or running an unreviewed workflow. Verify names and `updatedAt`
+timestamps only. The first live value validation happens in the protected
+release job after the deployment has been reviewed.
 
 ## Rotation and incident response
 
@@ -977,7 +1044,7 @@ been reviewed.
   method's secrets were deleted (not merely superseded) at every applicable
   scope — environment, repository, and any visible organization secret — see
   "Switching notarization methods safely" above (including its "drain queued
-  runs" and "authoritative sensitive-secret name set" steps) — so a leaked
+  runs" and "authoritative environment-secret name set" steps) — so a leaked
   or rotated credential from the unused method cannot silently remain
   configured, resurface through secret precedence, or run to completion in
   a queued job that started before the switch.
@@ -1018,11 +1085,11 @@ been reviewed.
       environment-only design otherwise still leaves the unused method
       reachable via repository/organization precedence once only the
       environment copy is removed
-- [ ] All ten names in "The authoritative sensitive-secret name set" —
+- [ ] All 15 names in "The authoritative environment-secret name set" —
       not only the unused notarization method's names — confirmed absent
       from repository and organization scope visible to `OpenCoven/seer`,
-      including the always-required signing/certificate secrets and
-      `RELEASES_REPO_TOKEN`
+      including credentials, `RELEASES_REPO_TOKEN`, and all seven protected
+      configuration names
 - [ ] Before any notarization-method switch: the release workflow disabled
       (`gh workflow disable release-macos.yml`), every queued, waiting, or
       in-progress release run drained (confirmed by the exhaustively
@@ -1038,10 +1105,17 @@ been reviewed.
 - [ ] Required `macos-release` environment secrets present by name, matching
       exactly one of the two expected-name lists in "Verify configuration
       without reading secrets"
-- [ ] `RELEASE_WRITER_LOGIN` and `RELEASE_WRITER_ID` set to the exact login
-      and numeric ID of the `RELEASES_REPO_TOKEN` owner
+- [ ] `RELEASE_WRITER_LOGIN` and `RELEASE_WRITER_ID` set as `macos-release`
+      environment secrets to the exact login and numeric ID of the
+      `RELEASES_REPO_TOKEN` owner
+- [ ] `APPLE_SIGNING_IDENTITY` and `APPLE_TEAM_ID` set as `macos-release`
+      environment secrets to the exact Developer ID authority and team
 - [ ] `macos-release` environment protection configured
-- [ ] Approval variables remain false until parity and clean-machine gates pass
+- [ ] Approval secrets remain `false`/`UNVERIFIED` until parity and
+      clean-machine gates pass
+- [ ] Environment, repository, and organization audits verify only secret
+      names, timestamps, and scope metadata; no value is printed, including
+      any semantically non-sensitive protected configuration
 - [ ] Original `.p12` and `.p8` retained only in approved secure storage
 - [ ] Secret-loading shell confirmed to run with xtrace (`set -x`) disabled
       before any secret value or file is read or piped

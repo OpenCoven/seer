@@ -222,6 +222,16 @@ require_value "APPLE_CERTIFICATE_PASSWORD" "${APPLE_CERTIFICATE_PASSWORD:-}" "si
 require_value "APPLE_SIGNING_IDENTITY" "${APPLE_SIGNING_IDENTITY:-}" "signing"
 require_value "APPLE_TEAM_ID" "${APPLE_TEAM_ID:-}" "signing"
 
+if [[ "${APPLE_SIGNING_IDENTITY}" == *$'\n'* || "${APPLE_SIGNING_IDENTITY}" == *$'\r'* ]]; then
+  fail "APPLE_SIGNING_IDENTITY must not contain CR or LF"
+fi
+if ! [[ "${APPLE_TEAM_ID}" =~ ^[A-Z0-9]{10}$ ]]; then
+  fail "APPLE_TEAM_ID must be a 10-character uppercase Apple team identifier"
+fi
+if ! [[ "${APPLE_SIGNING_IDENTITY}" =~ ^Developer\ ID\ Application:\ .+\ \(${APPLE_TEAM_ID}\)$ ]]; then
+  fail "APPLE_SIGNING_IDENTITY must be the exact Developer ID Application authority for APPLE_TEAM_ID"
+fi
+
 API_CREDENTIAL_COUNT=0
 [[ -n "${APPLE_API_ISSUER:-}" ]] && API_CREDENTIAL_COUNT=$((API_CREDENTIAL_COUNT + 1))
 [[ -n "${APPLE_API_KEY:-}" ]] && API_CREDENTIAL_COUNT=$((API_CREDENTIAL_COUNT + 1))
@@ -243,9 +253,6 @@ if [[ "${API_CREDENTIAL_COUNT}" -ne 3 && "${APPLE_ID_CREDENTIAL_COUNT}" -ne 2 ]]
   fail "exactly one complete notarization credential set is required"
 fi
 
-if ! [[ "${APPLE_TEAM_ID}" =~ ^[A-Z0-9]{10}$ ]]; then
-  fail "APPLE_TEAM_ID must be a 10-character uppercase Apple team identifier"
-fi
 if ! [[ "${SOURCE_COMMIT:-}" =~ ^[0-9a-f]{40}$ ]]; then
   fail "SOURCE_COMMIT must be a lowercase 40-character SHA"
 fi

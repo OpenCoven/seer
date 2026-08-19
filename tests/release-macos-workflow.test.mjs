@@ -13,6 +13,21 @@ const draftPolicySource = existsSync(draftPolicyPath) ? readFileSync(draftPolicy
 const draftStateHelperPath = join(repoRoot, "scripts", "release-macos-draft-state.mjs");
 const draftStateHelperSource = existsSync(draftStateHelperPath) ? readFileSync(draftStateHelperPath, "utf8") : "";
 const draftPolicyImplementation = `${draftPolicySource}\n${draftStateHelperSource}`;
+const releaseDocumentationPaths = [
+  join(repoRoot, "README.md"),
+  join(repoRoot, "docs", "apple-release-credential-packet.md"),
+  join(
+    repoRoot,
+    "docs",
+    "superpowers",
+    "specs",
+    "2026-08-10-seer-standalone-macos-distribution.md",
+  ),
+];
+const releaseDocumentation = releaseDocumentationPaths.map((path) => ({
+  path,
+  source: existsSync(path) ? readFileSync(path, "utf8") : "",
+}));
 
 function isYamlMap(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -62,14 +77,160 @@ test("release workflow exists and has only the protected tag trigger and scoped 
   assert.match(source, /^on:\n {2}push:\n {4}tags:\n {6}- "v\*\.\*\.\*"\n\npermissions:\n {2}actions: read\n {2}contents: read$/m);
   assert.deepEqual(idTokenWriteScopes(source), [], "workflow must not grant OIDC-capable permissions at workflow or job scope");
   assert.doesNotMatch(source, /\b(?:pull_request|workflow_dispatch|schedule):/);
-  assert.match(
-    source,
-    /concurrency:\n {2}group: release-macos-OpenCoven-seer-releases-\$\{\{ github\.ref_name \}\}\n {2}cancel-in-progress: false/,
-  );
   assert.deepEqual(
     [...source.matchAll(/^ {2}([a-z][a-z0-9-]*):\n {4}(?:name|needs|runs-on):/gm)].map((match) => match[1]),
     ["prepare", "sign-and-release"],
   );
+});
+
+test("all semantic-version tags share one repository-scoped max release concurrency queue", () => {
+  const workflow = yaml.load(source);
+  assert.deepEqual(workflow.concurrency, {
+    group: "release-macos-OpenCoven-seer-releases",
+    "cancel-in-progress": false,
+    queue: "max",
+  });
+  assert.doesNotMatch(workflow.concurrency.group, /\$\{\{|github\.ref|github\.ref_name/);
+});
+
+test("latest release publication proves the exhaustive global semantic-version maximum", () => {
+  assert.match(source, /authenticated exhaustive release inventory/i);
+  assert.match(draftPolicySource, /repos\/\$\{GH_REPO\}\/releases\/latest/);
+  assert.match(draftPolicySource, /make_latest.*\$\{make_latest\}/);
+  assert.match(draftPolicySource, /fetch_release_inventory/);
+  assert.match(draftStateHelperSource, /build-inventory/);
+  assert.match(draftStateHelperSource, /latest-decision/);
+  assert.match(draftStateHelperSource, /verify-global-latest/);
+  assert.match(draftStateHelperSource, /reconcile-published-latest/);
+  assert.match(draftStateHelperSource, /compareCanonicalSemver/);
+  assert.match(draftStateHelperSource, /maximumSafeIntegerDecimal/);
+  assert.match(draftStateHelperSource, /normalizeStableReleaseTrust/);
+  assert.match(draftStateHelperSource, /stable published release[\s\S]*author/);
+  assert.match(draftStateHelperSource, /stable published release[\s\S]*asset uploader/);
+  assert.doesNotMatch(draftPolicyImplementation, /make_latest.*legacy/);
+  assert.match(
+    draftPolicySource,
+    /reconcile_published\(\)[\s\S]*fetch_release_inventory "\$\{STATE_WORK_DIR\}\/existing-published-inventory"[\s\S]*fetch_latest_release "\$\{STATE_WORK_DIR\}\/existing-published-latest"[\s\S]*reconcile-published-latest[\s\S]*printf 'published=true/,
+  );
+
+  for (const { path, source: documentation } of releaseDocumentation) {
+    assert.ok(documentation.length > 0, `${path} must exist`);
+    assert.match(
+      documentation,
+      /all authenticated\s+stable published releases/i,
+      `${path} must define the global candidate set`,
+    );
+    assert.match(
+      documentation,
+      /exhaustive(?:ly)?[\s\S]{0,120}paginat/i,
+      `${path} must document exhaustive bounded pagination`,
+    );
+    assert.match(
+      documentation,
+      /full page[\s\S]{0,120}(?:fail|refus|truncat)/i,
+      `${path} must document max-page truncation failure`,
+    );
+    assert.match(documentation, /make_latest: "true"/, `${path} must document promotion`);
+    assert.match(documentation, /make_latest: "false"/, `${path} must document backports`);
+    assert.match(
+      documentation,
+      /stable[\s\S]{0,300}(?:release writer|protected writer)[\s\S]{0,100}author[\s\S]{0,300}(?:every|asset) uploader/i,
+      `${path} must document protected stable author and uploader identity`,
+    );
+    assert.match(
+      documentation,
+      /(?:historical[\s\S]{0,160}without downloading|does not download[\s\S]{0,80}historical)/i,
+      `${path} must document metadata-only historical inventory validation`,
+    );
+    assert.match(
+      documentation,
+      /inventory[\s\S]{0,160}(?:latest|\/releases\/latest)[\s\S]{0,160}(?:before|finish)[\s\S]{0,160}final draft/i,
+      `${path} must place final draft verification after inventory/latest selection`,
+    );
+    assert.match(
+      documentation,
+      /source tag[\s\S]{0,300}destination\s+anchor\/tag[\s\S]{0,300}remote lock[\s\S]{0,300}(?:before|immediately)[\s\S]{0,120}`?PATCH`?/i,
+      `${path} must document the final pre-PATCH verification order`,
+    );
+    assert.match(
+      documentation,
+      /(?:unavoidable|cannot be removed)[\s\S]{0,400}(?:no|contains no)[\s\S]{0,120}long-running/i,
+      `${path} must document the narrow unsupported-If-Match API boundary`,
+    );
+    assert.match(
+      documentation,
+      /(?:post-publication|post-publish|After[^\n]{0,80}publication)[\s\S]{0,400}(?:fresh|refetch)[\s\S]{0,250}global (?:semantic-version )?maximum/i,
+      `${path} must document fresh post-publication global-maximum verification`,
+    );
+    assert.match(
+      documentation,
+      /published\s+reconciliation[\s\S]{0,400}(?:fresh|refetch)[\s\S]{0,250}(?:inventory|all authenticated\s+stable published releases)[\s\S]{0,300}\/releases\/latest/i,
+      `${path} must document independent retry inventory and latest checks`,
+    );
+    assert.match(
+      documentation,
+      /current published release[\s\S]{0,300}(?:appear(?:s)?|present)[\s\S]{0,250}(?:inventory|candidate set)/i,
+      `${path} must bind the current release into retry inventory`,
+    );
+    assert.doesNotMatch(documentation, /make_latest.*legacy/i);
+  }
+});
+
+test("inventory/latest precede final draft bytes and final reference checks immediately precede PATCH", () => {
+  const publishCase = draftPolicySource.slice(draftPolicySource.indexOf("  publish)"));
+  const inventory = publishCase.indexOf("fetch_release_inventory");
+  const latest = publishCase.indexOf("fetch_latest_release");
+  const finalMetadata = publishCase.indexOf("publish-final-draft");
+  const finalCompare = publishCase.indexOf('node "${STATE_HELPER}" compare', finalMetadata);
+  const sourceTag = publishCase.indexOf("verify_source_tag", finalCompare);
+  const destination = publishCase.indexOf("verify_destination_anchor_and_tag", sourceTag);
+  const lock = publishCase.indexOf("verify_remote_lock", destination);
+  const patch = publishCase.indexOf("--request PATCH", lock);
+
+  assert.ok(
+    inventory !== -1 &&
+      inventory < latest &&
+      latest < finalMetadata &&
+      finalMetadata < finalCompare &&
+      finalCompare < sourceTag &&
+      sourceTag < destination &&
+      destination < lock &&
+      lock < patch,
+  );
+  assert.equal(
+    publishCase.slice(lock, patch),
+    "verify_remote_lock\n    set +e\n    curl --fail-with-body --silent --show-error \\\n      ",
+  );
+  assert.doesNotMatch(
+    publishCase.slice(finalCompare, patch),
+    /fetch_release_inventory|fetch_latest_release/,
+  );
+});
+
+test("the 15-name secret set is a union audit set while notarization methods remain exclusive", () => {
+  const distributionSpec = releaseDocumentation[2].source;
+  assert.match(distributionSpec, /15-name[\s\S]{0,100}union audit set/i);
+  assert.match(
+    distributionSpec,
+    /notarization[\s\S]{0,200}exactly one complete[\s\S]{0,160}(?:API-key|Apple ID)[\s\S]{0,160}(?:never both|mutually exclusive)/i,
+  );
+  assert.doesNotMatch(
+    distributionSpec,
+    /APPLE_ID[^.\n]*APPLE_PASSWORD[^.\n]*APPLE_TEAM_ID[^.\n]*provide the documented fallback/i,
+  );
+});
+
+test("protected configuration is consistently described as environment secrets", () => {
+  const [readme, credentialPacket, distributionSpec] = releaseDocumentation.map(
+    ({ source: documentation }) => documentation,
+  );
+
+  assert.doesNotMatch(source, /signing identity variables/i);
+  assert.doesNotMatch(readme, /reviewers,\s*variables,\s*secrets/i);
+  assert.doesNotMatch(credentialPacket, /environment,\s*its\s+secrets,\s*and\s+its\s+variables/i);
+  for (const documentation of [readme, credentialPacket, distributionSpec]) {
+    assert.match(documentation, /protected configuration[\s\S]{0,160}environment secrets/i);
+  }
 });
 
 test("prepare and sign-and-release are bound to the exact seer-macos-release runner group, not label-only scheduling", () => {
@@ -413,21 +574,34 @@ test("prepared release input is downloaded by exact name into a flat root and ch
   assert.ok(downloadIndex < verifyIndex && verifyIndex < signIndex);
 });
 
-test("signing uses a protected fresh job and rejects gates and identity mismatches before secrets", () => {
+test("signing uses a protected fresh job and rejects gates and identity mismatches before credentials", () => {
   const signing = jobBlock("sign-and-release");
-  const firstSecret = signing.indexOf("${{ secrets.");
+  const gateIndex = signing.indexOf("Enforce protected release gates before any credential");
+  const firstCredential = signing.indexOf("${{ secrets.RELEASES_REPO_TOKEN }}");
 
   assert.match(signing, /needs: prepare/);
   assert.match(signing, /runs-on:\n {6}group: seer-macos-release\n {6}labels: macos-14-xlarge/);
   assert.match(signing, /environment: macos-release/);
-  assert.match(signing, /BINARY_DISTRIBUTION_APPROVED: \$\{\{ vars\.BINARY_DISTRIBUTION_APPROVED \}\}/);
-  assert.match(signing, /PARITY_MATRIX_APPROVED: \$\{\{ vars\.PARITY_MATRIX_APPROVED \}\}/);
-  assert.match(signing, /CLEAN_MACHINE_VERIFIED_COMMIT: \$\{\{ vars\.CLEAN_MACHINE_VERIFIED_COMMIT \}\}/);
+  assert.match(
+    signing,
+    /BINARY_DISTRIBUTION_APPROVED: \$\{\{ secrets\.BINARY_DISTRIBUTION_APPROVED \}\}/,
+  );
+  assert.match(signing, /PARITY_MATRIX_APPROVED: \$\{\{ secrets\.PARITY_MATRIX_APPROVED \}\}/);
+  assert.match(
+    signing,
+    /CLEAN_MACHINE_VERIFIED_COMMIT: \$\{\{ secrets\.CLEAN_MACHINE_VERIFIED_COMMIT \}\}/,
+  );
   assert.match(signing, /\^v\[0-9\]\+\\\.\[0-9\]\+\\\.\[0-9\]\+\$/);
   assert.match(signing, /\^\[0-9a-f\]\{40\}\$/);
-  assert.match(signing, /CLEAN_MACHINE_VERIFIED_COMMIT.*GITHUB_SHA|GITHUB_SHA.*CLEAN_MACHINE_VERIFIED_COMMIT/s);
-  assert.ok(firstSecret > signing.indexOf("CLEAN_MACHINE_VERIFIED_COMMIT"));
-  assert.match(signing, /SIGNING_RUNNER_ID: gha:\$\{\{ github\.run_id \}\}:\$\{\{ github\.run_attempt \}\}:sign/);
+  assert.match(
+    signing,
+    /CLEAN_MACHINE_VERIFIED_COMMIT.*GITHUB_SHA|GITHUB_SHA.*CLEAN_MACHINE_VERIFIED_COMMIT/s,
+  );
+  assert.ok(gateIndex !== -1 && firstCredential > gateIndex);
+  assert.match(
+    signing,
+    /SIGNING_RUNNER_ID: gha:\$\{\{ github\.run_id \}\}:\$\{\{ github\.run_attempt \}\}:sign/,
+  );
   assert.match(signing, /plutil -extract prepareRunnerId raw/);
   assert.match(signing, /attested_prepare_runner_id.*SIGNING_RUNNER_ID|SIGNING_RUNNER_ID.*attested_prepare_runner_id/s);
   assert.match(signing, /name: \$\{\{ needs\.prepare\.outputs\.artifact-name \}\}/);
@@ -437,6 +611,42 @@ test("signing uses a protected fresh job and rejects gates and identity mismatch
   assert.doesNotMatch(signing, /\bnpm (?:ci|install|run)\b|\bnpx\b|\bxcodegen\b|node_modules/);
   assert.equal((signing.match(/\bxcodebuild\b/g) ?? []).length, 1);
   assert.match(signing, /xcodebuild -version/);
+});
+
+test("protected non-sensitive Apple identity secrets are shared by reconciliation and packaging", () => {
+  const signing = jobBlock("sign-and-release");
+  const steps = stepBlocks(signing);
+  const gate = steps.find((step) =>
+    step.includes("Enforce protected release gates before any credential"),
+  );
+  const reconciliation = steps.find((step) =>
+    step.includes("release-macos-draft.sh reconcile-published"),
+  );
+  const packaging = steps.find((step) => step.includes("scripts/package-macos-release.sh"));
+
+  for (const [name, step] of [
+    ["protected gate", gate],
+    ["published reconciliation", reconciliation],
+    ["packaging", packaging],
+  ]) {
+    assert.ok(step, `${name} step must exist`);
+    assert.match(step, /APPLE_SIGNING_IDENTITY: \$\{\{ secrets\.APPLE_SIGNING_IDENTITY \}\}/);
+    assert.match(step, /APPLE_TEAM_ID: \$\{\{ secrets\.APPLE_TEAM_ID \}\}/);
+    assert.doesNotMatch(step, /vars\.APPLE_(?:SIGNING_IDENTITY|TEAM_ID)/);
+  }
+
+  assert.match(reconciliation, /BUILD_NUMBER: \$\{\{ github\.run_number \}\}/);
+  assert.match(packaging, /BUILD_NUMBER: \$\{\{ github\.run_number \}\}/);
+  assert.match(gate, /\[\[ "\$\{APPLE_TEAM_ID\}" =~ \^\[A-Z0-9\]\{10\}\$ \]\]/);
+  assert.match(gate, /\[\[ -n "\$\{APPLE_SIGNING_IDENTITY\}" \]\]/);
+  assert.match(
+    gate,
+    /\[\[ "\$\{APPLE_SIGNING_IDENTITY\}" != \*\$'\\n'\* && "\$\{APPLE_SIGNING_IDENTITY\}" != \*\$'\\r'\* \]\]/,
+  );
+  assert.match(
+    gate,
+    /\[\[ "\$\{APPLE_SIGNING_IDENTITY\}" =~ \^Developer\\ ID\\ Application:\\ \.\+\\ \\\(\$\{APPLE_TEAM_ID\}\\\)\$ \]\]/,
+  );
 });
 
 test("signing keeps build tools out and scopes the releases token to release policy commands", () => {
@@ -455,10 +665,16 @@ test("signing keeps build tools out and scopes the releases token to release pol
     "APPLE_API_KEY_BASE64",
     "APPLE_ID",
     "APPLE_PASSWORD",
+    "BINARY_DISTRIBUTION_APPROVED",
+    "PARITY_MATRIX_APPROVED",
+    "CLEAN_MACHINE_VERIFIED_COMMIT",
+    "RELEASE_WRITER_LOGIN",
+    "RELEASE_WRITER_ID",
     "RELEASES_REPO_TOKEN",
   ]);
 
   assert.deepEqual(signingSecrets, expectedSecrets);
+  assert.doesNotMatch(signing, /\$\{\{\s*vars\./);
   assert.doesNotMatch(prepare, /RELEASES_REPO_TOKEN/);
   assert.match(signing, /run: bash scripts\/package-macos-release\.sh/);
 
@@ -477,7 +693,10 @@ test("signing keeps build tools out and scopes the releases token to release pol
     );
     if (hasToken) {
       assert.match(step, /GH_REPO: OpenCoven\/seer-releases/);
-      assert.doesNotMatch(step, /secrets\.APPLE_/);
+      assert.doesNotMatch(
+        step,
+        /secrets\.APPLE_(?:CERTIFICATE(?:_PASSWORD)?|API_ISSUER|API_KEY(?:_BASE64)?|ID|PASSWORD)\b/,
+      );
     }
   }
   assert.doesNotMatch(
@@ -521,9 +740,13 @@ test("a valid published reconciliation skips every signing, packaging, upload, a
     );
   }
 
-  const appleSecretSteps = steps.filter((step) => /\$\{\{\s*secrets\.APPLE_/.test(step));
-  assert.ok(appleSecretSteps.length > 0);
-  for (const step of appleSecretSteps) {
+  const appleCredentialSteps = steps.filter((step) =>
+    /\$\{\{\s*secrets\.APPLE_(?:CERTIFICATE(?:_PASSWORD)?|API_ISSUER|API_KEY(?:_BASE64)?|ID|PASSWORD)\s*\}\}/.test(
+      step,
+    ),
+  );
+  assert.ok(appleCredentialSteps.length > 0);
+  for (const step of appleCredentialSteps) {
     assert.match(step, /^\s+if: steps\.published-reconciliation\.outputs\.published != 'true'$/m);
   }
 });
@@ -606,8 +829,8 @@ test("release lock is always relinquished and governance identity is protected-e
     draftPolicySource,
     /GH_TOKEN="\$\{SOURCE_GITHUB_TOKEN\}" gh api[\s\S]*actions\/runs\/\$\{run_id\}\/attempts\/\$\{run_attempt\}/,
   );
-  assert.match(signing, /RELEASE_WRITER_LOGIN: \$\{\{ vars\.RELEASE_WRITER_LOGIN \}\}/);
-  assert.match(signing, /RELEASE_WRITER_ID: \$\{\{ vars\.RELEASE_WRITER_ID \}\}/);
+  assert.match(signing, /RELEASE_WRITER_LOGIN: \$\{\{ secrets\.RELEASE_WRITER_LOGIN \}\}/);
+  assert.match(signing, /RELEASE_WRITER_ID: \$\{\{ secrets\.RELEASE_WRITER_ID \}\}/);
   assert.match(signing, /WORKFLOW_ATTEMPT: \$\{\{ github\.run_attempt \}\}/);
   assert.match(draftPolicySource, /--method POST[\s\S]*repos\/\$\{GH_REPO\}\/git\/refs/);
   assert.match(
@@ -619,8 +842,10 @@ test("release lock is always relinquished and governance identity is protected-e
 
 test("source and destination tags remain cryptographically bound at publication", () => {
   const signing = jobBlock("sign-and-release");
-  const approval = signing.indexOf("Enforce protected release gates before any secret");
-  const sourceVerification = signing.indexOf("Verify source tag still resolves to the attested commit");
+  const approval = signing.indexOf("Enforce protected release gates before any credential");
+  const sourceVerification = signing.indexOf(
+    "Verify source tag still resolves to the attested commit",
+  );
   const signingStep = signing.indexOf("Sign and notarize attested input");
   const publishStep = stepBlocks(signing).find((step) =>
     step.includes("release-macos-draft.sh publish"),
