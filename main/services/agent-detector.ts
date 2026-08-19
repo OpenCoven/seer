@@ -27,19 +27,26 @@ import {
   CURSOR_RUNNING_TOOL_STATUSES,
   CURSOR_SQLITE_BUSY_TIMEOUT_MS,
   CURSOR_SQLITE_QUERY_DEADLINE_MS,
+  CURSOR_TIMESTAMP_SQL_FUNCTION_NAME,
+  cursorCanonicalIsoStringToEpochMs,
   cursorHeaderGrouping,
   cursorProjectLabel,
   cursorRecencySqlExpression,
   cursorRelevantBubbleIds,
+  daysFromCivil,
+  daysInGregorianMonth,
+  epochMsFromCanonicalCursorIsoComponents,
   friendlySessionLabel,
   humanizeProjectName,
   isCanonicalCursorIsoTimestamp,
   isDefinitelyOlderThanWindowLowerBound,
+  isGregorianLeapYear,
   isPlainCursorObject,
   isRecentTimestamp,
   malformedCursorAssessment,
   matchAgentKind,
   MAX_SUPPORTED_TIMESTAMP_MS,
+  parseCanonicalCursorIsoComponents,
   parseCursorTimestamp,
   parseTimestamp,
   PROCESS_ONLY_CPU_THRESHOLD,
@@ -430,7 +437,13 @@ type CursorWorkerMessage =
  */
 const CURSOR_WORKER_POLICY_FUNCTIONS = [
   isPlainCursorObject,
+  isGregorianLeapYear,
+  daysInGregorianMonth,
+  daysFromCivil,
+  epochMsFromCanonicalCursorIsoComponents,
+  parseCanonicalCursorIsoComponents,
   isCanonicalCursorIsoTimestamp,
+  cursorCanonicalIsoStringToEpochMs,
   parseCursorTimestamp,
   validateOptionalString,
   validateCursorRecordFields,
@@ -511,6 +524,24 @@ try {
     readOnly: true,
     timeout: workerData.sqliteBusyTimeoutMs,
   });
+  // Registers the scalar function workerData.recencySql's generated SQL
+  // calls by name (see cursorRecencySqlExpression's doc comment) — the
+  // literal name below is baked in at CURSOR_WORKER_DRIVER_SOURCE
+  // template-literal build time (interpolating the real, imported
+  // CURSOR_TIMESTAMP_SQL_FUNCTION_NAME constant in the *outer*, main-thread
+  // scope, before this text is ever eval'd as Worker source), never a
+  // free-variable reference resolved at Worker-eval time. deterministic:
+  // true is semantically correct (identical arguments always produce the
+  // identical result) though it does not by itself deduplicate multiple
+  // textual calls with identical arguments within one row/expression
+  // (confirmed empirically) — cursorRecencySqlExpression's own generated
+  // SQL already calls this at most once per candidate field via a small
+  // WITH, so that is not needed here.
+  db.function(
+    "${CURSOR_TIMESTAMP_SQL_FUNCTION_NAME}",
+    { deterministic: true },
+    cursorCanonicalIsoStringToEpochMs,
+  );
 } catch (error) {
   postError("databaseError", error && error.message ? error.message : String(error));
 }

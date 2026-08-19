@@ -930,6 +930,65 @@ export const CURSOR_TIMESTAMP_FIELDS_BY_PRIORITY = [
 ] as const;
 
 /**
+ * Deliberately narrow Cursor ISO-8601 timestamp *string* domain — the
+ * lower/upper year bound and maximum timezone-offset magnitude
+ * `parseCanonicalCursorIsoComponents`, the SQL `cursorRecencySqlExpression`
+ * component guards below, and the Swift ports of both enforce identically.
+ * These exist purely as named, documented, testable references: every
+ * `.toString()`-reconstructed function that actually *enforces* these bounds
+ * (`parseCanonicalCursorIsoComponents`) bakes them in as literal numbers
+ * instead of reading these `const`s — see that function's own comment for
+ * why (a top-level `const`, unlike a function, is never re-declared inside
+ * the Cursor scan Worker's `.toString()`-reconstructed source, so reading
+ * one as a free variable there would throw instead of resolving; this
+ * mirrors the existing precedent of `parseCursorTimestamp` inlining `1e12`
+ * rather than reading `CURSOR_TIMESTAMP_SECONDS_THRESHOLD_MS` above).
+ * `cursorRecencySqlExpression` itself is never reconstructed into the Worker
+ * (it only ever runs once, in the parent, to build a plain SQL *string* that
+ * is then handed to the Worker as inert `workerData`), so it safely reads
+ * these `const`s directly as its own parameter defaults.
+ */
+/**
+ * Lower bound is exactly 1970 (inclusive) — `new Date(0).toISOString()` is
+ * `"1970-01-01T00:00:00.000Z"`, and real Cursor on-disk data never predates
+ * the epoch. Upper bound is exactly 9999 (inclusive) — the largest year a
+ * 4-digit calendar year can spell. Restricting to this modern/safe range
+ * sidesteps a genuine (not just accept/reject) cross-engine *value*
+ * divergence: Foundation's `Date`/`Calendar` machinery computes a different
+ * epoch millisecond for some pre-1600 proleptic-Gregorian dates than V8's
+ * `Date.parse`/SQLite's date arithmetic do (confirmed empirically for
+ * `0001-01-01T00:00:00Z`, off by exactly 2 days) — no real Cursor timestamp
+ * can ever need a year outside this range, so excluding it entirely is
+ * strictly safer than trusting any engine's own ancient-date conversion.
+ */
+export const CURSOR_TIMESTAMP_MIN_YEAR = 1970;
+export const CURSOR_TIMESTAMP_MAX_YEAR = 9999;
+/**
+ * Maximum accepted `±HH:MM` timezone-offset magnitude, in minutes: 14 hours
+ * (840 minutes). Chosen, not incidental: it is both (a) the largest UTC
+ * offset any real-world timezone actually uses today (Kiribati's
+ * `+14:00`), so no genuine Cursor timestamp can ever need more, and (b)
+ * comfortably inside SQLite's own native `julianday()` offset cutoff
+ * (confirmed empirically: SQLite accepts any offset with magnitude strictly
+ * less than 15:00 and returns `NULL` at/beyond it) and V8's `Date.parse`
+ * (which has no cutoff of its own, accepting up to `+23:59`) — so this
+ * grammar's own explicit bound is always the *tightest* of the three, and
+ * no engine's differing native cutoff is ever relied upon.
+ */
+export const CURSOR_TIMESTAMP_MAX_OFFSET_MINUTES = 14 * 60;
+
+/**
+ * Name under which `cursorRecencySqlExpression`'s generated SQL calls
+ * `cursorCanonicalIsoStringToEpochMs` as a registered SQLite scalar
+ * function (`db.function(...)` in `agent-detector.ts`'s Worker driver and
+ * in `tests/agent-detection-parity.test.mjs`; `sqlite3_create_function_v2`
+ * in the Swift port). A single shared name/constant, never independently
+ * duplicated as a string literal, so the generator and every registration
+ * site can never drift apart.
+ */
+export const CURSOR_TIMESTAMP_SQL_FUNCTION_NAME = "cursor_canonical_iso_to_epoch_ms";
+
+/**
  * Builds a SQL expression that computes a Cursor `cursorDiskKV` composer
  * row's recency directly in SQLite, in epoch milliseconds (or `NULL` when
  * unrankable) — so a query can `ORDER BY` **actual last-activity time**
@@ -1004,26 +1063,28 @@ export const CURSOR_TIMESTAMP_FIELDS_BY_PRIORITY = [
  *       `parseCursorTimestamp` accepts that can make a composer active:
  *       a JSON number (seconds when `<= secondsThresholdMs`, else already
  *       milliseconds — mirroring the `> 1e12` heuristic exactly) or a JSON
- *       string matching `isCanonicalCursorIsoTimestamp`'s exact
- *       `YYYY-MM-DDTHH:MM:SS[.fraction](Z|±HH:MM)` grammar — the one string
- *       shape confirmed to parse to the exact same millisecond value under
- *       both this codebase's TS parser (`Date.parse`, gated by that same
- *       shape guard) and its Swift parser (`Date.ISO8601FormatStyle`). Any
- *       other string (zone-less, date-only, lower-case `t`/`z`,
- *       space-separated, no-seconds, or otherwise lenient-but-ambiguous
- *       `Date.parse` shapes) is unrankable here for the same reason it is
- *       unparseable to `parseCursorTimestamp` itself: real Cursor data only
- *       ever emits epoch-millisecond numbers on disk, so this restriction
- *       never under-ranks genuine data, and Swift's stricter ISO 8601
- *       parser flatly rejects several of those shapes anyway, so ranking on
- *       them could silently diverge between engines.
- *       A value that reaches SQLite's own date parser is additionally
- *       shape-guarded by `GLOB`/`substr` *before* `julianday()` ever runs,
- *       and the millisecond conversion is `ROUND`ed — confirmed empirically
- *       required, since the raw `(julianday(x) - 2440587.5) * 86400000.0`
- *       formula alone can be off by a sub-millisecond floating-point
- *       epsilon (e.g. `...123` computed as `...122.9927`) that `ROUND`
- *       corrects to the exact integer millisecond `Date.parse` produces.
+ *       string matching `parseCanonicalCursorIsoComponents`'s exact
+ *       `YYYY-MM-DDTHH:MM:SS[.fraction](Z|±HH:MM)` grammar *and* full
+ *       Gregorian range validation (real year/month/day-in-month/hour/
+ *       minute/second/offset-magnitude bounds — not just the shape) — the
+ *       one narrow string domain this codebase's TS parser, this SQL
+ *       expression, and the Swift port all three independently validate
+ *       and convert to the exact same millisecond value by construction,
+ *       via the identical Howard Hinnant `days_from_civil` integer
+ *       arithmetic formula, invoked through the registered
+ *       `CURSOR_TIMESTAMP_SQL_FUNCTION_NAME` scalar function (see
+ *       `cursorCanonicalIsoStringToEpochMs`'s and the function body below's
+ *       own comments), never `julianday()`/`Date.parse`/
+ *       `Date.ISO8601FormatStyle`'s own leniency or differing native
+ *       bounds. Any other string (zone-less, date-only, lower-case
+ *       `t`/`z`, space-separated, no-seconds, minute/second `60`, an
+ *       invalid calendar day, an out-of-range year, or an offset beyond
+ *       `maxOffsetMinutes`) is unrankable here for the same reason it is
+ *       unparseable to `parseCursorTimestamp` itself: real Cursor data
+ *       only ever emits epoch-millisecond numbers on disk, so this
+ *       restriction never under-ranks genuine data, and every one of those
+ *       shapes is now rejected identically by all three engines instead of
+ *       silently accepted-but-differently-computed by one of them.
  *     - Both also apply the same `ABS(ms) <= maxSupportedTimestampMs`
  *       bound as before, so an out-of-range numeric string/number never
  *       poisons the `MAX` with a nonsensical magnitude.
@@ -1038,6 +1099,9 @@ export function cursorRecencySqlExpression(
   maxValueBytes: number = CURSOR_MAX_VALUE_BYTES,
   maxSupportedTimestampMs: number = MAX_SUPPORTED_TIMESTAMP_MS,
   secondsThresholdMs: number = CURSOR_TIMESTAMP_SECONDS_THRESHOLD_MS,
+  minYear: number = CURSOR_TIMESTAMP_MIN_YEAR,
+  maxYear: number = CURSOR_TIMESTAMP_MAX_YEAR,
+  maxOffsetMinutes: number = CURSOR_TIMESTAMP_MAX_OFFSET_MINUTES,
 ): string {
   // Converts one already-`json_extract`-ed candidate (`typeExpr` its
   // `json_type(...)`, `rawExpr` its `json_extract(...)`) to epoch
@@ -1047,40 +1111,91 @@ export function cursorRecencySqlExpression(
   // between the two.
   const numericOrIsoStringToMsExpression = (typeExpr: string, rawExpr: string): string => {
     const scaledNumeric = `(CASE WHEN ${rawExpr} > ${secondsThresholdMs} THEN ${rawExpr} ELSE ${rawExpr} * 1000 END)`;
-    // `YYYY-MM-DDTHH:MM:SS` prefix (GLOB is case-sensitive, so a lower-case
-    // `t` never matches), then either bare `Z`, an explicit `±HH:MM` offset,
-    // or a `.` + EXACTLY 1-3 fractional digits followed by `Z` or an
-    // offset. GLOB has no `{1,3}`-style repetition, so each digit count is
-    // spelled out as its own alternative rather than the unrestricted `.*`
-    // wildcard a naive port would reach for — `.*` would happily match a
-    // 4-or-more-digit fraction too, which `Date.parse`/`ROUND(julianday(...))`
-    // /Swift's `ISO8601FormatStyle` can each round to a *different* integer
-    // millisecond (sub-millisecond precision none of the three parsers
-    // agrees on), silently breaking cross-engine parity. Anything else
-    // (zone-less, date-only, space-separated, lower-case, missing seconds,
-    // or a 4+-digit fraction) is intentionally left unmatched.
-    const fractionalSecondsDigitCounts = [1, 2, 3];
-    const suffixAlternatives = [
-      `substr(${rawExpr}, 20) = 'Z'`,
-      `substr(${rawExpr}, 20) GLOB '[+-][0-9][0-9]:[0-9][0-9]'`,
-      ...fractionalSecondsDigitCounts.flatMap((digits) => {
-        const fraction = `.${"[0-9]".repeat(digits)}`;
-        return [
-          `substr(${rawExpr}, 20) GLOB '${fraction}Z'`,
-          `substr(${rawExpr}, 20) GLOB '${fraction}[+-][0-9][0-9]:[0-9][0-9]'`,
-        ];
-      }),
-    ];
-    const isoShapeGuard =
-      `${rawExpr} GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*' ` +
-      `AND (${suffixAlternatives.join(" OR ")})`;
-    const scaledIsoString = `ROUND((julianday(${rawExpr}) - 2440587.5) * 86400000.0)`;
-    return (
-      `CASE ` +
-      `WHEN ${typeExpr} IN ('integer', 'real') AND ABS(${scaledNumeric}) <= ${maxSupportedTimestampMs} THEN ${scaledNumeric} ` +
-      `WHEN ${typeExpr} = 'text' AND ${isoShapeGuard} AND ABS(${scaledIsoString}) <= ${maxSupportedTimestampMs} THEN ${scaledIsoString} ` +
-      `ELSE NULL END`
-    );
+
+    // The ISO-string branch below enforces *exactly* the same grammar and
+    // range rules as `parseCanonicalCursorIsoComponents` (TS) and its Swift
+    // port — not just the `YYYY-MM-DDTHH:MM:SS` shape, but real
+    // year/month/day(-in-month, honoring leap years)/hour/minute/second
+    // range validation plus a bounded timezone-offset magnitude — computed
+    // via the identical Howard Hinnant `days_from_civil` integer-arithmetic
+    // formula, never `julianday()`. But unlike a same-language TS caller,
+    // this branch does not re-implement that grammar/arithmetic as inline
+    // SQL text at all: it calls `CURSOR_TIMESTAMP_SQL_FUNCTION_NAME`, a
+    // SQLite scalar function registered (in `agent-detector.ts`'s Worker
+    // driver, and in `tests/agent-detection-parity.test.mjs`'s direct-SQL
+    // tests; `sqlite3_create_function_v2` in the Swift port) to run
+    // `cursorCanonicalIsoStringToEpochMs` — the *exact* same JS function the
+    // pure-TS `parseCursorTimestamp` string branch already calls. This is a
+    // deliberate strengthening over an earlier version of this expression
+    // that shape-guarded the string and then trusted SQLite's own
+    // `julianday()` to compute (and implicitly range-validate) the value:
+    // `julianday()` independently agrees with `Date.parse` on nearly
+    // everything (both roll invalid calendar dates over rather than
+    // rejecting them) except its own offset-magnitude cutoff (confirmed
+    // empirically: `julianday()` accepts any `±HH:MM` with magnitude
+    // strictly less than 15:00, while `Date.parse` has no cutoff at all,
+    // accepting up to `+23:59`) — a genuine, independent three-way
+    // divergence this rewrite closes by never delegating to either engine's
+    // own leniency for range validation *or* arithmetic.
+    //
+    // A registered scalar function replaced two earlier from-scratch SQL
+    // encodings of this same grammar, each progressively smaller but still
+    // ultimately too slow for this codebase's tightest deadline test
+    // (`agent-detector.test.ts`'s "Cursor deadline exhaustion..." case,
+    // which budgets a `node:worker_threads` Worker only ~20ms total,
+    // ~16-17ms of which is fixed Worker-startup overhead this SQL cannot
+    // reduce, leaving only a few milliseconds for `prepare()` and the first
+    // row):
+    //  1. One `CASE` enumerating all 8 fraction-digit-count x zone-kind
+    //     combinations, each repeating the full calendar guard and Hinnant
+    //     arithmetic inline — ~350KB of generated SQL text for a single
+    //     field (confirmed empirically: `prepare()`-ing and first-rowing
+    //     this over 40 rows alone took >20ms).
+    //  2. A `WITH`-chain computing each sub-value (year/month/day/.../
+    //     fraction digits/offset hour+minute/the Hinnant running total)
+    //     exactly once, each as its own step — a large improvement
+    //     (measured at a few KB per field instead of ~350KB) but still not
+    //     enough margin once multiplied across every root/header candidate
+    //     field and the outer type-dispatch `CASE`'s multiple textual
+    //     references to it (confirmed empirically: still single-digit
+    //     milliseconds of `prepare()` + first-row time, eating most of the
+    //     Worker's remaining budget after startup).
+    // A registered function call's `prepare()` cost does not scale with
+    // this grammar's complexity at all — the SQL text is now a small, fixed
+    // call — and per-row evaluation is one native/JS function invocation
+    // instead of dozens of VDBE `CAST`/`substr`/`GLOB` opcodes (confirmed
+    // empirically: total prepare+first-row time for the full realistic
+    // COALESCE/header-subquery query dropped from double-digit milliseconds
+    // to a small fraction of a millisecond). The task's own requirement 3
+    // explicitly permits this design ("register an identical safe
+    // conversion function if that is cleaner and available in both SQLite
+    // paths") as an alternative to inline component/range guards.
+    //
+    // `minYear`/`maxYear`/`maxOffsetMinutes` are passed as literal SQL
+    // arguments (this function's own closed-over parameters, resolved once
+    // when `cursorRecencySqlExpression` runs on the main thread — never a
+    // free variable inside the Worker's reconstructed text), so an
+    // overridden bound reaches `cursorCanonicalIsoStringToEpochMs`'s actual
+    // validation instead of silently falling back to
+    // `parseCanonicalCursorIsoComponents`'s own literal defaults.
+    //
+    // Wrapped in a single small `WITH` (not referenced 3 times directly in
+    // the outer `CASE`, the way `scaledNumeric` still is): `ms` is computed
+    // *once* per row/field, then range-checked — semantically identical to
+    // three direct references (verified by exhaustive case analysis and by
+    // fuzz-testing against the prior direct-reference form: whichever
+    // branch's condition end up NULL/out-of-range, both forms agree on
+    // `NULL`; whichever is in-range, both agree on the exact same value)
+    // while only ever invoking the scalar function once.
+    const isoMsCall = `${CURSOR_TIMESTAMP_SQL_FUNCTION_NAME}(${rawExpr}, ${minYear}, ${maxYear}, ${maxOffsetMinutes})`;
+    const branchMs =
+      `(WITH msValue AS (SELECT CASE ` +
+      `WHEN ${typeExpr} IN ('integer', 'real') THEN ${scaledNumeric} ` +
+      `WHEN ${typeExpr} = 'text' THEN ${isoMsCall} ` +
+      `ELSE NULL END AS ms) ` +
+      `SELECT CASE WHEN ABS(ms) <= ${maxSupportedTimestampMs} THEN ms ELSE NULL END FROM msValue)`;
+
+    return branchMs;
   };
 
   const fieldExpression = (field: string): string => {
@@ -1173,50 +1288,275 @@ export function isPlainCursorObject(value: unknown): value is Record<string, unk
 }
 
 /**
- * The exact ISO-8601 string grammar `parseCursorTimestamp` accepts:
- * `YYYY-MM-DDTHH:MM:SS[.fraction](Z|±HH:MM)`, case-sensitive `T`/`Z`
- * (a lower-case `t` or `z` is rejected), seconds required (no date-only or
+ * The exact integer calendar/time/offset components a canonical Cursor
+ * ISO-8601 timestamp string decomposes into. Returned by
+ * `parseCanonicalCursorIsoComponents` so `epochMsFromCanonicalCursorIsoComponents`
+ * can turn them into an epoch millisecond value via explicit integer
+ * arithmetic — never `Date.UTC`/`Date.parse` — so this codebase's own
+ * computation is the single source of truth every engine (TS, Swift, SQL)
+ * independently reproduces bit-for-bit, rather than each trusting its own
+ * platform date library to agree with the others'.
+ */
+export type CanonicalCursorIsoComponents = {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second: number;
+  fractionMs: number;
+  /** Signed; positive for `+HH:MM`, negative for `-HH:MM`, zero for `Z`. */
+  offsetMinutes: number;
+};
+
+/**
+ * Standard Gregorian leap-year rule. `.toString()`-reconstructible with zero
+ * free variables (see `isRecentTimestamp`'s comment for why that matters to
+ * the Cursor worker driver) — pure arithmetic on its own parameter.
+ */
+export function isGregorianLeapYear(year: number): boolean {
+  return (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+}
+
+/**
+ * Number of days in `month` (1-12) of the Gregorian `year`, honoring the
+ * leap-year rule for February. `.toString()`-reconstructible with zero free
+ * variables — calls `isGregorianLeapYear` as a same-module function
+ * reference (safe: both are listed together in `agent-detector.ts`'s
+ * `CURSOR_WORKER_POLICY_FUNCTIONS`, exactly like every other cross-function
+ * call in this file).
+ */
+export function daysInGregorianMonth(year: number, month: number): number {
+  const daysByMonth = [31, isGregorianLeapYear(year) ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return daysByMonth[month - 1];
+}
+
+/**
+ * Days since the Unix epoch (1970-01-01) for a proleptic-Gregorian civil
+ * date, computed via Howard Hinnant's `days_from_civil` integer-arithmetic
+ * algorithm (http://howardhinnant.github.io/date_algorithms.html) —
+ * deliberately *not* `Date.UTC`, which is exactly the kind of
+ * platform-date-library call this rewrite exists to avoid, since its
+ * behavior for out-of-domain input is what silently diverged from SQLite
+ * and Foundation in the first place. Valid only for `year` within
+ * `CURSOR_TIMESTAMP_MIN_YEAR..CURSOR_TIMESTAMP_MAX_YEAR` (both callers
+ * already enforce this before ever computing days), which keeps
+ * `shiftedYear` non-negative so SQL's/Swift's truncating integer division
+ * behaves identically to the floor division used here — no negative-number
+ * edge cases to reconcile across engines. `.toString()`-reconstructible
+ * with zero free variables.
+ */
+export function daysFromCivil(year: number, month: number, day: number): number {
+  const shiftedYear = year - (month <= 2 ? 1 : 0);
+  const era = Math.floor(shiftedYear / 400);
+  const yearOfEra = shiftedYear - era * 400;
+  const shiftedMonth = month + (month > 2 ? -3 : 9);
+  const dayOfYear = Math.floor((153 * shiftedMonth + 2) / 5) + day - 1;
+  const dayOfEra = yearOfEra * 365 + Math.floor(yearOfEra / 4) - Math.floor(yearOfEra / 100) + dayOfYear;
+  return era * 146097 + dayOfEra - 719468;
+}
+
+/**
+ * Converts already-validated canonical components to an epoch millisecond
+ * value via plain integer arithmetic (`daysFromCivil` for the calendar part,
+ * then hour/minute/second/fraction/offset). The largest representable
+ * magnitude (year 9999) is ~2.5e14 — comfortably inside
+ * `Number.MAX_SAFE_INTEGER` (~9.007e15) and, for the identical Swift/SQL
+ * arithmetic, `Int64` range — so no overflow/precision-loss concern at any
+ * valid input. `.toString()`-reconstructible with zero free variables.
+ */
+export function epochMsFromCanonicalCursorIsoComponents(components: CanonicalCursorIsoComponents): number {
+  const days = daysFromCivil(components.year, components.month, components.day);
+  return (
+    days * 86_400_000 +
+    components.hour * 3_600_000 +
+    components.minute * 60_000 +
+    components.second * 1_000 +
+    components.fractionMs -
+    components.offsetMinutes * 60_000
+  );
+}
+
+/**
+ * The single shared validator/decomposer for this codebase's one canonical
+ * Cursor ISO-8601 timestamp *string* domain:
+ * `YYYY-MM-DDTHH:MM:SS[.fraction](Z|±HH:MM)`, case-sensitive `T`/`Z` (a
+ * lower-case `t` or `z` is rejected), seconds required (no date-only or
  * minute-only shape), no other separator (no space in place of `T`, no
- * RFC-2822 mail-date form), and an optional fractional-seconds component
+ * RFC-2822 mail-date form), an optional fractional-seconds component
  * restricted to exactly 1-3 digits (`.1`, `.12`, `.123` accepted; a
- * 4-or-more-digit fraction like `.1234` is rejected). The 1-3 digit bound
- * matters for more than grammar purity: `Date.parse` (this function),
- * `julianday()` (the SQL shape guard below), and Swift's
- * `Date.ISO8601FormatStyle` all only ever *emit* millisecond precision, but
- * a 4+-digit fraction is sub-millisecond precision that each of those three
- * parsers is free to round differently — confirmed empirically that without
- * this bound, the three engines can compute different integer millisecond
- * values for the exact same 4+-digit-fraction string, silently breaking the
- * cross-platform recency parity this grammar exists to guarantee. This is
- * the single canonical grammar this
- * codebase intentionally supports for a Cursor timestamp *string* — it is
- * deliberately narrower than what `Date.parse` alone would accept, because
- * it must agree with two other independent parsers of the exact same
- * on-disk value: `cursorRecencySqlExpression`'s SQL `GLOB`/`substr` shape
- * guard (`agent-detection-policy.ts`, above) and the Swift port's
- * `Date.ISO8601FormatStyle` (confirmed empirically to flatly reject a
- * date-only string, a minute-only string, a space-separated string, and a
- * lower-case `t`; it also happens to tolerate a lower-case trailing `z` as
- * an accidental Foundation leniency, which this grammar does not mirror —
- * real Cursor data never emits one, so rejecting it here only ever
- * tightens, never narrows, real-world coverage, and keeps this grammar
- * identical to the SQL guard's literal-uppercase-only `Z` check instead of
- * introducing a third, subtly different accepted shape).
+ * 4-or-more-digit fraction like `.1234` is rejected — sub-millisecond
+ * precision no engine here needs to agree on rounding for), and full
+ * Gregorian range validation this grammar's *shape* alone cannot express:
+ *  - Year restricted by default to `1970..9999` inclusive (see
+ *    `CURSOR_TIMESTAMP_MIN_YEAR`/`CURSOR_TIMESTAMP_MAX_YEAR`'s own comment)
+ *    — the `minYear`/`maxYear` parameters *default* to literal `1970`/`9999`
+ *    (not a read of those `const`s), for the same free-variable-safety
+ *    reason `1e12` is inlined elsewhere rather than reading
+ *    `CURSOR_TIMESTAMP_SECONDS_THRESHOLD_MS`: every call site in this file
+ *    that omits these arguments (`isCanonicalCursorIsoTimestamp`,
+ *    `parseCursorTimestamp`, and every internal call reconstructed into the
+ *    Cursor worker) resolves the identical literal default no matter how a
+ *    bundler renames this module's top-level bindings. The
+ *    `cursorCanonicalIsoStringToEpochMs` SQL-function wrapper below is the
+ *    one caller that *does* pass explicit values (from the SQL text's own
+ *    embedded literals, themselves ultimately from these same `const`s) —
+ *    still free-variable-safe, since a passed-in argument is never a free
+ *    variable.
+ *  - Month `01-12`; day `01`-through-the-real-last-day-of-that-month, i.e.
+ *    `daysInGregorianMonth(year, month)` — a real calendar check, not just
+ *    a `01-31` shape guard, so e.g. `2024-02-30` or a non-leap
+ *    `2023-02-29` is rejected exactly like `Date.UTC`'s *lack* of rollover
+ *    would compute for a real calendar (this grammar's own arithmetic never
+ *    rolls a date over the way lenient `Date.parse`/Foundation do; an
+ *    invalid day is a hard rejection, matching the "one narrow domain with
+ *    exact conversion" contract this grammar exists to guarantee instead of
+ *    each engine's own differing leniency).
+ *  - Hour `00-23`; minute `00-59`; second `00-59` — no leap second `:60`,
+ *    which both `Date.ISO8601FormatStyle` and V8's/SQLite's own rollover
+ *    otherwise silently accept in slightly different (and here, entirely
+ *    unnecessary) ways.
+ *  - Timezone `Z` or `±HH:MM` with offset minutes `00-59` and total
+ *    magnitude at most `maxOffsetMinutes` (defaults to the literal `840`,
+ *    i.e. `14:00` — see `CURSOR_TIMESTAMP_MAX_OFFSET_MINUTES`'s own comment;
+ *    same default-parameter reasoning as `minYear`/`maxYear` above).
+ *    `+00:00`/`-00:00` are both accepted as zero offset (unambiguous,
+ *    matching `Z`).
  *
+ * Byte/shape validation happens via one regular expression here because JS
+ * `RegExp`'s `\d` is always ASCII-only (never the Unicode `Nd` category) and
+ * `$` without the `/m` flag matches only true end-of-string (never before a
+ * trailing `\n`) — confirmed empirically safe against both a full-width
+ * Unicode-digit year and a trailing newline/whitespace, unlike Swift's
+ * `NSRegularExpression` (ICU semantics: `\d` matches the full Unicode `Nd`
+ * category, and `$` matches before a trailing `\n` even without explicit
+ * MULTILINE), which is exactly why the Swift port below hand-rolls a
+ * byte-level parser over `value.utf8` instead of using
+ * `NSRegularExpression` for this grammar at all.
+ *
+ * Returns the parsed `CanonicalCursorIsoComponents`, or `null` if `value`
+ * does not exactly match this grammar (whole-string match only — no partial
+ * prefix, no trailing content of any kind, including whitespace/newlines).
+ * `.toString()`-reconstructible with zero free variables (the regex pattern
+ * is a literal inside the function body, and the year/offset bounds are
+ * literal default parameter values — see this comment and
+ * `CURSOR_TIMESTAMP_MIN_YEAR`'s own comment above), so it is safe to call
+ * directly (as a same-module free-variable reference, like every other
+ * cross-function call in this file) from
+ * `isCanonicalCursorIsoTimestamp`/`parseCursorTimestamp` below.
+ */
+export function parseCanonicalCursorIsoComponents(
+  value: string,
+  minYear: number = 1970,
+  maxYear: number = 9999,
+  maxOffsetMinutes: number = 840,
+): CanonicalCursorIsoComponents | null {
+  const match =
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(Z|[+-]\d{2}:\d{2})$/.exec(value);
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  const fractionDigits = match[7];
+  const zone = match[8];
+
+  if (year < minYear || year > maxYear) return null;
+  if (month < 1 || month > 12) return null;
+  if (day < 1 || day > daysInGregorianMonth(year, month)) return null;
+  if (hour > 23) return null;
+  if (minute > 59) return null;
+  if (second > 59) return null; // no leap seconds
+
+  let fractionMs = 0;
+  if (fractionDigits !== undefined) {
+    // Left-pad to millisecond precision: ".1" -> 100ms, ".12" -> 120ms, ".123" -> 123ms.
+    fractionMs = Number(fractionDigits) * 10 ** (3 - fractionDigits.length);
+  }
+
+  let offsetMinutes = 0;
+  if (zone !== "Z") {
+    const sign = zone[0] === "-" ? -1 : 1;
+    const offsetHour = Number(zone.slice(1, 3));
+    const offsetMinute = Number(zone.slice(4, 6));
+    if (offsetMinute > 59) return null;
+    const totalOffsetMinutes = offsetHour * 60 + offsetMinute;
+    if (totalOffsetMinutes > maxOffsetMinutes) return null;
+    offsetMinutes = sign * totalOffsetMinutes;
+  }
+
+  return { year, month, day, hour, minute, second, fractionMs, offsetMinutes };
+}
+
+/**
  * Exported (not just module-private) as the one shared validator so
- * `parseCursorTimestamp`, its test suite, and the SQL-shape parity tests
- * all check the identical grammar rather than each restating their own
- * regex that could silently drift out of sync with the other two.
- * `.toString()`-reconstructible with zero free variables (the pattern is a
- * literal inside the function body, not a top-level `const` some other
- * bundled module's name could collide with and force a rename of — see
- * `isRecentTimestamp`'s comment for why that matters to the Cursor worker
- * driver), so it is safe to call directly (as a same-module free-variable
- * reference, like every other cross-function call in this file) from
- * `parseCursorTimestamp` below.
+ * `parseCursorTimestamp`, its test suite, and the SQL-shape parity tests all
+ * check the identical grammar rather than each restating their own check
+ * that could silently drift out of sync with the other two. A thin wrapper
+ * over `parseCanonicalCursorIsoComponents` — see that function's own
+ * comment for the exact grammar/range rules it enforces.
+ * `.toString()`-reconstructible with zero free variables.
  */
 export function isCanonicalCursorIsoTimestamp(value: string): boolean {
-  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?(Z|[+-]\d{2}:\d{2})$/.test(value);
+  return parseCanonicalCursorIsoComponents(value) !== null;
+}
+
+/**
+ * The SQL-side counterpart of `parseCanonicalCursorIsoComponents` +
+ * `epochMsFromCanonicalCursorIsoComponents`, registered as a SQLite scalar
+ * function under `CURSOR_TIMESTAMP_SQL_FUNCTION_NAME` (see
+ * `cursorRecencySqlExpression`'s doc comment for why: a registered function
+ * call is dramatically smaller/faster to `prepare()` and evaluate per row
+ * than the equivalent inline `WITH`-chain SQL text this replaced). Not a
+ * new parsing path — it is the *exact* same two functions the pure-TS
+ * `parseCursorTimestamp` string branch already calls, so there is only ever
+ * one JS implementation of this grammar/arithmetic to keep correct; SQLite
+ * itself never re-derives the value on its own.
+ *
+ * Defensive beyond what a same-language TS caller needs, because a SQL
+ * function's arguments come from SQLite's own type system, not from a
+ * caller who already knows `value` is a `string`:
+ *  - `value` is `unknown`, not `string` — a JSON column can legitimately
+ *    hold a non-string root/header timestamp field (a number, `null`, a
+ *    nested object/array), and `cursorRecencySqlExpression` already gates
+ *    this call behind `json_type(...) = 'text'` in the generated SQL, but
+ *    this function must still degrade safely (never throw) if ever invoked
+ *    on some other SQLite value type directly (e.g. a future caller, or a
+ *    test exercising the registered function in isolation) — returning
+ *    `null` (SQL `NULL`) exactly like an unparseable string would.
+ *  - Wrapped in `try`/`catch` returning `null` on any unexpected exception:
+ *    a thrown error from inside a registered SQLite function surfaces as a
+ *    query-level failure that would abort the whole scan, which is exactly
+ *    the "one malformed row poisons every other row's evidence" failure
+ *    mode this codebase's NULL-on-anything-invalid convention exists to
+ *    avoid everywhere else (see `malformedCursorAssessment`'s own
+ *    comment) — this function must be no less safe than that convention
+ *    just because it now runs inside SQLite rather than inside
+ *    `assessCursorComposerRecord`.
+ *
+ * `minYear`/`maxYear`/`maxOffsetMinutes` are ordinary parameters (bound SQL
+ * arguments at call time — never free variables), so
+ * `cursorRecencySqlExpression`'s own overridable bounds parameters reach
+ * this function's actual validation instead of silently falling back to
+ * `parseCanonicalCursorIsoComponents`'s literal defaults regardless of what
+ * a caller requested.
+ */
+export function cursorCanonicalIsoStringToEpochMs(
+  value: unknown,
+  minYear: number,
+  maxYear: number,
+  maxOffsetMinutes: number,
+): number | null {
+  try {
+    if (typeof value !== "string") return null;
+    const components = parseCanonicalCursorIsoComponents(value, minYear, maxYear, maxOffsetMinutes);
+    if (!components) return null;
+    return epochMsFromCanonicalCursorIsoComponents(components);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -1225,6 +1565,15 @@ export function isCanonicalCursorIsoTimestamp(value: string): boolean {
  * pass `maxSupportedTimestampMs` explicitly at every internal call site
  * inside the reconstructed text, rather than relying on the default to
  * resolve a (possibly renamed) free variable.
+ *
+ * The string branch computes its epoch millisecond value via
+ * `parseCanonicalCursorIsoComponents` + `epochMsFromCanonicalCursorIsoComponents`
+ * — explicit, self-contained integer arithmetic — rather than
+ * `Date.parse`: `Date.parse` remains otherwise unrestricted (RFC-2822,
+ * date-only, space-separated, lower-case `t`/`z`, minute-only, minute/second
+ * `60`, and more) even after a mere shape-only regex gate, so this parser
+ * never delegates to it (or to any other platform date API) for the one
+ * canonical Cursor string grammar this codebase intentionally supports.
  */
 export function parseCursorTimestamp(
   value: unknown,
@@ -1233,14 +1582,10 @@ export function parseCursorTimestamp(
   let parsed: number;
   if (typeof value === "number" && Number.isFinite(value)) {
     parsed = value > 1e12 ? value : value * 1000;
-  } else if (typeof value === "string" && isCanonicalCursorIsoTimestamp(value)) {
-    // `Date.parse` is otherwise unrestricted (RFC-2822, date-only,
-    // space-separated, lower-case `t`/`z`, minute-only, and more) — the
-    // `isCanonicalCursorIsoTimestamp` guard above is what actually narrows
-    // acceptance to the one grammar this parser intentionally supports;
-    // `Date.parse` on an already-shape-validated string only ever
-    // computes the millisecond value.
-    parsed = Date.parse(value);
+  } else if (typeof value === "string") {
+    const components = parseCanonicalCursorIsoComponents(value);
+    if (components === null) return null;
+    parsed = epochMsFromCanonicalCursorIsoComponents(components);
   } else {
     return null;
   }

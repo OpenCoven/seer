@@ -824,42 +824,286 @@ private struct ValidatedCursorConversationHeader {
     let bubbleId: String?
 }
 
-/// Swift port of `isCanonicalCursorIsoTimestamp` in
-/// `main/services/agent-detection-policy.ts`, and the canonical grammar
-/// `cursorRecencySqlExpression`'s SQL `GLOB`/`substr` shape guard also
-/// enforces: `YYYY-MM-DDTHH:MM:SS[.fraction](Z|±HH:MM)`, case-sensitive
-/// `T`/`Z` (a lower-case `t` OR `z` is rejected — Swift's own
-/// `Date.ISO8601FormatStyle` is confirmed empirically to tolerate a
-/// lower-case trailing `z` as an accidental Foundation leniency the TS/SQL
-/// grammar does not mirror), seconds required (no date-only or
-/// minute-only shape), no other separator (no space in place of `T`, no
-/// RFC-2822 mail-date form), and an optional fractional-seconds component
-/// restricted to EXACTLY 1-3 digits (`.1`/`.12`/`.123` accepted; a
-/// 4-or-more-digit fraction like `.1234` is rejected — confirmed
-/// empirically that `Date.ISO8601FormatStyle` itself happily parses a
-/// 4+-digit fraction to a *different* rounded millisecond value than
-/// `Date.parse`/`julianday()` compute for the identical text, which would
-/// silently break the cross-platform recency parity this grammar exists to
-/// guarantee).
-///
-/// Gating `parseCursorTimestamp` with this check BEFORE it ever reaches
-/// `Date.ISO8601FormatStyle` is what makes this Swift parser reject every
-/// shape `Date.ISO8601FormatStyle` alone would otherwise accept but the TS
-/// parser (`Date.parse`, itself gated by the identical
-/// `isCanonicalCursorIsoTimestamp` in the TS policy) and the SQL shape
-/// guard both reject — without this gate, a lower-case `z` or a 4+-digit
-/// fraction could make this Swift assessor call a composer "active" while
-/// the TS/SQL side disagrees.
-private func isCanonicalCursorIsoTimestamp(_ value: String) -> Bool {
-    guard let regex = try? NSRegularExpression(
-        pattern: #"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?(Z|[+-]\d{2}:\d{2})$"#
-    ) else {
-        return false
-    }
-    let range = NSRange(value.startIndex..<value.endIndex, in: value)
-    return regex.firstMatch(in: value, options: [], range: range) != nil
+/// Default year/offset bounds for the canonical Cursor ISO grammar below —
+/// the Swift twins of TS's `CURSOR_TIMESTAMP_MIN_YEAR` /
+/// `CURSOR_TIMESTAMP_MAX_YEAR` / `CURSOR_TIMESTAMP_MAX_OFFSET_MINUTES`. Kept
+/// as their own named constants (rather than only ever appearing as literal
+/// default-parameter values) so `SessionSnapshotSource.swift`'s SQL-function
+/// registration and this file's own default parameters can share one
+/// source of truth without either drifting from the TS `const`s they mirror.
+/// 1970 excludes the (correctly-computed, but practically impossible for a
+/// real Cursor timestamp) pre-Unix-epoch range entirely, sidestepping any
+/// question of whether an ancient proleptic-Gregorian date should even be
+/// considered valid; 9999 keeps every value comfortably inside `Int64`
+/// range for the arithmetic below. 840 minutes (`14:00`) is the largest UTC
+/// offset any real-world timezone actually uses today (Kiribati's
+/// `+14:00`).
+let cursorTimestampMinYear = 1970
+let cursorTimestampMaxYear = 9999
+let cursorTimestampMaxOffsetMinutes = 14 * 60
+
+/// The exact integer calendar/time/offset components a canonical Cursor
+/// ISO-8601 timestamp string decomposes into. Returned by
+/// `parseCanonicalCursorIsoComponents` so `epochMsFromCanonicalCursorIsoComponents`
+/// can turn them into an epoch millisecond value via explicit integer
+/// arithmetic — never `Date.ISO8601FormatStyle`/`Date.init(timeIntervalSince1970:)`
+/// derived from Foundation's own calendar math — so this codebase's own
+/// computation is the single source of truth every engine (TS, Swift, SQL)
+/// independently reproduces bit-for-bit, rather than each trusting its own
+/// platform date library to agree with the others'. Swift port of TS's
+/// `CanonicalCursorIsoComponents` type in `agent-detection-policy.ts`.
+struct CanonicalCursorIsoComponents: Equatable {
+    let year: Int
+    let month: Int
+    let day: Int
+    let hour: Int
+    let minute: Int
+    let second: Int
+    let fractionMs: Int
+    /// Signed; positive for `+HH:MM`, negative for `-HH:MM`, zero for `Z`.
+    let offsetMinutes: Int
 }
 
+/// Standard Gregorian leap-year rule. Swift port of TS's
+/// `isGregorianLeapYear`.
+func isGregorianLeapYear(_ year: Int) -> Bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+/// Number of days in `month` (1-12) of the Gregorian `year`, honoring the
+/// leap-year rule for February. Defensively bounds-checks `month` itself
+/// (returning `0`, which no real `day >= 1` can ever satisfy) even though
+/// every current caller already validates `month` first — unlike a JS
+/// array's out-of-bounds access (which yields `undefined`, not a crash),
+/// Swift array subscripting traps on an out-of-range index, so this guard
+/// is required for `daysInGregorianMonth` to be as crash-safe as its TS
+/// twin for any future caller. Swift port of TS's `daysInGregorianMonth`.
+func daysInGregorianMonth(_ year: Int, _ month: Int) -> Int {
+    guard month >= 1, month <= 12 else { return 0 }
+    let daysByMonth = [31, isGregorianLeapYear(year) ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    return daysByMonth[month - 1]
+}
+
+/// Days since the Unix epoch (1970-01-01) for a proleptic-Gregorian civil
+/// date, computed via Howard Hinnant's `days_from_civil` integer-arithmetic
+/// algorithm (http://howardhinnant.github.io/date_algorithms.html) —
+/// deliberately *not* `Date.ISO8601FormatStyle`'s own calendar math, which
+/// is exactly the kind of platform-date-library call this rewrite exists to
+/// avoid. Valid only for `year` within `cursorTimestampMinYear` (1970) or
+/// greater, which keeps `shiftedYear` non-negative so Swift's truncating
+/// integer division behaves identically to the floor division TS/SQL use —
+/// no negative-number edge cases to reconcile across engines. Swift port of
+/// TS's `daysFromCivil`; returns `Int64` (unlike TS's `number`, since Swift
+/// integer arithmetic doesn't share JS's implicit double-precision
+/// promotion) — every intermediate/final value here is comfortably inside
+/// `Int64` range for any in-domain year up to `cursorTimestampMaxYear`
+/// (9999).
+func daysFromCivil(_ year: Int, _ month: Int, _ day: Int) -> Int64 {
+    let shiftedYear = Int64(year) - (month <= 2 ? 1 : 0)
+    let era = shiftedYear / 400
+    let yearOfEra = shiftedYear - era * 400
+    let shiftedMonth = Int64(month) + (month > 2 ? -3 : 9)
+    let dayOfYear = (153 * shiftedMonth + 2) / 5 + Int64(day) - 1
+    let dayOfEra = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear
+    return era * 146_097 + dayOfEra - 719_468
+}
+
+/// Converts already-validated canonical components to an epoch millisecond
+/// value via plain integer arithmetic (`daysFromCivil` for the calendar
+/// part, then hour/minute/second/fraction/offset). The largest
+/// representable magnitude (year 9999) is ~2.5e14 — comfortably inside
+/// `Int64` range — so no overflow/precision-loss concern at any valid
+/// input. Swift port of TS's `epochMsFromCanonicalCursorIsoComponents`.
+func epochMsFromCanonicalCursorIsoComponents(_ components: CanonicalCursorIsoComponents) -> Int64 {
+    let days = daysFromCivil(components.year, components.month, components.day)
+    return days * 86_400_000
+        + Int64(components.hour) * 3_600_000
+        + Int64(components.minute) * 60_000
+        + Int64(components.second) * 1_000
+        + Int64(components.fractionMs)
+        - Int64(components.offsetMinutes) * 60_000
+}
+
+/// The single shared validator/decomposer for this codebase's one canonical
+/// Cursor ISO-8601 timestamp *string* domain — the Swift twin of TS's
+/// `parseCanonicalCursorIsoComponents` in `main/services/agent-detection-policy.ts`
+/// (see that function's own doc comment for the full grammar/range-rule
+/// rationale, which this mirrors exactly):
+/// `YYYY-MM-DDTHH:MM:SS[.fraction](Z|±HH:MM)`, case-sensitive `T`/`Z`,
+/// seconds required, an optional fractional-seconds component restricted to
+/// exactly 1-3 digits, year `minYear..maxYear` (default `1970..9999`), month
+/// `01-12`, day `01`-through-the-real-last-day-of-that-month (a real
+/// calendar check via `daysInGregorianMonth`, not just a `01-31` shape
+/// guard), hour `00-23`, minute `00-59`, second `00-59` (no leap second
+/// `:60`), and timezone `Z` or `±HH:MM` with offset minutes `00-59` and
+/// total magnitude at most `maxOffsetMinutes` (default `840`, i.e. `14:00`).
+///
+/// Deliberately hand-rolls a byte-level scan over `value.utf8` instead of
+/// `NSRegularExpression` — confirmed empirically (and asserted by this
+/// file's own test suite) that `NSRegularExpression`'s ICU semantics accept
+/// two shapes this grammar must reject that JS `RegExp` and this byte-level
+/// scan both correctly reject: (1) `\d` matches the full Unicode `Nd`
+/// category (e.g. full-width or Devanagari digits), not ASCII-only digits —
+/// this parser instead checks each digit position against the exact ASCII
+/// byte range `0x30...0x39`, so any non-ASCII UTF-8 byte (a multi-byte
+/// lead byte or continuation byte) can never satisfy it; (2) `$` matches
+/// immediately before a trailing `\n` even without the `/m` flag — this
+/// parser instead requires the scan to consume every byte in `bytes`
+/// (`index == bytes.count` at each terminal check), so a trailing
+/// newline/whitespace/any other content is unconditionally rejected. Whole
+/// string match only — no partial prefix, no trailing content of any kind.
+///
+/// `daysInGregorianMonth`'s real calendar check means `2024-02-30` or a
+/// non-leap `2023-02-29` is rejected outright — this grammar's own
+/// arithmetic never rolls a date over the way `Date.ISO8601FormatStyle`'s
+/// lenient normalization otherwise would.
+func parseCanonicalCursorIsoComponents(
+    _ value: String,
+    minYear: Int = 1970,
+    maxYear: Int = 9999,
+    maxOffsetMinutes: Int = 840
+) -> CanonicalCursorIsoComponents? {
+    let bytes = Array(value.utf8)
+    // Shortest possible valid shape is "YYYY-MM-DDTHH:MM:SSZ" (20 bytes).
+    guard bytes.count >= 20 else { return nil }
+
+    func digit(at index: Int) -> Int? {
+        guard index < bytes.count else { return nil }
+        let byte = bytes[index]
+        // Strictly ASCII '0'-'9' — never the Unicode `Nd` category.
+        guard byte >= 0x30, byte <= 0x39 else { return nil }
+        return Int(byte - 0x30)
+    }
+    func twoDigits(at index: Int) -> Int? {
+        guard let tens = digit(at: index), let ones = digit(at: index + 1) else { return nil }
+        return tens * 10 + ones
+    }
+    func fourDigits(at index: Int) -> Int? {
+        guard let thousands = digit(at: index), let hundreds = digit(at: index + 1),
+              let tens = digit(at: index + 2), let ones = digit(at: index + 3)
+        else {
+            return nil
+        }
+        return thousands * 1000 + hundreds * 100 + tens * 10 + ones
+    }
+    func literal(at index: Int, equals expected: UInt8) -> Bool {
+        index < bytes.count && bytes[index] == expected
+    }
+
+    guard let year = fourDigits(at: 0), literal(at: 4, equals: 0x2D), // '-'
+          let month = twoDigits(at: 5), literal(at: 7, equals: 0x2D), // '-'
+          let day = twoDigits(at: 8), literal(at: 10, equals: 0x54), // 'T'
+          let hour = twoDigits(at: 11), literal(at: 13, equals: 0x3A), // ':'
+          let minute = twoDigits(at: 14), literal(at: 16, equals: 0x3A), // ':'
+          let second = twoDigits(at: 17)
+    else {
+        return nil
+    }
+
+    guard year >= minYear, year <= maxYear else { return nil }
+    guard month >= 1, month <= 12 else { return nil }
+    guard day >= 1, day <= daysInGregorianMonth(year, month) else { return nil }
+    guard hour <= 23 else { return nil }
+    guard minute <= 59 else { return nil }
+    guard second <= 59 else { return nil } // no leap seconds
+
+    var index = 19
+    var fractionMs = 0
+    if index < bytes.count, bytes[index] == 0x2E { // '.'
+        var fractionValue = 0
+        var fractionDigitCount = 0
+        var probe = index + 1
+        while let value = digit(at: probe) {
+            fractionValue = fractionValue * 10 + value
+            fractionDigitCount += 1
+            probe += 1
+        }
+        // Exactly 1-3 fractional digits; 0 (a bare `.`) or 4+ both rejected.
+        guard fractionDigitCount >= 1, fractionDigitCount <= 3 else { return nil }
+        // Left-pad to millisecond precision: ".1" -> 100ms, ".12" -> 120ms, ".123" -> 123ms.
+        let millisecondScale = [100, 10, 1][fractionDigitCount - 1]
+        fractionMs = fractionValue * millisecondScale
+        index = probe
+    }
+
+    guard index < bytes.count else { return nil }
+    var offsetMinutes = 0
+    if bytes[index] == 0x5A { // 'Z' (case-sensitive: lower-case 'z' falls to the `else` branch below and is rejected)
+        guard index + 1 == bytes.count else { return nil } // no trailing content of any kind
+    } else if bytes[index] == 0x2B || bytes[index] == 0x2D { // '+' or '-'
+        let sign = bytes[index] == 0x2D ? -1 : 1
+        guard let offsetHour = twoDigits(at: index + 1), literal(at: index + 3, equals: 0x3A),
+              let offsetMinute = twoDigits(at: index + 4)
+        else {
+            return nil
+        }
+        guard index + 6 == bytes.count else { return nil } // no trailing content of any kind
+        guard offsetMinute <= 59 else { return nil }
+        let totalOffsetMinutes = offsetHour * 60 + offsetMinute
+        guard totalOffsetMinutes <= maxOffsetMinutes else { return nil }
+        offsetMinutes = sign * totalOffsetMinutes
+    } else {
+        return nil
+    }
+
+    return CanonicalCursorIsoComponents(
+        year: year, month: month, day: day,
+        hour: hour, minute: minute, second: second,
+        fractionMs: fractionMs, offsetMinutes: offsetMinutes
+    )
+}
+
+/// A thin wrapper over `parseCanonicalCursorIsoComponents` — see that
+/// function's own comment for the exact grammar/range rules it enforces.
+/// Swift port of TS's `isCanonicalCursorIsoTimestamp`.
+func isCanonicalCursorIsoTimestamp(_ value: String) -> Bool {
+    parseCanonicalCursorIsoComponents(value) != nil
+}
+
+/// The SQL-side counterpart of `parseCanonicalCursorIsoComponents` +
+/// `epochMsFromCanonicalCursorIsoComponents`, called by
+/// `SessionSnapshotSource.swift`'s `sqlite3_create_function_v2`-registered
+/// scalar function (see that file's `cursorRecencySqlExpression` for why: a
+/// registered function call is dramatically smaller/faster to prepare and
+/// evaluate per row than the equivalent inline SQL this replaced — mirroring
+/// the identical `CURSOR_TIMESTAMP_SQL_FUNCTION_NAME`-registered function on
+/// the TS/`node:sqlite` side). Not a new parsing path — it is the *exact*
+/// same two functions the pure-Swift `parseCursorTimestamp` string branch
+/// already calls, so there is only ever one Swift implementation of this
+/// grammar/arithmetic to keep correct. Swift port of TS's
+/// `cursorCanonicalIsoStringToEpochMs`; takes an already-extracted `String`
+/// (rather than TS's `unknown`) because the SQLite C-API caller has already
+/// checked `sqlite3_value_type(argv[0]) == SQLITE_TEXT` before ever reaching
+/// this function — the "is this actually text" defensiveness TS's own
+/// `typeof value !== "string"` check provides lives at that C-API call site
+/// instead. `minYear`/`maxYear`/`maxOffsetMinutes` are ordinary parameters
+/// (bound SQL arguments at call time), so an overridden bound reaches this
+/// function's actual validation instead of silently falling back to
+/// `parseCanonicalCursorIsoComponents`'s own literal defaults.
+func cursorCanonicalIsoStringToEpochMs(
+    _ value: String,
+    minYear: Int,
+    maxYear: Int,
+    maxOffsetMinutes: Int
+) -> Int64? {
+    guard let components = parseCanonicalCursorIsoComponents(
+        value, minYear: minYear, maxYear: maxYear, maxOffsetMinutes: maxOffsetMinutes
+    ) else {
+        return nil
+    }
+    return epochMsFromCanonicalCursorIsoComponents(components)
+}
+
+/// The string branch computes its epoch millisecond value via
+/// `parseCanonicalCursorIsoComponents` + `epochMsFromCanonicalCursorIsoComponents`
+/// — explicit, self-contained integer arithmetic — rather than
+/// `Date.ISO8601FormatStyle`: `Date.ISO8601FormatStyle` remains otherwise
+/// unrestricted (minute/second `60`, hour `24`, invalid calendar days,
+/// offsets beyond `14:00`, a lower-case trailing `z`, a trailing newline,
+/// and more — each confirmed empirically) even after a shape-only regex
+/// gate, so this parser never delegates to it (or to any other Foundation
+/// date API) for the one canonical Cursor string grammar this codebase
+/// intentionally supports. Swift port of TS's `parseCursorTimestamp`.
 private func parseCursorTimestamp(_ value: Any?) -> Int64? {
     if let numeric = finiteNumber(value) {
         let milliseconds = numeric > 1e12 ? numeric : numeric * 1_000
@@ -869,12 +1113,11 @@ private func parseCursorTimestamp(_ value: Any?) -> Int64? {
         return saturatingInt64(milliseconds)
     }
     guard let text = value as? String,
-          !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-          isCanonicalCursorIsoTimestamp(text),
-          let milliseconds = parseISO8601ToMs(text),
-          abs(Double(milliseconds)) <= maxSupportedTimestampMs else {
+          let components = parseCanonicalCursorIsoComponents(text) else {
         return nil
     }
+    let milliseconds = epochMsFromCanonicalCursorIsoComponents(components)
+    guard abs(Double(milliseconds)) <= maxSupportedTimestampMs else { return nil }
     return milliseconds
 }
 

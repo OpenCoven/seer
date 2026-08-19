@@ -1103,6 +1103,25 @@ final class TurnAssessorsTests: XCTestCase {
         var db: OpaquePointer?
         XCTAssertEqual(sqlite3_open(":memory:", &db), SQLITE_OK)
         defer { sqlite3_close(db) }
+        // cursorRecencySqlExpression's generated SQL calls this scalar
+        // function by name (see cursorCanonicalIsoToEpochMsXFunc's own doc
+        // comment) — must be registered on every connection that executes
+        // the expression, exactly like queryCursorComposers registers it on
+        // its own real connection.
+        XCTAssertEqual(
+            sqlite3_create_function_v2(
+                db,
+                cursorTimestampSqlFunctionName,
+                4,
+                SQLITE_UTF8 | SQLITE_DETERMINISTIC,
+                nil,
+                cursorCanonicalIsoToEpochMsXFunc,
+                nil,
+                nil,
+                nil
+            ),
+            SQLITE_OK
+        )
         XCTAssertEqual(
             sqlite3_exec(db, "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)", nil, nil, nil),
             SQLITE_OK
@@ -1404,5 +1423,240 @@ final class TurnAssessorsTests: XCTestCase {
         XCTAssertEqual(sqlRecency(forValueJSON: headerOnlyValid), now)
         let assessedHeaderOnly = try assessedLastActivityAt(forValueJSON: headerOnlyValid, now: now)
         XCTAssertEqual(assessedHeaderOnly, now)
+    }
+
+    // MARK: - Cursor canonical ISO grammar: exhaustive component/range
+    // validation matrix (the divergence this whole rewrite fixes). The OLD
+    // implementation validated shape with an `NSRegularExpression` (whose
+    // `\d` matches any Unicode decimal-digit code point, not just ASCII
+    // 0-9, and whose `$` matches before a trailing newline) and then handed
+    // the surviving string to `Date.ISO8601FormatStyle`/`julianday()`,
+    // which SILENTLY NORMALIZE several genuinely-invalid calendar shapes
+    // (minute 60, leap second 60, hour 24, day-of-month overflow, non-leap
+    // Feb 29, offsets beyond the documented maximum, a trailing newline)
+    // instead of rejecting them — confirmed empirically below via
+    // `parseISO8601ToMs` (the untouched, still-Foundation-backed general
+    // ISO-8601 parser used elsewhere in this file), which is exactly why
+    // `parseCanonicalCursorIsoComponents` validates every component
+    // explicitly and computes the epoch millisecond value via
+    // `daysFromCivil` integer arithmetic, never
+    // `Date.ISO8601FormatStyle`/`julianday()`. Every case here is mirrored
+    // in `tests/agent-detection-parity.test.mjs`'s TS counterpart — a
+    // string may never be assessor-valid yet SQL-NULL (or vice versa), and
+    // every engine that accepts a string must compute the identical
+    // millisecond value.
+
+    /// Direct unit coverage of the calendar/constant building blocks
+    /// `parseCanonicalCursorIsoComponents` is built from, so a regression in
+    /// any one of them is caught here rather than only surfacing as an
+    /// opaque parity mismatch.
+    func testCursorTimestampDomainConstantsAndGregorianCalendarHelpersAreInternallyConsistent() throws {
+        XCTAssertEqual(cursorTimestampMinYear, 1970)
+        XCTAssertEqual(cursorTimestampMaxYear, 9999)
+        XCTAssertEqual(cursorTimestampMaxOffsetMinutes, 14 * 60)
+
+        // isGregorianLeapYear: the standard rule — divisible by 4 and not by
+        // 100, UNLESS also divisible by 400.
+        XCTAssertTrue(isGregorianLeapYear(2024))
+        XCTAssertFalse(isGregorianLeapYear(2023))
+        XCTAssertFalse(isGregorianLeapYear(1900)) // divisible by 100, not 400
+        XCTAssertTrue(isGregorianLeapYear(2000)) // divisible by 400
+        XCTAssertFalse(isGregorianLeapYear(1970))
+
+        // daysInGregorianMonth: February must track isGregorianLeapYear
+        // exactly; every other month is fixed regardless of year.
+        XCTAssertEqual(daysInGregorianMonth(2024, 2), 29)
+        XCTAssertEqual(daysInGregorianMonth(2023, 2), 28)
+        XCTAssertEqual(daysInGregorianMonth(1900, 2), 28)
+        XCTAssertEqual(daysInGregorianMonth(2000, 2), 29)
+        XCTAssertEqual(daysInGregorianMonth(2024, 4), 30)
+        XCTAssertEqual(daysInGregorianMonth(2024, 1), 31)
+
+        // daysFromCivil(1970, 1, 1) must be the Unix epoch's own day zero,
+        // and epochMsFromCanonicalCursorIsoComponents must agree with
+        // isCanonicalCursorIsoTimestamp/parseCanonicalCursorIsoComponents
+        // end-to-end on a valid component set.
+        XCTAssertEqual(daysFromCivil(1970, 1, 1), 0)
+        let components = try XCTUnwrap(parseCanonicalCursorIsoComponents("2024-02-29T10:20:30.500Z"))
+        let valueJSON = #"{"status":"generating","lastUpdatedAt":"2024-02-29T10:20:30.500Z"}"#
+        let assessed = try assessedLastActivityAt(forValueJSON: valueJSON, now: 1_786_449_620_000)
+        XCTAssertEqual(epochMsFromCanonicalCursorIsoComponents(components), assessed)
+    }
+
+    /// Every shape below is either a real calendar/range violation the OLD
+    /// `NSRegularExpression`+`Date.ISO8601FormatStyle`/`julianday()` combo
+    /// would have silently normalized instead of rejecting, or a
+    /// case-sensitivity/whitespace/digit-encoding shape that combo also
+    /// accidentally accepted. `parseISO8601ToMs` (Foundation-backed, still
+    /// untouched) is used as the concrete "old lenient engine" ground
+    /// truth wherever it genuinely accepts the shape — proving these are
+    /// real, not hypothetical, divergences — while `isCanonicalCursorIsoTimestamp`,
+    /// `parseCanonicalCursorIsoComponents`, and `sqlRecency` must reject
+    /// every one of them without exception.
+    func testCursorCanonicalIsoGrammarRejectsInvalidComponentsAcceptedByLenientEngines() throws {
+        // Foundation's Date.ISO8601FormatStyle silently NORMALIZES each of
+        // these instead of rejecting them (confirmed empirically via
+        // parseISO8601ToMs): leap seconds are dropped/rolled, minute 60 and
+        // hour 24 roll into the next unit, day-of-month overflow rolls into
+        // the next month, non-leap Feb 29 rolls into March, offsets beyond
+        // +-14:00 are accepted with no bound at all, lowercase "z" is
+        // tolerated, and a trailing newline/space is silently ignored.
+        let acceptedByFoundationAlone = [
+            "2024-01-15T23:59:60Z", // leap second
+            "2024-06-30T23:59:60Z", // leap second, real leap-second-eligible date
+            "2024-01-15T10:60:30Z", // minute 60
+            "2024-01-15T24:00:00Z", // hour 24
+            "2024-02-30T10:20:30Z", // Feb 30
+            "2024-02-31T10:20:30Z", // Feb 31
+            "2024-04-31T10:20:30Z", // April has 30 days
+            "2023-02-29T10:20:30Z", // non-leap year (ordinary)
+            "1900-02-29T10:20:30Z", // non-leap year (divisible by 100, not 400)
+            "2024-01-15T10:20:30+15:00", // offset beyond +-14:00 maximum
+            "2024-01-15T10:20:30+14:01", // one minute past the 14:00 boundary
+            "2024-01-15T10:20:30-15:00",
+            "2024-01-15T10:20:30+05:60", // offset minute itself out of range
+            "2024-01-15T10:20:30z", // lower-case z
+            "2024-01-15T10:20:30Z\n", // trailing newline
+            "2024-01-15T10:20:30Z ", // trailing space
+            "1969-12-31T23:59:59Z", // pre-1970
+            "0001-01-01T00:00:00Z", // pre-1970
+            "10000-01-01T00:00:00Z", // 5-digit year
+        ]
+        for value in acceptedByFoundationAlone {
+            XCTAssertNotNil(parseISO8601ToMs(value), "fixture assumption: Foundation alone must accept \(value)")
+        }
+
+        // These specific shapes happen to already be rejected by
+        // Foundation/the old NSRegularExpression gate too (invalid
+        // month/day shape, the pre-existing lower-case "t" rejection, and
+        // leading whitespace) — included for completeness/non-regression,
+        // not because they demonstrate a NEW divergence.
+        let alreadyRejectedByFoundation = [
+            "2024-13-01T10:20:30Z", // invalid month 13
+            "2024-00-01T10:20:30Z", // invalid month 00
+            "2024-01-00T10:20:30Z", // invalid day 00
+            "2024-01-15t10:20:30Z", // lower-case t
+            " 2024-01-15T10:20:30Z", // leading space
+        ]
+        for value in alreadyRejectedByFoundation {
+            XCTAssertNil(parseISO8601ToMs(value), "fixture assumption: Foundation alone must reject \(value)")
+        }
+
+        // The OLD `NSRegularExpression`'s `\d` matches the full Unicode
+        // `Nd` category, not ASCII-only digits — a genuine gate-level bug —
+        // but Foundation's own downstream parse happens to still reject
+        // this particular shape, so it is listed separately rather than
+        // asserted as "Foundation accepts this".
+        let unicodeDigitYear = "\u{FF12}\u{FF10}\u{FF12}\u{FF14}-01-15T10:20:30Z" // fullwidth "2024"
+
+        let allInvalidCases = acceptedByFoundationAlone + alreadyRejectedByFoundation + [unicodeDigitYear]
+        for value in allInvalidCases {
+            XCTAssertFalse(isCanonicalCursorIsoTimestamp(value), value)
+            XCTAssertNil(parseCanonicalCursorIsoComponents(value), value)
+            let valueJSON = #"{"status":"generating","lastUpdatedAt":"\#(value)"}"#
+            XCTAssertNil(sqlRecency(forValueJSON: valueJSON), value)
+        }
+    }
+
+    /// Every valid Z/offset/leap-day/year boundary must be accepted, and
+    /// every engine (the byte-level parser, SQL via the registered scalar
+    /// function, and the assessor) must compute the IDENTICAL millisecond
+    /// value. Ground truth for each case was independently cross-checked
+    /// against `parseISO8601ToMs` (trustworthy across this entire
+    /// 1970-9999 domain for real calendar dates) and, for the offset
+    /// cases, against manual `zTimeMs -+ offsetMinutes * 60_000`
+    /// arithmetic — never generated FROM `parseCanonicalCursorIsoComponents`
+    /// itself, so this test cannot pass by merely being self-consistent
+    /// with a broken implementation.
+    func testCursorCanonicalIsoGrammarAcceptsEveryValidBoundaryWithMatchingMilliseconds() throws {
+        let validCases: [(label: String, value: String, expectedMs: Int64)] = [
+            ("ordinary Z timestamp", "2024-01-15T10:20:30Z", 1_705_314_030_000),
+            ("leap day, ordinary leap year (divisible by 4, not 100)", "2024-02-29T00:00:00Z", 1_709_164_800_000),
+            ("leap day, divisible-by-400 leap year", "2000-02-29T00:00:00Z", 951_782_400_000),
+            ("leap day, divisible-by-400 leap year (2400)", "2400-02-29T00:00:00Z", 13_574_563_200_000),
+            ("min supported year: exact epoch", "1970-01-01T00:00:00Z", 0),
+            ("max supported year boundary", "9999-12-31T23:59:59Z", 253_402_300_799_000),
+            ("max positive offset boundary +14:00", "2024-01-15T10:20:30+14:00", 1_705_263_630_000),
+            ("max negative offset boundary -14:00", "2024-01-15T10:20:30-14:00", 1_705_364_430_000),
+            ("explicit zero offset, equivalent to Z", "2024-01-15T10:20:30+00:00", 1_705_314_030_000),
+        ]
+
+        for testCase in validCases {
+            XCTAssertTrue(isCanonicalCursorIsoTimestamp(testCase.value), testCase.label)
+            let components = try XCTUnwrap(parseCanonicalCursorIsoComponents(testCase.value), testCase.label)
+            XCTAssertEqual(epochMsFromCanonicalCursorIsoComponents(components), testCase.expectedMs, testCase.label)
+            let valueJSON = #"{"status":"generating","lastUpdatedAt":"\#(testCase.value)"}"#
+            XCTAssertEqual(sqlRecency(forValueJSON: valueJSON), testCase.expectedMs, testCase.label)
+            let assessed = try assessedLastActivityAt(forValueJSON: valueJSON, now: testCase.expectedMs)
+            XCTAssertEqual(assessed, testCase.expectedMs, testCase.label)
+        }
+    }
+
+    // MARK: - Cursor row-limit truncation safety at the exact window
+    // cutoff, exercised through a canonical ISO *string* timestamp rather
+    // than a raw numeric one. This is the safety-critical case the whole
+    // rewrite exists to protect: if the string parser lost even one
+    // millisecond of precision relative to the numeric path, a composer
+    // sitting exactly at `sessionCandidateWindowMs`'s lower bound could be
+    // mis-classified as "definitely old" (safe to truncate) when it is
+    // not, or vice versa.
+
+    /// Mirrors the TS parity suite's window-cutoff test: at `cutoff - 1`,
+    /// `cutoff`, and `cutoff + 1` (`cutoff = now - sessionCandidateWindowMs`),
+    /// the ISO-string encoding of that millisecond value must produce the
+    /// exact same SQL recency and truncation-safety verdict as the raw
+    /// numeric value.
+    func testCursorSQLRecencyForISOStringTimestampMatchesNumericPathAtWindowCutoff() throws {
+        let now: Int64 = 1_786_449_620_000
+        let cutoff = now - sessionCandidateWindowMs
+
+        for offset: Int64 in [-1, 0, 1] {
+            let ms = cutoff + offset
+            let iso = isoStringWithMilliseconds(ms)
+            XCTAssertTrue(isCanonicalCursorIsoTimestamp(iso), iso)
+
+            let numericJSON = #"{"status":"generating","lastUpdatedAt":\#(ms)}"#
+            let stringJSON = #"{"status":"generating","lastUpdatedAt":"\#(iso)"}"#
+
+            let assessedNumeric = try assessedLastActivityAt(forValueJSON: numericJSON, now: now)
+            let assessedString = try assessedLastActivityAt(forValueJSON: stringJSON, now: now)
+            XCTAssertEqual(assessedString, assessedNumeric, iso)
+            XCTAssertEqual(assessedString, ms, iso)
+
+            let sqlNumeric = sqlRecency(forValueJSON: numericJSON)
+            let sqlString = sqlRecency(forValueJSON: stringJSON)
+            XCTAssertEqual(sqlString, sqlNumeric, iso)
+            XCTAssertEqual(sqlString, ms, iso)
+
+            let expectedVerdict = offset < 0
+            XCTAssertEqual(isDefinitelyOlderThanWindowLowerBound(ms, now: now, within: sessionCandidateWindowMs), expectedVerdict, "\(offset)")
+            XCTAssertEqual(
+                isDefinitelyOlderThanWindowLowerBound(sqlString ?? Int64.max, now: now, within: sessionCandidateWindowMs),
+                expectedVerdict,
+                "\(offset)"
+            )
+        }
+    }
+
+    /// Formats `ms` as the exact canonical grammar
+    /// `parseCanonicalCursorIsoComponents` accepts
+    /// (`YYYY-MM-DDTHH:MM:SS.mmmZ`), independent of `Date.ISO8601FormatStyle`
+    /// or any other platform date formatter — this test's own fixture
+    /// generator must not share an implementation with the parser under
+    /// test.
+    private func isoStringWithMilliseconds(_ ms: Int64) -> String {
+        let totalSeconds = ms.quotientAndRemainder(dividingBy: 1000)
+        let epochSeconds = totalSeconds.quotient
+        let milliseconds = totalSeconds.remainder
+        let date = Date(timeIntervalSince1970: TimeInterval(epochSeconds))
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "UTC")!
+        let components = calendar.dateComponents([.year, .month, .day, .hour, .minute, .second], from: date)
+        return String(
+            format: "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
+            components.year!, components.month!, components.day!,
+            components.hour!, components.minute!, components.second!,
+            milliseconds
+        )
     }
 }

@@ -17,17 +17,27 @@ import {
   CURSOR_RUNNING_TOOL_STATUSES,
   CURSOR_SQLITE_BUSY_TIMEOUT_MS,
   CURSOR_SQLITE_QUERY_DEADLINE_MS,
+  CURSOR_TIMESTAMP_MAX_OFFSET_MINUTES,
+  CURSOR_TIMESTAMP_MAX_YEAR,
+  CURSOR_TIMESTAMP_MIN_YEAR,
+  CURSOR_TIMESTAMP_SQL_FUNCTION_NAME,
   MAX_SUPPORTED_TIMESTAMP_MS,
   SESSION_CANDIDATE_WINDOW_MS,
   TIMESTAMP_FUTURE_SKEW_MS,
   assessCursorComposerRecord,
   assessDetectionFixture,
+  cursorCanonicalIsoStringToEpochMs,
   cursorRecencySqlExpression,
   cursorRelevantBubbleIds,
+  daysFromCivil,
+  daysInGregorianMonth,
+  epochMsFromCanonicalCursorIsoComponents,
   isCanonicalCursorIsoTimestamp,
   isDefinitelyOlderThanWindowLowerBound,
+  isGregorianLeapYear,
   isRecentTimestamp,
   matchAgentKind,
+  parseCanonicalCursorIsoComponents,
   parseCursorTimestamp,
 } from "../main/services/agent-detection-policy.ts";
 
@@ -578,6 +588,11 @@ test("exactly five scoped-package process matchers are case-sensitive", () => {
 function sqlRecencyForRawValue(rawValue) {
   const db = new DatabaseSync(":memory:");
   try {
+    // cursorRecencySqlExpression's generated SQL calls this scalar function
+    // by name (see its own doc comment) — must be registered on every
+    // connection that executes the expression, exactly like
+    // agent-detector.ts's Worker driver registers it on its own connection.
+    db.function(CURSOR_TIMESTAMP_SQL_FUNCTION_NAME, { deterministic: true }, cursorCanonicalIsoStringToEpochMs);
     const expression = cursorRecencySqlExpression("$value");
     const row = db.prepare(`SELECT (${expression}) AS recencyMs`).get({ value: rawValue });
     return row.recencyMs === null ? null : Number(row.recencyMs);
@@ -902,4 +917,199 @@ test("isDefinitelyOlderThanWindowLowerBound is not the negation of isRecentTimes
   // Only a timestamp strictly older than the lower bound is definitively old.
   assert.equal(isDefinitelyOlderThanWindowLowerBound(now - windowMs - 1, now, windowMs), true);
   assert.equal(isDefinitelyOlderThanWindowLowerBound(0, now, windowMs), true);
+});
+
+// MARK: - Cursor canonical ISO grammar: exhaustive component/range validation
+// matrix (the divergence this whole rewrite fixes). The OLD Swift
+// implementation validated shape with an `NSRegularExpression` (whose `\d`
+// matches any Unicode decimal-digit code point, not just ASCII 0-9, and
+// whose `$` matches before a trailing newline) and then handed the
+// surviving string to `Date.ISO8601FormatStyle`/`julianday()`, which
+// SILENTLY NORMALIZE several genuinely-invalid calendar shapes (minute 60,
+// leap second 60, hour 24, day-of-month overflow, non-leap Feb 29) instead
+// of rejecting them. `Date.parse` has the *same* kind of leniency for some
+// of these shapes (see the per-case comments below) — proof that no
+// engine's built-in date library can be trusted as the sole gate, which is
+// exactly why `parseCanonicalCursorIsoComponents` validates every component
+// explicitly and computes the epoch millisecond value via `daysFromCivil`
+// integer arithmetic, never `Date.parse`/`Date.UTC`/Foundation. Every case
+// below is mirrored byte-for-byte in
+// `TurnAssessorsTests.swift`'s `testCursorCanonicalIsoRejectsInvalidComponentsAcceptedByLenientEngines`
+// and `SessionSnapshotSourceTests.swift`'s SQL-parity counterpart — a
+// string may never be assessor-valid yet SQL-NULL (or vice versa), and
+// every engine that accepts a string must compute the identical
+// millisecond value.
+
+test("Cursor timestamp domain constants and Gregorian calendar helpers are internally consistent", () => {
+  assert.equal(CURSOR_TIMESTAMP_MIN_YEAR, 1970);
+  assert.equal(CURSOR_TIMESTAMP_MAX_YEAR, 9999);
+  assert.equal(CURSOR_TIMESTAMP_MAX_OFFSET_MINUTES, 14 * 60);
+
+  // isGregorianLeapYear: the standard rule — divisible by 4 and not by 100,
+  // UNLESS also divisible by 400.
+  assert.equal(isGregorianLeapYear(2024), true);
+  assert.equal(isGregorianLeapYear(2023), false);
+  assert.equal(isGregorianLeapYear(1900), false); // divisible by 100, not 400
+  assert.equal(isGregorianLeapYear(2000), true); // divisible by 400
+  assert.equal(isGregorianLeapYear(1970), false);
+
+  // daysInGregorianMonth: February must track isGregorianLeapYear exactly;
+  // every other month is fixed regardless of year.
+  assert.equal(daysInGregorianMonth(2024, 2), 29);
+  assert.equal(daysInGregorianMonth(2023, 2), 28);
+  assert.equal(daysInGregorianMonth(1900, 2), 28);
+  assert.equal(daysInGregorianMonth(2000, 2), 29);
+  assert.equal(daysInGregorianMonth(2024, 4), 30);
+  assert.equal(daysInGregorianMonth(2024, 1), 31);
+
+  // daysFromCivil(1970, 1, 1) must be the Unix epoch's own day zero, and
+  // epochMsFromCanonicalCursorIsoComponents must agree with
+  // parseCursorTimestamp end-to-end on every valid component set — it's
+  // the exact function parseCanonicalCursorIsoComponents's result actually
+  // gets threaded into.
+  assert.equal(daysFromCivil(1970, 1, 1), 0);
+  const components = parseCanonicalCursorIsoComponents("2024-02-29T10:20:30.500Z");
+  assert.notEqual(components, null);
+  assert.equal(
+    epochMsFromCanonicalCursorIsoComponents(components),
+    parseCursorTimestamp("2024-02-29T10:20:30.500Z"),
+  );
+});
+
+test("Cursor canonical ISO grammar rejects every invalid calendar/range component, even where Date.parse itself silently normalizes it", () => {
+  const invalidCases = [
+    // Leap seconds: never accepted, on any date.
+    "2024-01-15T23:59:60Z",
+    "2024-06-30T23:59:60Z", // a real historical leap-second-eligible date
+    // Minute 60 (must be 00-59). Date.parse also rejects this one (NaN).
+    "2024-01-15T10:60:30Z",
+    // Hour 24. Date.parse ACCEPTS this and silently carries it into the
+    // next calendar day — exactly the kind of platform-library
+    // normalization this parser must never inherit.
+    "2024-01-15T24:00:00Z",
+    // Day-of-month overflow. Date.parse ACCEPTS all three and carries them
+    // into the following month.
+    "2024-02-30T10:20:30Z",
+    "2024-02-31T10:20:30Z",
+    "2024-04-31T10:20:30Z", // April has 30 days
+    // Feb 29 in a non-leap year. Date.parse ACCEPTS both and carries them
+    // into March 1st — 2023 is an ordinary non-leap year, 1900 is the
+    // "divisible by 100 but not 400" Gregorian exception.
+    "2023-02-29T10:20:30Z",
+    "1900-02-29T10:20:30Z",
+    // Invalid month. Date.parse rejects these (NaN).
+    "2024-13-01T10:20:30Z",
+    "2024-00-01T10:20:30Z",
+    // Invalid day. Date.parse rejects this (NaN).
+    "2024-01-00T10:20:30Z",
+    // Offsets beyond the documented +-14:00 maximum
+    // (`CURSOR_TIMESTAMP_MAX_OFFSET_MINUTES`). Date.parse enforces no
+    // offset bound at all and ACCEPTS every one of these.
+    "2024-01-15T10:20:30+15:00",
+    "2024-01-15T10:20:30+14:01", // one minute past the 14:00 boundary
+    "2024-01-15T10:20:30-15:00",
+    "2024-01-15T10:20:30+05:60", // offset minute itself out of range
+    // Unicode decimal digits (fullwidth, Devanagari) standing in for ASCII
+    // 0-9. This is the exact `NSRegularExpression`/ICU `\d` divergence:
+    // `\d` in that engine matches any Unicode `Nd`-category code point.
+    "\uFF12\uFF10\uFF12\uFF14-01-15T10:20:30Z", // fullwidth "2024"
+    "\u0966\u0968\u0970\u096A-01-15T10:20:30Z", // Devanagari-ish digits
+    // Case-sensitivity: only upper-case "T"/"Z" are canonical.
+    "2024-01-15t10:20:30Z",
+    "2024-01-15T10:20:30z",
+    // Trailing/leading whitespace. Foundation's
+    // `Date.ISO8601FormatStyle` tolerates a trailing newline; this parser
+    // must reject it (and any other stray whitespace) unconditionally.
+    "2024-01-15T10:20:30Z\n",
+    "2024-01-15T10:20:30Z ",
+    " 2024-01-15T10:20:30Z",
+    // Pre-1970: both are computable, finite epoch values Date.parse
+    // happily returns, but they fall below `CURSOR_TIMESTAMP_MIN_YEAR` —
+    // this parser's domain is deliberately narrower than "every value
+    // `Date.parse` can represent".
+    "1969-12-31T23:59:59Z",
+    "0001-01-01T00:00:00Z",
+    // 5-digit year: outside the fixed 4-digit shape entirely.
+    "10000-01-01T00:00:00Z",
+  ];
+
+  for (const value of invalidCases) {
+    assert.equal(isCanonicalCursorIsoTimestamp(value), false, value);
+    assert.equal(parseCursorTimestamp(value), null, value);
+    assert.equal(parseCanonicalCursorIsoComponents(value), null, value);
+    const record = { status: "generating", lastUpdatedAt: value };
+    assert.equal(sqlRecencyFor(record), null, value);
+  }
+});
+
+test("Cursor canonical ISO grammar accepts every valid Z/offset/leap-day/year boundary and every engine computes the identical millisecond value", () => {
+  const validCases = [
+    ["ordinary Z timestamp", "2024-01-15T10:20:30Z", 1705314030000],
+    ["leap day, ordinary leap year (divisible by 4, not 100)", "2024-02-29T00:00:00Z", 1709164800000],
+    ["leap day, divisible-by-400 leap year", "2000-02-29T00:00:00Z", 951782400000],
+    ["leap day, divisible-by-400 leap year (2400)", "2400-02-29T00:00:00Z", 13574563200000],
+    ["min supported year: exact epoch", "1970-01-01T00:00:00Z", 0],
+    ["max supported year boundary", "9999-12-31T23:59:59Z", 253402300799000],
+    ["max positive offset boundary +14:00", "2024-01-15T10:20:30+14:00", 1705263630000],
+    ["max negative offset boundary -14:00", "2024-01-15T10:20:30-14:00", 1705364430000],
+    ["explicit zero offset, equivalent to Z", "2024-01-15T10:20:30+00:00", 1705314030000],
+  ];
+
+  for (const [label, value, expectedMs] of validCases) {
+    // Ground truth for every one of these specific cases was independently
+    // cross-checked against `Date.parse` (trustworthy across this entire
+    // 1970-9999 domain) and, for the offset cases, against manual
+    // `zTimeMs -+ offsetMinutes * 60_000` arithmetic — never generated
+    // FROM `parseCursorTimestamp` itself, so this test cannot pass by
+    // merely being self-consistent with a broken implementation.
+    assert.ok(isCanonicalCursorIsoTimestamp(value), `${label}: ${value}`);
+    assert.equal(parseCursorTimestamp(value), expectedMs, `${label}: ${value}`);
+    const record = { status: "generating", lastUpdatedAt: value };
+    assert.equal(sqlRecencyFor(record), expectedMs, `${label}: ${value}`);
+    assert.equal(assessedLastActivityAt(record), expectedMs, `${label}: ${value}`);
+  }
+});
+
+// MARK: - Cursor row-limit truncation safety at the exact window cutoff,
+// exercised through a canonical ISO *string* timestamp rather than a raw
+// numeric one. This is the safety-critical case the whole rewrite exists
+// to protect: if the string parser lost even one millisecond of precision
+// relative to the numeric path, a composer sitting exactly at
+// `SESSION_CANDIDATE_WINDOW_MS`'s lower bound could be mis-classified as
+// "definitely old" (safe to truncate) when it is not, or vice versa.
+
+test("Cursor SQL recency for an ISO-string timestamp matches the numeric path bit-for-bit at the window cutoff", () => {
+  const windowMs = SESSION_CANDIDATE_WINDOW_MS;
+  const cutoff = now - windowMs;
+
+  for (const offset of [-1, 0, 1]) {
+    const ms = cutoff + offset;
+    const iso = new Date(ms).toISOString();
+    // toISOString() always emits millisecond precision with a "Z" suffix —
+    // squarely inside the canonical grammar.
+    assert.ok(isCanonicalCursorIsoTimestamp(iso), iso);
+
+    const numericRecord = { status: "generating", lastUpdatedAt: ms };
+    const stringRecord = { status: "generating", lastUpdatedAt: iso };
+
+    // Both the assessor and SQL must compute the IDENTICAL recency value
+    // whether the source was a raw number or its canonical string
+    // encoding — no precision loss introduced by the string path.
+    assert.equal(parseCursorTimestamp(iso), ms, iso);
+    assert.equal(sqlRecencyFor(stringRecord), sqlRecencyFor(numericRecord), iso);
+    assert.equal(sqlRecencyFor(stringRecord), ms, iso);
+    assert.equal(assessedLastActivityAt(stringRecord), assessedLastActivityAt(numericRecord), iso);
+
+    // And the truncation-safety verdict itself must agree between the two
+    // encodings at every point around the cutoff: strictly older than the
+    // lower bound is definitively old, everything else (including exactly
+    // AT the lower bound) is merely inconclusive.
+    const expectedVerdict = offset < 0;
+    assert.equal(isDefinitelyOlderThanWindowLowerBound(ms, now, windowMs), expectedVerdict, String(offset));
+    assert.equal(
+      isDefinitelyOlderThanWindowLowerBound(sqlRecencyFor(stringRecord), now, windowMs),
+      expectedVerdict,
+      String(offset),
+    );
+  }
 });

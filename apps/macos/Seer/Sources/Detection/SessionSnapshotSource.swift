@@ -87,6 +87,78 @@ let cursorMaximumTotalDecodedValueBytes = 64_000_000
 /// duplicate references never cost more than a single lookup.
 let cursorMaximumBubbleLookups = 400
 
+/// Name under which `cursorRecencySqlExpression`'s generated SQL calls
+/// `cursorCanonicalIsoStringToEpochMs` (`TurnAssessors.swift`) as a
+/// registered SQLite scalar function, via `sqlite3_create_function_v2` in
+/// `queryCursorComposers`. Matches
+/// `CURSOR_TIMESTAMP_SQL_FUNCTION_NAME`/`cursor_canonical_iso_to_epoch_ms`
+/// on the TS side (`agent-detection-policy.ts`) — the two are otherwise
+/// independent string literals with no shared build-time constant across
+/// languages, so this is asserted equal by the parity test suite rather
+/// than statically enforced.
+let cursorTimestampSqlFunctionName = "cursor_canonical_iso_to_epoch_ms"
+
+/// C callback registered as the `cursorTimestampSqlFunctionName` SQLite
+/// scalar function via `sqlite3_create_function_v2` in
+/// `queryCursorComposers` below. A free (non-capturing) top-level function,
+/// exactly like this file's existing `sqlite3_progress_handler` callback
+/// closure (see below), so it converts implicitly to the `@convention(c)`
+/// function pointer `sqlite3_create_function_v2` expects.
+///
+/// Mirrors TS's `cursorCanonicalIsoStringToEpochMs` SQL-function wrapper:
+/// extracts `argv[0]` (the raw JSON value under test) as text and
+/// `argv[1..3]` as the `minYear`/`maxYear`/`maxOffsetMinutes` bounds
+/// `cursorRecencySqlExpression` bakes into the generated SQL as literal
+/// integers, then defers to `cursorCanonicalIsoStringToEpochMs`
+/// (`TurnAssessors.swift`) — the *exact* same Swift function
+/// `parseCursorTimestamp`'s own string branch already calls, so there is
+/// only ever one Swift implementation of this grammar/arithmetic to keep
+/// correct; SQLite itself never re-derives the value on its own.
+///
+/// Defensive beyond what a same-Swift caller needs, because SQLite hands
+/// this callback raw `sqlite3_value*` arguments whose runtime SQL type may
+/// not match what `cursorRecencySqlExpression`'s own `json_type(...) =
+/// 'text'` guard already checked before ever generating this call: this
+/// callback still degrades safely (calling `sqlite3_result_null`, never
+/// trapping) for any unexpected argument count or non-text first argument,
+/// exactly like an unparseable string would resolve — a thrown/trapped
+/// callback would abort the whole query, which is exactly the "one
+/// malformed row poisons every other row's evidence" failure mode this
+/// codebase's NULL-on-anything-invalid convention exists to avoid.
+///
+/// Deliberately internal (not `private`): `TurnAssessorsTests.swift`'s and
+/// `SessionSnapshotSourceTests.swift`'s own throwaway `:memory:` SQLite
+/// connections must register this exact same callback under
+/// `cursorTimestampSqlFunctionName` before they can execute
+/// `cursorRecencySqlExpression` themselves — mirroring how the TS parity
+/// suite's `sqlRecencyForRawValue` registers `cursorCanonicalIsoStringToEpochMs`
+/// on its own `node:sqlite` connection rather than only ever running the
+/// SQL through the one production call site.
+func cursorCanonicalIsoToEpochMsXFunc(
+    _ context: OpaquePointer?,
+    _ argc: Int32,
+    _ argv: UnsafeMutablePointer<OpaquePointer?>?
+) {
+    guard let context else { return }
+    guard let argv, argc == 4, sqlite3_value_type(argv[0]) == SQLITE_TEXT,
+          let textPointer = sqlite3_value_text(argv[0])
+    else {
+        sqlite3_result_null(context)
+        return
+    }
+    let value = String(cString: textPointer)
+    let minYear = Int(sqlite3_value_int64(argv[1]))
+    let maxYear = Int(sqlite3_value_int64(argv[2]))
+    let maxOffsetMinutes = Int(sqlite3_value_int64(argv[3]))
+    guard let milliseconds = cursorCanonicalIsoStringToEpochMs(
+        value, minYear: minYear, maxYear: maxYear, maxOffsetMinutes: maxOffsetMinutes
+    ) else {
+        sqlite3_result_null(context)
+        return
+    }
+    sqlite3_result_int64(context, milliseconds)
+}
+
 /// Mirrors `cursorRecencySqlExpression("cursorDiskKV.value")` in
 /// `main/services/agent-detection-policy.ts`: same field priority
 /// (`conversationCheckpointLastUpdatedAt`, `lastUpdatedAt`, `createdAt` —
@@ -162,34 +234,30 @@ let cursorMaximumBubbleLookups = 400
 ///       `"malformed JSON"` for a plain string/number/bool/null/array
 ///       entry in the headers array.
 ///     - Both root and header candidates accept either shape
-///       `parseCursorTimestamp`/`parseISO8601ToMs` accepts that can make a
-///       composer active: a JSON number (seconds when `<= 1e12`, else
-///       already milliseconds) or a JSON string in strict
-///       `YYYY-MM-DDTHH:MM:SS[.f|.ff|.fff](Z|±HH:MM)` form — EXACTLY 1-3
-///       fractional digits when a fraction is present (never 4+; a naive
-///       unbounded `.*` GLOB would match `.1234`-shaped sub-millisecond
-///       precision that `Date.parse`/`julianday()`/`ISO8601FormatStyle`
-///       can each round to a different integer millisecond) — the one
-///       string shape confirmed empirically to parse to the exact same
-///       millisecond value under both this codebase's TS parser
-///       (`Date.parse`, itself gated ahead of time by the identical
-///       `isCanonicalCursorIsoTimestamp` grammar) and this Swift parser
-///       (`Date.ISO8601FormatStyle`, likewise gated ahead of time by
-///       `isCanonicalCursorIsoTimestamp(_:)` in `TurnAssessors.swift`). Any
-///       other string (zone-less, date-only, lower-case `t`/`z`,
-///       space-separated, no-seconds, or a 4+-digit fraction) is
-///       deliberately left unrankable: real Cursor data only ever emits
-///       epoch-millisecond numbers on disk, and both platforms' grammar
-///       gate now flatly rejects every one of those shapes identically, so
-///       ranking on them could never happen in the assessor either. A
-///       value that reaches SQLite's own date parser is additionally
-///       shape-guarded by `GLOB`/`substr` *before* `julianday()` ever runs,
-///       and the millisecond conversion is `ROUND`ed — confirmed
-///       empirically required, since the raw
-///       `(julianday(x) - 2440587.5) * 86400000.0` formula alone can be
-///       off by a sub-millisecond floating-point epsilon that `ROUND`
-///       corrects to the exact integer millisecond
-///       `Date.parse`/`ISO8601FormatStyle` produce.
+///       `parseCursorTimestamp` accepts that can make a composer active: a
+///       JSON number (seconds when `<= 1e12`, else already milliseconds) or
+///       a JSON string matching `parseCanonicalCursorIsoComponents`'s exact
+///       `YYYY-MM-DDTHH:MM:SS[.fraction](Z|±HH:MM)` grammar *and* full
+///       Gregorian range validation (real year/month/day-in-month/hour/
+///       minute/second/offset-magnitude bounds — not just the shape) — the
+///       one narrow string domain this codebase's TS parser, this SQL
+///       expression, and this Swift assessor's own `parseCursorTimestamp`
+///       all three independently validate and convert to the exact same
+///       millisecond value by construction, via the identical Howard
+///       Hinnant `days_from_civil` integer arithmetic formula, invoked
+///       through the registered `cursorTimestampSqlFunctionName` scalar
+///       function (see `cursorCanonicalIsoToEpochMsXFunc`'s and the
+///       function body below's own comments), never `julianday()` /
+///       `Date.parse` / `Date.ISO8601FormatStyle`'s own leniency or
+///       differing native bounds. Any other string (zone-less, date-only,
+///       lower-case `t`/`z`, space-separated, no-seconds, minute/second
+///       `60`, an invalid calendar day, an out-of-range year, or an offset
+///       beyond `maxOffsetMinutes`) is unrankable here for the same reason
+///       it is unparseable to `parseCursorTimestamp` itself: real Cursor
+///       data only ever emits epoch-millisecond numbers on disk, so this
+///       restriction never under-ranks genuine data, and every one of those
+///       shapes is now rejected identically by all three engines instead of
+///       silently accepted-but-differently-computed by one of them.
 ///     - Both also apply the same `ABS(ms) <= maxSupportedTimestampMs`
 ///       bound as before, so an out-of-range numeric string/number never
 ///       poisons the `MAX` with a nonsensical magnitude.
@@ -207,37 +275,76 @@ let cursorRecencySqlExpression: String = {
     // between the two.
     func numericOrIsoStringToMsExpression(_ typeExpr: String, _ rawExpr: String) -> String {
         let scaledNumeric = "(CASE WHEN \(rawExpr) > 1000000000000 THEN \(rawExpr) ELSE \(rawExpr) * 1000 END)"
-        // `YYYY-MM-DDTHH:MM:SS` prefix (GLOB is case-sensitive, so a
-        // lower-case `t` never matches), then either bare `Z`, an explicit
-        // `±HH:MM` offset, or a `.` + EXACTLY 1-3 fractional digits
-        // followed by `Z` or an offset. GLOB has no `{1,3}`-style
-        // repetition, so each digit count is spelled out as its own
-        // alternative rather than the unrestricted `.*` wildcard a naive
-        // port would reach for — `.*` would happily match a 4-or-more-digit
-        // fraction too, which `Date.parse`/`ROUND(julianday(...))`/Swift's
-        // `ISO8601FormatStyle` can each round to a *different* integer
-        // millisecond (sub-millisecond precision none of the three parsers
-        // agrees on), silently breaking cross-engine parity. Anything else
-        // (zone-less, date-only, space-separated, lower-case, missing
-        // seconds, or a 4+-digit fraction) is intentionally left unmatched.
-        let fractionalSecondsDigitCounts = [1, 2, 3]
-        var suffixAlternatives = [
-            "substr(\(rawExpr), 20) = 'Z'",
-            "substr(\(rawExpr), 20) GLOB '[+-][0-9][0-9]:[0-9][0-9]'",
-        ]
-        for digits in fractionalSecondsDigitCounts {
-            let fraction = "." + String(repeating: "[0-9]", count: digits)
-            suffixAlternatives.append("substr(\(rawExpr), 20) GLOB '\(fraction)Z'")
-            suffixAlternatives.append("substr(\(rawExpr), 20) GLOB '\(fraction)[+-][0-9][0-9]:[0-9][0-9]'")
-        }
-        let isoShapeGuard =
-            "\(rawExpr) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*' " +
-            "AND (" + suffixAlternatives.joined(separator: " OR ") + ")"
-        let scaledIsoString = "ROUND((julianday(\(rawExpr)) - 2440587.5) * 86400000.0)"
-        return "CASE " +
-            "WHEN \(typeExpr) IN ('integer', 'real') AND ABS(\(scaledNumeric)) <= 8640000000000000 THEN \(scaledNumeric) " +
-            "WHEN \(typeExpr) = 'text' AND \(isoShapeGuard) AND ABS(\(scaledIsoString)) <= 8640000000000000 THEN \(scaledIsoString) " +
-            "ELSE NULL END"
+
+        // The ISO-string branch below enforces *exactly* the same grammar
+        // and range rules as `parseCanonicalCursorIsoComponents`
+        // (`TurnAssessors.swift`) and its TS twin — not just the
+        // `YYYY-MM-DDTHH:MM:SS` shape, but real year/month/day(-in-month,
+        // honoring leap years)/hour/minute/second range validation plus a
+        // bounded timezone-offset magnitude — computed via the identical
+        // Howard Hinnant `days_from_civil` integer-arithmetic formula, never
+        // `julianday()`. This branch does not re-implement that
+        // grammar/arithmetic as inline SQL text at all: it calls
+        // `cursorTimestampSqlFunctionName`, a SQLite scalar function
+        // registered via `sqlite3_create_function_v2` in
+        // `queryCursorComposers` below to run
+        // `cursorCanonicalIsoToEpochMsXFunc` → `cursorCanonicalIsoStringToEpochMs`
+        // — the *exact* same Swift function the pure-Swift
+        // `parseCursorTimestamp` string branch already calls. This is a
+        // deliberate strengthening over this expression's earlier version,
+        // which shape-guarded the string with `GLOB`/`substr` and then
+        // trusted SQLite's own `julianday()` to compute (and implicitly
+        // range-validate) the value: `julianday()` independently agrees
+        // with `Date.parse` on nearly everything (both roll invalid
+        // calendar dates over rather than rejecting them) except its own
+        // offset-magnitude cutoff (confirmed empirically: `julianday()`
+        // accepts any `±HH:MM` with magnitude strictly less than `15:00`,
+        // while `Date.parse` has no cutoff at all, accepting up to
+        // `+23:59`) — a genuine, independent three-way divergence this
+        // rewrite closes by never delegating to either engine's own
+        // leniency for range validation *or* arithmetic. It also silently
+        // accepted a leap second (`:60`), minute `60`, and other shapes
+        // `Date.ISO8601FormatStyle` itself would separately (and, prior to
+        // the Swift-side byte-level parser rewrite, inconsistently)
+        // normalize or reject.
+        //
+        // A registered scalar function call's `prepare()` cost does not
+        // scale with this grammar's complexity at all — confirmed
+        // empirically to be both *smaller* SQL text and *faster* to
+        // prepare/evaluate than the `GLOB`/`substr`/`julianday()` shape
+        // guard this replaced, even though Swift's own
+        // `sqlite3_progress_handler`-based deadline mechanism (unlike TS's
+        // `node:worker_threads` Worker-based one) never carried a large
+        // fixed startup tax that made this a *required* rewrite for
+        // performance on this platform — it is still strictly better on
+        // both counts here. The task's own requirement 3 explicitly permits
+        // this design ("register an identical safe conversion function if
+        // that is cleaner and available in both SQLite paths") as an
+        // alternative to inline component/range guards.
+        //
+        // `1970`/`9999`/`840` are literal SQL arguments (this codebase's
+        // own `cursorTimestampMinYear`/`cursorTimestampMaxYear`/
+        // `cursorTimestampMaxOffsetMinutes` defaults — see their own
+        // comments in `TurnAssessors.swift`), matching
+        // `parseCanonicalCursorIsoComponents`'s own literal defaults so
+        // this SQL expression and every zero-argument Swift caller
+        // (`parseCursorTimestamp`, `isCanonicalCursorIsoTimestamp`) enforce
+        // the identical bounds.
+        //
+        // Wrapped in a single small `WITH` (not referenced twice directly
+        // in the outer `CASE`, the way `scaledNumeric` still is): `ms` is
+        // computed *once* per row/field, then range-checked — semantically
+        // identical to two direct references (both forms always agree on
+        // `NULL` vs. the exact same value) while only ever invoking the
+        // scalar function once per row/field.
+        let isoMsCall = "\(cursorTimestampSqlFunctionName)(\(rawExpr), 1970, 9999, 840)"
+        let branchMs =
+            "(WITH msValue AS (SELECT CASE " +
+            "WHEN \(typeExpr) IN ('integer', 'real') THEN \(scaledNumeric) " +
+            "WHEN \(typeExpr) = 'text' THEN \(isoMsCall) " +
+            "ELSE NULL END AS ms) " +
+            "SELECT CASE WHEN ABS(ms) <= 8640000000000000 THEN ms ELSE NULL END FROM msValue)"
+        return branchMs
     }
 
     func fieldExpression(_ field: String) -> String {
@@ -853,6 +960,35 @@ enum SessionSnapshotSource {
         }
 
         sqlite3_extended_result_codes(db, 1)
+        // Registers the scalar function `cursorRecencySqlExpression`'s
+        // generated SQL calls by name (`cursorTimestampSqlFunctionName`) —
+        // must happen before that SQL is ever prepared below, on this same
+        // `db` handle (a fresh connection is opened per call to this
+        // function, so this registration cannot be hoisted or cached
+        // across calls). `SQLITE_DETERMINISTIC` is a true, honest claim
+        // here (identical arguments always produce the identical result,
+        // with no hidden dependency on database state) — unlike
+        // `node:sqlite`'s `deterministic: true` option, this flag lets
+        // SQLite's own query planner skip re-invoking the function for
+        // textually-identical calls with the identical arguments within one
+        // statement, though `cursorRecencySqlExpression`'s own single
+        // `WITH`-wrapped call site per field never relies on that
+        // optimization actually happening (see that expression's own
+        // comment).
+        try checkCursorSQLite(
+            sqlite3_create_function_v2(
+                db,
+                cursorTimestampSqlFunctionName,
+                4,
+                SQLITE_UTF8 | SQLITE_DETERMINISTIC,
+                nil,
+                cursorCanonicalIsoToEpochMsXFunc,
+                nil,
+                nil,
+                nil
+            ),
+            operation: "register cursor timestamp SQL function"
+        )
         try checkCursorSQLite(
             sqlite3_busy_timeout(db, cursorSQLiteBusyTimeoutMilliseconds),
             operation: "busy timeout configuration"
