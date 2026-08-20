@@ -68,6 +68,13 @@ gitleaks git . --redact      # full history
 gitleaks dir . --redact      # working tree
 ```
 
+`gitleaks dir` walks the whole directory, including untracked and ignored
+local build output such as `build/`, `node_modules/`, and any `.worktrees/`
+checkouts. Findings under those paths are local scratch, not repository
+content — CI scans a clean checkout and never sees them. Confirm the path is
+actually tracked (`git ls-files --error-unmatch <path>`) before treating a
+`gitleaks dir` result as a leak.
+
 Suppressions live in `.gitleaksignore` and are limited to fingerprint-pinned
 false positives with a written justification. Never add a bare path or rule
 suppression, and never commit a real credential — Apple signing and
