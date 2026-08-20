@@ -46,6 +46,37 @@ designed and planned but not yet implemented:
 Do not add Apple credentials until the release workflow has landed and been
 reviewed.
 
+## Security
+
+This repository is public and contains no credentials. Before your first
+commit, install the pre-commit protocol:
+
+```sh
+pre-commit install
+```
+
+That runs [gitleaks](https://github.com/gitleaks/gitleaks) and
+`detect-private-key` against every staged change. The same gitleaks scan runs
+server-side over the full history in
+[`.github/workflows/secret-scan.yml`](.github/workflows/secret-scan.yml), so
+skipping the hook does not skip the check.
+
+To scan by hand:
+
+```sh
+gitleaks git . --redact      # full history
+gitleaks dir . --redact      # working tree
+```
+
+Suppressions live in `.gitleaksignore` and are limited to fingerprint-pinned
+false positives with a written justification. Never add a bare path or rule
+suppression, and never commit a real credential — Apple signing and
+notarization secrets belong only in the protected `macos-release` GitHub
+environment (see
+[`docs/apple-release-credential-packet.md`](docs/apple-release-credential-packet.md)).
+
+Report vulnerabilities privately: see [`SECURITY.md`](SECURITY.md).
+
 ## Architecture
 
 - `main/` — lifecycle, agent detection, monitoring, storage, tray, panel, and IPC

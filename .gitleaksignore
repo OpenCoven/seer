@@ -1,0 +1,33 @@
+# gitleaks suppressions
+#
+# Every entry here MUST be a verified false positive, must be pinned to an
+# exact fingerprint (never a bare path or rule), and must carry a comment
+# explaining why the match is not a credential. Anything that cannot meet that
+# bar is a real finding and must be remediated and rotated instead of ignored.
+#
+# Fingerprint formats:
+#   history scan (`gitleaks git`):  <commit>:<path>:<rule>:<line>
+#   tree scan (`gitleaks dir`):     <path>:<rule>:<line>
+#
+# Line-pinned fingerprints fail closed: if the surrounding code moves, the
+# suppression stops matching and the scan reports the finding again for
+# re-review. That is intentional. Re-verify, then re-pin.
+
+# --------------------------------------------------------------------------
+# tests/package-macos-release.test.mjs — synthetic `codesign` stub (feat/seer-standalone-macos)
+#
+# The packaging test writes a throwaway shell script that impersonates
+# /usr/bin/codesign so the test can assert which `--keychain` argument the
+# packaging script passed. The gitleaks `generic-api-key` rule matches three
+# shell locals declared inside that heredoc: a variable holding the expected
+# keychain path (read at test runtime from a file in a temp directory), an
+# empty-string accumulator for the observed `--keychain` argument, and an
+# integer counter. The "keychain" keyword sitting next to a quoted assignment
+# is what trips the rule.
+#
+# There is no credential here: the values are an empty string, a zero, and a
+# temp path. Verified by reading the fixture at both the introducing commit and
+# the current branch tip. See
+# docs/superpowers/specs/2026-08-20-seer-public-publication-design.md.
+0891bf56ca622b603dde20a62e12612ad1e108ed:tests/package-macos-release.test.mjs:generic-api-key:1379
+tests/package-macos-release.test.mjs:generic-api-key:1444

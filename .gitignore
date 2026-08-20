@@ -17,6 +17,10 @@ tmp/
 /build/
 *.tsbuildinfo
 *.log
+*.profraw
+
+# Local git worktrees
+.worktrees/
 
 # OS files
 .DS_Store

@@ -1,0 +1,25 @@
+# Pre-commit protocol for OpenCoven/seer.
+#
+# Install once per clone:
+#   pre-commit install
+#
+# These hooks are the local half of the secret-leak defence. The other half is
+# .github/workflows/secret-scan.yml, which re-runs the same scanner over the
+# full history in CI so a bypassed or uninstalled hook cannot land a secret
+# silently.
+default_stages: [pre-commit]
+
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+        args: [--no-banner]
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: detect-private-key
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=2048]
