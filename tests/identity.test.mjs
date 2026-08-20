@@ -4,6 +4,8 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import test from "node:test";
+import yaml from "js-yaml";
+import { STANDALONE_SAFE_TEST_FILES } from "../scripts/run-standalone-tests.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = dirname(here);
@@ -14,6 +16,35 @@ function readText(relativePath) {
 
 function readJson(relativePath) {
   return JSON.parse(readText(relativePath));
+}
+
+const ciWorkflows = [
+  { name: "standalone-ci.yml", path: ".github/workflows/standalone-ci.yml" },
+  { name: "release-macos.yml", path: ".github/workflows/release-macos.yml" },
+];
+
+/**
+ * Returns every job step across `workflowSource` whose string `run:` value
+ * is exactly `exactRun` — a plain YAML-parsed equality check, not a scan of
+ * shell tokens, so there is nothing here that needs to understand quoting,
+ * comments, or control operators the way the deleted
+ * tests/helpers/workflow-node-test-invocations.mjs shell tokenizer did.
+ */
+function findStepsByExactRun(workflowSource, exactRun) {
+  const workflow = yaml.load(workflowSource);
+  const steps = [];
+  if (typeof workflow !== "object" || workflow === null || typeof workflow.jobs !== "object" || workflow.jobs === null) {
+    return steps;
+  }
+  for (const job of Object.values(workflow.jobs)) {
+    if (typeof job !== "object" || job === null || !Array.isArray(job.steps)) continue;
+    for (const step of job.steps) {
+      if (typeof step === "object" && step !== null && step.run === exactRun) {
+        steps.push(step);
+      }
+    }
+  }
+  return steps;
 }
 
 function gitChangeSet() {
@@ -131,6 +162,72 @@ test("User-facing surfaces are rebranded to Seer", () => {
   assert.match(readText("main/services/tray.ts"), /label:\s*"Open Seer"/);
   assert.match(readText("main/services/tray.ts"), /label:\s*"Quit Seer"/);
   assert.match(readText("main-window.html"), /<title>Seer<\/title>/);
+});
+
+test("UpdateService is constructed with the real packaged app version, not a hardcoded stand-in", () => {
+  const source = readText("main/index.ts");
+
+  assert.match(
+    source,
+    /new UpdateService\(\{\s*\n\s*currentVersion:\s*app\.getVersion\(\)/,
+    "main/index.ts must pass app.getVersion() as UpdateService's currentVersion so update comparisons reflect the actual packaged app version",
+  );
+  assert.ok(
+    !/currentVersion:\s*"1\.0\.0"/.test(source),
+    "main/index.ts must never hardcode UpdateService's currentVersion to a fixed string",
+  );
+});
+
+for (const { name, path } of ciWorkflows) {
+  test(`${name}: invokes the standalone-safe test suite via the shared npm script`, () => {
+    // Both workflows used to hand-maintain their own explicit "node --test"
+    // file list; verifying a given file was registered required parsing
+    // that shell text back out of the YAML. Now both workflows invoke the
+    // exact same fixed, argument-free command, so verifying that is a
+    // single exact-string comparison against the parsed YAML `run:` value -
+    // no shell parsing required. *Which* files that command runs is
+    // asserted separately below, directly against
+    // scripts/run-standalone-tests.mjs's exported list.
+    const source = readText(path);
+    const steps = findStepsByExactRun(source, "npm run test:standalone-safe");
+    assert.equal(
+      steps.length,
+      1,
+      `expected exactly one step in ${name} whose run: value is exactly "npm run test:standalone-safe" ` +
+        "(a bare package-script invocation, not a variant with an inline pipe, comment, or additional " +
+        "shell command)",
+    );
+  });
+}
+
+test("standalone-ci.yml stays on the standard Apple Silicon macOS 14 hosted runner", () => {
+  const workflow = yaml.load(readText(".github/workflows/standalone-ci.yml"));
+  assert.equal(
+    workflow.jobs.standalone["runs-on"],
+    "macos-14",
+    "standalone-ci.yml must use the standard macos-14 Apple Silicon hosted runner so pull_request jobs can start",
+  );
+});
+
+test("scripts/run-standalone-tests.mjs still registers tests/standalone-build-gate-serialization.test.mjs", () => {
+  // tests/standalone-build-gate-serialization.test.mjs used to assert its
+  // own registration in each workflow's explicit "node --test" file list,
+  // but that self-check only ran if a worker process was still executing
+  // that very file - if a future edit dropped the file from the shared
+  // list, the assertion guarding against exactly that removal would
+  // disappear along with it, and CI would stay green. This file
+  // (tests/identity.test.mjs) is itself registered in
+  // scripts/run-standalone-tests.mjs's STANDALONE_SAFE_TEST_FILES - the one
+  // list both workflows run via `npm run test:standalone-safe`, asserted
+  // above - so it keeps working even if
+  // tests/standalone-build-gate-serialization.test.mjs is ever removed from
+  // that list.
+  assert.ok(
+    STANDALONE_SAFE_TEST_FILES.includes("tests/standalone-build-gate-serialization.test.mjs"),
+    "scripts/run-standalone-tests.mjs's STANDALONE_SAFE_TEST_FILES must directly list " +
+      "tests/standalone-build-gate-serialization.test.mjs (not merely rely on it being reachable " +
+      "through some other glob or transitively-included file)",
+  );
 });
 
 test("No forbidden generated artifacts are in the change set", () => {

@@ -1,0 +1,10 @@
+{
+  "recent": {
+    "identity": "/tmp/seer-fixtures/agent-detection/goose-recent-project/session.json",
+    "mtimeMs": "2026-08-10T12:09:45.000Z"
+  },
+  "stale": {
+    "identity": "/tmp/seer-fixtures/agent-detection/goose-stale-project/session.json",
+    "mtimeMs": "2026-08-10T12:09:00.000Z"
+  }
+}

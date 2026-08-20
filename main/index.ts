@@ -2,12 +2,14 @@
 //
 // Menu-bar agent monitor: detects active agents, keeps Mac awake, native tray menu.
 
-import { app, Menu, logger, initDevToolsButtonState } from "@glaze/core/backend";
+import { app, ipcMain, Menu, logger, shell, initDevToolsButtonState } from "@glaze/core/backend";
 
 import { registerHandlers } from "./handlers/index.js";
 import { historyStore } from "./services/history-store.js";
 import { onMonitorStateChange, startMonitor, stopMonitor } from "./services/monitor.js";
+import { settingsStore } from "./services/settings-store.js";
 import { createTray, destroyTray } from "./services/tray.js";
+import { setSharedUpdateService, UpdateService } from "./services/update-check.js";
 
 // ── IPC Handlers ──────────────────────────────────────────────────────
 registerHandlers();
@@ -22,6 +24,7 @@ type AppAiDevHarness = {
 };
 let devHarness: DevHarness | null = null;
 let appAiDevHarness: AppAiDevHarness | null = null;
+let updateService: UpdateService | null = null;
 if (process.env.GLAZE_DEV_HARNESS === "1") {
   // @ts-ignore dev-only harness; present only in the template, excluded from scaffolded apps
   devHarness = (await import("./dev/parity-autotest.js")) as DevHarness;
@@ -74,6 +77,7 @@ app.on("activate", () => {
 app.on("before-quit", () => {
   logger.info("main", "App before-quit, cleaning up...");
   stopMonitor();
+  updateService?.stop();
   destroyTray();
   historyStore.flush();
 });
@@ -89,6 +93,29 @@ app.whenReady().then(async () => {
   await setupApplicationMenu();
 
   await historyStore.init();
+  await settingsStore.load();
+  updateService = new UpdateService({
+    currentVersion: app.getVersion(),
+    settings: settingsStore,
+    openExternal: (url) => shell.openExternal(url),
+  });
+  setSharedUpdateService(updateService);
+  updateService.subscribe((state) => {
+    ipcMain.broadcast("updates:changed", state);
+  });
+  // Deliberately not awaited: each update request is already bounded to
+  // ~10s (see `UpdateService`'s injected fetch timeout), but monitoring/
+  // tray startup must never depend on update availability at all — a
+  // slow or stalled GitHub response must never delay Seer's core
+  // purpose of watching for active agents. `start()`'s own state
+  // transitions still broadcast normally (both this startup check and
+  // every later scheduled one) via the `subscribe` above; `.catch` here
+  // only guards against an unhandled rejection, mirroring the previous
+  // try/catch's own warning-only handling.
+  void updateService.start().catch((error) => {
+    logger.warn("updates", "Startup update check failed", { error });
+  });
+
   onMonitorStateChange((state) => {
     historyStore.recordState(state);
   });

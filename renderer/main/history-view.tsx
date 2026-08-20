@@ -1,26 +1,14 @@
-import {
-  Button,
-  EmptyState,
-  List,
-  ScrollArea,
-  Text,
-  Toolbar,
-  ToolbarActions,
-  ToolbarContent,
-} from "@glaze/core/components";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Bot, Coffee, History as HistoryIcon, Trash2 } from "lucide-react";
 import type { ReactNode } from "react";
 
+import { useRendererBridge } from "../bridge/renderer-bridge-context";
+import type { AppSnapshot, AwakeSession } from "../bridge/types";
 import { PanelTabs } from "../components/panel-tabs";
-import {
-  EMPTY_STATS,
-  clearHistory,
-  fetchHistoryStats,
-  formatDuration,
-  formatSessionTime,
-  sessionAgentNames,
-} from "../lib/history";
+import { SnapshotAvailability } from "../components/snapshot-availability";
+import { formatDuration, formatSessionTime, sessionAgentNames } from "../lib/history";
+import { Button, EmptyState, List, ScrollPanel, Text, Toolbar, ToolbarActions, ToolbarContent } from "../ui/primitives";
+import { useAppSnapshot, writeAppSnapshot } from "./root-view";
 
 function StatTile({ label, value }: { label: string; value: string }) {
   return (
@@ -43,27 +31,47 @@ function SectionLabel({ children }: { children: ReactNode }) {
   );
 }
 
+export function HistoryClearButton({
+  disabled,
+  onClear,
+}: {
+  disabled: boolean;
+  onClear: () => void;
+}) {
+  return (
+    <Button
+      variant="transparent"
+      size="small"
+      onClick={onClear}
+      disabled={disabled}
+      aria-label="Clear history"
+    >
+      <Trash2 className="size-4" />
+    </Button>
+  );
+}
+
 export function HistoryView() {
+  const bridge = useRendererBridge();
   const queryClient = useQueryClient();
-  const { data: stats = EMPTY_STATS } = useQuery({
-    queryKey: ["historyStats"],
-    queryFn: fetchHistoryStats,
-  });
+  const { data: snapshot, isPending, isError } = useAppSnapshot();
+  const stats = snapshot?.history;
 
   const clearMutation = useMutation({
-    mutationFn: clearHistory,
-    onSuccess: (next) => queryClient.setQueryData(["historyStats"], next),
+    mutationFn: () => bridge.clearHistory(),
+    onSuccess: (next) => writeAppSnapshot(queryClient, next),
   });
 
   const handleQuit = () => {
-    void window.glazeAPI.glaze.ipc.invoke("app:quit");
+    void bridge.quit();
   };
 
   const hasHistory =
-    stats.totalAwakeMs > 0 || stats.recentSessions.length > 0 || stats.currentSession !== null;
+    stats !== undefined &&
+    (stats.totalAwakeMs > 0 || stats.recentSessions.length > 0 || stats.currentSession !== null);
 
   return (
-    <ScrollArea
+    <ScrollPanel
       className="h-full"
       toolbar={
         <Toolbar>
@@ -71,15 +79,10 @@ export function HistoryView() {
             <PanelTabs />
           </ToolbarContent>
           <ToolbarActions>
-            <Button
-              variant="transparent"
-              size="small"
-              onClick={() => clearMutation.mutate()}
-              disabled={!hasHistory || clearMutation.isPending}
-              aria-label="Clear history"
-            >
-              <Trash2 className="size-4" />
-            </Button>
+            <HistoryClearButton
+              onClear={() => clearMutation.mutate()}
+              disabled={!snapshot || isError || !hasHistory || clearMutation.isPending}
+            />
           </ToolbarActions>
         </Toolbar>
       }
@@ -91,6 +94,50 @@ export function HistoryView() {
         </div>
       }
     >
+      <HistorySnapshotContent snapshot={snapshot} isPending={isPending} isError={isError} />
+    </ScrollPanel>
+  );
+}
+
+export function HistorySnapshotContent({
+  snapshot,
+  isPending,
+  isError,
+}: {
+  snapshot: AppSnapshot | undefined;
+  isPending: boolean;
+  isError: boolean;
+}) {
+  if (!snapshot) {
+    return (
+      <SnapshotAvailability
+        isPending={isPending}
+        loadingTitle="Loading history"
+        errorTitle="History unavailable"
+        errorDescription="Seer could not load history. Live updates will restore this view automatically."
+        media={
+          <div className="flex size-12 items-center justify-center rounded-full bg-control">
+            <HistoryIcon className="size-5 text-secondary" />
+          </div>
+        }
+      />
+    );
+  }
+
+  const stats = snapshot.history;
+  const hasHistory =
+    stats.totalAwakeMs > 0 || stats.recentSessions.length > 0 || stats.currentSession !== null;
+
+  return (
+    <>
+      {isError ? (
+        <div role="alert" className="mx-3 mb-3 rounded-xl bg-control-subtle px-3 py-2">
+          <Text variant="small-strong">History unavailable</Text>
+          <Text variant="mini" color="secondary" className="mt-0.5 block">
+            Showing last known history. Clear history will return when live updates recover.
+          </Text>
+        </div>
+      ) : null}
       {!hasHistory ? (
         <div className="relative min-h-60 px-3 pt-1 pb-3">
           <EmptyState
@@ -133,9 +180,9 @@ export function HistoryView() {
             <div className="flex flex-col gap-2">
               <SectionLabel>By agent</SectionLabel>
               <div className="overflow-hidden rounded-xl bg-control-subtle">
-                <List.Root items={stats.perAgent} getItemKey={(agent) => agent.id}>
+                <List.Root>
                   {stats.perAgent.map((agent) => (
-                    <List.Item key={agent.id} item={agent}>
+                    <List.Item key={agent.id}>
                       <List.ItemIcon>
                         <Bot className="size-4 text-secondary" />
                       </List.ItemIcon>
@@ -158,9 +205,9 @@ export function HistoryView() {
             <div className="flex flex-col gap-2">
               <SectionLabel>Recent sessions</SectionLabel>
               <div className="overflow-hidden rounded-xl bg-control-subtle">
-                <List.Root items={stats.recentSessions} getItemKey={(session) => session.id}>
-                  {stats.recentSessions.map((session) => (
-                    <List.Item key={session.id} item={session}>
+                <List.Root>
+                  {stats.recentSessions.map((session: AwakeSession) => (
+                    <List.Item key={session.id}>
                       <List.ItemContent>
                         <List.ItemTitle>{formatSessionTime(session.startedAt)}</List.ItemTitle>
                         <List.ItemDescription>{sessionAgentNames(session)}</List.ItemDescription>
@@ -178,6 +225,6 @@ export function HistoryView() {
           ) : null}
         </div>
       )}
-    </ScrollArea>
+    </>
   );
 }

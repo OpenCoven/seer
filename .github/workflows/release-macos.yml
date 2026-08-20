@@ -1,0 +1,789 @@
+name: Release standalone macOS app
+
+# This workflow runs only in the private OpenCoven/seer source repository.
+# Maintainers separately create the public OpenCoven/seer-releases repository,
+# its fine-grained RELEASES_REPO_TOKEN, immutable-releases protection, and the
+# protected macos-release environment with required reviewers, protected
+# release-writer/signing-identity configuration secrets, and sensitive
+# signing/notarization credential secrets.
+# This workflow never creates or configures those protected resources.
+# GitHub's release PATCH API has no supported compare-and-swap precondition.
+# Cross-version exclusivity is enforced by this repository-wide queue:max
+# workflow group plus an atomic tag-scoped lock ref in the release repository;
+# the lock is verified around every mutation. The same queue serializes the
+# authenticated exhaustive release inventory and latest snapshot, explicit
+# global-maximum decision, publication PATCH, post-publication inventory/latest
+# verification, and each retry's independent published-reconciliation snapshot.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: release-macos-OpenCoven-seer-releases
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  prepare:
+    name: Prepare credential-free release input
+    # Object-form runs-on pins both the exact organization runner group and
+    # the exact runner label/name. A label-only `runs-on: macos-14-xlarge`
+    # would schedule onto ANY runner in the org carrying that label, not just
+    # the one this credential packet verified via `image_details` and
+    # `machine_size_details`. Binding the group closes that substitution gap.
+    runs-on:
+      group: seer-macos-release
+      labels: macos-14-xlarge
+    outputs:
+      version: ${{ steps.release-version.outputs.version }}
+      prepare-runner-id: ${{ steps.release-input.outputs.prepare-runner-id }}
+      unsigned-archive-sha256: ${{ steps.release-input.outputs.unsigned-archive-sha256 }}
+      unsigned-attestation-sha256: ${{ steps.release-input.outputs.unsigned-attestation-sha256 }}
+      artifact-name: ${{ steps.release-input.outputs.artifact-name }}
+    steps:
+      - name: Reject invalid source, tag, build, or runner
+        env:
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_REPOSITORY_PRIVATE: ${{ github.event.repository.private }}
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "tag must be vMAJOR.MINOR.PATCH" >&2
+            exit 1
+          }
+          [[ "${SOURCE_REPOSITORY}" == "OpenCoven/seer" ]] || {
+            echo "error: release workflow must run in OpenCoven/seer" >&2
+            exit 1
+          }
+          [[ "${SOURCE_REPOSITORY_PRIVATE}" == "true" ]] || {
+            echo "error: release source repository must be private" >&2
+            exit 1
+          }
+          [[ "${GITHUB_REF_TYPE}" == "tag" ]] || {
+            echo "error: release ref must be a tag" >&2
+            exit 1
+          }
+          [[ "${GITHUB_SHA}" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "error: GITHUB_SHA must be a lowercase 40-character commit" >&2
+            exit 1
+          }
+          [[ "${BUILD_NUMBER}" =~ ^[1-9][0-9]*$ ]] || {
+            echo "error: github.run_number must be a positive canonical integer" >&2
+            exit 1
+          }
+          [[ "$(uname -m)" == "arm64" ]] || {
+            echo "error: release preparation requires an Apple Silicon (arm64) runner" >&2
+            exit 1
+          }
+
+      - name: Checkout exact tagged commit
+        # v4.4.0, resolved from refs/tags/v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify tag equals MARKETING_VERSION
+        id: release-version
+        run: |
+          set -euo pipefail
+          version_file="apps/macos/Seer/Config/Version.xcconfig"
+          line_count="$(grep -Ec '^MARKETING_VERSION = [0-9]+\.[0-9]+\.[0-9]+$' "${version_file}")"
+          [[ "${line_count}" == "1" ]] || {
+            echo "error: Version.xcconfig must contain one canonical MARKETING_VERSION" >&2
+            exit 1
+          }
+          marketing_version="$(sed -nE 's/^MARKETING_VERSION = ([0-9]+\.[0-9]+\.[0-9]+)$/\1/p' "${version_file}")"
+          tag_version="${GITHUB_REF_NAME#v}"
+          [[ "${tag_version}" == "${marketing_version}" ]] || {
+            echo "error: tag version does not equal MARKETING_VERSION" >&2
+            exit 1
+          }
+          printf 'version=%s\n' "${tag_version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Select Xcode 16.2
+        # v1.7.0, peeled from the annotated refs/tags/v1
+        uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90
+        with:
+          xcode-version: "16.2"
+
+      - name: Install pinned XcodeGen 2.46.0
+        run: |
+          set -euo pipefail
+          xcodegen_root="${RUNNER_TEMP}/xcodegen-2.46.0"
+          archive="${xcodegen_root}/xcodegen.zip"
+          xcodegen_bin="${xcodegen_root}/xcodegen/bin"
+          [[ ! -e "${xcodegen_root}" && ! -L "${xcodegen_root}" ]]
+          mkdir "${xcodegen_root}"
+          /usr/bin/curl --fail --location --retry 3 --retry-all-errors --retry-delay 2 \
+            --output "${archive}" \
+            "https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip"
+          printf '%s  %s\n' \
+            '4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806' \
+            "${archive}" | /usr/bin/shasum -a 256 -c -
+          /usr/bin/unzip -q "${archive}" -d "${xcodegen_root}"
+          [[ -x "${xcodegen_bin}/xcodegen" && ! -L "${xcodegen_bin}/xcodegen" ]]
+          [[ "$("${xcodegen_bin}/xcodegen" --version)" == "Version: 2.46.0" ]] || {
+            echo "error: pinned XcodeGen did not report Version: 2.46.0" >&2
+            exit 1
+          }
+          printf '%s\n' "${xcodegen_bin}" >> "${GITHUB_PATH}"
+
+      - name: Setup Node 24
+        # v4.4.0, resolved from refs/tags/v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Print and verify release toolchain
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcodegen --version
+          node --version
+          npm --version
+          [[ "$(node --print 'process.versions.node.split(`.`)[0]')" == "24" ]] || {
+            echo "error: release preparation requires Node 24" >&2
+            exit 1
+          }
+
+      - name: Install locked standalone dependencies
+        run: npm ci
+
+      # The explicit standalone-safe test-file list and the
+      # `--test-concurrency=1` pin (tests/standalone-renderer.test.mjs and
+      # tests/standalone-renderer-lock.test.mjs both drive
+      # scripts/build-standalone-renderer.mjs against this repository's real
+      # .seer-standalone-renderer.lock directory, so they must never run as
+      # concurrent worker processes) live in one repository-owned module,
+      # scripts/run-standalone-tests.mjs, run here via the
+      # `test:standalone-safe` package script. This job's release-only
+      # draft/workflow policy tests (tests/release-macos-draft-policy.test.mjs,
+      # tests/release-macos-workflow.test.mjs) are part of that same shared
+      # superset list — see that module for why they are credential/network
+      # safe. tests/standalone-boundary.test.mjs is deliberately excluded
+      # from that module's list and run as its own explicit step after
+      # "Build unsigned Seer.app" below instead. Both this workflow and
+      # .github/workflows/standalone-ci.yml invoke the exact same package
+      # script, so there is no hand-maintained duplicate file list to drift
+      # between them.
+      - name: Run standalone-safe unit tests
+        run: npm run test:standalone-safe
+
+      - name: Run shared renderer unit tests
+        run: npm run test:renderer
+
+      - name: Type-check standalone surface
+        run: npm run type-check:standalone
+
+      - name: Lint standalone surface
+        run: npm run lint:standalone
+
+      - name: Build standalone renderer
+        run: npm run build:standalone-renderer
+
+      - name: Generate Xcode project
+        run: npm run generate:macos
+
+      - name: Run Swift tests
+        run: npm run test:macos
+
+      - name: Build unsigned Seer.app
+        run: npm run build:macos
+
+      - name: Run standalone boundary test suite
+        run: node --test --test-concurrency=1 tests/standalone-boundary.test.mjs
+
+      - name: Check repository and built-app boundary
+        run: npm run check:standalone-boundary
+
+      - name: Prepare fixed unsigned release input
+        id: release-input
+        env:
+          VERSION: ${{ steps.release-version.outputs.version }}
+          BUILD_NUMBER: ${{ github.run_number }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          PREPARE_RUNNER_ID: gha:${{ github.run_id }}:${{ github.run_attempt }}:prepare
+          ARTIFACT_NAME: seer-unsigned-release-input-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          bash scripts/prepare-macos-release-input.sh
+          input_dir="build/macos/release-input"
+          archive="${input_dir}/Seer-unsigned-arm64.tar"
+          attestation="${input_dir}/unsigned-app-attestation.json"
+          entry_count="$(find "${input_dir}" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')"
+          [[ "${entry_count}" == "2" ]] || {
+            echo "error: unsigned release input must contain exactly two entries" >&2
+            exit 1
+          }
+          [[ -f "${archive}" && ! -L "${archive}" ]] || {
+            echo "error: fixed unsigned archive is not a regular file" >&2
+            exit 1
+          }
+          [[ -f "${attestation}" && ! -L "${attestation}" ]] || {
+            echo "error: fixed unsigned attestation is not a regular file" >&2
+            exit 1
+          }
+          archive_sha256="$(/usr/bin/shasum -a 256 "${archive}" | awk '{print $1}')"
+          attestation_sha256="$(/usr/bin/shasum -a 256 "${attestation}" | awk '{print $1}')"
+          [[ "${archive_sha256}" =~ ^[0-9a-f]{64}$ ]]
+          [[ "${attestation_sha256}" =~ ^[0-9a-f]{64}$ ]]
+          printf 'prepare-runner-id=%s\n' "${PREPARE_RUNNER_ID}" >> "${GITHUB_OUTPUT}"
+          printf 'unsigned-archive-sha256=%s\n' "${archive_sha256}" >> "${GITHUB_OUTPUT}"
+          printf 'unsigned-attestation-sha256=%s\n' "${attestation_sha256}" >> "${GITHUB_OUTPUT}"
+          printf 'artifact-name=%s\n' "${ARTIFACT_NAME}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload only the attested unsigned release input
+        id: upload-release-input
+        # v4.6.2, resolved from refs/tags/v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ steps.release-input.outputs.artifact-name }}
+          path: |
+            build/macos/release-input/Seer-unsigned-arm64.tar
+            build/macos/release-input/unsigned-app-attestation.json
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+          overwrite: false
+          include-hidden-files: false
+
+  sign-and-release:
+    name: Sign, verify, and publish from a fresh runner
+    needs: prepare
+    # See the `prepare` job's runs-on comment: the group binding is required
+    # here too, since this job is the one that imports signing/notarization
+    # secrets and must not run on any label-matching runner outside the
+    # verified `seer-macos-release` group.
+    runs-on:
+      group: seer-macos-release
+      labels: macos-14-xlarge
+    environment: macos-release
+    steps:
+      - name: Enforce protected release gates before any credential
+        env:
+          BINARY_DISTRIBUTION_APPROVED: ${{ secrets.BINARY_DISTRIBUTION_APPROVED }}
+          PARITY_MATRIX_APPROVED: ${{ secrets.PARITY_MATRIX_APPROVED }}
+          CLEAN_MACHINE_VERIFIED_COMMIT: ${{ secrets.CLEAN_MACHINE_VERIFIED_COMMIT }}
+          RELEASE_WRITER_LOGIN: ${{ secrets.RELEASE_WRITER_LOGIN }}
+          RELEASE_WRITER_ID: ${{ secrets.RELEASE_WRITER_ID }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_REPOSITORY_PRIVATE: ${{ github.event.repository.private }}
+          BUILD_NUMBER: ${{ github.run_number }}
+          EXPECTED_PREPARE_RUNNER_ID: ${{ needs.prepare.outputs.prepare-runner-id }}
+          EXPECTED_ARCHIVE_SHA256: ${{ needs.prepare.outputs.unsigned-archive-sha256 }}
+          EXPECTED_ATTESTATION_SHA256: ${{ needs.prepare.outputs.unsigned-attestation-sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "${BINARY_DISTRIBUTION_APPROVED}" == "true" ]] || {
+            echo "error: BINARY_DISTRIBUTION_APPROVED must be exactly true" >&2
+            exit 1
+          }
+          [[ "${PARITY_MATRIX_APPROVED}" == "true" ]] || {
+            echo "error: PARITY_MATRIX_APPROVED must be exactly true" >&2
+            exit 1
+          }
+          [[ "${CLEAN_MACHINE_VERIFIED_COMMIT}" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "error: CLEAN_MACHINE_VERIFIED_COMMIT must be a lowercase 40-character SHA" >&2
+            exit 1
+          }
+          [[ "${CLEAN_MACHINE_VERIFIED_COMMIT}" == "${GITHUB_SHA}" ]] || {
+            echo "error: clean-machine verification does not match GITHUB_SHA" >&2
+            exit 1
+          }
+          [[ "${RELEASE_WRITER_LOGIN}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,38})$ ]] || {
+            echo "error: RELEASE_WRITER_LOGIN must be a canonical GitHub login" >&2
+            exit 1
+          }
+          [[ "${RELEASE_WRITER_ID}" =~ ^[1-9][0-9]*$ ]] || {
+            echo "error: RELEASE_WRITER_ID must be a positive canonical GitHub user ID" >&2
+            exit 1
+          }
+          [[ "${APPLE_TEAM_ID}" =~ ^[A-Z0-9]{10}$ ]] || {
+            echo "error: APPLE_TEAM_ID must be a 10-character uppercase Apple team identifier" >&2
+            exit 1
+          }
+          [[ -n "${APPLE_SIGNING_IDENTITY}" ]] || {
+            echo "error: APPLE_SIGNING_IDENTITY is required" >&2
+            exit 1
+          }
+          [[ "${APPLE_SIGNING_IDENTITY}" != *$'\n'* && "${APPLE_SIGNING_IDENTITY}" != *$'\r'* ]] || {
+            echo "error: APPLE_SIGNING_IDENTITY must not contain CR or LF" >&2
+            exit 1
+          }
+          [[ "${APPLE_SIGNING_IDENTITY}" =~ ^Developer\ ID\ Application:\ .+\ \(${APPLE_TEAM_ID}\)$ ]] || {
+            echo "error: APPLE_SIGNING_IDENTITY must be the exact Developer ID Application authority for APPLE_TEAM_ID" >&2
+            exit 1
+          }
+          [[ "${SOURCE_REPOSITORY}" == "OpenCoven/seer" && "${SOURCE_REPOSITORY_PRIVATE}" == "true" ]] || {
+            echo "error: protected release must run from the private OpenCoven/seer repository" >&2
+            exit 1
+          }
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "tag must be vMAJOR.MINOR.PATCH" >&2
+            exit 1
+          }
+          [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_SHA}" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "error: release ref and commit are invalid" >&2
+            exit 1
+          }
+          [[ "${BUILD_NUMBER}" =~ ^[1-9][0-9]*$ ]] || {
+            echo "error: github.run_number must be a positive canonical integer" >&2
+            exit 1
+          }
+          [[ "${EXPECTED_PREPARE_RUNNER_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]]
+          [[ "${EXPECTED_ARCHIVE_SHA256}" =~ ^[0-9a-f]{64}$ ]]
+          [[ "${EXPECTED_ATTESTATION_SHA256}" =~ ^[0-9a-f]{64}$ ]]
+
+      - name: Assert fresh Apple Silicon signing runner
+        run: |
+          set -euo pipefail
+          [[ "$(uname -m)" == "arm64" ]] || {
+            echo "error: signing requires an Apple Silicon (arm64) runner" >&2
+            exit 1
+          }
+
+      - name: Checkout exact prepared commit without credentials
+        # v4.4.0, resolved from refs/tags/v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Select Xcode 16.2
+        # v1.7.0, peeled from the annotated refs/tags/v1
+        uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90
+        with:
+          xcode-version: "16.2"
+
+      - name: Setup dependency-free Node 24 runtime
+        # v4.4.0, resolved from refs/tags/v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "24"
+
+      - name: Verify exact commit and release version
+        env:
+          EXPECTED_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse --verify HEAD)" == "${GITHUB_SHA}" ]] || {
+            echo "error: signing checkout does not match GITHUB_SHA" >&2
+            exit 1
+          }
+          version_file="apps/macos/Seer/Config/Version.xcconfig"
+          marketing_version="$(sed -nE 's/^MARKETING_VERSION = ([0-9]+\.[0-9]+\.[0-9]+)$/\1/p' "${version_file}")"
+          [[ "${EXPECTED_VERSION}" == "${GITHUB_REF_NAME#v}" && "${EXPECTED_VERSION}" == "${marketing_version}" ]] || {
+            echo "error: signing tag, prepared version, and MARKETING_VERSION differ" >&2
+            exit 1
+          }
+          xcodebuild -version
+          node --version
+          [[ "$(node --print 'process.versions.node.split(`.`)[0]')" == "24" ]]
+          [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]] || {
+            echo "error: signing checkout must be clean before release input download" >&2
+            exit 1
+          }
+
+      - name: Acquire atomic tag-scoped release lock
+        id: release-lock
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          SOURCE_GITHUB_TOKEN: ${{ github.token }}
+          GH_REPO: OpenCoven/seer-releases
+          RELEASE_WRITER_LOGIN: ${{ secrets.RELEASE_WRITER_LOGIN }}
+          RELEASE_WRITER_ID: ${{ secrets.RELEASE_WRITER_ID }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          SOURCE_TAG: ${{ github.ref_name }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_RUN: ${{ github.run_id }}
+          WORKFLOW_ATTEMPT: ${{ github.run_attempt }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: bash scripts/release-macos-draft.sh acquire-lock
+
+      - name: Create fresh published-reconciliation directory
+        id: published-reconciliation-state
+        run: |
+          set -euo pipefail
+          state_dir="${RUNNER_TEMP}/seer-existing-published-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          [[ ! -e "${state_dir}" && ! -L "${state_dir}" ]]
+          umask 077
+          mkdir "${state_dir}"
+          printf 'directory=%s\n' "${state_dir}" >> "${GITHUB_OUTPUT}"
+
+      - name: Reconcile immutable existing-published-state before signing
+        id: published-reconciliation
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          SOURCE_GITHUB_TOKEN: ${{ github.token }}
+          GH_REPO: OpenCoven/seer-releases
+          RELEASE_WRITER_LOGIN: ${{ secrets.RELEASE_WRITER_LOGIN }}
+          RELEASE_WRITER_ID: ${{ secrets.RELEASE_WRITER_ID }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          SOURCE_TAG: ${{ github.ref_name }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_RUN: ${{ github.run_id }}
+          WORKFLOW_ATTEMPT: ${{ github.run_attempt }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          BUILD_NUMBER: ${{ github.run_number }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          STATE_WORK_DIR: ${{ steps.published-reconciliation-state.outputs.directory }}
+        run: bash scripts/release-macos-draft.sh reconcile-published
+
+      - name: Reject unsafe release collisions
+        if: steps.published-reconciliation.outputs.published != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          GH_REPO: OpenCoven/seer-releases
+          RELEASE_WRITER_LOGIN: ${{ secrets.RELEASE_WRITER_LOGIN }}
+          RELEASE_WRITER_ID: ${{ secrets.RELEASE_WRITER_ID }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          SOURCE_TAG: ${{ github.ref_name }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_RUN: ${{ github.run_id }}
+          WORKFLOW_ATTEMPT: ${{ github.run_attempt }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: bash scripts/release-macos-draft.sh preflight
+
+      - name: Create empty release-input destination
+        if: steps.published-reconciliation.outputs.published != 'true'
+        run: |
+          set -euo pipefail
+          [[ ! -e build/macos/release-input && ! -L build/macos/release-input ]]
+          mkdir -p build/macos/release-input
+
+      # Downloading by exact `name:` (rather than `artifact-ids:`) makes
+      # download-artifact treat this as a single-artifact download, which it
+      # always extracts directly into `path` with no artifact-named
+      # subdirectory. Using `artifact-ids:` here would nest the two prepared
+      # files one level deeper even with a single ID, breaking the flat
+      # `release-input/{archive,attestation}` paths the signing step expects.
+      - name: Download only the prepared input artifact
+        if: steps.published-reconciliation.outputs.published != 'true'
+        # v4.3.0, resolved from refs/tags/v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: ${{ needs.prepare.outputs.artifact-name }}
+          path: build/macos/release-input
+
+      - name: Verify attested input and distinct runner identity
+        if: steps.published-reconciliation.outputs.published != 'true'
+        id: signing-input
+        env:
+          PREPARE_RUNNER_ID: ${{ needs.prepare.outputs.prepare-runner-id }}
+          EXPECTED_ARCHIVE_SHA256: ${{ needs.prepare.outputs.unsigned-archive-sha256 }}
+          EXPECTED_ATTESTATION_SHA256: ${{ needs.prepare.outputs.unsigned-attestation-sha256 }}
+          SIGNING_RUNNER_ID: gha:${{ github.run_id }}:${{ github.run_attempt }}:sign
+        run: |
+          set -euo pipefail
+          input_dir="build/macos/release-input"
+          archive="${input_dir}/Seer-unsigned-arm64.tar"
+          attestation="${input_dir}/unsigned-app-attestation.json"
+          entry_count="$(find "${input_dir}" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')"
+          [[ "${entry_count}" == "2" ]]
+          [[ -f "${archive}" && ! -L "${archive}" ]]
+          [[ -f "${attestation}" && ! -L "${attestation}" ]]
+          actual_archive_sha256="$(/usr/bin/shasum -a 256 "${archive}" | awk '{print $1}')"
+          actual_attestation_sha256="$(/usr/bin/shasum -a 256 "${attestation}" | awk '{print $1}')"
+          [[ "${actual_archive_sha256}" == "${EXPECTED_ARCHIVE_SHA256}" ]] || {
+            echo "error: unsigned-app archive SHA-256 mismatch" >&2
+            exit 1
+          }
+          [[ "${actual_attestation_sha256}" == "${EXPECTED_ATTESTATION_SHA256}" ]] || {
+            echo "error: unsigned-app attestation SHA-256 mismatch" >&2
+            exit 1
+          }
+          attested_prepare_runner_id="$(/usr/bin/plutil -extract prepareRunnerId raw -o - "${attestation}")"
+          [[ "${attested_prepare_runner_id}" == "${PREPARE_RUNNER_ID}" ]] || {
+            echo "error: attested preparation runner differs from the prepare job output" >&2
+            exit 1
+          }
+          [[ "${attested_prepare_runner_id}" != "${SIGNING_RUNNER_ID}" ]] || {
+            echo "error: attested preparation and signing runner identities must differ" >&2
+            exit 1
+          }
+          printf 'signing-runner-id=%s\n' "${SIGNING_RUNNER_ID}" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify source tag still resolves to the attested commit
+        if: steps.published-reconciliation.outputs.published != 'true'
+        env:
+          SOURCE_GITHUB_TOKEN: ${{ github.token }}
+          GH_REPO: OpenCoven/seer-releases
+          RELEASE_WRITER_LOGIN: ${{ secrets.RELEASE_WRITER_LOGIN }}
+          RELEASE_WRITER_ID: ${{ secrets.RELEASE_WRITER_ID }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          SOURCE_TAG: ${{ github.ref_name }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_RUN: ${{ github.run_id }}
+          WORKFLOW_ATTEMPT: ${{ github.run_attempt }}
+        run: bash scripts/release-macos-draft.sh verify-source-tag
+
+      # No dependency install or build command runs in this job. The signing-only
+      # script permits only fixed system tools while credentials exist, destroys
+      # its temporary keychain and notarization material, and only then invokes
+      # the checked-in Task 14 boundary scanner and manifest writer with Node.
+      - name: Sign and notarize attested input
+        if: steps.published-reconciliation.outputs.published != 'true'
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          BUILD_NUMBER: ${{ github.run_number }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          WORKFLOW_RUN: ${{ github.run_id }}
+          PREPARE_RUNNER_ID: ${{ needs.prepare.outputs.prepare-runner-id }}
+          SIGNING_RUNNER_ID: ${{ steps.signing-input.outputs.signing-runner-id }}
+          UNSIGNED_APP_ARCHIVE: ${{ github.workspace }}/build/macos/release-input/Seer-unsigned-arm64.tar
+          UNSIGNED_APP_ATTESTATION: ${{ github.workspace }}/build/macos/release-input/unsigned-app-attestation.json
+          UNSIGNED_APP_SHA256: ${{ needs.prepare.outputs.unsigned-archive-sha256 }}
+          UNSIGNED_APP_ATTESTATION_SHA256: ${{ needs.prepare.outputs.unsigned-attestation-sha256 }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+        run: bash scripts/package-macos-release.sh
+
+      - name: Allowlist public package outputs
+        if: steps.published-reconciliation.outputs.published != 'true'
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          RELEASE_DIR="build/macos/release"
+          expected=("Seer-v${VERSION}-arm64.dmg" "SHA256SUMS" "release-manifest.json")
+          entry_count="$(find "${RELEASE_DIR}" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')"
+          [[ "${entry_count}" == "${#expected[@]}" ]] || {
+            echo "error: release package contains an unexpected number of outputs" >&2
+            exit 1
+          }
+          for name in "${expected[@]}"; do
+            [[ -f "${RELEASE_DIR}/${name}" && ! -L "${RELEASE_DIR}/${name}" ]] || {
+              echo "error: missing or unsafe public release output ${name}" >&2
+              exit 1
+            }
+          done
+
+      - name: Generate path-free public release notes separately
+        if: steps.published-reconciliation.outputs.published != 'true'
+        id: release-notes
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          SOURCE_TAG: ${{ github.ref_name }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_RUN: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          notes_path="${RUNNER_TEMP}/release-notes.md"
+          [[ ! -e "${notes_path}" && ! -L "${notes_path}" ]]
+          umask 077
+          marker="$(bash scripts/release-macos-draft.sh marker)"
+          printf '%s\n\nSeer %s for Apple Silicon Macs running macOS 14 or later.\n' \
+            "${marker}" "${VERSION}" > "${notes_path}"
+          chmod 0644 "${notes_path}"
+          printf 'path=%s\n' "${notes_path}" >> "${GITHUB_OUTPUT}"
+
+      - name: Create published-retry verification directory
+        if: steps.published-reconciliation.outputs.published != 'true'
+        id: published-retry-state
+        run: |
+          set -euo pipefail
+          state_dir="${RUNNER_TEMP}/seer-published-retry-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          [[ ! -e "${state_dir}" && ! -L "${state_dir}" ]]
+          umask 077
+          mkdir "${state_dir}"
+          printf 'directory=%s\n' "${state_dir}" >> "${GITHUB_OUTPUT}"
+
+      - name: Create or resume draft and upload only public assets
+        if: steps.published-reconciliation.outputs.published != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          GH_REPO: OpenCoven/seer-releases
+          RELEASE_WRITER_LOGIN: ${{ secrets.RELEASE_WRITER_LOGIN }}
+          RELEASE_WRITER_ID: ${{ secrets.RELEASE_WRITER_ID }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          SOURCE_TAG: ${{ github.ref_name }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_RUN: ${{ github.run_id }}
+          WORKFLOW_ATTEMPT: ${{ github.run_attempt }}
+          RELEASE_BODY: ${{ steps.release-notes.outputs.path }}
+          RELEASE_DIR: build/macos/release
+          STATE_WORK_DIR: ${{ steps.published-retry-state.outputs.directory }}
+        run: bash scripts/release-macos-draft.sh upload
+
+      - name: Create fresh public-asset verification directory
+        if: steps.published-reconciliation.outputs.published != 'true'
+        id: public-assets
+        run: |
+          set -euo pipefail
+          verify_dir="${RUNNER_TEMP}/seer-public-assets-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          state_dir="${RUNNER_TEMP}/seer-release-state-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          [[ ! -e "${verify_dir}" && ! -L "${verify_dir}" ]]
+          [[ ! -e "${state_dir}" && ! -L "${state_dir}" ]]
+          umask 077
+          mkdir "${verify_dir}"
+          mkdir "${state_dir}"
+          printf 'directory=%s\n' "${verify_dir}" >> "${GITHUB_OUTPUT}"
+          printf 'state-directory=%s\n' "${state_dir}" >> "${GITHUB_OUTPUT}"
+          printf 'verified-state=%s\n' "${state_dir}/verified-release-state.json" >> "${GITHUB_OUTPUT}"
+
+      - name: Download only draft release assets
+        if: steps.published-reconciliation.outputs.published != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          GH_REPO: OpenCoven/seer-releases
+          VERSION: ${{ needs.prepare.outputs.version }}
+          VERIFY_DIR: ${{ steps.public-assets.outputs.directory }}
+        run: |
+          set -euo pipefail
+          gh release download "${GITHUB_REF_NAME}" \
+            --dir "${VERIFY_DIR}" \
+            --pattern "Seer-v${VERSION}-arm64.dmg" \
+            --pattern "SHA256SUMS" \
+            --pattern "release-manifest.json"
+
+      - name: Verify downloaded DMG and mounted app after credential teardown
+        if: steps.published-reconciliation.outputs.published != 'true'
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          VERIFY_DIR: ${{ steps.public-assets.outputs.directory }}
+        run: |
+          set -euo pipefail
+          expected=("Seer-v${VERSION}-arm64.dmg" "SHA256SUMS" "release-manifest.json")
+          entry_count="$(find "${VERIFY_DIR}" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')"
+          [[ "${entry_count}" == "${#expected[@]}" ]] || {
+            echo "error: downloaded release contains unexpected assets" >&2
+            exit 1
+          }
+          for name in "${expected[@]}"; do
+            [[ -f "${VERIFY_DIR}/${name}" && ! -L "${VERIFY_DIR}/${name}" ]]
+            cmp "build/macos/release/${name}" "${VERIFY_DIR}/${name}"
+          done
+          (
+            cd "${VERIFY_DIR}"
+            /usr/bin/shasum -a 256 -c SHA256SUMS
+          )
+
+          dmg="${VERIFY_DIR}/Seer-v${VERSION}-arm64.dmg"
+          /usr/bin/codesign --verify --strict --verbose=2 "${dmg}"
+          /usr/bin/xcrun stapler validate "${dmg}"
+          /usr/sbin/spctl --assess --type open --context context:primary-signature --verbose=4 "${dmg}"
+
+          mount_point="${RUNNER_TEMP}/seer-dmg-mount-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          [[ ! -e "${mount_point}" && ! -L "${mount_point}" ]]
+          mkdir "${mount_point}"
+          mounted=0
+          cleanup() {
+            status=$?
+            trap - EXIT HUP INT TERM
+            set +e
+            if [[ "${mounted}" -eq 1 ]]; then
+              /usr/bin/hdiutil detach "${mount_point}"
+            fi
+            rmdir "${mount_point}" >/dev/null 2>&1
+            exit "${status}"
+          }
+          trap cleanup EXIT
+          trap 'exit 129' HUP
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+
+          /usr/bin/hdiutil attach "${dmg}" \
+            -readonly \
+            -nobrowse \
+            -noautoopen \
+            -mountpoint "${mount_point}"
+          mounted=1
+
+          app="${mount_point}/Seer.app"
+          node scripts/check-release-boundary.mjs \
+            --dmg-root "${mount_point}" \
+            --forbid-path "${GITHUB_WORKSPACE}" \
+            --forbid-path "${VERIFY_DIR}"
+          /usr/bin/codesign --verify --deep --strict --verbose=2 "${app}"
+          /usr/bin/xcrun stapler validate "${app}"
+          /usr/sbin/spctl --assess --type execute --verbose=4 "${app}"
+          [[ "$(/usr/bin/lipo -archs "${app}/Contents/MacOS/Seer")" == "arm64" ]]
+
+          /usr/bin/hdiutil detach "${mount_point}"
+          mounted=0
+
+      - name: Capture the exact verified draft state
+        if: steps.published-reconciliation.outputs.published != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          GH_REPO: OpenCoven/seer-releases
+          RELEASE_WRITER_LOGIN: ${{ secrets.RELEASE_WRITER_LOGIN }}
+          RELEASE_WRITER_ID: ${{ secrets.RELEASE_WRITER_ID }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          SOURCE_TAG: ${{ github.ref_name }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_RUN: ${{ github.run_id }}
+          WORKFLOW_ATTEMPT: ${{ github.run_attempt }}
+          RELEASE_BODY: ${{ steps.release-notes.outputs.path }}
+          RELEASE_DIR: ${{ steps.public-assets.outputs.directory }}
+          VERIFIED_STATE: ${{ steps.public-assets.outputs.verified-state }}
+          STATE_WORK_DIR: ${{ steps.public-assets.outputs.state-directory }}
+        run: bash scripts/release-macos-draft.sh capture
+
+      - name: Publish only the verified draft
+        if: steps.published-reconciliation.outputs.published != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          SOURCE_GITHUB_TOKEN: ${{ github.token }}
+          GH_REPO: OpenCoven/seer-releases
+          RELEASE_WRITER_LOGIN: ${{ secrets.RELEASE_WRITER_LOGIN }}
+          RELEASE_WRITER_ID: ${{ secrets.RELEASE_WRITER_ID }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          SOURCE_TAG: ${{ github.ref_name }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_RUN: ${{ github.run_id }}
+          WORKFLOW_ATTEMPT: ${{ github.run_attempt }}
+          RELEASE_BODY: ${{ steps.release-notes.outputs.path }}
+          RELEASE_DIR: ${{ steps.public-assets.outputs.directory }}
+          VERIFIED_STATE: ${{ steps.public-assets.outputs.verified-state }}
+          STATE_WORK_DIR: ${{ steps.public-assets.outputs.state-directory }}
+        run: bash scripts/release-macos-draft.sh publish
+
+      - name: Always release the exact owned remote lock
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          GH_REPO: OpenCoven/seer-releases
+          RELEASE_WRITER_LOGIN: ${{ secrets.RELEASE_WRITER_LOGIN }}
+          RELEASE_WRITER_ID: ${{ secrets.RELEASE_WRITER_ID }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          SOURCE_TAG: ${{ github.ref_name }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_RUN: ${{ github.run_id }}
+          WORKFLOW_ATTEMPT: ${{ github.run_attempt }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: bash scripts/release-macos-draft.sh release-lock

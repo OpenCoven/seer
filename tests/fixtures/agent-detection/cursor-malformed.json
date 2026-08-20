@@ -1,0 +1,10 @@
+{
+  "composerKey": "cursor-malformed-composer",
+  "record": {
+    "status": 7,
+    "lastUpdatedAt": null,
+    "fullConversationHeadersOnly": [
+      { "type": 1 }
+    ]
+  }
+}

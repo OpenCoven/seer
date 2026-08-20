@@ -9,12 +9,22 @@
   "type": "module",
   "scripts": {
     "build": "node glaze.ts build",
+    "build:standalone-renderer": "node scripts/build-standalone-renderer.mjs",
+    "generate:macos": "node scripts/build-standalone-renderer.mjs -- xcodegen generate --spec apps/macos/Seer/project.yml",
+    "test:macos": "node scripts/build-standalone-renderer.mjs -- bash scripts/test-macos.sh",
+    "build:macos": "node scripts/build-standalone-renderer.mjs -- bash scripts/build-macos-app.sh",
+    "check:standalone-boundary": "node scripts/check-standalone-boundary.mjs",
+    "test:build-macos-destination-safety": "node --test tests/safe-app-publication.test.mjs",
+    "test:standalone-safe": "node scripts/run-standalone-tests.mjs",
     "dev": "node glaze.ts dev",
     "dev:renderer": "node glaze.ts dev:renderer",
     "lint": "node glaze.ts lint",
+    "lint:standalone": "eslint --no-error-on-unmatched-pattern --config eslint.standalone.config.js renderer main/services/agent-detection-policy.ts main/services/update-check.ts vite.standalone.config.ts",
     "type-check": "node glaze.ts type-check",
+    "type-check:standalone": "tsc -p tsconfig.standalone.json --noEmit",
     "format": "node glaze.ts format",
-    "test": "node --test tests/*.test.mjs"
+    "test": "node --test --test-concurrency=1 tests/*.test.mjs",
+    "test:renderer": "tsx --test renderer/**/*.test.ts main/services/*.test.ts"
   },
   "dependencies": {
     "@radix-ui/colors": "^3.0.0",
@@ -45,6 +55,7 @@
     "eslint": "^9.39.2",
     "eslint-plugin-import": "^2.31.0",
     "globals": "^17.3.0",
+    "js-yaml": "^4.3.1",
     "oxfmt": "^0.26.0",
     "tailwindcss": "^4.2.2",
     "tsx": "^4.20.5",

@@ -26,8 +26,9 @@ pass the same parity matrix.
 - The app uses Hardened Runtime without App Sandbox.
 - Source remains private.
 - Public binaries are published through `OpenCoven/seer-releases`.
-- Signing, notarization, and release credentials are secrets scoped to the
-  protected `macos-release` GitHub environment.
+- Signing, notarization, and release credentials, plus all approval-critical
+  protected configuration, are environment secrets scoped to the protected
+  `macos-release` GitHub environment.
 
 ## Goals
 
@@ -397,26 +398,48 @@ The release target uses Hardened Runtime and no App Sandbox entitlement. The
 entitlements file contains only capabilities demonstrated to be necessary.
 The app is signed with an OpenCoven Developer ID Application identity.
 
-The protected `macos-release` environment uses secrets following the existing
-OpenCoven macOS naming convention:
+The following 15 names form the authoritative **union audit set** across the
+two supported `macos-release` configurations. They are not all provisioned at
+once: the five notarization names include two mutually exclusive methods.
+Notarization uses exactly one complete method, either API-key or Apple ID; the
+methods are mutually exclusive and never both configured.
 
-| Secret | Purpose |
+| Environment secret | Purpose |
 | --- | --- |
 | `APPLE_CERTIFICATE` | Base64-encoded Developer ID Application `.p12` |
 | `APPLE_CERTIFICATE_PASSWORD` | Password for the `.p12` |
-| `APPLE_SIGNING_IDENTITY` | Exact Developer ID identity |
 | `APPLE_API_ISSUER` | App Store Connect issuer UUID |
 | `APPLE_API_KEY` | App Store Connect key ID |
 | `APPLE_API_KEY_BASE64` | Base64-encoded `.p8` key |
-| `APPLE_ID` | Apple ID for the supported notarization fallback |
-| `APPLE_PASSWORD` | App-specific password for the notarization fallback |
-| `APPLE_TEAM_ID` | Apple Developer team ID |
-| `RELEASES_REPO_TOKEN` | Fine-grained token limited to release writes in `OpenCoven/seer-releases` |
+| `APPLE_ID` | Apple ID for the alternative notarization method |
+| `APPLE_PASSWORD` | App-specific password for the alternative notarization method |
+| `RELEASES_REPO_TOKEN` | Fine-grained token limited to contents/release writes and immutable-release configuration reads in `OpenCoven/seer-releases`; its exact identity is the sole release writer |
+| `BINARY_DISTRIBUTION_APPROVED` | Exact `true` approval for binary distribution |
+| `PARITY_MATRIX_APPROVED` | Exact `true` approval for the parity matrix |
+| `CLEAN_MACHINE_VERIFIED_COMMIT` | Exact lowercase 40-character release commit verified on a clean machine |
+| `RELEASE_WRITER_LOGIN` | Exact canonical login of the release-token owner |
+| `RELEASE_WRITER_ID` | Exact positive numeric GitHub ID of the release-token owner |
+| `APPLE_SIGNING_IDENTITY` | Exact `Developer ID Application: … (TEAMID)` authority |
+| `APPLE_TEAM_ID` | 10-character Apple Developer team ID |
 
-App Store Connect API-key authentication is the default notarization path.
-`APPLE_ID`, `APPLE_PASSWORD`, and `APPLE_TEAM_ID` provide the documented
-fallback if API-key authentication is unavailable; the workflow selects one
-complete credential set and fails rather than mixing partial sets.
+The final seven rows are semantically non-sensitive protected configuration,
+but they are deliberately stored as environment secrets rather than Actions
+variables. This guarantees environment-over-repository-over-organization
+precedence and binds their use to environment approval. Provision the signing,
+publication, and seven protected-configuration names with
+`gh secret set <NAME> --repo OpenCoven/seer --env macos-release`, plus exactly
+one complete notarization method: all three App Store Connect API-key names or
+both Apple ID names, never both methods. Every name belonging to the unused
+method must be absent from the environment.
+
+The 15-name union audit set remains the scope for repository- and
+organization-level duplicate audits, including names from the unused method.
+Repository-scope duplicates must be absent, and organization secrets must be
+absent or restricted so `OpenCoven/seer` cannot access them. Audits use
+`gh secret list --json name,updatedAt` to verify names and timestamps only; they
+never print values, including the non-sensitive seven. App Store Connect API-key
+authentication is recommended; Apple ID is the mutually exclusive alternative.
+Partial credentials, both complete methods, or neither complete method fail.
 
 The workflow creates a temporary keychain and deletes key material and the
 keychain in an `always()` cleanup step. Secret values are never written to
@@ -443,6 +466,14 @@ The release workflow:
 15. Downloads and re-verifies every uploaded artifact.
 16. Publishes the release only after all checks pass.
 
+Before step 13, the workflow acquires a tag-scoped lock ref atomically in the
+release repository. Its annotated tag binds the source tag, source commit,
+workflow run, and attempt to a verified existing release-repository commit.
+One repository-global `queue: max` workflow concurrency group and this lock
+replace unsupported release `If-Match` compare-and-swap semantics. Every
+mutating phase verifies exact lock ownership; an `always()` step removes only
+the owned lock ref.
+
 The public release repository contains a product README and release metadata,
 not application source. Its automatically generated source archive therefore
 contains only that public repository's metadata.
@@ -454,6 +485,52 @@ contains only that public repository's metadata.
 - Failed workflows leave no published partial release. A draft may remain for
   maintainers to inspect or delete.
 - The cross-repository token is fine-grained and cannot read private source.
+- GitHub immutable releases must be enabled and is verified through the
+  repository API before release work. The published release must report itself
+  immutable.
+- The protected token's API login and numeric ID must match the configured
+  writer, and every release author and asset uploader must match that identity.
+- Within the repository-global queue, publication performs two matching,
+  exhaustive authenticated pagination scans of the release list. A scan ends
+  only on a short page; reaching the configured maximum with a full page fails
+  as possible truncation. All authenticated stable published releases must have
+  positive safe IDs, `draft=false`, `prerelease=false`, `immutable=true`, and
+  unique bounded canonical semantic-version tags. Every stable entry must also
+  have the exact protected writer as author and exactly its versioned public
+  three-asset allowlist, with every uploader equal to that writer. Historical
+  candidates are trusted from validated metadata without downloading their
+  bytes. Drafts and prereleases are excluded from the maximum, but the exact
+  current draft ID and tag must appear in the inventory. Authenticated
+  `/releases/latest` must independently pass the same author/uploader/asset
+  checks and equal the inventory's fully trusted global semantic-version
+  maximum, or return the canonical 404 when there are no stable candidates.
+  Overflow-safe comparison then explicitly sets `make_latest: "true"` for the
+  first or a strictly newer version and `make_latest: "false"` for a lower
+  backport; a same version fails.
+- Inventory and latest selection complete before final draft verification.
+  Immediately before publication, the workflow refetches the selected draft
+  metadata and freshly downloads every exact asset ID to compare release/asset
+  IDs, sizes, server digests, uploader identities, local notes, and hashes with
+  captured state. It then re-resolves the source tag, verifies the destination
+  anchor/tag, and revalidates the remote lock as the final operations before
+  `PATCH`. GitHub release `PATCH` does not support `If-Match`, so the interval
+  after the final draft comparison is an unavoidable non-atomic API boundary.
+  It contains only the required source-tag, destination, and lock reads followed
+  by `PATCH`; `PATCH` is the immediate request after the final lock response.
+  The boundary contains no scan, download, build, or other long-running work.
+  The workflow refetches after the normal `draft:false` PATCH; any mismatch
+  fails loudly and never deletes the release.
+- Post-publication verification refetches a fresh exhaustive inventory and
+  `/releases/latest`, requires the current release to be present as stable and
+  immutable, and proves that latest is exactly the fresh global maximum.
+  Published reconciliation independently refetches a fresh exhaustive inventory
+  of all authenticated stable published releases and `/releases/latest` without
+  reusing prior decision state. The current published release must appear
+  exactly in that inventory. An intervening higher release is acceptable only
+  when it is the genuine global maximum and latest has its exact ID and tag.
+  Malformed or duplicate stable entries, list mutation, truncation, pointer
+  mismatch, ambiguous responses, or API errors fail before `published=true`.
+  Reconciliation never mutates immutable published metadata.
 - Release jobs use a protected GitHub environment with required approval.
 - Workflow actions are pinned to immutable commit SHAs.
 - The build fails if the runner is not arm64.

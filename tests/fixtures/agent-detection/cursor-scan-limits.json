@@ -1,0 +1,12 @@
+{
+  "_comment": "Single source of truth for Cursor SQLite scan bounds. apps/macos/Seer/Sources/Detection/SessionSnapshotSource.swift, apps/macos/Seer/Sources/Detection/TurnAssessors.swift, and main/services/agent-detection-policy.ts (imported by main/services/agent-detector.ts) each hardcode these same values under their own naming convention; a parity test in each language asserts against this file so the two scanners can never silently drift apart.",
+  "cursorMaximumValidCandidates": 200,
+  "cursorMaximumKeyBytes": 4096,
+  "cursorMaximumValueBytes": 4000000,
+  "cursorSQLiteBusyTimeoutMilliseconds": 100,
+  "cursorSQLiteQueryDeadlineMilliseconds": 4000,
+  "cursorMaximumInspectedRows": 2000,
+  "cursorMaximumTotalDecodedValueBytes": 64000000,
+  "cursorMaximumBubbleLookups": 400,
+  "cursorMaximumRecentHeadersPerComposer": 8
+}

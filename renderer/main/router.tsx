@@ -8,13 +8,13 @@ import { HomeView } from "./home-view";
 import { HistoryView } from "./history-view";
 import { RootView } from "./root-view";
 import { QueryClient } from "@tanstack/react-query";
-import { ErrorBoundaryView } from "@glaze/core/components";
+import { RouteErrorBoundary } from "../ui/error-boundary";
 
 const rootRoute = createRootRouteWithContext<{
   queryClient: QueryClient;
 }>()({
   component: RootView,
-  errorComponent: ErrorBoundaryView,
+  errorComponent: RouteErrorBoundary,
   notFoundComponent: () => {
     return (
       <div className="flex flex-col items-center justify-center h-screen">
@@ -63,7 +63,7 @@ declare module "@tanstack/react-router" {
   }
   interface StaticDataRouteOption {
     title?: string;
-    component?: any;
+    component?: unknown;
   }
 }
 

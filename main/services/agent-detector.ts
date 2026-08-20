@@ -3,44 +3,83 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
+import { Worker } from "node:worker_threads";
 
 import { logger } from "@glaze/core/backend";
 
+import {
+  AGENT_KINDS,
+  assessClaudeTurn,
+  assessCodexTurn,
+  assessCursorComposerRecord,
+  assessGenericMtime,
+  assessGrokTurn,
+  assessValidatedCursorComposerRecord,
+  buildFriendlyDetail,
+  codexProjectLabelFromPath,
+  CURSOR_MAX_ACTIVE_CANDIDATES,
+  CURSOR_MAX_BUBBLE_LOOKUPS,
+  CURSOR_MAX_INSPECTED_ROWS,
+  CURSOR_MAX_KEY_BYTES,
+  CURSOR_MAX_RECENT_HEADERS_PER_COMPOSER,
+  CURSOR_MAX_TOTAL_DECODED_VALUE_BYTES,
+  CURSOR_MAX_VALUE_BYTES,
+  CURSOR_RUNNING_TOOL_STATUSES,
+  CURSOR_SQLITE_BUSY_TIMEOUT_MS,
+  CURSOR_SQLITE_QUERY_DEADLINE_MS,
+  CURSOR_TIMESTAMP_SQL_FUNCTION_NAME,
+  cursorCanonicalIsoStringToEpochMs,
+  cursorHeaderGrouping,
+  cursorProjectLabel,
+  cursorRecencySqlExpression,
+  cursorRelevantBubbleIds,
+  daysFromCivil,
+  daysInGregorianMonth,
+  epochMsFromCanonicalCursorIsoComponents,
+  friendlySessionLabel,
+  humanizeProjectName,
+  isCanonicalCursorIsoTimestamp,
+  isDefinitelyOlderThanWindowLowerBound,
+  isGregorianLeapYear,
+  isPlainCursorObject,
+  isRecentTimestamp,
+  malformedCursorAssessment,
+  matchAgentKind,
+  MAX_SUPPORTED_TIMESTAMP_MS,
+  parseCanonicalCursorIsoComponents,
+  parseCursorTimestamp,
+  parseTimestamp,
+  PROCESS_ONLY_CPU_THRESHOLD,
+  SESSION_CANDIDATE_WINDOW_MS,
+  titleCaseWords,
+  TIMESTAMP_FUTURE_SKEW_MS,
+  TOOL_TURN_GRACE_MS,
+  TURN_ACTIVE_GRACE_MS,
+  utf8ByteLength,
+  validateCursorHeaders,
+  validateCursorRecordFields,
+  validateOptionalString,
+  type AgentKind,
+  type TurnAssessment,
+} from "./agent-detection-policy.js";
 import type { ActiveAgent, AgentActivitySource } from "./types.js";
 
 const execFileAsync = promisify(execFile);
 
 /**
- * Detection policy:
- * - Prefer session/transcript turn state over process presence.
- * - Idle agent processes (terminal open, waiting for input) must NOT keep the Mac awake.
- * - Process CPU alone is never enough for agents that leave daemons running.
+ * IO-bound session/process scanning for agent detection. Pure policy
+ * (agent definitions, timestamp parsing, friendly labels, turn assessors,
+ * and the CPU threshold) lives in `agent-detection-policy.ts` — see that
+ * module for the shared detection-policy contract. This module owns every
+ * filesystem read, process listing, and SQLite query, and calls into the
+ * pure policy module to interpret what it reads.
  */
-const SESSION_CANDIDATE_WINDOW_MS = 10 * 60_000;
-const TURN_ACTIVE_GRACE_MS = 45_000;
-const TOOL_TURN_GRACE_MS = 3 * 60_000;
-/**
- * Codex writes explicit turn boundaries (task_started … task_complete), so an
- * open turn can be trusted far longer than a bare event — long builds/tests can
- * run for minutes without a single rollout write. Bounded so a crashed app
- * can't caffeinate forever (the 10 min candidate window caps it anyway).
- */
-const CODEX_OPEN_TURN_GRACE_MS = 8 * 60_000;
-const CODEX_TAIL_QUIET_MS = 15_000;
-const CODEX_HEAD_SCAN_BYTES = 32_000;
-const PROCESS_ONLY_CPU_THRESHOLD = 25;
 const MAX_SESSION_WALK_DEPTH = 5;
 const MAX_SESSION_FILES_PER_ROOT = 400;
+export const MAX_SESSION_INSPECTED_ENTRIES_PER_ROOT = 2_048;
+export const MAX_SESSION_INSPECTED_DIRECTORIES_PER_ROOT = 128;
 const SESSION_TAIL_BYTES = 120_000;
-
-/**
- * Grok CLI brackets every turn with turn_started … turn_ended in events.jsonl,
- * so an open turn is trustworthy for the same window as Codex. Streaming phase
- * events are extremely chatty, so the tail can flood past the turn boundary —
- * see the fallback in assessGrokTurn.
- */
-const GROK_OPEN_TURN_GRACE_MS = 8 * 60_000;
-const GROK_TAIL_QUIET_MS = 15_000;
+const CODEX_HEAD_SCAN_BYTES = 32_000;
 
 /**
  * EXPERIMENTAL Raycast AI log hack (not a supported API).
@@ -60,22 +99,6 @@ const RAYCAST_OPEN_TURN_GRACE_MS = 5 * 60_000;
 const RAYCAST_STREAM_RECENT_MS = 8_000;
 const RAYCAST_LOG_TAIL_BYTES = 250_000;
 
-type AgentKind = {
-  id: string;
-  name: string;
-  processMatchers: RegExp[];
-  sessionRoots: string[];
-  sessionExtensions: string[];
-  /** Only consider session files with these exact names (e.g. Grok's events.jsonl). */
-  sessionFileNames?: string[];
-  /** How to interpret session files for this agent family. */
-  sessionFormat: "claude" | "codex" | "grok" | "generic-mtime" | "cursor" | "none";
-  /** If true, never treat bare process CPU as active work. */
-  requireSessionTurn?: boolean;
-  /** Allow high-CPU process fallback even when a session format exists (e.g. Cursor CLI). */
-  allowProcessFallback?: boolean;
-};
-
 type ProcessHit = {
   pid: number;
   cpuPercent: number;
@@ -88,278 +111,8 @@ type SessionCandidate = {
   label: string;
 };
 
-type TurnAssessment = {
-  active: boolean;
-  lastActivityAt: number;
-  reason: string;
-};
-
-const AGENT_KINDS: AgentKind[] = [
-  {
-    id: "claude-code",
-    name: "Claude Code",
-    processMatchers: [/(^|[/\s])claude(\s|$)/i, /@anthropic-ai\/claude-code/, /claude[-_]code/i],
-    sessionRoots: [".claude/projects"],
-    sessionExtensions: [".jsonl"],
-    sessionFormat: "claude",
-    requireSessionTurn: true,
-  },
-  {
-    id: "codex",
-    name: "Codex",
-    processMatchers: [/(^|[/\s])codex(\s|$)/i, /@openai\/codex/],
-    sessionRoots: [".codex/sessions"],
-    sessionExtensions: [".jsonl"],
-    sessionFormat: "codex",
-    requireSessionTurn: true,
-  },
-  {
-    id: "grok",
-    name: "Grok",
-    // The launcher lives in ~/.grok/bin; the real binary is ~/.grok/downloads/grok-<ver>-macos-*.
-    processMatchers: [
-      /(^|[/\s])grok(\s|$)/i,
-      /\.grok\/(?:bin|downloads)\//i,
-      /grok-\d+\.\d+\.\d+-macos/i,
-    ],
-    sessionRoots: [".grok/sessions"],
-    sessionExtensions: [".jsonl"],
-    // Sessions also hold chat_history/updates/rewind_points — only events.jsonl has turn state.
-    sessionFileNames: ["events.jsonl"],
-    sessionFormat: "grok",
-    requireSessionTurn: true,
-  },
-  {
-    id: "gemini",
-    name: "Gemini CLI",
-    processMatchers: [/(^|[/\s])gemini(\s|$)/i, /@google\/gemini-cli/],
-    sessionRoots: [".gemini"],
-    sessionExtensions: [".jsonl", ".json"],
-    sessionFormat: "generic-mtime",
-  },
-  {
-    id: "aider",
-    name: "Aider",
-    processMatchers: [/(^|[/\s])aider(\s|$)/i],
-    sessionRoots: [],
-    sessionExtensions: [],
-    sessionFormat: "none",
-  },
-  {
-    id: "opencode",
-    name: "OpenCode",
-    processMatchers: [/(^|[/\s])opencode(\s|$)/i],
-    sessionRoots: [".local/share/opencode", ".config/opencode"],
-    sessionExtensions: [".jsonl", ".json"],
-    sessionFormat: "generic-mtime",
-  },
-  {
-    id: "goose",
-    name: "Goose",
-    processMatchers: [/(^|[/\s])goose(\s|$)/i],
-    sessionRoots: [".config/goose"],
-    sessionExtensions: [".jsonl", ".json"],
-    sessionFormat: "generic-mtime",
-  },
-  {
-    id: "amp",
-    name: "Amp",
-    processMatchers: [/(^|[/\s])amp(\s|$)/i, /@sourcegraph\/amp/],
-    sessionRoots: [],
-    sessionExtensions: [],
-    sessionFormat: "none",
-  },
-  {
-    id: "cursor",
-    name: "Cursor",
-    // IDE agent is detected via composer state; process matchers cover the CLI only.
-    // Do not match bare Cursor.app — it stays open while idle.
-    processMatchers: [
-      /(^|[/\s])cursor-agent(\s|$)/i,
-      /cursor-agent-svc/i,
-      /cursor(?:-agent)?(?:\.js)?\s+--agent\b/i,
-    ],
-    sessionRoots: [],
-    sessionExtensions: [],
-    sessionFormat: "cursor",
-    allowProcessFallback: true,
-  },
-  {
-    id: "continue",
-    name: "Continue",
-    processMatchers: [/continue-cli/i, /@continuedev\/cli/],
-    sessionRoots: [".continue/sessions"],
-    sessionExtensions: [".jsonl", ".json"],
-    sessionFormat: "generic-mtime",
-  },
-];
-
-const CLAUDE_METADATA_TYPES = new Set([
-  "last-prompt",
-  "mode",
-  "permission-mode",
-  "queue-operation",
-  "ai-title",
-  "custom-title",
-  "agent-name",
-  "pr-link",
-  "file-history-snapshot",
-]);
-
 function homePath(...parts: string[]): string {
   return path.join(os.homedir(), ...parts);
-}
-
-function titleCaseWords(raw: string): string {
-  return raw
-    .split(/[\s_./]+/)
-    .filter(Boolean)
-    .map((word) => {
-      if (/^[A-Z0-9]{2,}$/.test(word)) return word;
-      if (word.length <= 2 && word === word.toLowerCase()) return word;
-      return word.charAt(0).toUpperCase() + word.slice(1);
-    })
-    .join(" ");
-}
-
-/** Turn path slugs / bundle ids into short display names. */
-function humanizeProjectName(raw: string): string {
-  let value = raw.trim();
-  if (!value) return "";
-
-  // my-project-local-1pwq7g9n → my-project
-  value = value.replace(/-local-[a-z0-9]+$/i, "");
-  // strip trailing build-ish ids
-  value = value.replace(/-[a-f0-9]{6,}$/i, "");
-  value = value.replace(/[_./]+/g, "-");
-  value = value.replace(/-+/g, "-").replace(/^-|-$/g, "");
-
-  const titled = titleCaseWords(value.replace(/-/g, " "));
-  return titled || raw;
-}
-
-/** Grok sessions live at .grok/sessions/<url-encoded cwd>/<session id>/events.jsonl. */
-function grokProjectLabel(filePath: string): string {
-  const parts = filePath.split(path.sep);
-  const encodedCwd = parts[parts.length - 3];
-  if (!encodedCwd) return "";
-
-  let decoded: string;
-  try {
-    decoded = decodeURIComponent(encodedCwd);
-  } catch {
-    return "";
-  }
-
-  const base = path.basename(decoded.replace(/[/\\]+$/, ""));
-  return base ? humanizeProjectName(base) : "";
-}
-
-function friendlySessionLabel(filePath: string): string {
-  const parts = filePath.split(path.sep);
-  const file = parts[parts.length - 1] ?? "session";
-  const parent = parts[parts.length - 2] ?? "";
-
-  // Grok's session id folder is a uuid — the project comes from the encoded cwd above it.
-  if (file === "events.jsonl") return grokProjectLabel(filePath);
-
-  // Codex rollouts live under sessions/YYYY/MM/DD — the project comes from the
-  // session's cwd instead, so don't label the agent with a date folder.
-  if (file.startsWith("rollout-")) return "";
-
-  if (parent.startsWith("-")) {
-    const withoutLeading = parent.replace(/^-/, "");
-    const [primary = withoutLeading] = withoutLeading.split("--");
-    const segments = primary.split("-").filter(Boolean);
-
-    const appsIdx = segments.lastIndexOf("apps");
-    if (appsIdx >= 0 && appsIdx < segments.length - 1) {
-      return humanizeProjectName(segments.slice(appsIdx + 1).join("-"));
-    }
-
-    const codeIdx = segments.lastIndexOf("Code");
-    if (codeIdx >= 0 && codeIdx < segments.length - 1) {
-      return humanizeProjectName(segments.slice(codeIdx + 1).join("-"));
-    }
-
-    return humanizeProjectName(segments.slice(-3).join("-")) || "Project";
-  }
-
-  if (parent && parent !== "sessions" && parent !== "projects") {
-    return humanizeProjectName(parent);
-  }
-
-  return humanizeProjectName(file.replace(/\.jsonl?$/i, "")) || "Session";
-}
-
-/** Internal turn reasons → short, human activity copy. */
-function friendlyActivity(reason: string | undefined, processOnly: boolean): string {
-  if (processOnly) return "Busy";
-  if (!reason) return "Working";
-
-  const normalized = reason.toLowerCase();
-  if (
-    normalized.includes("tool_use") ||
-    normalized.includes("tool_call") ||
-    normalized.includes("function_call")
-  ) {
-    return "Running tools";
-  }
-  if (normalized.includes("awaiting model") || normalized.includes("tool result")) {
-    return "Thinking";
-  }
-  if (normalized.includes("reasoning") || normalized.includes("thinking")) {
-    return "Thinking";
-  }
-  if (
-    normalized.includes("assistant") ||
-    normalized.includes("agent_message") ||
-    normalized.includes("agent_reasoning")
-  ) {
-    return "Writing";
-  }
-  if (normalized.includes("user prompt") || normalized.includes("started")) {
-    return "Started";
-  }
-  if (normalized.includes("streaming")) return "Writing";
-  if (normalized.includes("generating") || normalized.includes("continuation")) {
-    return "Writing";
-  }
-  if (normalized.includes("recent session")) return "Active";
-  if (normalized.startsWith("stale")) return "Wrapping up";
-  return "Working";
-}
-
-function buildFriendlyDetail(options: {
-  projectLabel?: string;
-  reason?: string;
-  processOnly?: boolean;
-}): string {
-  const activity = friendlyActivity(options.reason, options.processOnly === true);
-  if (options.projectLabel) {
-    return `${options.projectLabel} · ${activity}`;
-  }
-  return activity;
-}
-
-function matchAgentKind(command: string): AgentKind | null {
-  for (const kind of AGENT_KINDS) {
-    if (kind.processMatchers.some((re) => re.test(command))) {
-      return kind;
-    }
-  }
-  return null;
-}
-
-function parseTimestamp(value: unknown, fallbackMs: number): number {
-  if (typeof value === "number" && Number.isFinite(value)) {
-    return value > 1e12 ? value : value * 1000;
-  }
-  if (typeof value === "string" && value.trim()) {
-    const parsed = Date.parse(value);
-    if (Number.isFinite(parsed)) return parsed;
-  }
-  return fallbackMs;
 }
 
 async function listProcesses(): Promise<ProcessHit[]> {
@@ -396,31 +149,63 @@ async function listProcesses(): Promise<ProcessHit[]> {
   }
 }
 
-async function walkRecentSessions(
+type SessionWalkResult = {
+  candidates: SessionCandidate[];
+  inspectedEntries: number;
+  inspectedDirectories: number;
+};
+
+export async function walkRecentSessionsWithStats(
   root: string,
   extensions: string[],
   now: number,
   fileNames?: string[],
-): Promise<SessionCandidate[]> {
+): Promise<SessionWalkResult> {
   const hits: SessionCandidate[] = [];
+  const budget = {
+    inspectedEntries: 0,
+    inspectedDirectories: 0,
+  };
+
+  function retainRecent(candidate: SessionCandidate): void {
+    if (hits.length < MAX_SESSION_FILES_PER_ROOT) {
+      hits.push(candidate);
+      return;
+    }
+    let oldestIndex = 0;
+    for (let index = 1; index < hits.length; index += 1) {
+      if (hits[index]!.mtimeMs < hits[oldestIndex]!.mtimeMs) oldestIndex = index;
+    }
+    if (candidate.mtimeMs > hits[oldestIndex]!.mtimeMs) hits[oldestIndex] = candidate;
+  }
 
   async function walk(dir: string, depth: number): Promise<void> {
-    if (hits.length >= MAX_SESSION_FILES_PER_ROOT) return;
     if (depth > MAX_SESSION_WALK_DEPTH) return;
+    if (budget.inspectedEntries >= MAX_SESSION_INSPECTED_ENTRIES_PER_ROOT) return;
+    if (budget.inspectedDirectories >= MAX_SESSION_INSPECTED_DIRECTORIES_PER_ROOT) return;
 
-    let entries;
+    let directory;
     try {
-      entries = await fs.readdir(dir, { withFileTypes: true });
+      directory = await fs.opendir(dir);
     } catch {
       return;
     }
+    budget.inspectedDirectories += 1;
 
-    for (const entry of entries) {
-      if (hits.length >= MAX_SESSION_FILES_PER_ROOT) break;
+    for await (const entry of directory) {
+      if (budget.inspectedEntries >= MAX_SESSION_INSPECTED_ENTRIES_PER_ROOT) break;
+      budget.inspectedEntries += 1;
 
       const fullPath = path.join(dir, entry.name);
+      let stat;
+      try {
+        stat = await fs.lstat(fullPath);
+      } catch {
+        continue;
+      }
+      if (stat.isSymbolicLink()) continue;
 
-      if (entry.isDirectory()) {
+      if (stat.isDirectory()) {
         if (entry.name === "node_modules" || entry.name === ".git" || entry.name === "cache") {
           continue;
         }
@@ -430,35 +215,36 @@ async function walkRecentSessions(
         continue;
       }
 
-      if (!entry.isFile()) continue;
+      if (!stat.isFile()) continue;
       if (fileNames && !fileNames.includes(entry.name)) continue;
       if (!extensions.some((ext) => entry.name.endsWith(ext))) continue;
 
-      try {
-        const stat = await fs.stat(fullPath);
-        const age = now - stat.mtimeMs;
-        if (age <= SESSION_CANDIDATE_WINDOW_MS) {
-          hits.push({
-            filePath: fullPath,
-            mtimeMs: stat.mtimeMs,
-            label: friendlySessionLabel(fullPath),
-          });
-        }
-      } catch {
-        // ignore
+      if (isRecentTimestamp(stat.mtimeMs, now, SESSION_CANDIDATE_WINDOW_MS)) {
+        retainRecent({
+          filePath: fullPath,
+          mtimeMs: stat.mtimeMs,
+          label: friendlySessionLabel(fullPath),
+        });
       }
     }
   }
 
-  try {
-    await fs.access(root);
-  } catch {
-    return hits;
-  }
-
   await walk(root, 0);
   hits.sort((a, b) => b.mtimeMs - a.mtimeMs);
-  return hits;
+  return {
+    candidates: hits,
+    inspectedEntries: budget.inspectedEntries,
+    inspectedDirectories: budget.inspectedDirectories,
+  };
+}
+
+async function walkRecentSessions(
+  root: string,
+  extensions: string[],
+  now: number,
+  fileNames?: string[],
+): Promise<SessionCandidate[]> {
+  return (await walkRecentSessionsWithStats(root, extensions, now, fileNames)).candidates;
 }
 
 async function readSessionTailLines(filePath: string): Promise<unknown[]> {
@@ -494,194 +280,6 @@ async function readSessionTailLines(filePath: string): Promise<unknown[]> {
   }
 }
 
-function assessClaudeTurn(events: unknown[], mtimeMs: number, now: number): TurnAssessment {
-  for (let i = events.length - 1; i >= 0; i -= 1) {
-    const event = events[i];
-    if (!event || typeof event !== "object") continue;
-    const record = event as Record<string, unknown>;
-    const type = typeof record.type === "string" ? record.type : "";
-
-    if (CLAUDE_METADATA_TYPES.has(type)) continue;
-
-    const timestamp = parseTimestamp(record.timestamp, mtimeMs);
-    const age = now - timestamp;
-
-    if (type === "system") {
-      const subtype = typeof record.subtype === "string" ? record.subtype : "";
-      if (subtype === "turn_duration" || subtype === "away_summary") {
-        return { active: false, lastActivityAt: timestamp, reason: `turn ended (${subtype})` };
-      }
-      continue;
-    }
-
-    if (type === "assistant") {
-      const message =
-        record.message && typeof record.message === "object"
-          ? (record.message as Record<string, unknown>)
-          : null;
-      const stopReason =
-        (typeof message?.stop_reason === "string" && message.stop_reason) ||
-        (typeof record.stop_reason === "string" && record.stop_reason) ||
-        "";
-
-      if (stopReason === "end_turn" || stopReason === "stop_sequence") {
-        return { active: false, lastActivityAt: timestamp, reason: "end_turn" };
-      }
-
-      if (stopReason === "tool_use") {
-        return {
-          active: age <= TOOL_TURN_GRACE_MS,
-          lastActivityAt: timestamp,
-          reason: age <= TOOL_TURN_GRACE_MS ? "tool_use in progress" : "stale tool_use",
-        };
-      }
-
-      // Streaming / incomplete assistant chunk without an end marker.
-      return {
-        active: age <= TURN_ACTIVE_GRACE_MS,
-        lastActivityAt: timestamp,
-        reason: age <= TURN_ACTIVE_GRACE_MS ? "assistant output" : "stale assistant output",
-      };
-    }
-
-    if (type === "user") {
-      const hasToolResult = "toolUseResult" in record;
-      if (hasToolResult) {
-        return {
-          active: age <= TOOL_TURN_GRACE_MS,
-          lastActivityAt: timestamp,
-          reason: age <= TOOL_TURN_GRACE_MS ? "awaiting model after tool" : "stale tool result",
-        };
-      }
-
-      // Fresh human prompt starts a turn.
-      return {
-        active: age <= TURN_ACTIVE_GRACE_MS,
-        lastActivityAt: timestamp,
-        reason: age <= TURN_ACTIVE_GRACE_MS ? "user prompt" : "stale user prompt",
-      };
-    }
-  }
-
-  // No turn events — file touch alone is not work.
-  return { active: false, lastActivityAt: mtimeMs, reason: "no turn events" };
-}
-
-/** Codex rollout events that open a turn (both CLI and Codex Desktop). */
-const CODEX_TURN_START_EVENTS = new Set(["task_started", "user_message", "user_input"]);
-/** Events that close a turn. */
-const CODEX_TURN_END_EVENTS = new Set([
-  "task_complete",
-  "turn_aborted",
-  "turn_failed",
-  "shutdown_complete",
-]);
-/** Model output in progress. */
-const CODEX_STREAM_EVENTS = new Set([
-  "agent_message",
-  "agent_message_delta",
-  "agent_message_content_delta",
-  "agent_reasoning",
-  "agent_reasoning_delta",
-  "agent_reasoning_section_break",
-  "agent_reasoning_raw_content",
-  "agent_reasoning_raw_content_delta",
-]);
-/** The turn is parked on a human decision — that is not the agent working. */
-const CODEX_APPROVAL_EVENTS = new Set([
-  "exec_approval_request",
-  "apply_patch_approval_request",
-  "elicitation_request",
-]);
-/** Bookkeeping that says nothing about whether a turn is running. */
-const CODEX_META_EVENTS = new Set([
-  "token_count",
-  "thread_settings_applied",
-  "session_configured",
-  "notification",
-  "background_event",
-]);
-
-type CodexSignalRole = "start" | "end" | "stream" | "tool" | "await-user" | "meta";
-type CodexSignal = { role: CodexSignalRole; kind: string; at: number };
-
-function asRecord(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === "object" ? (value as Record<string, unknown>) : null;
-}
-
-/** Tool traffic keeps arriving under new names — match the shape, not a fixed list. */
-function isCodexToolEventName(name: string): boolean {
-  return /(_begin|_end|_delta|_call|_output|_result)$/.test(name);
-}
-
-function classifyCodexEvent(record: Record<string, unknown>): {
-  role: CodexSignalRole;
-  kind: string;
-} {
-  const type = typeof record.type === "string" ? record.type : "";
-  const payload = asRecord(record.payload);
-  const payloadType = typeof payload?.type === "string" ? payload.type : "";
-
-  if (type === "event_msg") {
-    if (CODEX_META_EVENTS.has(payloadType)) return { role: "meta", kind: payloadType };
-    if (CODEX_TURN_END_EVENTS.has(payloadType)) return { role: "end", kind: payloadType };
-    if (CODEX_TURN_START_EVENTS.has(payloadType)) return { role: "start", kind: payloadType };
-    if (CODEX_APPROVAL_EVENTS.has(payloadType)) return { role: "await-user", kind: payloadType };
-    if (CODEX_STREAM_EVENTS.has(payloadType)) return { role: "stream", kind: payloadType };
-    if (isCodexToolEventName(payloadType)) return { role: "tool", kind: payloadType };
-    return { role: "meta", kind: payloadType || type };
-  }
-
-  if (type === "response_item") {
-    if (payloadType === "reasoning") return { role: "stream", kind: "agent_reasoning" };
-    if (payloadType === "message") {
-      const role = typeof payload?.role === "string" ? payload.role : "";
-      if (role === "assistant") return { role: "stream", kind: "agent_message" };
-      if (role === "user") return { role: "start", kind: "user_message" };
-      return { role: "meta", kind: "message" };
-    }
-    if (isCodexToolEventName(payloadType)) return { role: "tool", kind: payloadType };
-    return { role: "meta", kind: payloadType || type };
-  }
-
-  return { role: "meta", kind: type };
-}
-
-function codexSignalReason(signal: CodexSignal | null): string {
-  if (!signal) return "turn in progress";
-  if (signal.role === "tool") {
-    return /(_end|_output|_result)$/.test(signal.kind)
-      ? "awaiting model after tool"
-      : `tool_call ${signal.kind}`;
-  }
-  if (signal.role === "stream") return signal.kind;
-  return "user prompt";
-}
-
-/** Codex records the working directory in session_meta / turn_context. */
-function codexProjectLabelFromPath(cwd: string): string | undefined {
-  const base = path.basename(cwd.replace(/[/\\]+$/, ""));
-  return base ? humanizeProjectName(base) : undefined;
-}
-
-function codexProjectLabel(events: unknown[]): string | undefined {
-  for (let i = events.length - 1; i >= 0; i -= 1) {
-    const record = asRecord(events[i]);
-    if (!record) continue;
-    const payload = asRecord(record.payload);
-    const cwd =
-      (typeof payload?.cwd === "string" && payload.cwd) ||
-      (typeof record.cwd === "string" && record.cwd) ||
-      "";
-    if (cwd) {
-      const label = codexProjectLabelFromPath(cwd);
-      if (label) return label;
-    }
-  }
-  return undefined;
-}
-
-/** CLI sessions only write session_meta at the top of the file. */
 async function readCodexSessionCwd(filePath: string): Promise<string | undefined> {
   try {
     const handle = await fs.open(filePath, "r");
@@ -705,181 +303,6 @@ async function readCodexSessionCwd(filePath: string): Promise<string | undefined
  * and the first reasoning chunk, or a long shell command — so track the turn
  * boundaries instead and use the newest signal only for the status wording.
  */
-function assessCodexTurn(
-  events: unknown[],
-  mtimeMs: number,
-  now: number,
-): TurnAssessment & { label?: string } {
-  const label = codexProjectLabel(events);
-
-  let startedAt = -1;
-  let endedAt = -1;
-  let lastActivityAt = -1;
-  let latest: CodexSignal | null = null;
-
-  for (const event of events) {
-    const record = asRecord(event);
-    if (!record) continue;
-
-    const { role, kind } = classifyCodexEvent(record);
-    if (role === "meta") continue;
-
-    const at = parseTimestamp(record.timestamp, mtimeMs);
-    if (at > lastActivityAt) lastActivityAt = at;
-    if (role === "start" && at > startedAt) startedAt = at;
-    if (role === "end" && at > endedAt) endedAt = at;
-    if (!latest || at >= latest.at) latest = { role, kind, at };
-  }
-
-  if (lastActivityAt < 0) {
-    // Tail held nothing recognizable (huge single records) — trust fresh writes only.
-    const age = now - mtimeMs;
-    return {
-      active: age <= CODEX_TAIL_QUIET_MS,
-      lastActivityAt: mtimeMs,
-      reason: age <= CODEX_TAIL_QUIET_MS ? "recent session write" : "no turn events",
-      label,
-    };
-  }
-
-  const age = now - lastActivityAt;
-
-  if (latest?.role === "await-user") {
-    return { active: false, lastActivityAt, reason: "waiting for approval", label };
-  }
-
-  if (startedAt > endedAt) {
-    const active = age <= CODEX_OPEN_TURN_GRACE_MS;
-    const reason = codexSignalReason(latest);
-    return { active, lastActivityAt, reason: active ? reason : `stale ${reason}`, label };
-  }
-
-  // Turn is closed; only output written after the end marker still counts.
-  if (latest && latest.at > endedAt && (latest.role === "stream" || latest.role === "tool")) {
-    const grace = latest.role === "tool" ? TOOL_TURN_GRACE_MS : TURN_ACTIVE_GRACE_MS;
-    const reason = codexSignalReason(latest);
-    return { active: age <= grace, lastActivityAt, reason, label };
-  }
-
-  return { active: false, lastActivityAt, reason: endedAt >= 0 ? "turn complete" : "idle", label };
-}
-
-type GrokSignalRole = "start" | "end" | "stream" | "tool" | "await-user" | "meta";
-type GrokSignal = { role: GrokSignalRole; kind: string; at: number };
-
-const GROK_PHASE_SIGNALS: Record<string, { role: GrokSignalRole; kind: string }> = {
-  waiting_for_model: { role: "stream", kind: "awaiting model" },
-  streaming_reasoning: { role: "stream", kind: "reasoning" },
-  streaming_text: { role: "stream", kind: "streaming text" },
-  tool_execution: { role: "tool", kind: "tool_call" },
-  permission_prompt: { role: "await-user", kind: "permission prompt" },
-};
-
-function classifyGrokEvent(record: Record<string, unknown>): {
-  role: GrokSignalRole;
-  kind: string;
-} {
-  const type = typeof record.type === "string" ? record.type : "";
-  const toolName = typeof record.tool_name === "string" ? record.tool_name : "";
-
-  switch (type) {
-    case "turn_started":
-      return { role: "start", kind: "user prompt" };
-    case "turn_ended":
-      return { role: "end", kind: "turn complete" };
-    case "permission_requested":
-      return { role: "await-user", kind: "permission prompt" };
-    case "permission_resolved":
-    case "loop_started":
-    case "first_token":
-      return { role: "stream", kind: "awaiting model" };
-    case "tool_started":
-      return { role: "tool", kind: toolName ? `tool_call ${toolName}` : "tool_call" };
-    case "tool_completed":
-      return { role: "tool", kind: "awaiting model after tool" };
-    case "phase_changed": {
-      const phase = typeof record.phase === "string" ? record.phase : "";
-      return GROK_PHASE_SIGNALS[phase] ?? { role: "meta", kind: phase || "phase" };
-    }
-    default:
-      return { role: "meta", kind: type };
-  }
-}
-
-/**
- * Grok CLI ("grok", incl. the grok-build fork) writes turn_started … turn_ended plus
- * fine-grained phase_changed events. Turn boundaries decide active/idle; the newest
- * signal only picks the status wording. An unresolved permission_requested means Grok
- * is waiting on the human, which must never keep the Mac awake.
- */
-function assessGrokTurn(events: unknown[], mtimeMs: number, now: number): TurnAssessment {
-  let startedAt = -1;
-  let endedAt = -1;
-  let lastActivityAt = -1;
-  let latest: GrokSignal | null = null;
-
-  for (const event of events) {
-    const record = asRecord(event);
-    if (!record) continue;
-
-    const { role, kind } = classifyGrokEvent(record);
-    if (role === "meta") continue;
-
-    const at = parseTimestamp(record.ts, mtimeMs);
-    if (at > lastActivityAt) lastActivityAt = at;
-    if (role === "start" && at > startedAt) startedAt = at;
-    if (role === "end" && at > endedAt) endedAt = at;
-    if (!latest || at >= latest.at) latest = { role, kind, at };
-  }
-
-  if (lastActivityAt < 0) {
-    const age = now - mtimeMs;
-    return {
-      active: age <= GROK_TAIL_QUIET_MS,
-      lastActivityAt: mtimeMs,
-      reason: age <= GROK_TAIL_QUIET_MS ? "recent session write" : "no turn events",
-    };
-  }
-
-  const age = now - lastActivityAt;
-  const reason = latest?.kind ?? "turn in progress";
-
-  if (latest?.role === "await-user") {
-    return { active: false, lastActivityAt, reason: "waiting for approval" };
-  }
-
-  if (startedAt > endedAt) {
-    const active = age <= GROK_OPEN_TURN_GRACE_MS;
-    return { active, lastActivityAt, reason: active ? reason : `stale ${reason}` };
-  }
-
-  // Long streaming turns emit thousands of phase events, so the tail can begin after
-  // turn_started. Fall back to the newest signal with the short grace instead.
-  const noBoundaryInTail = startedAt < 0 && endedAt < 0;
-  const outputAfterEnd = latest !== null && latest.at > endedAt;
-
-  if (
-    (noBoundaryInTail || outputAfterEnd) &&
-    latest &&
-    (latest.role === "stream" || latest.role === "tool")
-  ) {
-    const grace = latest.role === "tool" ? TOOL_TURN_GRACE_MS : TURN_ACTIVE_GRACE_MS;
-    return { active: age <= grace, lastActivityAt, reason };
-  }
-
-  return { active: false, lastActivityAt, reason: endedAt >= 0 ? "turn complete" : "idle" };
-}
-
-function assessGenericMtime(mtimeMs: number, now: number): TurnAssessment {
-  const age = now - mtimeMs;
-  // Generic logs only get a short window — better false negatives than caffeinating idle CLIs.
-  return {
-    active: age <= 20_000,
-    lastActivityAt: mtimeMs,
-    reason: age <= 20_000 ? "recent session write" : "stale session write",
-  };
-}
-
 async function assessSessionTurn(
   kind: AgentKind,
   candidate: SessionCandidate,
@@ -919,188 +342,6 @@ async function assessSessionTurn(
   return { active: false, lastActivityAt: candidate.mtimeMs, reason: "unreadable session" };
 }
 
-type CursorComposerRecord = {
-  status?: unknown;
-  name?: unknown;
-  subtitle?: unknown;
-  lastUpdatedAt?: unknown;
-  createdAt?: unknown;
-  conversationCheckpointLastUpdatedAt?: unknown;
-  unifiedMode?: unknown;
-  isContinuationInProgress?: unknown;
-  generatingBubbleIds?: unknown;
-  workspaceIdentifier?: unknown;
-  fullConversationHeadersOnly?: unknown;
-};
-
-type CursorConversationHeader = {
-  type?: unknown;
-  createdAt?: unknown;
-  grouping?: unknown;
-};
-
-const CURSOR_RUNNING_TOOL_STATUSES = new Set([
-  "loading",
-  "running",
-  "pending",
-  "in_progress",
-  "inProgress",
-]);
-
-function cursorProjectLabel(record: CursorComposerRecord): string | undefined {
-  const workspace = record.workspaceIdentifier;
-  if (workspace && typeof workspace === "object") {
-    const ws = workspace as Record<string, unknown>;
-    const uri = ws.uri && typeof ws.uri === "object" ? (ws.uri as Record<string, unknown>) : null;
-    const fsPath =
-      (typeof uri?.fsPath === "string" && uri.fsPath) ||
-      (typeof uri?.path === "string" && uri.path) ||
-      (typeof ws.id === "string" && !/^[a-f0-9]{16,}$/i.test(ws.id) ? ws.id : "");
-    if (fsPath) {
-      const base = path.basename(fsPath.replace(/[/\\]+$/, ""));
-      if (base) return humanizeProjectName(base);
-    }
-  }
-
-  if (typeof record.name === "string" && record.name.trim()) {
-    return record.name.trim();
-  }
-  return undefined;
-}
-
-function cursorHeaderGrouping(header: CursorConversationHeader): Record<string, unknown> {
-  return header.grouping && typeof header.grouping === "object"
-    ? (header.grouping as Record<string, unknown>)
-    : {};
-}
-
-/**
- * Cursor often leaves composer status stuck at "completed" on disk while a turn
- * is still running (especially during shell/tool waits). Prefer conversation
- * headers: an open user turn without turnDurationMs, or a tool still loading.
- */
-function assessCursorComposerRecord(
-  record: CursorComposerRecord,
-  now: number,
-): TurnAssessment & { label?: string } {
-  const status = typeof record.status === "string" ? record.status : "none";
-  const generatingIds = Array.isArray(record.generatingBubbleIds) ? record.generatingBubbleIds : [];
-  const continuation = record.isContinuationInProgress === true;
-  const label = cursorProjectLabel(record);
-
-  let lastActivityAt = parseTimestamp(
-    record.conversationCheckpointLastUpdatedAt ?? record.lastUpdatedAt ?? record.createdAt,
-    now,
-  );
-
-  if (status === "generating" || continuation || generatingIds.length > 0) {
-    let reason = "generating";
-    if (generatingIds.length > 0) reason = "generating bubbles";
-    else if (continuation) reason = "continuation in progress";
-    else if (typeof record.unifiedMode === "string" && record.unifiedMode === "agent") {
-      reason = "agent generating";
-    }
-    return { active: true, lastActivityAt, reason, label };
-  }
-
-  const headers = Array.isArray(record.fullConversationHeadersOnly)
-    ? (record.fullConversationHeadersOnly as CursorConversationHeader[])
-    : [];
-
-  let openUserTurnAt: number | null = null;
-  let sawCompletedTurnAfterUser = false;
-  let openTurnTouchesTools = false;
-  let runningTool = false;
-
-  for (const header of headers) {
-    const createdAt = parseTimestamp(header.createdAt, lastActivityAt);
-    if (createdAt > lastActivityAt) lastActivityAt = createdAt;
-
-    const grouping = cursorHeaderGrouping(header);
-    const toolStatus =
-      typeof grouping.toolFormerStatus === "string" ? grouping.toolFormerStatus.toLowerCase() : "";
-    const shellStatus =
-      typeof grouping.shellStatus === "string" ? grouping.shellStatus.toLowerCase() : "";
-
-    if (
-      CURSOR_RUNNING_TOOL_STATUSES.has(toolStatus) ||
-      CURSOR_RUNNING_TOOL_STATUSES.has(shellStatus)
-    ) {
-      runningTool = true;
-      openTurnTouchesTools = true;
-      sawCompletedTurnAfterUser = false;
-    }
-
-    // Cursor bubble types: 1 = user, 2 = assistant/tool/thinking
-    if (header.type === 1) {
-      openUserTurnAt = createdAt;
-      sawCompletedTurnAfterUser = false;
-      openTurnTouchesTools = false;
-      continue;
-    }
-
-    if (openUserTurnAt == null) continue;
-
-    if (typeof grouping.turnDurationMs === "number") {
-      // Final assistant bubble for the turn.
-      sawCompletedTurnAfterUser = true;
-      openTurnTouchesTools = false;
-      continue;
-    }
-
-    if (
-      toolStatus === "completed" ||
-      shellStatus === "success" ||
-      shellStatus === "completed" ||
-      shellStatus === "error" ||
-      shellStatus === "failed"
-    ) {
-      // Tool finished but the turn may still stream a final reply.
-      openTurnTouchesTools = true;
-      sawCompletedTurnAfterUser = false;
-      continue;
-    }
-
-    // Thinking / streaming text / other assistant bubbles before turnDurationMs.
-    sawCompletedTurnAfterUser = false;
-  }
-
-  if (runningTool) {
-    return {
-      active: true,
-      lastActivityAt,
-      reason: "tool_call in progress",
-      label,
-    };
-  }
-
-  if (openUserTurnAt != null && !sawCompletedTurnAfterUser) {
-    const age = now - lastActivityAt;
-    const grace = openTurnTouchesTools ? TOOL_TURN_GRACE_MS : TURN_ACTIVE_GRACE_MS;
-    if (age <= grace) {
-      return {
-        active: true,
-        lastActivityAt,
-        reason: openTurnTouchesTools ? "awaiting model after tool" : "user prompt",
-        label,
-      };
-    }
-    return {
-      active: false,
-      lastActivityAt,
-      reason: openTurnTouchesTools ? "stale tool turn" : "stale user prompt",
-      label,
-    };
-  }
-
-  return {
-    active: false,
-    lastActivityAt,
-    reason: status === "completed" ? "completed" : status === "aborted" ? "aborted" : "idle",
-    label,
-  };
-}
-
 type ActiveTurnHit = TurnAssessment & {
   label?: string;
   filePath?: string;
@@ -1108,14 +349,645 @@ type ActiveTurnHit = TurnAssessment & {
   identity: string;
 };
 
+/** Every reason a Cursor scan can stop before conclusively enumerating every
+ * matching `cursorDiskKV` row (natural `LIMIT`-bounded exhaustion aside). */
+export type CursorScanIncompleteReason =
+  | "rowLimit"
+  | "decodedByteLimit"
+  | "bubbleLookupLimit"
+  | "deadline";
+
+/**
+ * Thrown when a Cursor scan is stopped — by a hard bound (rows, cumulative
+ * decoded bytes, bubble lookups, or elapsed time) or by an operational
+ * SQLite failure (busy/locked/corrupt) — before it could conclusively
+ * enumerate every composer. `detectActiveAgents`'s caller
+ * (`monitor.ts`'s `scanOnce`) must never treat this as "zero active Cursor
+ * agents": its existing catch-and-retain behavior keeps the last
+ * successful agent list instead, exactly as it already does for any other
+ * unexpected detector failure.
+ */
+export class CursorSessionScanError extends Error {
+  readonly reason: CursorScanIncompleteReason | "databaseError";
+  readonly cause?: unknown;
+
+  constructor(reason: CursorScanIncompleteReason | "databaseError", options?: { cause?: unknown }) {
+    super(
+      reason === "databaseError"
+        ? `Cursor session database operation failed${
+            options?.cause instanceof Error ? `: ${options.cause.message}` : ""
+          }`
+        : `Cursor session scan stopped before completion (${reason}); treating as inconclusive`,
+    );
+    this.name = "CursorSessionScanError";
+    this.reason = reason;
+    this.cause = options?.cause;
+  }
+}
+
+/**
+ * Test-only instrumentation. Every field is `undefined` at every production
+ * call site, so none of this can affect real scans — only tests that
+ * explicitly construct hooks can observe inspected-row/bubble-lookup counts
+ * or force a near-immediate deadline.
+ *
+ * `onRowInspected`/`onBubbleLookup` are live callbacks, so they cannot cross
+ * into the scan Worker directly — `runCursorScanInWorker` relays them from
+ * `"rowInspected"`/`"bubbleLookup"` progress messages instead, and only asks
+ * the worker to post those messages at all when a hook is actually present
+ * (`buildCursorWorkerData`'s `reportRowProgress`/`reportBubbleProgress`), so
+ * a real (non-test) scan never pays for progress messaging it has no
+ * listener for. `simulateRowProcessingDelayMs` is plain data (not a
+ * function), so — unlike the callbacks — it crosses via `workerData`
+ * directly and can genuinely busy-wait *inside* the worker, letting a test
+ * force a deadline trip without a live cross-thread callback.
+ */
+type CursorScanTestHooks = {
+  onRowInspected?: () => void;
+  onBubbleLookup?: () => void;
+  deadlineMillisecondsOverride?: number;
+  simulateRowProcessingDelayMs?: number;
+};
+
+/** Every message the Cursor scan Worker can post back to its parent. */
+type CursorWorkerMessage =
+  | { type: "rowInspected" }
+  | { type: "bubbleLookup" }
+  | { type: "malformedRow" }
+  | { type: "result"; evidence: ActiveTurnHit[] }
+  | { type: "error"; reason: CursorScanIncompleteReason | "databaseError"; message?: string };
+
+/**
+ * Every pure Cursor-assessment function the scan Worker's row/bubble loop
+ * needs, reconstructed via `Function.prototype.toString()` so the whole
+ * bounded SQLite scan can run inside a real, terminable
+ * `node:worker_threads` Worker (see `runCursorScanInWorker` below) without a
+ * second, fragile, hand-maintained copy of this logic living in an external
+ * runtime file. Every one of these is either free-variable-free, or (per
+ * its own comment in `agent-detection-policy.ts`) takes every module
+ * constant/bound it needs as an explicit trailing parameter instead of
+ * reading it as a free variable — so the reconstructed text below stays
+ * correct no matter how esbuild's bundler happens to rename a top-level
+ * binding in the *real*, bundled copy of this module (confirmed
+ * empirically: even unminified, esbuild renames colliding cross-module
+ * bindings — e.g. a second `import * as path from "node:path"` becomes
+ * `path2`). `CURSOR_WORKER_DRIVER_SOURCE` below always passes every bound
+ * explicitly from `workerData`, never relying on a function's own default
+ * parameter to resolve one.
+ */
+const CURSOR_WORKER_POLICY_FUNCTIONS = [
+  isPlainCursorObject,
+  isGregorianLeapYear,
+  daysInGregorianMonth,
+  daysFromCivil,
+  epochMsFromCanonicalCursorIsoComponents,
+  parseCanonicalCursorIsoComponents,
+  isCanonicalCursorIsoTimestamp,
+  cursorCanonicalIsoStringToEpochMs,
+  parseCursorTimestamp,
+  validateOptionalString,
+  validateCursorRecordFields,
+  validateCursorHeaders,
+  malformedCursorAssessment,
+  utf8ByteLength,
+  titleCaseWords,
+  humanizeProjectName,
+  cursorProjectLabel,
+  cursorHeaderGrouping,
+  parseTimestamp,
+  isRecentTimestamp,
+  isDefinitelyOlderThanWindowLowerBound,
+  cursorRelevantBubbleIds,
+  assessValidatedCursorComposerRecord,
+  assessCursorComposerRecord,
+];
+
+/**
+ * Hand-written worker-side driver, joined with the `.toString()`-
+ * reconstructed policy functions above into one `eval: true` Worker source
+ * string (`buildCursorWorkerSource`). Plain runtime JS text, not real
+ * checked TypeScript — this only ever runs inside the Worker `eval`, never
+ * through the TypeScript compiler.
+ *
+ * Requires only `node:worker_threads` (destructuring `parentPort`/
+ * `workerData`, never `Worker` itself), `node:sqlite`, and `node:path`:
+ * this worker must never be able to spawn a descendant Worker of its own
+ * (`CURSOR_WORKER_SOURCE` is asserted free of the literal text
+ * `"new Worker("` — see `agent-detector.test.ts`).
+ *
+ * Opens the vault read-only and performs exactly two parameterized
+ * queries — composer rows (`key LIKE 'composerData:%'`) and exact
+ * `bubbleId:<composerId>:<bubbleId>` point lookups — both built with the
+ * same bounded-value pattern: `octet_length(value)` is checked *before*
+ * the value column is ever selected unbounded, so an oversized row's value
+ * is replaced with SQL `NULL` (never crossing into JS) while its true byte
+ * count still comes back for skip/limit accounting. Composer rows are
+ * ordered by `workerData.recencySql` (validated JSON recency, built by
+ * `cursorRecencySqlExpression` in the parent) DESC, with `rowid` only as a
+ * deterministic tiebreaker — never bare `rowid` alone, which is only ever
+ * insertion order and never moves when Cursor UPSERTs an existing composer
+ * row in place.
+ *
+ * Posts back exactly one final `"result"`/`"error"` message, plus,
+ * opportunistically, `"rowInspected"`/`"bubbleLookup"`/`"malformedRow"`
+ * progress messages along the way.
+ */
+const CURSOR_WORKER_DRIVER_SOURCE = `
+function postResult(evidence) {
+  parentPort.postMessage({ type: "result", evidence });
+}
+function postError(reason, message) {
+  parentPort.postMessage({
+    type: "error",
+    reason,
+    message: message === undefined ? undefined : String(message),
+  });
+}
+
+const runningToolStatuses = new Set(workerData.runningToolStatuses);
+const cursorAssessmentLimits = {
+  sessionCandidateWindowMs: workerData.sessionCandidateWindowMs,
+  toolTurnGraceMs: workerData.toolTurnGraceMs,
+  turnActiveGraceMs: workerData.turnActiveGraceMs,
+  timestampFutureSkewMs: workerData.timestampFutureSkewMs,
+  maxSupportedTimestampMs: workerData.maxSupportedTimestampMs,
+  runningToolStatuses,
+  basename: (input) => path.basename(input),
+};
+
+const deadlineAtMs = performance.now() + workerData.deadlineMs;
+const deadlineExpired = () => performance.now() >= deadlineAtMs;
+
+let db;
+try {
+  db = new DatabaseSync(workerData.dbPath, {
+    readOnly: true,
+    timeout: workerData.sqliteBusyTimeoutMs,
+  });
+  // Registers the scalar function workerData.recencySql's generated SQL
+  // calls by name (see cursorRecencySqlExpression's doc comment) — the
+  // literal name below is baked in at CURSOR_WORKER_DRIVER_SOURCE
+  // template-literal build time (interpolating the real, imported
+  // CURSOR_TIMESTAMP_SQL_FUNCTION_NAME constant in the *outer*, main-thread
+  // scope, before this text is ever eval'd as Worker source), never a
+  // free-variable reference resolved at Worker-eval time. deterministic:
+  // true is semantically correct (identical arguments always produce the
+  // identical result) though it does not by itself deduplicate multiple
+  // textual calls with identical arguments within one row/expression
+  // (confirmed empirically) — cursorRecencySqlExpression's own generated
+  // SQL already calls this at most once per candidate field via a small
+  // WITH, so that is not needed here.
+  db.function(
+    "${CURSOR_TIMESTAMP_SQL_FUNCTION_NAME}",
+    { deterministic: true },
+    cursorCanonicalIsoStringToEpochMs,
+  );
+} catch (error) {
+  postError("databaseError", error && error.message ? error.message : String(error));
+}
+
+if (db) {
+  let transactionOpen = false;
+  try {
+    db.exec("BEGIN");
+    transactionOpen = true;
+
+    // Bounded blob processing (issue: JS must never materialize an
+    // oversized value before it is size-checked): this CASE WHEN gate
+    // rejects an oversized value to SQL NULL *before* it ever crosses into
+    // JS, while octet_length(value) still reports the true byte count so
+    // the row/skip logic below can act on it without ever touching the
+    // value itself. The threshold is a bound named parameter
+    // ($maxValueBytes), never interpolated into the SQL text, so the byte
+    // bound can never be mistaken for (or corrupted by) untrusted SQL.
+    const boundedValueSql =
+      "CASE WHEN octet_length(value) <= $maxValueBytes THEN value ELSE NULL END";
+    // ORDER BY validated JSON recency (see cursorRecencySqlExpression),
+    // newest first, rowid only as a deterministic tiebreaker — never bare
+    // rowid, which is only ever insertion order and does not move when
+    // Cursor UPSERTs an existing composer row in place.
+    const composerStatement = db.prepare(
+      "SELECT key, " +
+        boundedValueSql +
+        " AS boundedValue, octet_length(value) AS valueByteCount, (" +
+        workerData.recencySql +
+        ") AS recencyMs FROM cursorDiskKV WHERE key LIKE $keyPattern ORDER BY recencyMs DESC, rowid DESC LIMIT $rowLimit",
+    );
+    // Prepared once, reused (bound fresh per call) for every bubble
+    // lookup — an exact parameterized point lookup, never SQL
+    // concatenation.
+    const bubbleStatement = db.prepare(
+      "SELECT " +
+        boundedValueSql +
+        " AS boundedValue, octet_length(value) AS valueByteCount FROM cursorDiskKV WHERE key = $bubbleKey",
+    );
+
+    const evidence = [];
+    let rowsInspected = 0;
+    let totalDecodedBytes = 0;
+    let totalBubbleLookups = 0;
+    const attemptedBubbleKeys = new Set();
+    const bubbleCache = new Map();
+    let stopReason = null;
+
+    // Every counter/flag here is charged identically whether the row or
+    // bubble turns out to be inactive, malformed, or a duplicate reference
+    // — limits count inspected work, not just active results.
+    const lookUpBubble = (bubbleKey) => {
+      if (attemptedBubbleKeys.has(bubbleKey)) {
+        // Duplicate reference (already attempted this scan): serve from
+        // cache without a second round trip or byte charge.
+        const cached = bubbleCache.get(bubbleKey);
+        return cached ? { kind: "found", bubble: cached } : { kind: "absentOrMalformed" };
+      }
+      if (deadlineExpired()) {
+        stopReason = stopReason || "deadline";
+        return { kind: "limitExceeded" };
+      }
+      if (totalBubbleLookups >= workerData.maxBubbleLookups) {
+        stopReason = stopReason || "bubbleLookupLimit";
+        return { kind: "limitExceeded" };
+      }
+      attemptedBubbleKeys.add(bubbleKey);
+      totalBubbleLookups += 1;
+      if (workerData.reportBubbleProgress) parentPort.postMessage({ type: "bubbleLookup" });
+
+      const row = bubbleStatement.get({ maxValueBytes: workerData.maxValueBytes, bubbleKey });
+      if (!row || typeof row.boundedValue !== "string") return { kind: "absentOrMalformed" };
+      const valueByteCount = row.valueByteCount;
+      if (valueByteCount === 0 || valueByteCount > workerData.maxValueBytes) {
+        return { kind: "absentOrMalformed" };
+      }
+      if (totalDecodedBytes + valueByteCount > workerData.maxTotalDecodedValueBytes) {
+        stopReason = stopReason || "decodedByteLimit";
+        return { kind: "limitExceeded" };
+      }
+      totalDecodedBytes += valueByteCount;
+      let bubble;
+      try {
+        bubble = JSON.parse(row.boundedValue);
+      } catch {
+        return { kind: "absentOrMalformed" };
+      }
+      if (!bubble || typeof bubble !== "object" || Array.isArray(bubble)) {
+        return { kind: "absentOrMalformed" };
+      }
+      bubbleCache.set(bubbleKey, bubble);
+      return { kind: "found", bubble };
+    };
+
+    rowLoop: for (const row of composerStatement.iterate({
+      maxValueBytes: workerData.maxValueBytes,
+      keyPattern: "composerData:%",
+      rowLimit: workerData.maxInspectedRows + 1,
+    })) {
+      if (deadlineExpired()) {
+        stopReason = "deadline";
+        break;
+      }
+
+      if (rowsInspected >= workerData.maxInspectedRows) {
+        // Pure existence+recency sentinel, the (cap + 1)-th matching row:
+        // never assessed, returned, or counted as inspected. Rows are
+        // already ordered newest-first by validated JSON recency (rowid
+        // only breaks ties), so truncation is only ever safe when this
+        // cut-off candidate's own timestamp is *definitively* older than
+        // the candidate window's lower bound — every omitted row beyond it
+        // is then provably no newer either, so the newest maxInspectedRows
+        // can be accepted instead of treating "more history exists" alone
+        // as a failure. A missing/unrankable, recent, OR too-far-future
+        // sentinel must all stay inconclusive ("rowLimit"): using
+        // isRecentTimestamp here (and trusting its "not recent" result as
+        // "safe") would be wrong specifically for a far-future sentinel —
+        // isRecentTimestamp reports a far-future timestamp as not recent
+        // too, which would wrongly bless truncation as safe even though a
+        // corrupt/adversarial far-future recency value could rank ahead of,
+        // and thereby hide, a genuinely active composer beyond the cap.
+        const sentinelRecencyMs = typeof row.recencyMs === "number" ? row.recencyMs : null;
+        const sentinelDefinitelyOld =
+          sentinelRecencyMs !== null &&
+          isDefinitelyOlderThanWindowLowerBound(
+            sentinelRecencyMs,
+            workerData.now,
+            workerData.sessionCandidateWindowMs,
+            workerData.maxSupportedTimestampMs,
+          );
+        if (!sentinelDefinitelyOld) {
+          stopReason = "rowLimit";
+        }
+        break;
+      }
+      rowsInspected += 1;
+      if (workerData.reportRowProgress) parentPort.postMessage({ type: "rowInspected" });
+
+      if (workerData.simulateRowProcessingDelayMs > 0) {
+        const until = performance.now() + workerData.simulateRowProcessingDelayMs;
+        while (performance.now() < until) {
+          // Test-only busy-wait simulating slow per-row processing, so a
+          // deadline test can force a trip without a live cross-thread
+          // callback (only plain data crosses via workerData).
+        }
+      }
+
+      if (typeof row.key !== "string") continue;
+      const keyByteCount = Buffer.byteLength(row.key, "utf8");
+      if (keyByteCount === 0 || keyByteCount > workerData.maxKeyBytes) continue;
+
+      if (typeof row.boundedValue !== "string") continue;
+      const valueByteCount = row.valueByteCount;
+      // Bounded blob processing: skip (never log) anything implausibly
+      // large for a composer record — already NULL from the SQL gate.
+      if (valueByteCount === 0 || valueByteCount > workerData.maxValueBytes) continue;
+
+      if (totalDecodedBytes + valueByteCount > workerData.maxTotalDecodedValueBytes) {
+        stopReason = "decodedByteLimit";
+        break;
+      }
+      totalDecodedBytes += valueByteCount;
+
+      let record;
+      try {
+        record = JSON.parse(row.boundedValue);
+      } catch {
+        continue;
+      }
+      if (!record || typeof record !== "object" || Array.isArray(record)) continue;
+
+      const key = row.key;
+      const identity = key.indexOf("composerData:") === 0 ? key.slice("composerData:".length) : key;
+
+      let finalAssessment;
+      try {
+        // First pass never touches bubbles; lastActivityAt is folded
+        // purely from already-decoded, trusted composer/header fields, so
+        // it is identical whether or not bubbles are ultimately consulted
+        // below.
+        const provisional = assessCursorComposerRecord(record, workerData.now, {}, cursorAssessmentLimits);
+        finalAssessment = provisional;
+
+        if (
+          !provisional.active &&
+          isRecentTimestamp(
+            provisional.lastActivityAt,
+            workerData.now,
+            workerData.toolTurnGraceMs,
+            workerData.timestampFutureSkewMs,
+            workerData.maxSupportedTimestampMs,
+          )
+        ) {
+          // Only a plausibly-recent composer's verdict can change once a
+          // hidden bubble tool status is known — this keeps bubble lookups
+          // bounded to the small fraction of composers where they could
+          // possibly matter, instead of spending budget on every
+          // long-completed conversation the scan steps over.
+          const bubbles = {};
+          let truncatedByBubbleLookup = false;
+          for (const bubbleId of cursorRelevantBubbleIds(
+            record,
+            workerData.maxRecentHeadersPerComposer,
+            workerData.maxKeyBytes,
+            workerData.maxSupportedTimestampMs,
+          )) {
+            const outcome = lookUpBubble("bubbleId:" + identity + ":" + bubbleId);
+            if (outcome.kind === "found") {
+              bubbles[bubbleId] = outcome.bubble;
+            } else if (outcome.kind === "limitExceeded") {
+              truncatedByBubbleLookup = true;
+              break;
+            }
+          }
+          if (truncatedByBubbleLookup) break rowLoop;
+          finalAssessment = assessCursorComposerRecord(record, workerData.now, bubbles, cursorAssessmentLimits);
+        }
+      } catch {
+        parentPort.postMessage({ type: "malformedRow" });
+        continue;
+      }
+
+      if (!finalAssessment.active) continue;
+      evidence.push(Object.assign({}, finalAssessment, { filePath: workerData.dbPath, identity }));
+      if (evidence.length >= workerData.maxActiveCandidates) break;
+    }
+
+    // Any stop reason other than natural LIMIT-bounded exhaustion, the
+    // intentional maxActiveCandidates early exit, or a row-limit sentinel
+    // that itself proves every omitted row is no newer, means an unseen
+    // row or bubble could have been active — never trust the partial
+    // evidence gathered so far in that case.
+    if (stopReason) {
+      postError(stopReason);
+    } else {
+      db.exec("COMMIT");
+      transactionOpen = false;
+      evidence.sort((a, b) => b.lastActivityAt - a.lastActivityAt);
+      postResult(evidence);
+    }
+  } catch (error) {
+    postError("databaseError", error && error.message ? error.message : String(error));
+  } finally {
+    if (transactionOpen) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        // Best-effort rollback only; the error/result already determined
+        // above takes precedence.
+      }
+    }
+    try {
+      db.close();
+    } catch {
+      // Best-effort close only.
+    }
+  }
+}
+`;
+
+function buildCursorWorkerSource(): string {
+  const policyFunctionsSource = CURSOR_WORKER_POLICY_FUNCTIONS.map((fn) => fn.toString()).join("\n\n");
+  return [
+    '"use strict";',
+    'const { parentPort, workerData } = require("node:worker_threads");',
+    'const { DatabaseSync } = require("node:sqlite");',
+    'const path = require("node:path");',
+    "",
+    policyFunctionsSource,
+    "",
+    CURSOR_WORKER_DRIVER_SOURCE,
+  ].join("\n");
+}
+
+/**
+ * Assembled once at module load (cheap: a handful of `.toString()` calls
+ * plus string concatenation) rather than once per scan. Exported so both
+ * `runCursorScanInWorker` and `agent-detector.test.ts` share exactly one
+ * assembled source string — the test asserts this text never contains the
+ * literal `"new Worker("`, so the scan Worker can never spawn a descendant
+ * of its own.
+ */
+export const CURSOR_WORKER_SOURCE = buildCursorWorkerSource();
+
+function buildCursorWorkerData(dbPath: string, now: number, testHooks: CursorScanTestHooks | undefined) {
+  return {
+    dbPath,
+    now,
+    deadlineMs: testHooks?.deadlineMillisecondsOverride ?? CURSOR_SQLITE_QUERY_DEADLINE_MS,
+    sqliteBusyTimeoutMs: CURSOR_SQLITE_BUSY_TIMEOUT_MS,
+    maxInspectedRows: CURSOR_MAX_INSPECTED_ROWS,
+    maxKeyBytes: CURSOR_MAX_KEY_BYTES,
+    maxValueBytes: CURSOR_MAX_VALUE_BYTES,
+    maxTotalDecodedValueBytes: CURSOR_MAX_TOTAL_DECODED_VALUE_BYTES,
+    maxBubbleLookups: CURSOR_MAX_BUBBLE_LOOKUPS,
+    maxActiveCandidates: CURSOR_MAX_ACTIVE_CANDIDATES,
+    maxRecentHeadersPerComposer: CURSOR_MAX_RECENT_HEADERS_PER_COMPOSER,
+    sessionCandidateWindowMs: SESSION_CANDIDATE_WINDOW_MS,
+    toolTurnGraceMs: TOOL_TURN_GRACE_MS,
+    turnActiveGraceMs: TURN_ACTIVE_GRACE_MS,
+    timestampFutureSkewMs: TIMESTAMP_FUTURE_SKEW_MS,
+    maxSupportedTimestampMs: MAX_SUPPORTED_TIMESTAMP_MS,
+    runningToolStatuses: [...CURSOR_RUNNING_TOOL_STATUSES],
+    // Table-qualified, not bare "value": cursorRecencySqlExpression's own
+    // header subquery aliases a `json_each(...)` call in the same query,
+    // and json_each declares its own `value` output column — a bare
+    // "value" reference would silently self-collide with that alias
+    // instead of correlating to this row's real value column (see that
+    // function's doc comment).
+    recencySql: cursorRecencySqlExpression("cursorDiskKV.value"),
+    reportRowProgress: testHooks?.onRowInspected !== undefined,
+    reportBubbleProgress: testHooks?.onBubbleLookup !== undefined,
+    simulateRowProcessingDelayMs: testHooks?.simulateRowProcessingDelayMs ?? 0,
+  };
+}
+
+/**
+ * Runs the whole Cursor SQLite scan inside a terminable
+ * `node:worker_threads` Worker so this process's main event loop stays
+ * responsive even while SQLite performs a large, synchronous scan:
+ * `node:sqlite`'s `DatabaseSync` has no interrupt/progress-handler API, so
+ * a deadline check between `iterate()` steps on the main thread could never
+ * actually preempt a single slow native call — moving the whole scan to a
+ * Worker makes `worker.terminate()` (awaited here before rejecting on
+ * timeout) the real, effective backstop instead.
+ *
+ * `deadlineMs` must be a positive, finite number of milliseconds; an
+ * invalid deadline rejects immediately rather than spawning a Worker that
+ * could then never time out.
+ */
+function runCursorScanInWorker(
+  dbPath: string,
+  now: number,
+  testHooks?: CursorScanTestHooks,
+): Promise<ActiveTurnHit[]> {
+  const deadlineMs = testHooks?.deadlineMillisecondsOverride ?? CURSOR_SQLITE_QUERY_DEADLINE_MS;
+  if (!Number.isFinite(deadlineMs) || deadlineMs <= 0) {
+    return Promise.reject(
+      new CursorSessionScanError("databaseError", {
+        cause: new Error("Cursor scan deadline must be a positive, finite number of milliseconds"),
+      }),
+    );
+  }
+
+  const worker = new Worker(CURSOR_WORKER_SOURCE, {
+    eval: true,
+    workerData: buildCursorWorkerData(dbPath, now, testHooks),
+  });
+
+  return new Promise<ActiveTurnHit[]>((resolve, reject) => {
+    let settled = false;
+
+    const hardDeadlineTimer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      // Await termination before rejecting: this is the real preemption
+      // backstop (see this function's own doc comment) — the caller must
+      // never observe "deadline" while the worker (and its DatabaseSync
+      // handle) might still be running.
+      void worker.terminate().finally(() => {
+        reject(new CursorSessionScanError("deadline"));
+      });
+    }, deadlineMs);
+
+    worker.on("message", (message: CursorWorkerMessage) => {
+      if (message.type === "rowInspected") {
+        testHooks?.onRowInspected?.();
+        return;
+      }
+      if (message.type === "bubbleLookup") {
+        testHooks?.onBubbleLookup?.();
+        return;
+      }
+      if (message.type === "malformedRow") {
+        logger.debug("detector", "Skipped malformed Cursor composer row", {
+          reason: "assessment exception",
+        });
+        return;
+      }
+      if (settled) return;
+      settled = true;
+      clearTimeout(hardDeadlineTimer);
+      if (message.type === "result") {
+        resolve(message.evidence);
+      } else {
+        reject(
+          new CursorSessionScanError(
+            message.reason,
+            message.message !== undefined ? { cause: new Error(message.message) } : undefined,
+          ),
+        );
+      }
+      void worker.terminate();
+    });
+
+    worker.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(hardDeadlineTimer);
+      reject(new CursorSessionScanError("databaseError", { cause: error }));
+    });
+
+    worker.on("exit", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(hardDeadlineTimer);
+      reject(
+        new CursorSessionScanError("databaseError", {
+          cause: new Error(`Cursor session scan worker exited unexpectedly (code ${code})`),
+        }),
+      );
+    });
+  });
+}
+
 /**
  * Cursor IDE stores composer/agent state in globalStorage state.vscdb
  * (cursorDiskKV composerData:*). Disk `status` is unreliable mid-turn, so we
- * also inspect conversation headers for open turns and running tools.
- * Returns every active composer so concurrent agents all appear in the menu.
+ * also inspect conversation headers for open turns and running tools — and,
+ * since real Cursor data records a running tool's actual status in a
+ * separate `bubbleId:<composerId>:<bubbleId>` row rather than embedding it
+ * in the header itself, a bounded set of those rows too (see
+ * `cursorRelevantBubbleIds`). Returns every active composer so concurrent
+ * agents all appear in the menu.
+ *
+ * The whole SQLite scan runs inside a terminable Worker (see
+ * `runCursorScanInWorker`) so a large/pathological vault can never block
+ * this process's main event loop.
+ *
+ * Every hard bound below (see `agent-detection-policy.ts`'s
+ * `CURSOR_MAX_*`/`CURSOR_SQLITE_*` constants) counts inactive, malformed,
+ * duplicate, and active rows/lookups alike. Reaching any of them — other
+ * than the intentional `CURSOR_MAX_ACTIVE_CANDIDATES` early exit once
+ * plenty of concurrent agents are already found, natural exhaustion of the
+ * `LIMIT`-bounded result set, or a row-limit cut-off whose own validated
+ * JSON recency proves every omitted row is provably no newer (see
+ * `CURSOR_WORKER_DRIVER_SOURCE`'s row-limit sentinel logic) — rejects with
+ * `CursorSessionScanError` rather than silently returning whatever partial
+ * evidence was gathered so far: an unbounded/pathological Cursor vault must
+ * never be able to make this function falsely report "no active Cursor
+ * agents" merely because a bound was hit before the scan could look far
+ * enough.
  */
-async function detectCursorComposerActivity(now: number): Promise<ActiveTurnHit[]> {
-  const dbPath = path.join(
+export async function detectCursorComposerActivity(
+  now: number,
+  dbPath = path.join(
     os.homedir(),
     "Library",
     "Application Support",
@@ -1123,90 +995,16 @@ async function detectCursorComposerActivity(now: number): Promise<ActiveTurnHit[
     "User",
     "globalStorage",
     "state.vscdb",
-  );
-
+  ),
+  testHooks?: CursorScanTestHooks,
+): Promise<ActiveTurnHit[]> {
   try {
     await fs.access(dbPath);
   } catch {
     return [];
   }
 
-  try {
-    // Read-only URI so Cursor can keep the DB open while we poll.
-    const dbUri = `file:${dbPath}?mode=ro`;
-    // Recent composers only — full blobs are small but no need to scan ancient chats.
-    const sinceMs = now - SESSION_CANDIDATE_WINDOW_MS;
-    const { stdout } = await execFileAsync(
-      "/usr/bin/sqlite3",
-      [
-        "-readonly",
-        "-json",
-        dbUri,
-        `SELECT key, value FROM cursorDiskKV
-         WHERE key LIKE 'composerData:%'
-           AND value IS NOT NULL
-           AND (
-             json_extract(value, '$.status') = 'generating'
-             OR json_extract(value, '$.isContinuationInProgress') = 1
-             OR json_array_length(COALESCE(json_extract(value, '$.generatingBubbleIds'), '[]')) > 0
-             OR COALESCE(json_extract(value, '$.conversationCheckpointLastUpdatedAt'), 0) >= ${sinceMs}
-             OR COALESCE(json_extract(value, '$.lastUpdatedAt'), 0) >= ${sinceMs}
-             OR COALESCE(json_extract(value, '$.createdAt'), 0) >= ${sinceMs}
-           )`,
-      ],
-      {
-        timeout: 4_000,
-        maxBuffer: 8 * 1024 * 1024,
-        encoding: "utf-8",
-      },
-    );
-
-    const trimmed = stdout.trim();
-    if (!trimmed || trimmed === "[]") return [];
-
-    let rows: Array<{ key?: string; value?: string }> = [];
-    try {
-      rows = JSON.parse(trimmed) as Array<{ key?: string; value?: string }>;
-    } catch (error) {
-      logger.debug("detector", "Failed to parse Cursor composer rows", { error });
-      return [];
-    }
-
-    const active: ActiveTurnHit[] = [];
-
-    for (const row of rows) {
-      if (typeof row.value !== "string" || !row.value) continue;
-
-      let record: CursorComposerRecord;
-      try {
-        record = JSON.parse(row.value) as CursorComposerRecord;
-      } catch {
-        continue;
-      }
-
-      const assessment = assessCursorComposerRecord(record, now);
-      if (!assessment.active) continue;
-
-      const composerKey =
-        typeof row.key === "string" && row.key.startsWith("composerData:")
-          ? row.key.slice("composerData:".length)
-          : typeof row.key === "string"
-            ? row.key
-            : `composer-${assessment.lastActivityAt}`;
-
-      active.push({
-        ...assessment,
-        filePath: dbPath,
-        identity: composerKey,
-      });
-    }
-
-    active.sort((a, b) => b.lastActivityAt - a.lastActivityAt);
-    return active;
-  } catch (error) {
-    logger.debug("detector", "Failed to read Cursor composer state", { error });
-    return [];
-  }
+  return runCursorScanInWorker(dbPath, now, testHooks);
 }
 
 type RaycastChatEvent = {

@@ -1,0 +1,3 @@
+{"timestamp":"2026-08-10T12:04:00.000Z","type":"event_msg","payload":{"type":"task_started","cwd":"/tmp/seer-fixtures/codex-complete-project"}}
+{"timestamp":"2026-08-10T12:04:02.000Z","type":"event_msg","payload":{"type":"agent_reasoning"}}
+{"timestamp":"2026-08-10T12:09:59.000Z","type":"event_msg","payload":{"type":"task_complete"}}

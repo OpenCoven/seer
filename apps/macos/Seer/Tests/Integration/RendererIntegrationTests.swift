@@ -1,0 +1,1038 @@
+import XCTest
+import WebKit
+import CryptoKit
+@testable import Seer
+
+// MARK: - The real, bundled production renderer
+
+/// Locates the exact production standalone renderer this suite loads —
+/// never a synthetic fixture. `SeerTests` runs hosted inside `Seer.app`
+/// (`TEST_HOST` in `Seer.xcodeproj`), so `Bundle.main` here *is* the built
+/// `Seer.app` bundle, and its own `Resources` build phase already copies
+/// `build/standalone-renderer/Renderer` — built from `renderer/standalone/
+/// index.tsx` by the lock-owning official npm workflow before it launches
+/// xcodegen/xcodebuild, with the same lock held through Xcode's Resources
+/// phase — into
+/// it under the name `Renderer`. This is precisely the same expression
+/// `AppDelegate.bootstrapServices(...)`'s own `rendererRoot` default
+/// parameter uses (see `Sources/App/AppDelegate.swift`), so every test in
+/// this file drives the real `SeerSchemeHandler` serving the real,
+/// Vite-built React app that ships in production, through the real
+/// `PanelController` wiring — nothing here is stood in for.
+private enum BundledRenderer {
+    static let root = SeerRendererRoot(
+        url: Bundle.main.resourceURL!.appendingPathComponent("Renderer", isDirectory: true)
+    )
+
+    private static let documentFileName = "standalone-window.html"
+    private static let manifestFileName = "build-manifest.json"
+
+    /// Must match `scripts/renderer-build-identity.mjs`'s own
+    /// `RENDERER_BUILD_MANIFEST_SCHEMA_VERSION`/
+    /// `RENDERER_BUILD_MANIFEST_ALGORITHM` exactly. This Swift
+    /// recomputation and that Node implementation are two independent
+    /// implementations of the exact same digest contract — see
+    /// `RendererBuildIdentityTests` below, which proves both agree
+    /// byte-for-byte over the same committed fixture — so both must first
+    /// agree on the manifest's shape before ever comparing digests.
+    fileprivate static let manifestSchemaVersion = 2
+    fileprivate static let manifestAlgorithm = "sha256"
+
+    /// Same fixed, repo-root-relative files (outside `renderer/`) as
+    /// `scripts/renderer-build-identity.mjs`'s own `TOP_LEVEL_INPUT_FILES`
+    /// — kept in this exact spelling/order deliberately, so the two lists
+    /// are trivially diffable against each other. `tsconfig.json` is
+    /// included because `tsconfig.standalone.json`'s own
+    /// `"extends": "./tsconfig.json"` means the root config's
+    /// `compilerOptions` genuinely feed into how the standalone renderer
+    /// is type-checked/compiled.
+    fileprivate static let topLevelInputFiles = [
+        "standalone-window.html",
+        "vite.standalone.config.ts",
+        "package.json",
+        "package-lock.json",
+        "tsconfig.standalone.json",
+        "tsconfig.json",
+    ]
+
+    fileprivate static let rendererSourceDirName = "renderer"
+
+    /// The *only* filename excluded from `renderer/`'s otherwise-exhaustive
+    /// recursive walk — mirrors `scripts/renderer-build-identity.mjs`'s own
+    /// `EXCLUDED_METADATA_FILENAMES` exactly. `.DS_Store` is Finder-generated
+    /// metadata macOS silently writes into any directory a Finder window has
+    /// ever browsed; its bytes never reflect anything the build actually
+    /// reads, so letting it participate would let purely-local Finder
+    /// browsing "poison" (change) a checkout's build-identity digest with no
+    /// corresponding change to the built output.
+    ///
+    /// Deliberately narrow: this excludes *only* a file named exactly
+    /// `.DS_Store`, never dotfiles/dot-directories in general (previously
+    /// this used `FileManager.DirectoryEnumerationOptions.skipsHiddenFiles`,
+    /// which — unlike the Node implementation, which excluded nothing at
+    /// all — silently dropped *every* hidden file/directory, including any
+    /// that might be genuine, intentionally-hidden build input; the two
+    /// implementations must agree exactly on which files count as build
+    /// input, so both now apply this exact same narrow, named-file
+    /// exclusion instead).
+    fileprivate static let excludedMetadataFilenames: Set<String> = [".DS_Store"]
+
+    /// Thrown whenever the bundled renderer document is missing or stale
+    /// relative to the checked-out renderer source — surfaced as a real
+    /// XCTest setup failure (never `XCTSkip`), so a missing/misconfigured
+    /// prebuild is always visible as a failing required-coverage test,
+    /// never silently allowed to "pass" with no renderer under test.
+    struct SetupFailure: Error, CustomStringConvertible {
+        let description: String
+    }
+
+    /// A deterministic precondition, run once before every test in this
+    /// file. The bundled renderer is built by the lock-owning package
+    /// workflow before xcodebuild starts, and that wrapper keeps the same
+    /// lock through Xcode's "Copy Resources" phase — so by the time
+    /// `SeerTests` even links against `Seer.app` (its `TEST_HOST`), the
+    /// bundled `Renderer` folder this reads has already been produced from
+    /// the current checkout. This precondition therefore never launches
+    /// `npm`/any subprocess itself (that previously risked an
+    /// xcodebuild-invoked `Process` deadlocking or timing out draining a
+    /// long-running child's stdout/stderr pipes) — it only ever *verifies*
+    /// what the prebuild step already produced, and fails closed (throws
+    /// `SetupFailure`, never `XCTSkip`) both when the document is entirely
+    /// absent and when `build-manifest.json`'s content digest shows the
+    /// bundle no longer corresponds to the checked-out renderer source (see
+    /// `verifyManifestIsFresh` below).
+    static func ensureAvailable(file: StaticString = #filePath) throws {
+        let documentURL = root.url.appendingPathComponent(documentFileName)
+        guard FileManager.default.fileExists(atPath: documentURL.path) else {
+            throw SetupFailure(description: """
+                Bundled renderer document not found at \(documentURL.path). Run the official \
+                `npm run test:macos` workflow so its renderer lock wrapper builds and publishes an \
+                immutable generation before xcodebuild copies resources.
+                """)
+        }
+        let repoRoot = try repoRootURL(fromTestFile: file)
+        try verifyManifestIsFresh(
+            manifestURL: root.url.appendingPathComponent(manifestFileName),
+            repoRoot: repoRoot
+        )
+    }
+
+    /// Reads the deterministic content digests the lock-owning renderer
+    /// wrapper writes into `build-manifest.json` (via the single shared
+    /// `scripts/renderer-build-identity.mjs` implementation), independently
+    /// recomputes that exact same digest over the current checkout's
+    /// renderer build inputs, and fails closed unless they match exactly —
+    /// proof the bundled renderer genuinely corresponds to the current
+    /// source tree, never a stale artifact left over in `build/` from an
+    /// earlier checkout (e.g. the prebuild phase having been bypassed, or
+    /// `build/` restored from a cache). Deliberately never compares
+    /// timestamps or `git` state: a wall-clock timestamp only proves *when*
+    /// a build ran, never *what* it was built from, and a commit SHA can't
+    /// tell a clean checkout apart from one with uncommitted local edits
+    /// (and is simply unavailable outside a git checkout at all) — so this
+    /// check is exactly as strict with dirty/uncommitted renderer source or
+    /// no git repository present as it is with a clean one.
+    fileprivate static func verifyManifestIsFresh(manifestURL: URL, repoRoot: URL) throws {
+        guard let data = FileManager.default.contents(atPath: manifestURL.path) else {
+            throw SetupFailure(description: """
+                Bundled renderer manifest not found at \(manifestURL.path); the official macOS npm \
+                workflows always publish it alongside \(documentFileName) before launching xcodebuild.
+                """)
+        }
+        guard
+            let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+            let schemaVersion = json["schemaVersion"] as? Int,
+            let algorithm = json["algorithm"] as? String,
+            let sourceDigest = json["sourceDigest"] as? String,
+            let assetDigest = json["assetDigest"] as? String,
+            Set(json.keys) == Set(["schemaVersion", "algorithm", "sourceDigest", "assetDigest"])
+        else {
+            throw SetupFailure(description: """
+                Bundled renderer manifest at \(manifestURL.path) is malformed: \
+                \(String(data: data, encoding: .utf8) ?? "<non-UTF8 contents>")
+                """)
+        }
+        guard schemaVersion == manifestSchemaVersion, algorithm == manifestAlgorithm else {
+            throw SetupFailure(description: """
+                Bundled renderer manifest at \(manifestURL.path) has an unsupported \
+                schemaVersion/algorithm (\(schemaVersion)/\(algorithm)); expected \
+                \(manifestSchemaVersion)/\(manifestAlgorithm). Regenerate it with the current official \
+                macOS npm workflow.
+                """)
+        }
+
+        let expectedDigest = try computeRendererSourceDigest(repoRoot: repoRoot)
+        guard sourceDigest == expectedDigest else {
+            throw SetupFailure(description: """
+                Bundled renderer at \(manifestURL.deletingLastPathComponent().path) was built with source \
+                digest \(sourceDigest) (per \
+                \(manifestURL.path)), but independently recomputing that same digest over the current \
+                checkout's renderer build inputs (\(rendererSourceDirName)/, \
+                \(topLevelInputFiles.joined(separator: ", "))) yields \(expectedDigest) instead. The \
+                bundled renderer is stale relative to the current renderer source; rerun the official \
+                macOS npm workflow before running these tests again.
+                """)
+        }
+
+        let rendererRoot = manifestURL.deletingLastPathComponent()
+        let actualAssetDigest = try computeRendererAssetDigest(rendererRoot: rendererRoot)
+        guard assetDigest == actualAssetDigest else {
+            throw SetupFailure(description: """
+                Bundled renderer assets at \(rendererRoot.path) hash to \(actualAssetDigest), but \
+                \(manifestURL.path) binds generation \(assetDigest). The bundled copy is mixed, missing, \
+                or was modified after publication.
+                """)
+        }
+    }
+
+    /// Independently recomputes the exact same deterministic content digest
+    /// `scripts/renderer-build-identity.mjs`'s `computeRendererBuildDigest`
+    /// computes: lowercase hex SHA-256 over a stable manifest of
+    /// `<posix-relative-path>:<sha256-hex-of-file-bytes>\n` lines — one per
+    /// file returned by `rendererBuildInputFiles`, sorted by path.
+    fileprivate static func computeRendererSourceDigest(repoRoot: URL) throws -> String {
+        let relativePaths = try rendererBuildInputFiles(repoRoot: repoRoot)
+        var manifestLines = ""
+        for relativePath in relativePaths {
+            let absoluteURL = repoRoot.appendingPathComponent(relativePath)
+            let contents = try Data(contentsOf: absoluteURL)
+            manifestLines += "\(relativePath):\(sha256Hex(contents))\n"
+        }
+        return sha256Hex(Data(manifestLines.utf8))
+    }
+
+    /// Hashes the bundled generation itself, excluding only its manifest to
+    /// avoid self-reference. This independently verifies the exact copy that
+    /// Xcode placed in Seer.app, not the mutable repository output directory.
+    fileprivate static func computeRendererAssetDigest(rendererRoot: URL) throws -> String {
+        let fileManager = FileManager.default
+        guard let enumerator = fileManager.enumerator(
+            at: rendererRoot,
+            includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]
+        ) else {
+            throw SetupFailure(description: "Unable to enumerate bundled renderer at \(rendererRoot.path)")
+        }
+
+        var relativePaths: [String] = []
+        for case let fileURL as URL in enumerator {
+            let values = try fileURL.resourceValues(
+                forKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]
+            )
+            let relativePath = posixRelativePath(of: fileURL, relativeTo: rendererRoot)
+            if values.isSymbolicLink == true {
+                throw SetupFailure(description: "Bundled renderer asset is a symlink: \(relativePath)")
+            }
+            if values.isDirectory == true { continue }
+            guard values.isRegularFile == true else {
+                throw SetupFailure(description: "Bundled renderer asset is not a regular file: \(relativePath)")
+            }
+            if relativePath != manifestFileName {
+                relativePaths.append(relativePath)
+            }
+        }
+
+        var manifestLines = ""
+        for relativePath in relativePaths.sorted(by: canonicalRendererAssetPathPrecedes) {
+            let contents = try Data(contentsOf: rendererRoot.appendingPathComponent(relativePath))
+            manifestLines += "\(relativePath):\(sha256Hex(contents))\n"
+        }
+        return sha256Hex(Data(manifestLines.utf8))
+    }
+
+    /// Canonical asset-path ordering shared with `renderer-build-identity.mjs`
+    /// and `renderer-asset-digest.py`: compare exact UTF-8 bytes, with no
+    /// locale collation, case folding, or Unicode normalization.
+    private static func canonicalRendererAssetPathPrecedes(_ left: String, _ right: String) -> Bool {
+        let leftBytes = Array(left.utf8)
+        let rightBytes = Array(right.utf8)
+        let commonCount = min(leftBytes.count, rightBytes.count)
+        for index in 0 ..< commonCount where leftBytes[index] != rightBytes[index] {
+            return leftBytes[index] < rightBytes[index]
+        }
+        return leftBytes.count < rightBytes.count
+    }
+
+    /// Every path (relative to `repoRoot`, POSIX-style, sorted) this
+    /// digest depends on: `renderer/` walked recursively (excluding only
+    /// `excludedMetadataFilenames`, e.g. `.DS_Store`), plus whichever of
+    /// `topLevelInputFiles` actually exist on disk. Mirrors
+    /// `rendererBuildInputFiles` in `scripts/renderer-build-identity.mjs`
+    /// exactly — never returns an absolute path.
+    fileprivate static func rendererBuildInputFiles(repoRoot: URL) throws -> [String] {
+        let fileManager = FileManager.default
+        var absoluteFiles: [URL] = []
+
+        let rendererDir = repoRoot.appendingPathComponent(rendererSourceDirName, isDirectory: true)
+        // Deliberately no `.skipsHiddenFiles`: that would drop *every*
+        // hidden file/directory, not just `.DS_Store`, and diverge from
+        // the Node implementation's own narrow exclusion (see
+        // `excludedMetadataFilenames`'s doc comment above).
+        if let enumerator = fileManager.enumerator(
+            at: rendererDir,
+            includingPropertiesForKeys: [.isDirectoryKey]
+        ) {
+            for case let fileURL as URL in enumerator {
+                if excludedMetadataFilenames.contains(fileURL.lastPathComponent) { continue }
+                let values = try fileURL.resourceValues(forKeys: [.isDirectoryKey])
+                if values.isDirectory != true {
+                    absoluteFiles.append(fileURL)
+                }
+            }
+        }
+
+        for relativePath in topLevelInputFiles {
+            let absolutePath = repoRoot.appendingPathComponent(relativePath)
+            var isDirectory: ObjCBool = false
+            if fileManager.fileExists(atPath: absolutePath.path, isDirectory: &isDirectory), !isDirectory.boolValue {
+                absoluteFiles.append(absolutePath)
+            }
+        }
+
+        let relativePaths = absoluteFiles.map { posixRelativePath(of: $0, relativeTo: repoRoot) }
+        return relativePaths.sorted()
+    }
+
+    /// `fileURL`'s path relative to `repoRoot`, always using `/` — never
+    /// the absolute path, and never leaking `repoRoot`'s own on-disk
+    /// location into the (relative) result.
+    fileprivate static func posixRelativePath(of fileURL: URL, relativeTo repoRoot: URL) -> String {
+        let filePath = fileURL.standardizedFileURL.path
+        let rootPath = repoRoot.standardizedFileURL.path
+        let rootPrefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
+        guard filePath.hasPrefix(rootPrefix) else { return filePath }
+        return String(filePath.dropFirst(rootPrefix.count))
+    }
+
+    fileprivate static func sha256Hex(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Derives the repository root by walking upward from this very
+    /// source file's own on-disk location (`apps/macos/Seer/Tests/
+    /// Integration/RendererIntegrationTests.swift`) until it finds the
+    /// directory that actually contains both `package.json` and
+    /// `vite.standalone.config.ts` — the two files that mark the real
+    /// repository root `npm run build:standalone-renderer` must be
+    /// invoked from — rather than a brittle fixed count of
+    /// `deleteLastPathComponent()` calls (which previously undershot by
+    /// one level, resolving to `<repo>/apps` instead of `<repo>`, so
+    /// `npm run` there always failed with "no such file or directory:
+    /// package.json") or any assumption about the current working
+    /// directory `xcodebuild` happens to invoke tests from. Deterministic
+    /// regardless of caller; throws rather than looping forever if it
+    /// ever walks past the filesystem root without finding a match.
+    /// `fileprivate` (not `private`) so `RendererIntegrationTests`' own
+    /// `testBundledRendererRepoRootDiscoveryFindsTheActualRepoRoot`
+    /// characterization test — in this same file — can exercise it
+    /// directly.
+    fileprivate static func repoRootURL(fromTestFile file: StaticString) throws -> URL {
+        let markers = ["package.json", "vite.standalone.config.ts"]
+        let fileManager = FileManager.default
+        var directory = URL(fileURLWithPath: "\(file)").deletingLastPathComponent()
+
+        while true {
+            let isRepoRoot = markers.allSatisfy {
+                fileManager.fileExists(atPath: directory.appendingPathComponent($0).path)
+            }
+            if isRepoRoot { return directory }
+
+            let parent = directory.deletingLastPathComponent()
+            guard parent.path != directory.path else {
+                throw SetupFailure(description: """
+                    Could not locate the repository root (a directory containing both \
+                    \(markers.joined(separator: " and "))) by walking upward from \(file).
+                    """)
+            }
+            directory = parent
+        }
+    }
+}
+
+// MARK: - Test doubles
+
+/// A scripted `AgentDetecting` double whose `detect(now:)` result is set by
+/// the test *before* `AgentMonitor.scan()` is invoked, and only ever read
+/// afterward (`AgentMonitor.scan()` runs the detector inside a detached
+/// task — see its own documentation — so this must genuinely be safe to
+/// read cross-thread). `@unchecked Sendable` on the same "call ordering,
+/// never true concurrent access" basis already documented by this
+/// codebase's other single-writer-then-many-reader fakes (e.g.
+/// `AppSnapshotCoordinatorTests.CoordinatorFakePowerBackend`).
+private final class FakeAgentDetecting: AgentDetecting, @unchecked Sendable {
+    var nextAgents: [ActiveAgent] = []
+
+    func detect(now: Int64) async throws -> [ActiveAgent] {
+        nextAgents
+    }
+}
+
+/// An always-succeeding `PowerAssertionBackend` double, additionally
+/// tracking every assertion it ever created/released — this suite's
+/// lifecycle assertions use these counts to prove
+/// `AppSnapshotCoordinator.shutdown()` actually released whatever it had
+/// created, never leaving one retained past a test.
+private final class FakePowerAssertionBackend: PowerAssertionBackend, @unchecked Sendable {
+    private var nextID: UInt32 = 1
+    private(set) var createdCount = 0
+    private(set) var releasedIDs: [UInt32] = []
+
+    func createAssertion(mode: KeepAwakeMode, reason: String) throws -> UInt32 {
+        defer { nextID += 1 }
+        createdCount += 1
+        return nextID
+    }
+
+    func releaseAssertion(id: UInt32) throws {
+        releasedIDs.append(id)
+    }
+}
+
+/// The typed, closed `BridgeCommandHandling` fake this suite's real-UI
+/// bridge-path test routes `BridgeMessageHandler` through — recording the
+/// *exact* commands/arguments it receives, rather than standing up a real
+/// `AppSnapshotCoordinator` (whose real side effects — power assertions,
+/// disk-backed history — are irrelevant to proving the wire path itself
+/// works end to end).
+@MainActor
+private final class RecordingBridgeCommandRouter: BridgeCommandHandling {
+    private(set) var keepAwakeModeSetCalls: [KeepAwakeMode] = []
+    private(set) var historyClearCallCount = 0
+    private let snapshot: AppSnapshot
+
+    init(snapshot: AppSnapshot) {
+        self.snapshot = snapshot
+    }
+
+    func snapshotGet() async -> BridgeSnapshotOutcome { .success(snapshot) }
+
+    func keepAwakeModeSet(_ mode: KeepAwakeMode) async -> BridgeSnapshotOutcome {
+        keepAwakeModeSetCalls.append(mode)
+        return .success(snapshot)
+    }
+
+    func historyClear() async -> BridgeSnapshotOutcome {
+        historyClearCallCount += 1
+        return .success(snapshot)
+    }
+
+    func updatesCheck() async -> BridgeSnapshotOutcome { .success(snapshot) }
+    func updatesOpen() async -> BridgeVoidOutcome { .success(()) }
+    func panelHide() async -> BridgeVoidOutcome { .success(()) }
+    func appQuit() async -> BridgeVoidOutcome { .success(()) }
+}
+
+// MARK: - RendererIntegrationTests
+
+@MainActor
+final class RendererIntegrationTests: XCTestCase {
+    private let settingsURL = URL(fileURLWithPath: "/Renderer-Integration-Test/ai.opencoven.seer/settings.json")
+    private let historyURL = URL(fileURLWithPath: "/Renderer-Integration-Test/ai.opencoven.seer/history.json")
+
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        try BundledRenderer.ensureAvailable()
+    }
+
+    /// A characterization test for `BundledRenderer.repoRootURL`
+    /// independent of the renderer build itself: proves the walk-upward
+    /// discovery actually lands on the real repository root (a directory
+    /// containing both `package.json` and `vite.standalone.config.ts`),
+    /// not merely "some ancestor directory" — the previous fixed
+    /// `deleteLastPathComponent()` count silently resolved one level too
+    /// shallow (`<repo>/apps`) and this test would have caught that
+    /// regression directly, without needing a full `npm` build to surface
+    /// the failure downstream.
+    func testBundledRendererRepoRootDiscoveryFindsTheActualRepoRoot() throws {
+        let discovered = try BundledRenderer.repoRootURL(fromTestFile: #filePath)
+
+        let fileManager = FileManager.default
+        XCTAssertTrue(
+            fileManager.fileExists(atPath: discovered.appendingPathComponent("package.json").path),
+            "discovered root \(discovered.path) must contain package.json"
+        )
+        XCTAssertTrue(
+            fileManager.fileExists(atPath: discovered.appendingPathComponent("vite.standalone.config.ts").path),
+            "discovered root \(discovered.path) must contain vite.standalone.config.ts"
+        )
+        XCTAssertFalse(
+            discovered.path.hasSuffix("/apps"),
+            "must not undershoot to <repo>/apps, the previous fixed-depth bug's exact failure mode"
+        )
+    }
+
+    /// Proves this Swift recomputation and `scripts/renderer-build-identity.mjs`'s
+    /// independent Node implementation are genuinely the same digest
+    /// contract — not two implementations that merely happen to agree with
+    /// themselves — by both reading the exact same committed fixture
+    /// (`tests/fixtures/renderer-build-identity/repo`) and its single
+    /// `expected-digest.txt` oracle (see
+    /// `tests/renderer-build-identity.test.mjs`'s
+    /// "matches the shared cross-language fixture oracle" test, which
+    /// asserts the identical thing from the Node side). Neither language
+    /// restates the expected digest value as a literal in test code, so a
+    /// change to one implementation that silently diverges from the other
+    /// shows up as a cross-language mismatch here, not a same-language
+    /// tautology.
+    func testComputeRendererSourceDigestMatchesSharedCrossLanguageFixtureOracle() throws {
+        let repoRoot = try BundledRenderer.repoRootURL(fromTestFile: #filePath)
+        let fixtureDir = repoRoot
+            .appendingPathComponent("tests", isDirectory: true)
+            .appendingPathComponent("fixtures", isDirectory: true)
+            .appendingPathComponent("renderer-build-identity", isDirectory: true)
+        let fixtureRepo = fixtureDir.appendingPathComponent("repo", isDirectory: true)
+        let expectedDigestURL = fixtureDir.appendingPathComponent("expected-digest.txt")
+
+        let expectedDigest = try String(contentsOf: expectedDigestURL, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let actualDigest = try BundledRenderer.computeRendererSourceDigest(repoRoot: fixtureRepo)
+
+        XCTAssertEqual(
+            actualDigest,
+            expectedDigest,
+            "the Swift digest must match the fixture oracle Node's independent recomputation also reads"
+        )
+    }
+
+    /// A disposable copy of the shared `tests/fixtures/renderer-build-identity/repo`
+    /// fixture, mutable per-test without ever touching the real
+    /// repository's own `renderer/` tree or the committed fixture itself.
+    /// Mirrors `tests/renderer-build-identity.test.mjs`'s own
+    /// `withFixtureCopy` helper.
+    private func withScratchFixtureCopy<T>(_ run: (URL) throws -> T) throws -> T {
+        let repoRoot = try BundledRenderer.repoRootURL(fromTestFile: #filePath)
+        let fixtureRepo = repoRoot
+            .appendingPathComponent("tests", isDirectory: true)
+            .appendingPathComponent("fixtures", isDirectory: true)
+            .appendingPathComponent("renderer-build-identity", isDirectory: true)
+            .appendingPathComponent("repo", isDirectory: true)
+
+        let fileManager = FileManager.default
+        let scratchRoot = fileManager.temporaryDirectory
+            .appendingPathComponent("seer-renderer-build-identity-scratch-\(UUID().uuidString)", isDirectory: true)
+        let scratchRepo = scratchRoot.appendingPathComponent("repo", isDirectory: true)
+        try fileManager.createDirectory(at: scratchRoot, withIntermediateDirectories: true)
+        try fileManager.copyItem(at: fixtureRepo, to: scratchRepo)
+        defer { try? fileManager.removeItem(at: scratchRoot) }
+
+        return try run(scratchRepo)
+    }
+
+    /// Proves the root `tsconfig.json` is a genuine build input on the
+    /// Swift side too: `tsconfig.standalone.json`'s own
+    /// `"extends": "./tsconfig.json"` means the root config's
+    /// `compilerOptions` feed into how the standalone renderer compiles,
+    /// so changing its bytes must change the digest — mirrors
+    /// `tests/renderer-build-identity.test.mjs`'s identically-named Node
+    /// test exactly.
+    func testModifyingRootTsconfigJsonChangesTheDigest() throws {
+        try withScratchFixtureCopy { fixtureRepo in
+            let before = try BundledRenderer.computeRendererSourceDigest(repoRoot: fixtureRepo)
+
+            let rootTsconfigURL = fixtureRepo.appendingPathComponent("tsconfig.json")
+            let originalContents = try String(contentsOf: rootTsconfigURL, encoding: .utf8)
+            try (originalContents + "\n// modified\n").write(to: rootTsconfigURL, atomically: true, encoding: .utf8)
+
+            let after = try BundledRenderer.computeRendererSourceDigest(repoRoot: fixtureRepo)
+            XCTAssertNotEqual(
+                after,
+                before,
+                "the root tsconfig.json is extended by tsconfig.standalone.json, so changing its bytes must change the digest"
+            )
+        }
+    }
+
+    /// A `.DS_Store` file anywhere under `renderer/` (top-level or nested)
+    /// must never affect the digest — mirrors
+    /// `tests/renderer-build-identity.test.mjs`'s identically-named Node
+    /// test exactly, proving both implementations apply the exact same
+    /// narrow exclusion.
+    func testDSStoreFilesUnderRendererNeverAffectTheDigest() throws {
+        try withScratchFixtureCopy { fixtureRepo in
+            let before = try BundledRenderer.computeRendererSourceDigest(repoRoot: fixtureRepo)
+
+            let metadata = "finder metadata, never real source\n"
+            try metadata.write(
+                to: fixtureRepo.appendingPathComponent("renderer/.DS_Store"),
+                atomically: true,
+                encoding: .utf8
+            )
+            try metadata.write(
+                to: fixtureRepo.appendingPathComponent("renderer/nested/.DS_Store"),
+                atomically: true,
+                encoding: .utf8
+            )
+
+            let after = try BundledRenderer.computeRendererSourceDigest(repoRoot: fixtureRepo)
+            XCTAssertEqual(
+                after,
+                before,
+                ".DS_Store is Finder-generated metadata with no bearing on the build and must never poison the digest"
+            )
+        }
+    }
+
+    /// A hidden dotfile under `renderer/` that is *not* `.DS_Store` must
+    /// still be treated as real build input — proving the exclusion is
+    /// narrowly scoped to `.DS_Store` alone, never a blanket "skip all
+    /// hidden files" rule. Mirrors
+    /// `tests/renderer-build-identity.test.mjs`'s identically-named Node
+    /// test exactly.
+    func testHiddenDotfileUnderRendererThatIsNotDSStoreStillAffectsTheDigest() throws {
+        try withScratchFixtureCopy { fixtureRepo in
+            let before = try BundledRenderer.computeRendererSourceDigest(repoRoot: fixtureRepo)
+
+            try "export const z = 5;\n".write(
+                to: fixtureRepo.appendingPathComponent("renderer/.hidden-but-intentional.ts"),
+                atomically: true,
+                encoding: .utf8
+            )
+
+            let after = try BundledRenderer.computeRendererSourceDigest(repoRoot: fixtureRepo)
+            XCTAssertNotEqual(
+                after,
+                before,
+                "a dotfile that isn't .DS_Store may be genuine, intentionally-hidden source and must still affect the digest"
+            )
+        }
+    }
+
+    /// Proves `BundledRenderer.verifyManifestIsFresh` — the exact function
+    /// `ensureAvailable()`'s precondition relies on to fail closed — both
+    /// accepts a manifest whose digest genuinely matches the current
+    /// source tree, and rejects (throws `SetupFailure`, never silently
+    /// passes) one whose digest no longer matches after relevant source
+    /// changed. Exercised against a disposable copy of the shared fixture
+    /// repo, mutated in place, so this never touches the real repository's
+    /// own `renderer/` tree.
+    func testVerifyManifestIsFreshAcceptsAMatchingDigestAndRejectsAStaleOne() throws {
+        let repoRoot = try BundledRenderer.repoRootURL(fromTestFile: #filePath)
+        let fixtureRepo = repoRoot
+            .appendingPathComponent("tests", isDirectory: true)
+            .appendingPathComponent("fixtures", isDirectory: true)
+            .appendingPathComponent("renderer-build-identity", isDirectory: true)
+            .appendingPathComponent("repo", isDirectory: true)
+
+        let fileManager = FileManager.default
+        let scratchRoot = fileManager.temporaryDirectory
+            .appendingPathComponent("seer-renderer-build-identity-swift-\(UUID().uuidString)", isDirectory: true)
+        let scratchRepo = scratchRoot.appendingPathComponent("repo", isDirectory: true)
+        try fileManager.createDirectory(at: scratchRoot, withIntermediateDirectories: true)
+        try fileManager.copyItem(at: fixtureRepo, to: scratchRepo)
+        defer { try? fileManager.removeItem(at: scratchRoot) }
+
+        let rendererBundle = scratchRoot.appendingPathComponent("Renderer", isDirectory: true)
+        try fileManager.createDirectory(at: rendererBundle, withIntermediateDirectories: true)
+        let documentURL = rendererBundle.appendingPathComponent("standalone-window.html")
+        try "<html>fresh</html>\n".write(to: documentURL, atomically: true, encoding: .utf8)
+        let manifestURL = rendererBundle.appendingPathComponent("build-manifest.json")
+        let freshSourceDigest = try BundledRenderer.computeRendererSourceDigest(repoRoot: scratchRepo)
+        let freshAssetDigest = try BundledRenderer.computeRendererAssetDigest(rendererRoot: rendererBundle)
+        let freshManifest = """
+            {"schemaVersion": \(BundledRenderer.manifestSchemaVersion), \
+            "algorithm": "\(BundledRenderer.manifestAlgorithm)", \
+            "sourceDigest": "\(freshSourceDigest)", "assetDigest": "\(freshAssetDigest)"}
+            """
+        try freshManifest.write(to: manifestURL, atomically: true, encoding: .utf8)
+
+        XCTAssertNoThrow(
+            try BundledRenderer.verifyManifestIsFresh(manifestURL: manifestURL, repoRoot: scratchRepo),
+            "a manifest digest that matches the current source tree must be accepted"
+        )
+
+        // Mutate a file the digest actually depends on *after* the manifest
+        // was written — the exact "stale bundle" scenario this precondition
+        // exists to catch.
+        let rendererFile = scratchRepo.appendingPathComponent("renderer/index.ts")
+        let originalContents = try String(contentsOf: rendererFile, encoding: .utf8)
+        try (originalContents + "// modified after the manifest was written\n").write(
+            to: rendererFile,
+            atomically: true,
+            encoding: .utf8
+        )
+
+        XCTAssertThrowsError(
+            try BundledRenderer.verifyManifestIsFresh(manifestURL: manifestURL, repoRoot: scratchRepo),
+            "a manifest digest that no longer matches modified source must be rejected"
+        ) { error in
+            XCTAssertTrue(
+                error is BundledRenderer.SetupFailure,
+                "expected a SetupFailure, got \(error)"
+            )
+        }
+
+        let refreshedSourceDigest = try BundledRenderer.computeRendererSourceDigest(repoRoot: scratchRepo)
+        let refreshedManifest = """
+            {"schemaVersion": \(BundledRenderer.manifestSchemaVersion), \
+            "algorithm": "\(BundledRenderer.manifestAlgorithm)", \
+            "sourceDigest": "\(refreshedSourceDigest)", "assetDigest": "\(freshAssetDigest)"}
+            """
+        try refreshedManifest.write(to: manifestURL, atomically: true, encoding: .utf8)
+        try "<html>tampered after publication</html>\n".write(
+            to: documentURL,
+            atomically: true,
+            encoding: .utf8
+        )
+        XCTAssertThrowsError(
+            try BundledRenderer.verifyManifestIsFresh(manifestURL: manifestURL, repoRoot: scratchRepo),
+            "a bundled asset changed after publication must be rejected"
+        ) { error in
+            XCTAssertTrue(error is BundledRenderer.SetupFailure, "expected a SetupFailure, got \(error)")
+        }
+    }
+
+    /// `verifyManifestIsFresh` must also fail closed on a manifest with an
+    /// unrecognized `schemaVersion`/`algorithm` — never silently trust a
+    /// `digest` field produced under a contract this code doesn't
+    /// implement.
+    func testVerifyManifestIsFreshRejectsAnUnsupportedSchemaVersion() throws {
+        let repoRoot = try BundledRenderer.repoRootURL(fromTestFile: #filePath)
+        let fixtureRepo = repoRoot
+            .appendingPathComponent("tests", isDirectory: true)
+            .appendingPathComponent("fixtures", isDirectory: true)
+            .appendingPathComponent("renderer-build-identity", isDirectory: true)
+            .appendingPathComponent("repo", isDirectory: true)
+
+        let fileManager = FileManager.default
+        let scratchRoot = fileManager.temporaryDirectory
+            .appendingPathComponent("seer-renderer-build-identity-schema-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: scratchRoot, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: scratchRoot) }
+
+        let manifestURL = scratchRoot.appendingPathComponent("build-manifest.json")
+        let digest = try BundledRenderer.computeRendererSourceDigest(repoRoot: fixtureRepo)
+        try """
+            {"schemaVersion": 999, "algorithm": "sha256", \
+            "sourceDigest": "\(digest)", "assetDigest": "\(digest)"}
+            """.write(to: manifestURL, atomically: true, encoding: .utf8)
+
+        XCTAssertThrowsError(
+            try BundledRenderer.verifyManifestIsFresh(manifestURL: manifestURL, repoRoot: fixtureRepo)
+        ) { error in
+            XCTAssertTrue(error is BundledRenderer.SetupFailure, "expected a SetupFailure, got \(error)")
+        }
+    }
+
+    /// One full, real Swift-side stack: a real `PanelController` (and
+    /// therefore real `SeerWebViewFactory`/`SeerSchemeHandler`/
+    /// `SeerWebViewNavigationDelegate` wiring) serving the *real bundled*
+    /// `BundledRenderer.root`, a real `RendererEventSink`, and a real
+    /// `BridgeMessageHandler` registered via the real
+    /// `BridgeMessageHandlerRegistration.register(_:on:)` — i.e. exactly
+    /// production's own `AppDelegate.bootstrapServices(...)` wiring, minus
+    /// the status item/agent-monitor-loop/update-scheduler pieces this
+    /// suite does not need. `router` is the only seam a test controls
+    /// directly.
+    @MainActor
+    private struct Harness {
+        let panel: PanelController
+        let bridgeMessageHandler: BridgeMessageHandler
+        let coordinator: AppSnapshotCoordinator?
+
+        var webView: WKWebView { panel.webView }
+
+        /// Fully, deterministically releases every real resource this
+        /// harness acquired: stops accepting/cancels in-flight bridge
+        /// work, runs the real `AppSnapshotCoordinator.shutdown()` path
+        /// (releasing its power assertion and stopping its update
+        /// scheduler) when a real coordinator backs this harness, removes
+        /// the exact registration `BridgeMessageHandlerRegistration
+        /// .register` installed (the isolated-world script message
+        /// handler and the relay user script), and finally stops loading
+        /// and closes the panel/web view. Idempotent — every step here is
+        /// safe to run more than once — so callers may invoke this both
+        /// explicitly at the end of a passing test *and* register it via
+        /// `XCTestCase.addTeardownBlock`, which XCTest guarantees runs
+        /// after the test method returns whether it passed, failed an
+        /// assertion, or threw partway through — so a thrown error can
+        /// never skip this and leak a webview/power assertion/update
+        /// scheduler.
+        func tearDown() async {
+            bridgeMessageHandler.stopAccepting()
+            bridgeMessageHandler.cancelAll()
+            try? await coordinator?.shutdown()
+            panel.userContentController.removeScriptMessageHandler(
+                forName: BridgeMessageHandler.messageHandlerName,
+                contentWorld: BridgeContentWorld.bridge
+            )
+            panel.userContentController.removeAllUserScripts()
+            panel.webView.stopLoading()
+            panel.panel.close()
+        }
+    }
+
+    private func makeHarness(router: any BridgeCommandHandling) -> Harness {
+        let panel = PanelController(rendererRoot: BundledRenderer.root)
+        let rendererSink = RendererEventSink(javaScriptCaller: panel.webView)
+        let bridgeMessageHandler = BridgeMessageHandler(router: router, responder: rendererSink)
+        BridgeMessageHandlerRegistration.register(bridgeMessageHandler, on: panel.userContentController)
+        panel.loadInitialDocument()
+
+        return Harness(panel: panel, bridgeMessageHandler: bridgeMessageHandler, coordinator: nil)
+    }
+
+    /// Builds the same harness, but with a *real* `AppSnapshotCoordinator`
+    /// (backed by in-memory settings/history storage, a fake power
+    /// backend, and a fake update service — the "fake detector, storage,
+    /// history, power, and update services" this task's requirements
+    /// name) routed through `StandaloneBridgeCommandRouter.forCoordinator`
+    /// — exactly the router production wiring builds.
+    private func makeRealCoordinatorHarness(
+        clock: MutableClock = MutableClock(now: 1_700_000_000_000)
+    ) async throws -> (
+        harness: Harness,
+        coordinator: AppSnapshotCoordinator,
+        detector: FakeAgentDetecting,
+        agentMonitor: AgentMonitor,
+        power: PowerAssertionService,
+        powerBackend: FakePowerAssertionBackend,
+        updateScheduler: FakeUpdateSchedulerControlling
+    ) {
+        let settingsStore = SettingsStore(
+            store: AtomicJSONStore<SettingsDocument>(fileURL: settingsURL, fileSystem: InMemorySettingsFileSystem(), clock: clock)
+        )
+        let historyStore = HistoryStore(
+            store: AtomicJSONStore<HistoryDocument>(fileURL: historyURL, fileSystem: InMemorySettingsFileSystem(), clock: clock),
+            clock: clock
+        )
+        let powerBackend = FakePowerAssertionBackend()
+        let power = PowerAssertionService(backend: powerBackend)
+        let updateService = FakeUpdateChecking()
+        let updateScheduler = FakeUpdateSchedulerControlling()
+        let detector = FakeAgentDetecting()
+        let agentMonitor = AgentMonitor(detector: detector, clock: clock)
+
+        let panel = PanelController(rendererRoot: BundledRenderer.root)
+        let rendererSink = RendererEventSink(javaScriptCaller: panel.webView)
+
+        let coordinator = await AppSnapshotCoordinator.makeAtStartup(
+            settingsStore: settingsStore,
+            historyStore: historyStore,
+            power: power,
+            renderer: rendererSink,
+            clock: clock,
+            appVersion: "1.0.0-integration-test",
+            updateService: updateService,
+            updateScheduler: updateScheduler
+        )
+
+        let router = StandaloneBridgeCommandRouter.forCoordinator(coordinator)
+        let bridgeMessageHandler = BridgeMessageHandler(router: router, responder: rendererSink)
+        BridgeMessageHandlerRegistration.register(bridgeMessageHandler, on: panel.userContentController)
+        panel.loadInitialDocument()
+
+        let harness = Harness(panel: panel, bridgeMessageHandler: bridgeMessageHandler, coordinator: coordinator)
+        return (harness, coordinator, detector, agentMonitor, power, powerBackend, updateScheduler)
+    }
+
+    // MARK: - JS helpers
+
+    private func waitUntil(timeout: TimeInterval = 10, _ condition: @escaping () async -> Bool) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while await !condition(), Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+
+    private func evaluateString(_ webView: WKWebView, _ expression: String) async -> String? {
+        (try? await webView.evaluateJavaScript(expression)) as? String
+    }
+
+    /// The real `HomeView`'s status title text node (`renderer/main/
+    /// home-view.tsx`'s `statusTitle`) — exactly "Idle" or "Keeping Mac
+    /// awake", nothing else in the bundled app renders either string.
+    /// Never a test-fixture stand-in element.
+    private func statusTitleText(_ webView: WKWebView) async -> String? {
+        let expression = """
+            (function () {
+              var nodes = Array.from(document.querySelectorAll('span'));
+              var match = nodes.find(function (node) {
+                return node.textContent === 'Idle' || node.textContent === 'Keeping Mac awake';
+              });
+              return match ? match.textContent : null;
+            })()
+            """
+        return await evaluateString(webView, expression)
+    }
+
+    /// Clicks the first real `<button>` whose exact, trimmed text content
+    /// matches `text` (e.g. the real `PanelTabs`/`SegmentedControlItem`
+    /// buttons) — driving the actual production React UI, never a
+    /// directly-injected wire-protocol event. Returns whether a match was
+    /// found and clicked.
+    private func clickButtonWithText(_ webView: WKWebView, _ text: String) async -> Bool {
+        let escaped = text.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "'", with: "\\'")
+        let expression = """
+            (function () {
+              var buttons = Array.from(document.querySelectorAll('button'));
+              var match = buttons.find(function (button) {
+                return button.textContent && button.textContent.trim() === '\(escaped)';
+              });
+              if (!match) { return false; }
+              match.click();
+              return true;
+            })()
+            """
+        return (try? await webView.evaluateJavaScript(expression)) as? Bool ?? false
+    }
+
+    /// Clicks the real, non-disabled `<button aria-label="…">` matching
+    /// `label` (e.g. `HistoryView`'s real "Clear history" button) — again
+    /// driving actual production UI, not a synthetic stand-in. Returns
+    /// `false` (and never clicks) while the button is still disabled, so
+    /// callers can `waitUntil` it becomes clickable.
+    private func clickButtonWithAriaLabel(_ webView: WKWebView, _ label: String) async -> Bool {
+        let escaped = label.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "'", with: "\\'")
+        let expression = """
+            (function () {
+              var match = document.querySelector('[aria-label=\\'\(escaped)\\']');
+              if (!match || match.disabled) { return false; }
+              match.click();
+              return true;
+            })()
+            """
+        return (try? await webView.evaluateJavaScript(expression)) as? Bool ?? false
+    }
+
+    // MARK: 1. Bundled document loads, exposes the exact bridge version
+
+    /// Full, real stack (real `PanelController`, real `SeerSchemeHandler`
+    /// serving the *actual bundled* `standalone-window.html` from
+    /// `build/standalone-renderer/Renderer`, real navigation policy) with
+    /// fake detector/storage/history/power/update services backing a real
+    /// `AppSnapshotCoordinator`. Waits for the bundled document to
+    /// actually finish loading through `seer://app/standalone-window.html`
+    /// before asserting `document.title`/`window.seerNative.version`, and
+    /// confirms the real coordinator's shutdown lifecycle (power
+    /// assertion released, update scheduler stopped) leaves nothing
+    /// retained once this test's own harness tears down.
+    func testBundledDocumentLoadsAndExposesBridgeVersion() async throws {
+        let (harness, _, _, _, power, powerBackend, updateScheduler) = try await makeRealCoordinatorHarness()
+        addTeardownBlock { await harness.tearDown() }
+
+        await waitUntil { await self.evaluateString(harness.webView, "document.title") == "Seer" }
+
+        let title = await evaluateString(harness.webView, "document.title")
+        XCTAssertEqual(title, "Seer")
+
+        let version = await evaluateString(harness.webView, "window.seerNative && window.seerNative.version")
+        XCTAssertEqual(version, bridgeVersion)
+
+        await harness.tearDown()
+        XCTAssertFalse(power.isActive, "the coordinator's shutdown() must release the power assertion, leaving none retained")
+        XCTAssertEqual(
+            powerBackend.releasedIDs.count, powerBackend.createdCount,
+            "every power assertion this test's coordinator created must have been released"
+        )
+        XCTAssertEqual(updateScheduler.stopCallCount, 1, "the coordinator's shutdown() must stop the update scheduler exactly once")
+    }
+
+    // MARK: 2. A synthetic AppSnapshot visibly updates the real Status UI
+
+    /// Drives a real scan through a fake `AgentDetecting`/`AgentMonitor`
+    /// pair, exactly mirroring `AppDelegate.performScanTick(agentMonitor:
+    /// coordinator:)`'s own two-step handoff (`agentMonitor.scan()` then
+    /// `coordinator.applyScan(state.agents, scannedAt:)`), then confirms
+    /// the resulting `snapshot.changed` event — delivered through the
+    /// real `RendererEventSink` → `window.seerNative.receive` path, into
+    /// the real bundled React app's own `useAppSnapshot`/`HomeView` —
+    /// is visibly reflected in the real, rendered status title text.
+    func testSyntheticSnapshotUpdatesVisibleStatusText() async throws {
+        let (harness, coordinator, detector, agentMonitor, power, powerBackend, updateScheduler) = try await makeRealCoordinatorHarness()
+        addTeardownBlock { await harness.tearDown() }
+
+        await waitUntil { await self.evaluateString(harness.webView, "document.title") == "Seer" }
+        await waitUntil { await self.statusTitleText(harness.webView) != nil }
+
+        let initialStatus = await statusTitleText(harness.webView)
+        XCTAssertEqual(initialStatus, "Idle", "the real HomeView status title must read Idle before any agent is detected")
+
+        detector.nextAgents = [
+            ActiveAgent(
+                id: "codex:/fixtures/active.jsonl",
+                name: "Codex",
+                detail: "Fixtures · Working",
+                source: .session,
+                lastActivityAt: 1_700_000_000_000
+            ),
+        ]
+        await agentMonitor.scan()
+        let state = await agentMonitor.state
+        XCTAssertTrue(state.active, "the fake detector's scripted agent must have made the monitor report active")
+        await coordinator.applyScan(state.agents, scannedAt: state.lastScanAt)
+
+        await waitUntil { await self.statusTitleText(harness.webView) == "Keeping Mac awake" }
+        let updatedStatus = await statusTitleText(harness.webView)
+        XCTAssertEqual(
+            updatedStatus, "Keeping Mac awake",
+            "a real snapshot.changed event must visibly update the real HomeView's status title"
+        )
+        XCTAssertTrue(coordinator.snapshot.monitor.active)
+
+        await harness.tearDown()
+        XCTAssertFalse(power.isActive, "the coordinator's shutdown() must release the power assertion, leaving none retained")
+        XCTAssertEqual(
+            powerBackend.releasedIDs.count, powerBackend.createdCount,
+            "every power assertion this test's coordinator created must have been released"
+        )
+        XCTAssertEqual(updateScheduler.stopCallCount, 1, "the coordinator's shutdown() must stop the update scheduler exactly once")
+    }
+
+    // MARK: 3. keepAwakeMode.set / history.clear reach the typed fake coordinator
+
+    /// Triggers both commands by clicking real, rendered buttons in the
+    /// actual bundled React app — the "System + Display" segmented-control
+    /// option (`HomeView`) and the "Clear history" toolbar button
+    /// (`HistoryView`) — never by injecting a hand-rolled wire-protocol
+    /// event. Each click flows through the real `RendererBridge` →
+    /// `createDomRelayPort` → `BridgeRelayUserScript`'s isolated
+    /// content-world listener → real `BridgeMessageHandler`, and is
+    /// asserted to have reached the typed `RecordingBridgeCommandRouter`
+    /// fake with the exact commands/arguments — never
+    /// `BridgeMessageHandler.handle(body:)` called directly, and no bridge
+    /// logic of any kind duplicated in this test file.
+    func testKeepAwakeModeSetAndHistoryClearReachTypedFakeCoordinatorThroughRealBridgePath() async throws {
+        // Seeded with non-empty history so `HistoryView`'s real
+        // "Clear history" button (disabled while there is nothing to
+        // clear) is actually clickable from the moment the page loads.
+        let seededSnapshot = AppSnapshot(
+            monitor: AgentMonitorState(active: false, keepingAwake: false, keepAwakeMode: .system, agents: [], lastScanAt: 0),
+            history: HistoryStats(
+                totalAwakeMs: 3_600_000,
+                todayAwakeMs: 1_800_000,
+                sessionCount: 1,
+                perAgent: [],
+                currentSession: nil,
+                recentSessions: [
+                    AwakeSession(
+                        id: "session-1",
+                        startedAt: 1_699_999_000_000,
+                        endedAt: 1_700_000_000_000,
+                        durationMs: 1_000_000,
+                        mode: .system,
+                        agents: []
+                    ),
+                ]
+            ),
+            update: UpdateState(checking: false, availableVersion: nil, releaseURL: nil, lastCheckedAt: nil),
+            diagnostics: [],
+            appVersion: "1.0.0-integration-test"
+        )
+        let router = RecordingBridgeCommandRouter(snapshot: seededSnapshot)
+        let harness = makeHarness(router: router)
+        addTeardownBlock { await harness.tearDown() }
+
+        await waitUntil { await self.evaluateString(harness.webView, "document.title") == "Seer" }
+
+        await waitUntil { await self.clickButtonWithText(harness.webView, "System + Display") }
+        await waitUntil { router.keepAwakeModeSetCalls.count == 1 }
+
+        await waitUntil { await self.clickButtonWithText(harness.webView, "History") }
+        await waitUntil { await self.clickButtonWithAriaLabel(harness.webView, "Clear history") }
+        await waitUntil { router.historyClearCallCount == 1 }
+
+        XCTAssertEqual(router.keepAwakeModeSetCalls, [.display], "the exact requested mode must reach the typed fake coordinator")
+        XCTAssertEqual(router.historyClearCallCount, 1, "history.clear must reach the typed fake coordinator exactly once")
+
+        await harness.tearDown()
+    }
+}

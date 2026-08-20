@@ -1,0 +1,169 @@
+name: Standalone macOS CI
+
+# This checks the standalone Seer.app surface (renderer + Swift app), not the
+# Glaze/Electron variant: this runner deliberately has no private Glaze SDK,
+# so every step below relies on the ":standalone"/"-macos" package scripts,
+# never `npm run build|lint|type-check|test|dev` (those wrap `glaze.ts`,
+# which requires the private SDK — see glaze.ts) and never `tests/*.test.mjs`
+# as a glob (that would also pull in tests/glaze-runtime-resolution.test.mjs,
+# which exercises that same Glaze/Electron wrapper — out of scope here).
+# tests/standalone-boundary.test.mjs is run explicitly as its own step below,
+# after the "Build unsigned Seer.app" step: its final test shells out to
+# `npm run build:macos` itself, redundantly rebuilding the app a second time,
+# which is accepted so the full file always executes in CI (no test skipped).
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  standalone:
+    name: standalone
+    # Pull requests run in a GitHub-hosted context where the standard Apple
+    # Silicon macOS 14 image is available, but the larger-runner-only
+    # `macos-14-xlarge` label can fail before any job step starts. Keep this on
+    # the normal hosted arm64 image and assert the architecture in the first
+    # step below.
+    runs-on: macos-14
+    steps:
+      - name: Assert Apple Silicon runner
+        run: |
+          set -euo pipefail
+          host_arch="$(uname -m)"
+          if [ "${host_arch}" != "arm64" ]; then
+            echo "error: expected an Apple Silicon (arm64) runner, got '${host_arch}'" >&2
+            exit 1
+          fi
+          echo "runner arch: ${host_arch}"
+
+      - name: Checkout
+        # v4.4.0
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Select Xcode 16.2
+        # v1.7.0
+        uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90
+        with:
+          xcode-version: "16.2"
+
+      - name: xcodebuild -version
+        run: xcodebuild -version
+
+      - name: Install xcodegen
+        run: |
+          set -euo pipefail
+          brew install xcodegen
+          xcodegen --version
+
+      - name: Setup Node 24
+        # v4.4.0
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: npm ci
+        run: npm ci
+
+      - name: Prepare diagnostics directory
+        run: mkdir -p ci-logs
+
+      # The explicit standalone-safe test-file list, the `--test-concurrency=1`
+      # pin (tests/standalone-renderer.test.mjs and
+      # tests/standalone-renderer-lock.test.mjs both drive
+      # scripts/build-standalone-renderer.mjs against this repository's real
+      # .seer-standalone-renderer.lock directory, so they must never run as
+      # concurrent worker processes), and the release-only draft/workflow
+      # policy tests all live in one repository-owned module,
+      # scripts/run-standalone-tests.mjs, run here via the
+      # `test:standalone-safe` package script — not `tests/*.test.mjs`,
+      # which would also pull in tests/glaze-runtime-resolution.test.mjs
+      # (the Glaze/Electron SDK-resolution wrapper — out of scope for this
+      # standalone-only runner). The release-only draft/workflow policy
+      # tests are included in this pull-request-triggered runner too (one
+      # shared superset list, not a second hand-reviewed list) because they
+      # stub every signing/notarization/`curl`/`gh` invocation behind fakes
+      # on `PATH` or perform only static source/YAML analysis — never real
+      # credentials or network access. tests/standalone-boundary.test.mjs is
+      # deliberately excluded from that module's list and run as its own
+      # explicit step after "Build unsigned Seer.app" below instead (its
+      # shared `main/services/update-check.test.ts` sibling is exercised via
+      # the "Run shared renderer unit tests" step instead). Both this
+      # workflow and .github/workflows/release-macos.yml invoke the exact
+      # same package script, so there is no hand-maintained duplicate file
+      # list to drift between them; GitHub Actions captures this step's
+      # stdout/stderr itself, so no `tee` redirect is needed here.
+      - name: Run standalone-safe unit tests (identity, renderer, publication, packaging, agent-detection, update)
+        run: npm run test:standalone-safe
+
+      - name: Run shared renderer unit tests
+        run: |
+          set -euo pipefail
+          npm run test:renderer 2>&1 | tee ci-logs/test-renderer.log
+
+      - name: Type-check standalone surface
+        run: |
+          set -euo pipefail
+          npm run type-check:standalone 2>&1 | tee ci-logs/type-check-standalone.log
+
+      - name: Lint standalone surface
+        run: |
+          set -euo pipefail
+          npm run lint:standalone 2>&1 | tee ci-logs/lint-standalone.log
+
+      - name: Build standalone renderer
+        run: |
+          set -euo pipefail
+          npm run build:standalone-renderer 2>&1 | tee ci-logs/build-standalone-renderer.log
+
+      # These three package scripts (not raw `xcodegen`/`xcodebuild`) each
+      # acquire the renderer build lock themselves via
+      # scripts/build-standalone-renderer.mjs before shelling out, so
+      # running them one after another in this single job never races a
+      # concurrent renderer generation (see
+      # tests/standalone-renderer-lock.test.mjs).
+      - name: Generate Xcode project
+        run: |
+          set -euo pipefail
+          npm run generate:macos 2>&1 | tee ci-logs/generate-macos.log
+
+      - name: Run Swift tests
+        run: |
+          set -euo pipefail
+          npm run test:macos 2>&1 | tee ci-logs/test-macos.log
+
+      - name: Build unsigned Seer.app
+        run: |
+          set -euo pipefail
+          npm run build:macos 2>&1 | tee ci-logs/build-macos.log
+
+      # Runs the full standalone-boundary suite, including its own
+      # "npm run build:macos produces..." test, which redundantly rebuilds
+      # the app a second time. That redundancy is accepted here so this
+      # file always executes in full in CI rather than being partially
+      # excluded (see the explicit unit-test file list above).
+      - name: Run standalone boundary test suite
+        run: |
+          set -euo pipefail
+          node --test --test-concurrency=1 tests/standalone-boundary.test.mjs 2>&1 | tee ci-logs/standalone-boundary-test.log
+
+      - name: Repository and built-app boundary checks
+        run: |
+          set -euo pipefail
+          npm run check:standalone-boundary 2>&1 | tee ci-logs/check-standalone-boundary.log
+
+      # Only the plain-text stdout/stderr logs captured above — never the
+      # built Seer.app, DerivedData, or an .xcresult bundle (which can embed
+      # source snippets) — so a failed run's diagnostics can never leak the
+      # app binary or source.
+      - name: Upload test diagnostics on failure
+        if: failure()
+        # v4.6.2
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: standalone-ci-logs
+          path: ci-logs/*.log
+          if-no-files-found: warn
+          retention-days: 7

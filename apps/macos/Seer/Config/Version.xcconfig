@@ -1,0 +1,7 @@
+// Version and deployment-target settings shared by every configuration of
+// the Seer app target. Bump MARKETING_VERSION / CURRENT_PROJECT_VERSION here
+// for releases — do not hardcode version numbers elsewhere.
+
+MARKETING_VERSION = 1.0.0
+CURRENT_PROJECT_VERSION = 1
+MACOSX_DEPLOYMENT_TARGET = 14.0

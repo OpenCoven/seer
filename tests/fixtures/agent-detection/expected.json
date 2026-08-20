@@ -1,0 +1,818 @@
+{
+  "now": "2026-08-10T12:10:00.000Z",
+  "cases": [
+    {
+      "id": "claude-active",
+      "family": "claude-code",
+      "kind": "session",
+      "format": "claude",
+      "fixtureFile": "claude-active.jsonl",
+      "identity": "/tmp/seer-fixtures/agent-detection/claude-active-project/claude-active.jsonl",
+      "mtimeMs": "2026-08-10T12:09:55.000Z",
+      "expected": {
+        "active": true,
+        "source": "session",
+        "detail": "Claude Active Project · Running tools",
+        "id": "claude-code:/tmp/seer-fixtures/agent-detection/claude-active-project/claude-active.jsonl"
+      }
+    },
+    {
+      "id": "claude-complete",
+      "family": "claude-code",
+      "kind": "session",
+      "format": "claude",
+      "fixtureFile": "claude-complete.jsonl",
+      "identity": "/tmp/seer-fixtures/agent-detection/claude-complete-project/claude-complete.jsonl",
+      "mtimeMs": "2026-08-10T12:09:58.000Z",
+      "expected": {
+        "active": false,
+        "source": "session",
+        "detail": "Claude Complete Project · Working",
+        "id": "claude-code:/tmp/seer-fixtures/agent-detection/claude-complete-project/claude-complete.jsonl"
+      }
+    },
+    {
+      "id": "codex-active",
+      "family": "codex",
+      "kind": "session",
+      "format": "codex",
+      "fixtureFile": "codex-active.jsonl",
+      "identity": "/tmp/seer-fixtures/agent-detection/codex-active.jsonl",
+      "mtimeMs": "2026-08-10T12:09:50.000Z",
+      "expected": {
+        "active": true,
+        "source": "session",
+        "detail": "Codex Active Project · Thinking",
+        "id": "codex:/tmp/seer-fixtures/agent-detection/codex-active.jsonl"
+      }
+    },
+    {
+      "id": "codex-complete",
+      "family": "codex",
+      "kind": "session",
+      "format": "codex",
+      "fixtureFile": "codex-complete.jsonl",
+      "identity": "/tmp/seer-fixtures/agent-detection/codex-complete.jsonl",
+      "mtimeMs": "2026-08-10T12:09:59.000Z",
+      "expected": {
+        "active": false,
+        "source": "session",
+        "detail": "Codex Complete Project · Working",
+        "id": "codex:/tmp/seer-fixtures/agent-detection/codex-complete.jsonl"
+      }
+    },
+    {
+      "id": "codex-awaiting-approval",
+      "family": "codex",
+      "kind": "session",
+      "format": "codex",
+      "fixtureFile": "codex-awaiting-approval.jsonl",
+      "identity": "/tmp/seer-fixtures/agent-detection/codex-awaiting-approval.jsonl",
+      "mtimeMs": "2026-08-10T12:09:58.000Z",
+      "expected": {
+        "active": false,
+        "source": "session",
+        "detail": "Codex Approval Project · Working",
+        "id": "codex:/tmp/seer-fixtures/agent-detection/codex-awaiting-approval.jsonl"
+      }
+    },
+    {
+      "id": "grok-active",
+      "family": "grok",
+      "kind": "session",
+      "format": "grok",
+      "fixtureFile": "grok-active.jsonl",
+      "identity": "/tmp/seer-fixtures/agent-detection/grok/sessions/%2Ftmp%2Fseer-fixtures%2Fgrok-active-project/session-1/events.jsonl",
+      "mtimeMs": "2026-08-10T12:09:50.000Z",
+      "expected": {
+        "active": true,
+        "source": "session",
+        "detail": "Grok Active Project · Running tools",
+        "id": "grok:/tmp/seer-fixtures/agent-detection/grok/sessions/%2Ftmp%2Fseer-fixtures%2Fgrok-active-project/session-1/events.jsonl"
+      }
+    },
+    {
+      "id": "grok-complete",
+      "family": "grok",
+      "kind": "session",
+      "format": "grok",
+      "fixtureFile": "grok-complete.jsonl",
+      "identity": "/tmp/seer-fixtures/agent-detection/grok/sessions/%2Ftmp%2Fseer-fixtures%2Fgrok-complete-project/session-2/events.jsonl",
+      "mtimeMs": "2026-08-10T12:09:59.000Z",
+      "expected": {
+        "active": false,
+        "source": "session",
+        "detail": "Grok Complete Project · Working",
+        "id": "grok:/tmp/seer-fixtures/agent-detection/grok/sessions/%2Ftmp%2Fseer-fixtures%2Fgrok-complete-project/session-2/events.jsonl"
+      }
+    },
+    {
+      "id": "grok-awaiting-approval",
+      "family": "grok",
+      "kind": "session",
+      "format": "grok",
+      "fixtureFile": "grok-awaiting-approval.jsonl",
+      "identity": "/tmp/seer-fixtures/agent-detection/grok/sessions/%2Ftmp%2Fseer-fixtures%2Fgrok-approval-project/session-3/events.jsonl",
+      "mtimeMs": "2026-08-10T12:09:57.000Z",
+      "expected": {
+        "active": false,
+        "source": "session",
+        "detail": "Grok Approval Project · Working",
+        "id": "grok:/tmp/seer-fixtures/agent-detection/grok/sessions/%2Ftmp%2Fseer-fixtures%2Fgrok-approval-project/session-3/events.jsonl"
+      }
+    },
+    {
+      "id": "claude-bounded-future-skew",
+      "family": "claude-code",
+      "kind": "session",
+      "format": "claude",
+      "fixtureFile": "claude-skew.jsonl",
+      "identity": "/tmp/seer-fixtures/agent-detection/claude-skew-project/session.jsonl",
+      "mtimeMs": "2026-08-10T12:10:00.000Z",
+      "expected": {
+        "active": true,
+        "source": "session",
+        "detail": "Claude Skew Project · Running tools",
+        "id": "claude-code:/tmp/seer-fixtures/agent-detection/claude-skew-project/session.jsonl"
+      }
+    },
+    {
+      "id": "claude-extreme-future",
+      "family": "claude-code",
+      "kind": "session",
+      "format": "claude",
+      "fixtureFile": "claude-future.jsonl",
+      "identity": "/tmp/seer-fixtures/agent-detection/claude-future-project/session.jsonl",
+      "mtimeMs": "2026-08-10T12:10:00.000Z",
+      "expected": {
+        "active": false,
+        "source": "session",
+        "detail": "Claude Future Project · Running tools",
+        "id": "claude-code:/tmp/seer-fixtures/agent-detection/claude-future-project/session.jsonl"
+      }
+    },
+    {
+      "id": "codex-bounded-future-skew",
+      "family": "codex",
+      "kind": "session",
+      "format": "codex",
+      "fixtureFile": "codex-skew.jsonl",
+      "identity": "/tmp/seer-fixtures/agent-detection/codex-skew.jsonl",
+      "mtimeMs": "2026-08-10T12:10:00.000Z",
+      "expected": {
+        "active": true,
+        "source": "session",
+        "detail": "Codex Skew Project · Started",
+        "id": "codex:/tmp/seer-fixtures/agent-detection/codex-skew.jsonl"
+      }
+    },
+    {
+      "id": "codex-extreme-future",
+      "family": "codex",
+      "kind": "session",
+      "format": "codex",
+      "fixtureFile": "codex-future.jsonl",
+      "identity": "/tmp/seer-fixtures/agent-detection/codex-future.jsonl",
+      "mtimeMs": "2026-08-10T12:10:00.000Z",
+      "expected": {
+        "active": false,
+        "source": "session",
+        "detail": "Codex Future Project · Started",
+        "id": "codex:/tmp/seer-fixtures/agent-detection/codex-future.jsonl"
+      }
+    },
+    {
+      "id": "codex-fallback-bounded-future-skew",
+      "family": "codex",
+      "kind": "session",
+      "format": "codex",
+      "fixtureFile": "fallback-meta.jsonl",
+      "identity": "/tmp/seer-fixtures/agent-detection/codex-fallback-skew.jsonl",
+      "mtimeMs": "2026-08-10T12:10:05.000Z",
+      "expected": {
+        "active": true,
+        "source": "session",
+        "detail": "Agent Detection · Active",
+        "id": "codex:/tmp/seer-fixtures/agent-detection/codex-fallback-skew.jsonl"
+      }
+    },
+    {
+      "id": "codex-fallback-extreme-future",
+      "family": "codex",
+      "kind": "session",
+      "format": "codex",
+      "fixtureFile": "fallback-meta.jsonl",
+      "identity": "/tmp/seer-fixtures/agent-detection/codex-fallback-future.jsonl",
+      "mtimeMs": "9999-12-31T23:59:59.999Z",
+      "expected": {
+        "active": false,
+        "source": "session",
+        "detail": "Agent Detection · Working",
+        "id": "codex:/tmp/seer-fixtures/agent-detection/codex-fallback-future.jsonl"
+      }
+    },
+    {
+      "id": "grok-bounded-future-skew",
+      "family": "grok",
+      "kind": "session",
+      "format": "grok",
+      "fixtureFile": "grok-skew.jsonl",
+      "identity": "/tmp/seer-fixtures/agent-detection/grok/sessions/%2Ftmp%2Fseer-fixtures%2Fgrok-skew-project/session-skew/events.jsonl",
+      "mtimeMs": "2026-08-10T12:10:00.000Z",
+      "expected": {
+        "active": true,
+        "source": "session",
+        "detail": "Grok Skew Project · Started",
+        "id": "grok:/tmp/seer-fixtures/agent-detection/grok/sessions/%2Ftmp%2Fseer-fixtures%2Fgrok-skew-project/session-skew/events.jsonl"
+      }
+    },
+    {
+      "id": "grok-extreme-future",
+      "family": "grok",
+      "kind": "session",
+      "format": "grok",
+      "fixtureFile": "grok-future.jsonl",
+      "identity": "/tmp/seer-fixtures/agent-detection/grok/sessions/%2Ftmp%2Fseer-fixtures%2Fgrok-future-project/session-future/events.jsonl",
+      "mtimeMs": "2026-08-10T12:10:00.000Z",
+      "expected": {
+        "active": false,
+        "source": "session",
+        "detail": "Grok Future Project · Started",
+        "id": "grok:/tmp/seer-fixtures/agent-detection/grok/sessions/%2Ftmp%2Fseer-fixtures%2Fgrok-future-project/session-future/events.jsonl"
+      }
+    },
+    {
+      "id": "grok-fallback-bounded-future-skew",
+      "family": "grok",
+      "kind": "session",
+      "format": "grok",
+      "fixtureFile": "fallback-meta.jsonl",
+      "identity": "/tmp/seer-fixtures/agent-detection/grok/sessions/%2Ftmp%2Fseer-fixtures%2Fgrok-fallback-skew/session-skew/events.jsonl",
+      "mtimeMs": "2026-08-10T12:10:05.000Z",
+      "expected": {
+        "active": true,
+        "source": "session",
+        "detail": "Grok Fallback Skew · Active",
+        "id": "grok:/tmp/seer-fixtures/agent-detection/grok/sessions/%2Ftmp%2Fseer-fixtures%2Fgrok-fallback-skew/session-skew/events.jsonl"
+      }
+    },
+    {
+      "id": "grok-fallback-extreme-future",
+      "family": "grok",
+      "kind": "session",
+      "format": "grok",
+      "fixtureFile": "fallback-meta.jsonl",
+      "identity": "/tmp/seer-fixtures/agent-detection/grok/sessions/%2Ftmp%2Fseer-fixtures%2Fgrok-fallback-future/session-future/events.jsonl",
+      "mtimeMs": "9999-12-31T23:59:59.999Z",
+      "expected": {
+        "active": false,
+        "source": "session",
+        "detail": "Grok Fallback Future · Working",
+        "id": "grok:/tmp/seer-fixtures/agent-detection/grok/sessions/%2Ftmp%2Fseer-fixtures%2Fgrok-fallback-future/session-future/events.jsonl"
+      }
+    },
+    {
+      "id": "generic-mtime-bounded-future-skew",
+      "family": "gemini",
+      "kind": "session",
+      "format": "generic-mtime",
+      "fixtureFile": "generic-future-skew.json",
+      "selector": "skew",
+      "expected": {
+        "active": true,
+        "source": "session",
+        "detail": "Generic Skew Project · Active",
+        "id": "gemini:/tmp/seer-fixtures/agent-detection/generic-skew-project/session.json"
+      }
+    },
+    {
+      "id": "generic-mtime-extreme-future",
+      "family": "gemini",
+      "kind": "session",
+      "format": "generic-mtime",
+      "fixtureFile": "generic-future-skew.json",
+      "selector": "future",
+      "expected": {
+        "active": false,
+        "source": "session",
+        "detail": "Generic Future Project · Wrapping up",
+        "id": "gemini:/tmp/seer-fixtures/agent-detection/generic-future-project/session.json"
+      }
+    },
+    {
+      "id": "cursor-bounded-future-skew",
+      "family": "cursor",
+      "kind": "session",
+      "format": "cursor",
+      "fixtureFile": "cursor-skew.json",
+      "expected": {
+        "active": true,
+        "source": "session",
+        "detail": "Cursor Skew Project · Writing",
+        "id": "cursor:cursor-skew-composer"
+      }
+    },
+    {
+      "id": "cursor-extreme-future",
+      "family": "cursor",
+      "kind": "session",
+      "format": "cursor",
+      "fixtureFile": "cursor-future.json",
+      "expected": {
+        "active": false,
+        "source": "session",
+        "detail": "Working",
+        "id": "cursor:cursor-future-composer"
+      }
+    },
+    {
+      "id": "cursor-malformed-record",
+      "family": "cursor",
+      "kind": "session",
+      "format": "cursor",
+      "fixtureFile": "cursor-malformed.json",
+      "expected": {
+        "active": false,
+        "source": "session",
+        "detail": "Working",
+        "id": "cursor:cursor-malformed-composer"
+      }
+    },
+    {
+      "id": "gemini-recent",
+      "family": "gemini",
+      "kind": "session",
+      "format": "generic-mtime",
+      "fixtureFile": "gemini-recent.json",
+      "selector": "recent",
+      "expected": {
+        "active": true,
+        "source": "session",
+        "detail": "Gemini Recent Project · Active",
+        "id": "gemini:/tmp/seer-fixtures/agent-detection/gemini-recent-project/session.json"
+      }
+    },
+    {
+      "id": "gemini-stale",
+      "family": "gemini",
+      "kind": "session",
+      "format": "generic-mtime",
+      "fixtureFile": "gemini-recent.json",
+      "selector": "stale",
+      "expected": {
+        "active": false,
+        "source": "session",
+        "detail": "Gemini Stale Project · Wrapping up",
+        "id": "gemini:/tmp/seer-fixtures/agent-detection/gemini-stale-project/session.json"
+      }
+    },
+    {
+      "id": "opencode-recent",
+      "family": "opencode",
+      "kind": "session",
+      "format": "generic-mtime",
+      "fixtureFile": "opencode-recent.json",
+      "selector": "recent",
+      "expected": {
+        "active": true,
+        "source": "session",
+        "detail": "Opencode Recent Project · Active",
+        "id": "opencode:/tmp/seer-fixtures/agent-detection/opencode-recent-project/session.json"
+      }
+    },
+    {
+      "id": "opencode-stale",
+      "family": "opencode",
+      "kind": "session",
+      "format": "generic-mtime",
+      "fixtureFile": "opencode-recent.json",
+      "selector": "stale",
+      "expected": {
+        "active": false,
+        "source": "session",
+        "detail": "Opencode Stale Project · Wrapping up",
+        "id": "opencode:/tmp/seer-fixtures/agent-detection/opencode-stale-project/session.json"
+      }
+    },
+    {
+      "id": "goose-recent",
+      "family": "goose",
+      "kind": "session",
+      "format": "generic-mtime",
+      "fixtureFile": "goose-recent.json",
+      "selector": "recent",
+      "expected": {
+        "active": true,
+        "source": "session",
+        "detail": "Goose Recent Project · Active",
+        "id": "goose:/tmp/seer-fixtures/agent-detection/goose-recent-project/session.json"
+      }
+    },
+    {
+      "id": "goose-stale",
+      "family": "goose",
+      "kind": "session",
+      "format": "generic-mtime",
+      "fixtureFile": "goose-recent.json",
+      "selector": "stale",
+      "expected": {
+        "active": false,
+        "source": "session",
+        "detail": "Goose Stale Project · Wrapping up",
+        "id": "goose:/tmp/seer-fixtures/agent-detection/goose-stale-project/session.json"
+      }
+    },
+    {
+      "id": "continue-recent",
+      "family": "continue",
+      "kind": "session",
+      "format": "generic-mtime",
+      "fixtureFile": "continue-recent.json",
+      "selector": "recent",
+      "expected": {
+        "active": true,
+        "source": "session",
+        "detail": "Continue Recent Project · Active",
+        "id": "continue:/tmp/seer-fixtures/agent-detection/continue-recent-project/session.json"
+      }
+    },
+    {
+      "id": "continue-stale",
+      "family": "continue",
+      "kind": "session",
+      "format": "generic-mtime",
+      "fixtureFile": "continue-recent.json",
+      "selector": "stale",
+      "expected": {
+        "active": false,
+        "source": "session",
+        "detail": "Continue Stale Project · Wrapping up",
+        "id": "continue:/tmp/seer-fixtures/agent-detection/continue-stale-project/session.json"
+      }
+    },
+    {
+      "id": "cursor-active",
+      "family": "cursor",
+      "kind": "session",
+      "format": "cursor",
+      "fixtureFile": "cursor-active.json",
+      "expected": {
+        "active": true,
+        "source": "session",
+        "detail": "Cursor Active Project · Writing",
+        "id": "cursor:cursor-active-composer"
+      }
+    },
+    {
+      "id": "cursor-idle",
+      "family": "cursor",
+      "kind": "session",
+      "format": "cursor",
+      "fixtureFile": "cursor-idle.json",
+      "expected": {
+        "active": false,
+        "source": "session",
+        "detail": "Cursor Idle Project · Working",
+        "id": "cursor:cursor-idle-composer"
+      }
+    },
+    {
+      "id": "cursor-tool-inprogress-mixed-case",
+      "family": "cursor",
+      "kind": "session",
+      "format": "cursor",
+      "fixtureFile": "cursor-tool-inprogress.json",
+      "expected": {
+        "active": true,
+        "source": "session",
+        "detail": "Cursor Tool Inprogress Project · Running tools",
+        "id": "cursor:cursor-tool-inprogress-composer"
+      }
+    },
+    {
+      "id": "aider-below-threshold",
+      "family": "aider",
+      "kind": "process",
+      "fixtureFile": "process-snapshots.json",
+      "selector": "aider-below-threshold",
+      "expected": {
+        "active": false,
+        "source": "process",
+        "detail": "Busy",
+        "id": "aider:pid:10010"
+      }
+    },
+    {
+      "id": "aider-at-threshold",
+      "family": "aider",
+      "kind": "process",
+      "fixtureFile": "process-snapshots.json",
+      "selector": "aider-at-threshold",
+      "expected": {
+        "active": true,
+        "source": "process",
+        "detail": "Busy",
+        "id": "aider:pid:10011"
+      }
+    },
+    {
+      "id": "aider-above-threshold",
+      "family": "aider",
+      "kind": "process",
+      "fixtureFile": "process-snapshots.json",
+      "selector": "aider-above-threshold",
+      "expected": {
+        "active": true,
+        "source": "process",
+        "detail": "Busy",
+        "id": "aider:pid:10012"
+      }
+    },
+    {
+      "id": "amp-below-threshold",
+      "family": "amp",
+      "kind": "process",
+      "fixtureFile": "process-snapshots.json",
+      "selector": "amp-below-threshold",
+      "expected": {
+        "active": false,
+        "source": "process",
+        "detail": "Busy",
+        "id": "amp:pid:20010"
+      }
+    },
+    {
+      "id": "amp-at-threshold",
+      "family": "amp",
+      "kind": "process",
+      "fixtureFile": "process-snapshots.json",
+      "selector": "amp-at-threshold",
+      "expected": {
+        "active": true,
+        "source": "process",
+        "detail": "Busy",
+        "id": "amp:pid:20011"
+      }
+    },
+    {
+      "id": "amp-above-threshold",
+      "family": "amp",
+      "kind": "process",
+      "fixtureFile": "process-snapshots.json",
+      "selector": "amp-above-threshold",
+      "expected": {
+        "active": true,
+        "source": "process",
+        "detail": "Busy",
+        "id": "amp:pid:20012"
+      }
+    },
+    {
+      "id": "cursor-cli-below-threshold",
+      "family": "cursor",
+      "kind": "process",
+      "fixtureFile": "process-snapshots.json",
+      "selector": "cursor-cli-below-threshold",
+      "expected": {
+        "active": false,
+        "source": "process",
+        "detail": "Busy",
+        "id": "cursor:pid:30010"
+      }
+    },
+    {
+      "id": "cursor-cli-at-threshold",
+      "family": "cursor",
+      "kind": "process",
+      "fixtureFile": "process-snapshots.json",
+      "selector": "cursor-cli-at-threshold",
+      "expected": {
+        "active": true,
+        "source": "process",
+        "detail": "Busy",
+        "id": "cursor:pid:30011"
+      }
+    },
+    {
+      "id": "cursor-cli-above-threshold",
+      "family": "cursor",
+      "kind": "process",
+      "fixtureFile": "process-snapshots.json",
+      "selector": "cursor-cli-above-threshold",
+      "expected": {
+        "active": true,
+        "source": "process",
+        "detail": "Busy",
+        "id": "cursor:pid:30012"
+      }
+    }
+  ],
+  "matcherCases": [
+    {
+      "id": "matcher-family-claude-code",
+      "kind": "family",
+      "command": "claude",
+      "expectedFamily": "claude-code"
+    },
+    {
+      "id": "matcher-family-codex",
+      "kind": "family",
+      "command": "codex",
+      "expectedFamily": "codex"
+    },
+    {
+      "id": "matcher-family-grok",
+      "kind": "family",
+      "command": "grok",
+      "expectedFamily": "grok"
+    },
+    {
+      "id": "matcher-family-gemini",
+      "kind": "family",
+      "command": "gemini",
+      "expectedFamily": "gemini"
+    },
+    {
+      "id": "matcher-family-aider",
+      "kind": "family",
+      "command": "aider",
+      "expectedFamily": "aider"
+    },
+    {
+      "id": "matcher-family-opencode",
+      "kind": "family",
+      "command": "opencode",
+      "expectedFamily": "opencode"
+    },
+    {
+      "id": "matcher-family-goose",
+      "kind": "family",
+      "command": "goose",
+      "expectedFamily": "goose"
+    },
+    {
+      "id": "matcher-family-amp",
+      "kind": "family",
+      "command": "amp",
+      "expectedFamily": "amp"
+    },
+    {
+      "id": "matcher-family-cursor",
+      "kind": "family",
+      "command": "cursor-agent",
+      "expectedFamily": "cursor"
+    },
+    {
+      "id": "matcher-family-continue",
+      "kind": "family",
+      "command": "continue-cli",
+      "expectedFamily": "continue"
+    },
+    {
+      "id": "matcher-family-no-match",
+      "kind": "family",
+      "command": "vim myfile.txt",
+      "expectedFamily": null
+    },
+    {
+      "id": "matcher-family-claude-code-uppercase-cli",
+      "kind": "family",
+      "command": "CLAUDE",
+      "expectedFamily": "claude-code"
+    },
+    {
+      "id": "matcher-family-codex-uppercase-cli",
+      "kind": "family",
+      "command": "CODEX",
+      "expectedFamily": "codex"
+    },
+    {
+      "id": "matcher-family-grok-uppercase-cli",
+      "kind": "family",
+      "command": "GROK",
+      "expectedFamily": "grok"
+    },
+    {
+      "id": "matcher-family-gemini-uppercase-cli",
+      "kind": "family",
+      "command": "GEMINI",
+      "expectedFamily": "gemini"
+    },
+    {
+      "id": "matcher-family-aider-uppercase-cli",
+      "kind": "family",
+      "command": "AIDER",
+      "expectedFamily": "aider"
+    },
+    {
+      "id": "matcher-family-opencode-uppercase-cli",
+      "kind": "family",
+      "command": "OPENCODE",
+      "expectedFamily": "opencode"
+    },
+    {
+      "id": "matcher-family-goose-uppercase-cli",
+      "kind": "family",
+      "command": "GOOSE",
+      "expectedFamily": "goose"
+    },
+    {
+      "id": "matcher-family-amp-uppercase-cli",
+      "kind": "family",
+      "command": "AMP",
+      "expectedFamily": "amp"
+    },
+    {
+      "id": "matcher-family-cursor-uppercase-cli",
+      "kind": "family",
+      "command": "CURSOR-AGENT",
+      "expectedFamily": "cursor"
+    },
+    {
+      "id": "matcher-family-continue-uppercase-cli",
+      "kind": "family",
+      "command": "CONTINUE-CLI",
+      "expectedFamily": "continue"
+    },
+    {
+      "id": "matcher-pattern-claude-code-scoped-lowercase",
+      "kind": "pattern",
+      "family": "claude-code",
+      "patternIndex": 1,
+      "command": "@anthropic-ai/claude-code",
+      "expectedMatch": true
+    },
+    {
+      "id": "matcher-pattern-claude-code-scoped-uppercase",
+      "kind": "pattern",
+      "family": "claude-code",
+      "patternIndex": 1,
+      "command": "@ANTHROPIC-AI/CLAUDE-CODE",
+      "expectedMatch": false
+    },
+    {
+      "id": "matcher-pattern-codex-scoped-lowercase",
+      "kind": "pattern",
+      "family": "codex",
+      "patternIndex": 1,
+      "command": "@openai/codex",
+      "expectedMatch": true
+    },
+    {
+      "id": "matcher-pattern-codex-scoped-uppercase",
+      "kind": "pattern",
+      "family": "codex",
+      "patternIndex": 1,
+      "command": "@OPENAI/CODEX",
+      "expectedMatch": false
+    },
+    {
+      "id": "matcher-pattern-gemini-scoped-lowercase",
+      "kind": "pattern",
+      "family": "gemini",
+      "patternIndex": 1,
+      "command": "@google/gemini-cli",
+      "expectedMatch": true
+    },
+    {
+      "id": "matcher-pattern-gemini-scoped-uppercase",
+      "kind": "pattern",
+      "family": "gemini",
+      "patternIndex": 1,
+      "command": "@GOOGLE/GEMINI-CLI",
+      "expectedMatch": false
+    },
+    {
+      "id": "matcher-pattern-amp-scoped-lowercase",
+      "kind": "pattern",
+      "family": "amp",
+      "patternIndex": 1,
+      "command": "@sourcegraph/amp",
+      "expectedMatch": true
+    },
+    {
+      "id": "matcher-pattern-amp-scoped-uppercase",
+      "kind": "pattern",
+      "family": "amp",
+      "patternIndex": 1,
+      "command": "@SOURCEGRAPH/AMP",
+      "expectedMatch": false
+    },
+    {
+      "id": "matcher-pattern-continue-scoped-lowercase",
+      "kind": "pattern",
+      "family": "continue",
+      "patternIndex": 1,
+      "command": "@continuedev/cli",
+      "expectedMatch": true
+    },
+    {
+      "id": "matcher-pattern-continue-scoped-uppercase",
+      "kind": "pattern",
+      "family": "continue",
+      "patternIndex": 1,
+      "command": "@CONTINUEDEV/CLI",
+      "expectedMatch": false
+    }
+  ]
+}

@@ -1,0 +1,69 @@
+name: Seer
+options:
+  bundleIdPrefix: ai.opencoven
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    ARCHS: arm64
+    ONLY_ACTIVE_ARCH: YES
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+
+configFiles:
+  Debug: Config/Version.xcconfig
+  Release: Config/Version.xcconfig
+
+targets:
+  Seer:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources
+      - path: Resources
+        buildPhase: resources
+      - path: ../../../build/standalone-renderer/Renderer
+        type: folder
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_NAME: Seer
+        PRODUCT_BUNDLE_IDENTIFIER: ai.opencoven.seer
+        INFOPLIST_FILE: Config/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Config/Seer.entitlements
+        ENABLE_HARDENED_RUNTIME: YES
+        GENERATE_INFOPLIST_FILE: NO
+        SWIFT_VERSION: "6.0"
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        MARKETING_VERSION: "$(MARKETING_VERSION)"
+        CURRENT_PROJECT_VERSION: "$(CURRENT_PROJECT_VERSION)"
+    dependencies:
+      # Linked for SessionSnapshotSource's read-only Cursor `state.vscdb`
+      # access via the SQLite C API (never the `sqlite3` executable).
+      - sdk: libsqlite3.tbd
+      # Linked for PowerAssertionService's production IOKitPowerAssertionBackend,
+      # which wraps IOPMAssertionCreateWithName/IOPMAssertionRelease.
+      - sdk: IOKit.framework
+
+  SeerTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests
+    settings:
+      base:
+        SWIFT_VERSION: "6.0"
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        GENERATE_INFOPLIST_FILE: YES
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Seer.app/Contents/MacOS/Seer"
+    dependencies:
+      - target: Seer
+      # Tests construct synthetic `state.vscdb` fixtures directly via the
+      # SQLite C API, so the test bundle needs the same linkage.
+      - sdk: libsqlite3.tbd
+      # Matches the Seer target's IOKit linkage above (needed because the
+      # test bundle links directly against @testable import Seer's symbols).
+      - sdk: IOKit.framework

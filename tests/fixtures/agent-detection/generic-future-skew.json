@@ -1,0 +1,10 @@
+{
+  "skew": {
+    "identity": "/tmp/seer-fixtures/agent-detection/generic-skew-project/session.json",
+    "mtimeMs": "2026-08-10T12:10:05.000Z"
+  },
+  "future": {
+    "identity": "/tmp/seer-fixtures/agent-detection/generic-future-project/session.json",
+    "mtimeMs": "9999-12-31T23:59:59.999Z"
+  }
+}

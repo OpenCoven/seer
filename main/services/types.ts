@@ -22,6 +22,14 @@ export type AgentMonitorState = {
 
 export type AppSettings = {
   keepAwakeMode: KeepAwakeMode;
+  includePrereleaseUpdates: boolean;
+};
+
+export type UpdateState = {
+  checking: boolean;
+  availableVersion: string | null;
+  releaseURL: string | null;
+  lastCheckedAt: number | null;
 };
 
 export type AgentUsage = {

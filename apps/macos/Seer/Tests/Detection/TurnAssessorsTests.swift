@@ -1,0 +1,1703 @@
+import XCTest
+import SQLite3
+@testable import Seer
+
+/// Table-driven parity tests: every case in the shared fixture oracle
+/// (`tests/fixtures/agent-detection/expected.json`) is asserted against the
+/// Swift turn assessors. TypeScript's `tests/agent-detection-parity.test.mjs`
+/// asserts the exact same oracle through
+/// `assessDetectionFixture` in `main/services/agent-detection-policy.ts` —
+/// this file locates the oracle from `#filePath` rather than copying or
+/// restating any expected value, so both languages are proven to agree on
+/// the exact same corpus.
+final class TurnAssessorsTests: XCTestCase {
+    private final class LockedCompilationCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storage = 0
+
+        func increment() {
+            lock.lock()
+            storage += 1
+            lock.unlock()
+        }
+
+        var value: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return storage
+        }
+    }
+
+    // MARK: - Shared fixture oracle
+
+    private struct FixtureOracle: Decodable {
+        let now: String
+        let cases: [FixtureCase]
+    }
+
+    private struct FixtureCase: Decodable {
+        let id: String
+        let family: String
+        let kind: String
+        let format: String?
+        let fixtureFile: String
+        let identity: String?
+        let mtimeMs: String?
+        let selector: String?
+        let expected: FixtureExpected
+    }
+
+    private struct FixtureExpected: Decodable, Equatable {
+        let active: Bool
+        let source: AgentActivitySource
+        let detail: String
+        let id: String
+    }
+
+    private enum FixtureAssessorError: Error {
+        case invalidFixture(String)
+        case missingSelector(String)
+    }
+
+    /// Walks up from this test file to the repository root and back down to
+    /// the shared fixture directory — never a copy of fixture content.
+    private func fixturesDirectory() -> URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // Tests/Detection
+            .deletingLastPathComponent() // Tests
+            .deletingLastPathComponent() // Seer (apps/macos/Seer project root)
+            .deletingLastPathComponent() // apps/macos
+            .deletingLastPathComponent() // apps
+            .deletingLastPathComponent() // repository root
+            .appendingPathComponent("tests/fixtures/agent-detection", isDirectory: true)
+    }
+
+    private func loadOracle() throws -> FixtureOracle {
+        let url = fixturesDirectory().appendingPathComponent("expected.json")
+        let data = try Data(contentsOf: url)
+        return try JSONDecoder().decode(FixtureOracle.self, from: data)
+    }
+
+    private func readJSONValue(_ fixtureFile: String) throws -> Any {
+        let url = fixturesDirectory().appendingPathComponent(fixtureFile)
+        let data = try Data(contentsOf: url)
+        return try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+    }
+
+    /// Parses line-delimited JSON tolerating corrupt/partial lines — the same
+    /// leniency the production session-tail reader applies.
+    private func readJSONLEvents(_ fixtureFile: String) throws -> [JSONObject] {
+        let url = fixturesDirectory().appendingPathComponent(fixtureFile)
+        let text = try String(contentsOf: url, encoding: .utf8)
+        var events: [JSONObject] = []
+        for rawLine in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let trimmed = rawLine.trimmingCharacters(in: .whitespaces)
+            guard trimmed.hasPrefix("{") else { continue }
+            guard let data = trimmed.data(using: .utf8) else { continue }
+            guard let object = (try? JSONSerialization.jsonObject(with: data, options: [])) as? JSONObject else {
+                continue
+            }
+            events.append(object)
+        }
+        return events
+    }
+
+    /// Assesses a single synthetic fixture case using the exact same pure
+    /// turn assessors ported to `TurnAssessors.swift`, mirroring
+    /// `assessDetectionFixture` in `main/services/agent-detection-policy.ts`.
+    private func assessSharedFixture(_ testCase: FixtureCase, now: Int64) throws -> FixtureExpected {
+        if testCase.kind == "process" {
+            guard let rows = try readJSONValue(testCase.fixtureFile) as? [JSONObject] else {
+                throw FixtureAssessorError.invalidFixture(testCase.fixtureFile)
+            }
+            guard let row = rows.first(where: { ($0["key"] as? String) == testCase.selector }) else {
+                throw FixtureAssessorError.missingSelector(testCase.selector ?? "")
+            }
+            guard
+                let family = row["family"] as? String,
+                let pidNumber = row["pid"] as? NSNumber,
+                let cpuPercent = finiteNumber(row["cpuPercent"])
+            else {
+                throw FixtureAssessorError.invalidFixture(testCase.fixtureFile)
+            }
+            let active = cpuPercent >= processOnlyCPUThreshold
+            return FixtureExpected(
+                active: active,
+                source: .process,
+                detail: buildFriendlyDetail(projectLabel: nil, processOnly: true),
+                id: "\(family):pid:\(pidNumber.intValue)"
+            )
+        }
+
+        if testCase.format == "cursor" {
+            guard
+                let data = try readJSONValue(testCase.fixtureFile) as? JSONObject,
+                let composerKey = data["composerKey"] as? String,
+                let record = asRecord(data["record"])
+            else {
+                throw FixtureAssessorError.invalidFixture(testCase.fixtureFile)
+            }
+            var bubbles: [String: JSONObject] = [:]
+            if let rawBubbles = asRecord(data["bubbles"]) {
+                for (bubbleId, value) in rawBubbles {
+                    if let bubble = asRecord(value) {
+                        bubbles[bubbleId] = bubble
+                    }
+                }
+            }
+            let assessment = assessCursorComposerRecord(record, bubbles: bubbles, now: now)
+            return FixtureExpected(
+                active: assessment.active,
+                source: .session,
+                detail: buildFriendlyDetail(projectLabel: assessment.label, reason: assessment.reason),
+                id: "\(testCase.family):\(composerKey)"
+            )
+        }
+
+        if testCase.format == "generic-mtime" {
+            guard let data = try readJSONValue(testCase.fixtureFile) as? JSONObject else {
+                throw FixtureAssessorError.invalidFixture(testCase.fixtureFile)
+            }
+            let selectorKey = testCase.selector ?? "recent"
+            guard
+                let entry = asRecord(data[selectorKey]),
+                let identity = entry["identity"] as? String,
+                let mtimeText = entry["mtimeMs"] as? String,
+                let mtimeMs = parseISO8601ToMs(mtimeText)
+            else {
+                throw FixtureAssessorError.invalidFixture(testCase.fixtureFile)
+            }
+            let assessment = assessGenericMtime(mtimeMs: mtimeMs, now: now)
+            let label = friendlySessionLabel(identity)
+            return FixtureExpected(
+                active: assessment.active,
+                source: .session,
+                detail: buildFriendlyDetail(projectLabel: label, reason: assessment.reason),
+                id: "\(testCase.family):\(identity)"
+            )
+        }
+
+        // claude / codex / grok session transcripts.
+        let events = try readJSONLEvents(testCase.fixtureFile)
+        let mtimeMs = testCase.mtimeMs.flatMap(parseISO8601ToMs) ?? 0
+        let identity = testCase.identity ?? ""
+
+        let assessment: TurnAssessment
+        switch testCase.format {
+        case "claude":
+            assessment = assessClaudeTurn(events, mtimeMs: mtimeMs, now: now)
+        case "codex":
+            assessment = assessCodexTurn(events, mtimeMs: mtimeMs, now: now)
+        case "grok":
+            assessment = assessGrokTurn(events, mtimeMs: mtimeMs, now: now)
+        default:
+            throw FixtureAssessorError.invalidFixture(testCase.fixtureFile)
+        }
+
+        let label = assessment.label ?? friendlySessionLabel(identity)
+        return FixtureExpected(
+            active: assessment.active,
+            source: .session,
+            detail: buildFriendlyDetail(projectLabel: label, reason: assessment.reason),
+            id: "\(testCase.family):\(identity)"
+        )
+    }
+
+    // MARK: - Oracle-driven tests
+
+    func testFixtureAssessments() throws {
+        let oracle = try loadOracle()
+        guard let fixedNow = parseISO8601ToMs(oracle.now) else {
+            XCTFail("expected.json 'now' did not parse as ISO 8601")
+            return
+        }
+
+        let coveredFamilies = Set(oracle.cases.map(\.family))
+        let approvedFamilies = Set(AgentFamily.allCases.map(\.rawValue))
+        XCTAssertEqual(
+            coveredFamilies,
+            approvedFamilies,
+            "expected.json must cover exactly the ten approved families"
+        )
+
+        XCTAssertTrue(
+            oracle.cases.contains { $0.family == "aider" && $0.kind == "process" && $0.expected.source == .process },
+            "expected.json must prove Aider process-only detection"
+        )
+        XCTAssertTrue(
+            oracle.cases.contains { $0.family == "amp" && $0.kind == "process" && $0.expected.source == .process },
+            "expected.json must prove Amp process-only detection"
+        )
+        XCTAssertTrue(
+            oracle.cases.contains { $0.family == "cursor" && $0.kind == "process" && $0.expected.source == .process },
+            "expected.json must prove Cursor CLI process-only detection"
+        )
+
+        for testCase in oracle.cases {
+            let result = try assessSharedFixture(testCase, now: fixedNow)
+            XCTAssertEqual(result, testCase.expected, testCase.id)
+        }
+    }
+
+    // MARK: - Direct unit cases beyond the oracle
+
+    func testHumanizeProjectNameStripsLocalAndHexSuffixes() {
+        // "my" is a 2-character word that is already lowercase, so it is left
+        // untouched (only words longer than 2 characters are capitalized) —
+        // this is a faithful, deliberate port of the TS `titleCaseWords` rule.
+        XCTAssertEqual(humanizeProjectName("my-project-local-1pwq7g9n"), "my Project")
+        XCTAssertEqual(humanizeProjectName("my-project-a1b2c3"), "my Project")
+        XCTAssertEqual(humanizeProjectName("seer-project.name"), "Seer Project Name")
+        XCTAssertEqual(humanizeProjectName(""), "")
+    }
+
+    func testFriendlyActivityMapsReasonsToLabels() {
+        XCTAssertEqual(friendlyActivity(nil, processOnly: true), "Busy")
+        XCTAssertEqual(friendlyActivity("tool_use in progress", processOnly: false), "Running tools")
+        XCTAssertEqual(friendlyActivity("awaiting model after tool", processOnly: false), "Thinking")
+        XCTAssertEqual(friendlyActivity("agent_reasoning", processOnly: false), "Thinking")
+        XCTAssertEqual(friendlyActivity("agent_message", processOnly: false), "Writing")
+        XCTAssertEqual(friendlyActivity("user prompt", processOnly: false), "Started")
+        XCTAssertEqual(friendlyActivity("generating bubbles", processOnly: false), "Writing")
+        XCTAssertEqual(friendlyActivity("recent session write", processOnly: false), "Active")
+        XCTAssertEqual(friendlyActivity("stale session write", processOnly: false), "Wrapping up")
+        XCTAssertEqual(friendlyActivity("end_turn", processOnly: false), "Working")
+        XCTAssertEqual(friendlyActivity(nil, processOnly: false), "Working")
+    }
+
+    func testParseTimestampHandlesSecondsMillisecondsAndFallback() {
+        // Seconds-based epoch (below the 1e12 cutoff) is scaled to ms.
+        XCTAssertEqual(parseTimestamp(1_700_000_000, fallbackMs: -1), 1_700_000_000_000)
+        // Already-ms epoch (above the cutoff) passes through unchanged.
+        XCTAssertEqual(parseTimestamp(1_700_000_000_000, fallbackMs: -1), 1_700_000_000_000)
+        // ISO 8601 strings parse to the same Unix ms Date.parse would produce.
+        XCTAssertEqual(parseTimestamp("2026-08-10T12:00:00.000Z", fallbackMs: -1), 1_786_363_200_000)
+        // A JSON boolean must not be treated as a numeric timestamp.
+        XCTAssertEqual(parseTimestamp(true, fallbackMs: 42), 42)
+        // Unparseable strings and missing values fall back.
+        XCTAssertEqual(parseTimestamp("not-a-date", fallbackMs: 7), 7)
+        XCTAssertEqual(parseTimestamp(nil, fallbackMs: 7), 7)
+    }
+
+    func testISO8601ParserReusesItsTwoFormatStrategies() {
+        let counter = LockedCompilationCounter()
+        let parser = ISO8601TimestampParser { includesFractionalSeconds in
+            counter.increment()
+            return Date.ISO8601FormatStyle(
+                includingFractionalSeconds: includesFractionalSeconds
+            )
+        }
+
+        func requireSendable<T: Sendable>(_: T) {}
+        requireSendable(parser)
+        XCTAssertEqual(counter.value, 2)
+
+        for _ in 0..<100 {
+            XCTAssertEqual(parser.parseToMilliseconds("2026-08-10T12:00:00.123Z"), 1_786_363_200_123)
+            XCTAssertEqual(parser.parseToMilliseconds("2026-08-10T12:00:00Z"), 1_786_363_200_000)
+            XCTAssertEqual(parser.parseToMilliseconds("2026-08-10T14:30:00+02:30"), 1_786_363_200_000)
+            XCTAssertNil(parser.parseToMilliseconds("not-a-timestamp"))
+        }
+
+        XCTAssertEqual(
+            counter.value,
+            2,
+            "parse calls must reuse the fractional and nonfractional strategies"
+        )
+    }
+
+    func testGrokProjectLabelDecodesPercentEncodedCwd() {
+        let path = "/home/user/.grok/sessions/%2Fhome%2Fuser%2Fmy-app/session-1/events.jsonl"
+        // "my" is a 2-character lowercase word left untouched by titleCaseWords.
+        XCTAssertEqual(grokProjectLabel(path), "my App")
+        XCTAssertEqual(grokProjectLabel("events.jsonl"), "")
+    }
+
+    func testAssessGenericMtimeIsExactlyAtTheTwentySecondBoundary() {
+        let now: Int64 = 1_786_449_620_000
+        let atBoundary = assessGenericMtime(mtimeMs: now - genericMtimeWindowMs, now: now)
+        XCTAssertTrue(atBoundary.active, "age == 20s must still be active (inclusive boundary)")
+
+        let pastBoundary = assessGenericMtime(mtimeMs: now - genericMtimeWindowMs - 1, now: now)
+        XCTAssertFalse(pastBoundary.active, "age == 20s + 1ms must be stale")
+    }
+
+    func testRecencyHelperEnforcesGraceFutureSkewAndOverflowBoundaries() {
+        let now: Int64 = 1_786_449_620_000
+        let cases: [(name: String, timestamp: Int64, grace: Int64, expected: Bool)] = [
+            ("grace start", now - turnActiveGraceMs, turnActiveGraceMs, true),
+            ("past grace", now - turnActiveGraceMs - 1, turnActiveGraceMs, false),
+            ("future skew boundary", now + timestampFutureSkewMs, turnActiveGraceMs, true),
+            ("past future skew", now + timestampFutureSkewMs + 1, turnActiveGraceMs, false),
+            ("extreme future", Int64.max, turnActiveGraceMs, false),
+            ("extreme past", Int64.min, turnActiveGraceMs, false),
+            ("overflow future", Int64.max, Int64.min, false),
+            ("overflow past", Int64.min, Int64.max, false),
+        ]
+
+        for testCase in cases {
+            XCTAssertEqual(
+                isRecentTimestamp(testCase.timestamp, now: now, within: testCase.grace),
+                testCase.expected,
+                testCase.name
+            )
+        }
+    }
+
+    func testEveryAssessorFamilyRejectsExtremeFutureButAcceptsBoundedClockSkew() {
+        let now: Int64 = 1_786_449_620_000
+        let assessors: [(String, (Int64) -> TurnAssessment)] = [
+            ("claude", { timestamp in
+                assessClaudeTurn(
+                    [["type": "assistant", "timestamp": timestamp, "message": ["stop_reason": "tool_use"]]],
+                    mtimeMs: now,
+                    now: now
+                )
+            }),
+            ("codex", { timestamp in
+                assessCodexTurn(
+                    [["timestamp": timestamp, "type": "event_msg", "payload": ["type": "task_started"]]],
+                    mtimeMs: now,
+                    now: now
+                )
+            }),
+            ("grok", { timestamp in
+                assessGrokTurn([["ts": timestamp, "type": "turn_started"]], mtimeMs: now, now: now)
+            }),
+            ("generic mtime", { timestamp in
+                assessGenericMtime(mtimeMs: timestamp, now: now)
+            }),
+            ("cursor", { timestamp in
+                assessCursorComposerRecord(
+                    ["status": "generating", "lastUpdatedAt": timestamp, "fullConversationHeadersOnly": []],
+                    now: now
+                )
+            }),
+        ]
+
+        for (name, assess) in assessors {
+            XCTAssertTrue(assess(now + timestampFutureSkewMs).active, "\(name) must tolerate the documented skew")
+            XCTAssertFalse(assess(Int64.max).active, "\(name) must reject extreme future evidence")
+        }
+    }
+
+    func testCodexAndGrokQuietTailFallbacksRejectExtremeFutureMtimeButAllowBoundedSkew() {
+        let now: Int64 = 1_786_449_620_000
+        for (name, assess) in [
+            ("codex", { (mtime: Int64) in assessCodexTurn([], mtimeMs: mtime, now: now) }),
+            ("grok", { (mtime: Int64) in assessGrokTurn([], mtimeMs: mtime, now: now) }),
+        ] {
+            XCTAssertTrue(assess(now + timestampFutureSkewMs).active, "\(name) fallback must tolerate bounded skew")
+            XCTAssertFalse(assess(Int64.max).active, "\(name) fallback must reject extreme future mtime")
+        }
+    }
+
+    // MARK: - Timestamp overflow hardening (Finding 1)
+
+    /// A finite JSON number far above `Int64` range (`1e300`) must saturate
+    /// to `Int64.max` rather than trapping in `Int64(doubleValue)`. `1e300 >
+    /// 1e12`, so this exercises the "already milliseconds" branch directly
+    /// (no multiplication involved).
+    func testParseTimestampSaturatesAboveInt64RangeInsteadOfTrapping() {
+        XCTAssertEqual(parseTimestamp(1e300, fallbackMs: -1), Int64.max)
+    }
+
+    /// A finite JSON number far below negative `Int64` range (`-1e300`) must
+    /// saturate to `Int64.min`. `-1e300` is not `> 1e12`, so this exercises
+    /// the "seconds → ms" branch, i.e. a `Double` multiplication by 1000
+    /// (`-1e300 * 1000 == -1e303`) followed by a saturating conversion.
+    func testParseTimestampSaturatesBelowInt64RangeInsteadOfTrapping() {
+        XCTAssertEqual(parseTimestamp(-1e300, fallbackMs: -1), Int64.min)
+    }
+
+    /// Values whose magnitude alone wouldn't overflow `Int64`, but which
+    /// cross the boundary only *after* the `* 1000` seconds→ms multiplication,
+    /// must also saturate instead of trapping. `-1e16` is well within
+    /// `Double`/`Int64` range on its own, but `-1e16 * 1000 == -1e19`, which
+    /// exceeds `Int64.min` (~`-9.223e18`).
+    func testParseTimestampSaturatesOnMultiplicationBoundaryOverflow() {
+        XCTAssertEqual(parseTimestamp(-1e16, fallbackMs: -1), Int64.min)
+    }
+
+    /// A value just inside the seconds→ms multiplication range must convert
+    /// exactly, proving the saturation logic doesn't clamp values that
+    /// legitimately fit — only genuine out-of-range magnitudes.
+    func testParseTimestampDoesNotOversaturateInRangeMultiplication() {
+        XCTAssertEqual(parseTimestamp(-9.2e12, fallbackMs: -1), Int64(-9.2e12 * 1000))
+    }
+
+    /// `finiteNumber`/`parseTimestamp` must reject non-finite `NSNumber`
+    /// values (`+inf`, `-inf`, `NaN`) called directly — mirroring TS
+    /// `Number.isFinite` — and fall back rather than trapping on the
+    /// downstream `Int64` conversion.
+    func testParseTimestampFallsBackOnNonfiniteNSNumberCalledDirectly() {
+        XCTAssertEqual(parseTimestamp(NSNumber(value: Double.infinity), fallbackMs: 42), 42)
+        XCTAssertEqual(parseTimestamp(NSNumber(value: -Double.infinity), fallbackMs: 42), 42)
+        XCTAssertEqual(parseTimestamp(NSNumber(value: Double.nan), fallbackMs: 42), 42)
+    }
+
+    /// End-to-end: syntactically valid JSON containing `1e300` must parse via
+    /// `JSONSerialization`, flow through `assessClaudeTurn` without trapping,
+    /// and produce a bounded `lastActivityAt`. A future-huge timestamp must
+    /// saturate to `Int64.max` and be rejected as implausibly future-dated.
+    func testAssessClaudeTurnSurvivesHugeFutureTimestampJSON() throws {
+        let json = #"""
+        [{"type":"assistant","timestamp":1e300,"message":{"stop_reason":"tool_use"}}]
+        """#
+        let events = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(json.utf8), options: [.fragmentsAllowed]) as? [JSONObject]
+        )
+        let now: Int64 = 1_786_449_620_000
+        let assessment = assessClaudeTurn(events, mtimeMs: now, now: now)
+        XCTAssertEqual(assessment.lastActivityAt, Int64.max)
+        XCTAssertFalse(assessment.active, "a huge future timestamp must be rejected, not active forever")
+    }
+
+    /// The past-huge mirror: `-1e300` must saturate to `Int64.min`, and the
+    /// resulting astronomically large age must classify as stale rather than
+    /// trapping the `now - timestamp` subtraction.
+    func testAssessClaudeTurnSurvivesHugeAncientTimestampJSON() throws {
+        let json = #"""
+        [{"type":"assistant","timestamp":-1e300,"message":{"stop_reason":"tool_use"}}]
+        """#
+        let events = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(json.utf8), options: [.fragmentsAllowed]) as? [JSONObject]
+        )
+        let now: Int64 = 1_786_449_620_000
+        let assessment = assessClaudeTurn(events, mtimeMs: now, now: now)
+        XCTAssertEqual(assessment.lastActivityAt, Int64.min)
+        XCTAssertFalse(assessment.active, "a huge ancient timestamp must saturate to stale, not trap")
+    }
+
+    func testAssessClaudeTurnTreatsEmptyNestedStopReasonAsAbsent() {
+        let now: Int64 = 1_786_449_620_000
+        let timestamp = now - 120_000
+        let assessment = assessClaudeTurn(
+            [[
+                "type": "assistant",
+                "timestamp": timestamp,
+                "message": ["stop_reason": ""],
+                "stop_reason": "tool_use",
+            ]],
+            mtimeMs: now,
+            now: now
+        )
+
+        XCTAssertTrue(assessment.active, "empty nested stop_reason must fall back to the top-level tool_use grace window")
+        XCTAssertEqual(assessment.lastActivityAt, timestamp)
+        XCTAssertEqual(assessment.reason, "tool_use in progress")
+    }
+
+    func testAssessClaudeTurnPreservesNonEmptyNestedStopReasonPrecedence() {
+        let now: Int64 = 1_786_449_620_000
+        let timestamp = now - 1_000
+        let assessment = assessClaudeTurn(
+            [[
+                "type": "assistant",
+                "timestamp": timestamp,
+                "message": ["stop_reason": "end_turn"],
+                "stop_reason": "tool_use",
+            ]],
+            mtimeMs: now,
+            now: now
+        )
+
+        XCTAssertFalse(assessment.active)
+        XCTAssertEqual(assessment.lastActivityAt, timestamp)
+        XCTAssertEqual(assessment.reason, "end_turn")
+    }
+
+    /// Same JSON-callable trap coverage for the Codex assessor: a huge future
+    /// `timestamp` in an `event_msg`/`task_started` record must not trap, and
+    /// must be rejected as implausibly future-dated.
+    func testAssessCodexTurnSurvivesHugeFutureTimestampJSON() throws {
+        let json = #"""
+        [{"timestamp":1e300,"type":"event_msg","payload":{"type":"task_started","cwd":"/tmp/x"}}]
+        """#
+        let events = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(json.utf8), options: [.fragmentsAllowed]) as? [JSONObject]
+        )
+        let now: Int64 = 1_786_449_620_000
+        let assessment = assessCodexTurn(events, mtimeMs: now, now: now)
+        XCTAssertEqual(assessment.lastActivityAt, Int64.max)
+        XCTAssertFalse(assessment.active)
+    }
+
+    /// Same JSON-callable trap coverage for the Grok assessor. Grok tracks
+    /// `lastActivityAt` via a running max (`if at > lastActivityAt { … }`),
+    /// so a huge-ancient timestamp (saturating to `Int64.min`) can never win
+    /// that comparison against a real anchor event — this is the exact same
+    /// (crash-free) outcome the TS reference produces for identical input,
+    /// not a Swift-only quirk: the huge-ancient event is simply ignored by
+    /// the max-tracking logic, and the assessment reflects the real anchor
+    /// event instead of trapping or corrupting `lastActivityAt`.
+    func testAssessGrokTurnSurvivesHugeAncientTimestampJSON() throws {
+        let json = #"""
+        [
+          {"ts": 1786449520000, "type": "turn_started"},
+          {"ts": -1e300, "type": "phase_changed", "phase": "streaming_text"}
+        ]
+        """#
+        let events = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(json.utf8), options: [.fragmentsAllowed]) as? [JSONObject]
+        )
+        let now: Int64 = 1_786_449_620_000
+        let assessment = assessGrokTurn(events, mtimeMs: now, now: now)
+        XCTAssertEqual(assessment.lastActivityAt, 1_786_449_520_000)
+        XCTAssertTrue(assessment.active)
+        XCTAssertEqual(assessment.reason, "user prompt")
+    }
+
+    /// The generic-mtime assessor takes a bare `Int64` `mtimeMs`, not a
+    /// parsed JSON value, but its `now - mtimeMs` age subtraction must still
+    /// be overflow-safe against an already-saturated extreme timestamp
+    /// (e.g. one that flowed in from `parseTimestamp` upstream).
+    func testAssessGenericMtimeSurvivesSaturatedExtremeTimestamps() {
+        let now: Int64 = 1_786_449_620_000
+        let future = assessGenericMtime(mtimeMs: Int64.max, now: now)
+        XCTAssertFalse(future.active)
+        let ancient = assessGenericMtime(mtimeMs: Int64.min, now: now)
+        XCTAssertFalse(ancient.active)
+    }
+
+    /// Cursor activity requires a finite timestamp inside ECMAScript Date's
+    /// supported range, so a huge finite JSON number is malformed and stale.
+    func testAssessCursorComposerRecordRejectsHugeFutureTimestampJSON() throws {
+        let json = #"""
+        {"status":"none","lastUpdatedAt":1e300,"fullConversationHeadersOnly":[]}
+        """#
+        let record = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(json.utf8), options: [.fragmentsAllowed]) as? JSONObject
+        )
+        let now: Int64 = 1_786_449_620_000
+        let assessment = assessCursorComposerRecord(record, now: now)
+        XCTAssertEqual(assessment.lastActivityAt, 0)
+        XCTAssertFalse(assessment.active)
+        XCTAssertEqual(assessment.reason, "malformed cursor composer")
+    }
+
+    /// Direct boundary tests for the saturating subtraction helper backing
+    /// every `age = now - timestamp` computation: overflow in either
+    /// direction must saturate, not trap, and in-range subtraction must be
+    /// exact.
+    func testSaturatingSubtractHandlesOverflowInBothDirections() {
+        XCTAssertEqual(saturatingSubtract(10, 3), 7)
+        XCTAssertEqual(saturatingSubtract(0, Int64.min), Int64.max, "0 - Int64.min overflows positive")
+        XCTAssertEqual(saturatingSubtract(Int64.min, Int64.max), Int64.min, "Int64.min - Int64.max overflows negative")
+        XCTAssertEqual(saturatingSubtract(Int64.max, Int64.max), 0)
+    }
+
+    /// Direct boundary tests for the saturating `Double -> Int64` conversion
+    /// backing `parseTimestamp`.
+    func testSaturatingInt64ClampsNonfiniteAndOutOfRangeValues() {
+        XCTAssertEqual(saturatingInt64(Double.infinity), Int64.max)
+        XCTAssertEqual(saturatingInt64(-Double.infinity), Int64.min)
+        XCTAssertEqual(saturatingInt64(Double.nan), Int64.min, "NaN has no sign; saturating to a bound must not trap")
+        XCTAssertEqual(saturatingInt64(1e300), Int64.max)
+        XCTAssertEqual(saturatingInt64(-1e300), Int64.min)
+        XCTAssertEqual(saturatingInt64(42.0), 42)
+    }
+
+    // MARK: - Process matcher case-sensitivity (Finding 2)
+
+    private struct MatcherFixtureOracle: Decodable {
+        let matcherCases: [MatcherFixtureCase]
+    }
+
+    private struct MatcherFixtureCase: Decodable {
+        let id: String
+        let kind: String
+        let family: String?
+        let patternIndex: Int?
+        let command: String
+        let expectedFamily: String??
+        let expectedMatch: Bool?
+    }
+
+    private func loadMatcherOracle() throws -> MatcherFixtureOracle {
+        let url = fixturesDirectory().appendingPathComponent("expected.json")
+        let data = try Data(contentsOf: url)
+        return try JSONDecoder().decode(MatcherFixtureOracle.self, from: data)
+    }
+
+    /// Cross-language parity: every `matcherCases` row is asserted here and
+    /// in `tests/agent-detection-parity.test.mjs` against the exact same
+    /// `command` / `patternIndex` values, proving Swift's `matchAgentKind`
+    /// (whole-family) and per-pattern case-sensitivity flags agree with the
+    /// TS `RegExp` reference, including the five intentionally
+    /// case-sensitive scoped-package patterns TS never applies `/i` to.
+    func testProcessMatcherOracle() throws {
+        let oracle = try loadMatcherOracle()
+        XCTAssertFalse(oracle.matcherCases.isEmpty)
+
+        for testCase in oracle.matcherCases {
+            switch testCase.kind {
+            case "family":
+                let matched = matchAgentKind(command: testCase.command)
+                let expected = (testCase.expectedFamily ?? nil).flatMap { $0 }
+                XCTAssertEqual(matched?.id.rawValue, expected, testCase.id)
+
+            case "pattern":
+                guard
+                    let familyRaw = testCase.family,
+                    let family = AgentFamily(rawValue: familyRaw),
+                    let patternIndex = testCase.patternIndex,
+                    let expectedMatch = testCase.expectedMatch,
+                    let kind = AGENT_KINDS.first(where: { $0.id == family })
+                else {
+                    XCTFail("malformed pattern matcher case \(testCase.id)")
+                    continue
+                }
+                XCTAssertTrue(patternIndex >= 0 && patternIndex < kind.processMatchers.count, testCase.id)
+                let matcher = kind.processMatchers[patternIndex]
+                XCTAssertEqual(matcher.matches(testCase.command), expectedMatch, testCase.id)
+
+            default:
+                XCTFail("unknown matcherCases kind \(testCase.kind)")
+            }
+        }
+    }
+
+    func testProcessDefinitionsCompileEachPatternOnceOutsideMatchingHotLoop() {
+        let counter = LockedCompilationCounter()
+        let definitions = makeAgentKinds(
+            regexCompiler: ProcessRegexCompiler(onCompilation: counter.increment)
+        )
+        let patternCount = definitions.reduce(0) { $0 + $1.processMatchers.count }
+        XCTAssertGreaterThan(patternCount, 0)
+        XCTAssertEqual(patternCount, AGENT_KINDS.reduce(0) { $0 + $1.processMatchers.count })
+        XCTAssertEqual(counter.value, patternCount)
+
+        let commands = [
+            "/opt/homebrew/bin/claude",
+            "npx @openai/codex",
+            "/Users/example/.grok/downloads/grok-1.2.3-macos-arm64",
+            "cursor-agent --agent",
+            "definitely-not-an-agent",
+        ]
+        for index in 0..<10_000 {
+            _ = matchAgentKind(command: commands[index % commands.count], kinds: definitions)
+        }
+
+        XCTAssertEqual(
+            counter.value,
+            patternCount,
+            "matching thousands of processes must reuse the definitions' precompiled regexes"
+        )
+    }
+
+    /// Structural guard: exactly the five scoped-package patterns
+    /// (`@anthropic-ai/claude-code`, `@openai/codex`, `@google/gemini-cli`,
+    /// `@sourcegraph/amp`, `@continuedev/cli`) are compiled case-sensitively;
+    /// every other pattern stays case-insensitive, mirroring the `/i` flag
+    /// (or its absence) on each `RegExp` literal in the TS policy exactly.
+    func testExactlyFiveScopedPackagePatternsAreCaseSensitive() {
+        let caseSensitivePatterns = AGENT_KINDS.flatMap { kind in
+            kind.processMatchers.filter { !$0.caseInsensitive }.map(\.pattern)
+        }
+        XCTAssertEqual(caseSensitivePatterns.count, 5)
+        XCTAssertEqual(Set(caseSensitivePatterns), [
+            #"@anthropic-ai/claude-code"#,
+            #"@openai/codex"#,
+            #"@google/gemini-cli"#,
+            #"@sourcegraph/amp"#,
+            #"@continuedev/cli"#,
+        ])
+    }
+
+    // MARK: - Cursor composer header `type` strict-equality hardening (Finding 2)
+
+    /// Builds a Cursor composer record with a single conversation header
+    /// whose `type` field is `headerType` and a recent `createdAt`. Status
+    /// is `"completed"` (not `"generating"`) so the record only becomes
+    /// `active` if the header loop itself recognizes `headerType` as a
+    /// user-turn opener (`type == 1`) — an idle `"completed"`/`false` result
+    /// proves the header was correctly rejected.
+    private func assessCursorHeaderType(_ headerType: Any, now: Int64) -> TurnAssessment {
+        let record: JSONObject = [
+            "status": "completed",
+            "lastUpdatedAt": now - 1_000,
+            "fullConversationHeadersOnly": [
+                ["type": headerType, "createdAt": now - 1_000] as JSONObject,
+            ],
+        ]
+        return assessCursorComposerRecord(record, now: now)
+    }
+
+    /// TS uses strict equality (`header.type === 1`), which a JSON boolean
+    /// can never satisfy (`true === 1` is `false` in JS). `JSONSerialization`
+    /// represents JSON `true` as an `NSNumber` indistinguishable from `1` by
+    /// naive `NSNumber` truncation, so a header of `type: true` must NOT be
+    /// treated as a user-turn opener — the turn stays idle/"completed", not
+    /// an open active user prompt.
+    func testAssessCursorComposerRecordRejectsBooleanHeaderType() {
+        let now: Int64 = 1_786_449_620_000
+        let assessment = assessCursorHeaderType(true, now: now)
+        XCTAssertFalse(assessment.active, "a JSON boolean `type` must never open a user turn")
+        XCTAssertEqual(assessment.reason, "malformed cursor composer")
+    }
+
+    /// `1.0` is the exact same JS/JSON number as `1` (`1.0 === 1` is `true`
+    /// in JS; IEEE-754 doubles don't distinguish integral floats), so this
+    /// must still open a user turn — proving the fix isn't over-broad.
+    func testAssessCursorComposerRecordAcceptsNumericOneEquivalentToInteger() {
+        let now: Int64 = 1_786_449_620_000
+        let assessment = assessCursorHeaderType(1.0, now: now)
+        XCTAssertTrue(assessment.active, "1.0 == 1 numerically and must open a user turn, matching TS `=== 1`")
+        XCTAssertEqual(assessment.reason, "user prompt")
+    }
+
+    /// `1.5 !== 1` under strict equality; a non-integral numeric `type` must
+    /// not be treated as the user-bubble marker.
+    func testAssessCursorComposerRecordRejectsNonIntegralHeaderType() {
+        let now: Int64 = 1_786_449_620_000
+        let assessment = assessCursorHeaderType(1.5, now: now)
+        XCTAssertFalse(assessment.active, "1.5 is not strictly === 1 and must never open a user turn")
+        XCTAssertEqual(assessment.reason, "malformed cursor composer")
+    }
+
+    /// `"1" !== 1` under strict equality (no numeric coercion); a JSON
+    /// string `type` must never be treated as the user-bubble marker even
+    /// if the string carries a numerically equivalent value.
+    func testAssessCursorComposerRecordRejectsStringHeaderType() {
+        let now: Int64 = 1_786_449_620_000
+        let assessment = assessCursorHeaderType("1", now: now)
+        XCTAssertFalse(assessment.active, "a JSON string \"1\" must never open a user turn")
+        XCTAssertEqual(assessment.reason, "malformed cursor composer")
+    }
+
+    /// Normal fixture behavior must be unaffected: an integer JSON `type: 1`
+    /// header still opens a user turn exactly as before the hardening.
+    func testAssessCursorComposerRecordStillAcceptsIntegerHeaderType() {
+        let now: Int64 = 1_786_449_620_000
+        let assessment = assessCursorHeaderType(1, now: now)
+        XCTAssertTrue(assessment.active, "a plain integer 1 must still open a user turn")
+        XCTAssertEqual(assessment.reason, "user prompt")
+    }
+
+    func testCursorContinuationBooleanAcceptsOnlyActualCFBooleanValues() {
+        XCTAssertEqual(strictCursorBoolean(true), true)
+        XCTAssertEqual(strictCursorBoolean(false), false)
+        XCTAssertNil(strictCursorBoolean(NSNumber(value: 1)))
+        XCTAssertNil(strictCursorBoolean(NSNumber(value: 0)))
+    }
+
+    func testNumericContinuationFlagWithoutTimestampCannotBecomeRecentlyActive() {
+        let now: Int64 = 1_786_449_620_000
+        let assessment = assessCursorComposerRecord(
+            [
+                "status": "completed",
+                "isContinuationInProgress": NSNumber(value: 1),
+                "fullConversationHeadersOnly": [],
+            ],
+            now: now
+        )
+
+        XCTAssertFalse(assessment.active)
+        XCTAssertEqual(assessment.reason, "malformed cursor composer")
+        XCTAssertNotEqual(assessment.lastActivityAt, now)
+    }
+
+    func testCursorRecordPrimitivesAndMissingActivityTimestampsNeverRefreshAcrossScans() {
+        let now: Int64 = 1_786_449_620_000
+        let malformedRecords: [JSONObject] = [
+            [
+                "status": NSNull(),
+                "lastUpdatedAt": now,
+                "fullConversationHeadersOnly": [],
+            ],
+            [
+                "status": NSNumber(value: 1),
+                "lastUpdatedAt": now,
+                "fullConversationHeadersOnly": [],
+            ],
+            [
+                "status": "generating",
+                "lastUpdatedAt": NSNull(),
+                "fullConversationHeadersOnly": [],
+            ],
+            [
+                "status": "generating",
+                "lastUpdatedAt": true,
+                "fullConversationHeadersOnly": [],
+            ],
+            [
+                "status": "generating",
+                "fullConversationHeadersOnly": [],
+            ],
+            [
+                "status": "completed",
+                "isContinuationInProgress": NSNumber(value: 1),
+                "fullConversationHeadersOnly": [],
+            ],
+            [
+                "status": "generating",
+                "lastUpdatedAt": now,
+                "generatingBubbleIds": [NSNumber(value: 1)],
+                "fullConversationHeadersOnly": [],
+            ],
+        ]
+
+        for scanNow in [now, now + 1_000, now + 60_000] {
+            for record in malformedRecords {
+                let assessment = assessCursorComposerRecord(record, now: scanNow)
+                XCTAssertFalse(assessment.active)
+                XCTAssertEqual(assessment.reason, "malformed cursor composer")
+                XCTAssertNotEqual(assessment.lastActivityAt, scanNow)
+            }
+        }
+    }
+
+    func testCursorMixedHeadersProcessOnlyValidEntriesWithoutPerpetualFreshness() {
+        let now: Int64 = 1_786_449_620_000
+        let record: JSONObject = [
+            "status": "completed",
+            "lastUpdatedAt": now - 60_000,
+            "fullConversationHeadersOnly": [
+                NSNull(),
+                true,
+                NSNumber(value: 42),
+                "header",
+                [],
+                ["type": "1", "createdAt": now],
+                ["type": 1, "createdAt": NSNull()],
+                ["type": 1, "createdAt": now - 1_000],
+            ] as [Any],
+        ]
+
+        let fresh = assessCursorComposerRecord(record, now: now)
+        XCTAssertTrue(fresh.active)
+        XCTAssertEqual(fresh.lastActivityAt, now - 1_000)
+        XCTAssertEqual(fresh.reason, "user prompt")
+
+        let repeated = assessCursorComposerRecord(record, now: now + turnActiveGraceMs + 1)
+        XCTAssertFalse(repeated.active)
+        XCTAssertEqual(repeated.lastActivityAt, now - 1_000)
+        XCTAssertEqual(repeated.reason, "stale user prompt")
+    }
+
+    /// `toolFormerStatus`/`shellStatus` are always lowercased before being
+    /// checked against the running-tool allowlist, so the allowlist must
+    /// store its "in progress" entry lowercase too. A mixed-case entry like
+    /// `"inProgress"` never matches the lowercased field and silently never
+    /// classifies a running Cursor tool call as active.
+    func testCursorToolStatusInProgressMixedCaseIsActive() {
+        let now: Int64 = 1_786_449_620_000
+        let record: JSONObject = [
+            "status": "completed",
+            "lastUpdatedAt": now - 5_000,
+            "fullConversationHeadersOnly": [
+                ["type": 2, "createdAt": now - 5_000, "grouping": ["toolFormerStatus": "inProgress"]] as JSONObject,
+            ],
+        ]
+        let assessment = assessCursorComposerRecord(record, now: now)
+        XCTAssertTrue(assessment.active, "toolFormerStatus \"inProgress\" must classify the tool call as active")
+        XCTAssertEqual(assessment.reason, "tool_call in progress")
+    }
+
+    /// The field is lowercased before the allowlist check, so every raw case
+    /// variant of "in progress" must be normalized to the same active result.
+    func testCursorToolStatusInProgressCaseVariantsAreActive() {
+        let now: Int64 = 1_786_449_620_000
+        for rawStatus in ["inProgress", "INPROGRESS", "InProgress", "inprogress", "in_progress"] {
+            let toolRecord: JSONObject = [
+                "status": "completed",
+                "lastUpdatedAt": now - 5_000,
+                "fullConversationHeadersOnly": [
+                    ["type": 2, "createdAt": now - 5_000, "grouping": ["toolFormerStatus": rawStatus]] as JSONObject,
+                ],
+            ]
+            let toolAssessment = assessCursorComposerRecord(toolRecord, now: now)
+            XCTAssertTrue(toolAssessment.active, "toolFormerStatus \"\(rawStatus)\" should be active")
+            XCTAssertEqual(toolAssessment.reason, "tool_call in progress", "toolFormerStatus \"\(rawStatus)\" should report a running tool")
+
+            let shellRecord: JSONObject = [
+                "status": "completed",
+                "lastUpdatedAt": now - 5_000,
+                "fullConversationHeadersOnly": [
+                    ["type": 2, "createdAt": now - 5_000, "grouping": ["shellStatus": rawStatus]] as JSONObject,
+                ],
+            ]
+            let shellAssessment = assessCursorComposerRecord(shellRecord, now: now)
+            XCTAssertTrue(shellAssessment.active, "shellStatus \"\(rawStatus)\" should be active")
+            XCTAssertEqual(shellAssessment.reason, "tool_call in progress", "shellStatus \"\(rawStatus)\" should report a running tool")
+        }
+    }
+
+    // MARK: - Cursor: realistic bubble-based tool status (issue B)
+
+    /// Real Cursor state never embeds `grouping.toolFormerStatus` — the
+    /// header only references a bubble id, and the actual tool status lives
+    /// in that bubble's own `bubbleId:<composerId>:<bubbleId>` row under
+    /// `toolFormerData.status`. This proves the bubble-derived source alone
+    /// (no legacy embedded fields at all) is enough to classify a running
+    /// tool call as active, mirroring
+    /// `testCursorToolStatusInProgressMixedCaseIsActive` for the legacy path.
+    func testCursorBubbleToolFormerDataStatusInProgressIsActive() {
+        let now: Int64 = 1_786_449_620_000
+        let record: JSONObject = [
+            "status": "completed",
+            "lastUpdatedAt": now - 5_000,
+            "fullConversationHeadersOnly": [
+                ["type": 2, "createdAt": now - 5_000, "bubbleId": "bubble-1"] as JSONObject,
+            ],
+        ]
+        let bubbles: [String: JSONObject] = [
+            "bubble-1": ["toolFormerData": ["status": "inProgress"]],
+        ]
+
+        let withoutBubble = assessCursorComposerRecord(record, now: now)
+        XCTAssertFalse(withoutBubble.active, "a bare bubble reference with no bubble content must not itself imply activity")
+
+        let withBubble = assessCursorComposerRecord(record, bubbles: bubbles, now: now)
+        XCTAssertTrue(withBubble.active, "toolFormerData.status \"inProgress\" resolved via the referenced bubble must classify the tool call as active")
+        XCTAssertEqual(withBubble.reason, "tool_call in progress")
+    }
+
+    /// Every raw case variant of "in progress" must normalize identically
+    /// whether the status arrives via the legacy embedded header field or
+    /// the realistic bubble row — same allowlist, same lowercasing.
+    func testCursorBubbleToolFormerDataStatusCaseVariantsAreActive() {
+        let now: Int64 = 1_786_449_620_000
+        for rawStatus in ["inProgress", "INPROGRESS", "InProgress", "inprogress", "in_progress"] {
+            let record: JSONObject = [
+                "status": "completed",
+                "lastUpdatedAt": now - 5_000,
+                "fullConversationHeadersOnly": [
+                    ["type": 2, "createdAt": now - 5_000, "bubbleId": "bubble-1"] as JSONObject,
+                ],
+            ]
+            let bubbles: [String: JSONObject] = [
+                "bubble-1": ["toolFormerData": ["status": rawStatus]],
+            ]
+            let assessment = assessCursorComposerRecord(record, bubbles: bubbles, now: now)
+            XCTAssertTrue(assessment.active, "bubble toolFormerData.status \"\(rawStatus)\" should be active")
+            XCTAssertEqual(assessment.reason, "tool_call in progress", "bubble toolFormerData.status \"\(rawStatus)\" should report a running tool")
+        }
+    }
+
+    /// A resolved bubble reporting a terminal status (mirroring the legacy
+    /// `shellStatus`/`toolFormerStatus` terminal set) marks the turn as
+    /// tool-touched/completed rather than running, exactly like the legacy
+    /// embedded fields already do.
+    func testCursorBubbleToolFormerDataTerminalStatusesAreNotRunning() {
+        let now: Int64 = 1_786_449_620_000
+        for rawStatus in ["completed", "success", "error", "failed"] {
+            let record: JSONObject = [
+                "status": "completed",
+                "lastUpdatedAt": now - 5_000,
+                "fullConversationHeadersOnly": [
+                    ["type": 1, "createdAt": now - 10_000] as JSONObject,
+                    ["type": 2, "createdAt": now - 5_000, "bubbleId": "bubble-1"] as JSONObject,
+                ],
+            ]
+            let bubbles: [String: JSONObject] = [
+                "bubble-1": ["toolFormerData": ["status": rawStatus]],
+            ]
+            let assessment = assessCursorComposerRecord(record, bubbles: bubbles, now: now)
+            XCTAssertNotEqual(assessment.reason, "tool_call in progress", "terminal bubble status \"\(rawStatus)\" must not report a running tool")
+        }
+    }
+
+    /// A missing bubble (dangling reference), a bubble present but lacking
+    /// `toolFormerData`, and a non-object `toolFormerData.status` must all be
+    /// treated identically to "no status" rather than crashing or throwing.
+    func testCursorBubbleMissingOrMalformedNeverCrashesOrFalselyActivates() {
+        let now: Int64 = 1_786_449_620_000
+        let record: JSONObject = [
+            "status": "completed",
+            "lastUpdatedAt": now - 5_000,
+            "fullConversationHeadersOnly": [
+                ["type": 2, "createdAt": now - 5_000, "bubbleId": "bubble-missing"] as JSONObject,
+            ],
+        ]
+        let malformedBubbleSets: [[String: JSONObject]] = [
+            [:], // dangling reference: bubble id not present at all.
+            ["bubble-missing": [:]], // bubble present, no toolFormerData at all.
+            ["bubble-missing": ["toolFormerData": "not-an-object"]],
+            ["bubble-missing": ["toolFormerData": ["status": NSNumber(value: 1)]]],
+            ["bubble-missing": ["toolFormerData": ["status": NSNull()]]],
+        ]
+        for bubbles in malformedBubbleSets {
+            let assessment = assessCursorComposerRecord(record, bubbles: bubbles, now: now)
+            XCTAssertNotEqual(assessment.reason, "tool_call in progress")
+        }
+    }
+
+    /// `cursorRelevantBubbleIds` must exclude `type == 1` (user) bubble ids
+    /// and deduplicate a repeated reference within the trailing window.
+    func testCursorRelevantBubbleIdsExcludesUserBubblesAndDeduplicates() {
+        let record: JSONObject = [
+            "fullConversationHeadersOnly": [
+                ["type": 1, "createdAt": Int64(0), "bubbleId": "user-0"] as JSONObject,
+                ["type": 2, "createdAt": Int64(1), "bubbleId": "tool-0"] as JSONObject,
+                ["type": 1, "createdAt": Int64(2), "bubbleId": "user-1"] as JSONObject,
+                ["type": 2, "createdAt": Int64(3), "bubbleId": "tool-1"] as JSONObject,
+                // Duplicate reference to an already-listed bubble id.
+                ["type": 2, "createdAt": Int64(4), "bubbleId": "tool-0"] as JSONObject,
+            ],
+        ]
+
+        XCTAssertEqual(cursorRelevantBubbleIds(record), ["tool-0", "tool-1"])
+    }
+
+    /// A conversation with more trailing `type == 2` bubble references than
+    /// `cursorMaximumRecentHeadersPerComposer` must be capped to exactly that
+    /// many — the most recent ones — never growing unbounded with
+    /// conversation length (this is what keeps the global
+    /// `cursorMaximumBubbleLookups` scan budget meaningful).
+    func testCursorRelevantBubbleIdsBoundedToRecentHeadersPerComposer() {
+        var headers: [JSONObject] = []
+        for index in 0..<12 {
+            headers.append(["type": 2, "createdAt": Int64(index), "bubbleId": "tool-\(index)"])
+        }
+        let record: JSONObject = ["fullConversationHeadersOnly": headers]
+
+        let ids = cursorRelevantBubbleIds(record)
+
+        XCTAssertEqual(cursorMaximumRecentHeadersPerComposer, 8)
+        XCTAssertEqual(ids, ["tool-4", "tool-5", "tool-6", "tool-7", "tool-8", "tool-9", "tool-10", "tool-11"])
+    }
+
+    func testAssessCodexTurnDistinguishesApprovalFromCompletion() {
+        let cwdPayload: JSONObject = ["cwd": "/tmp/seer-fixtures/codex-boundary-project"]
+        let started: JSONObject = [
+            "timestamp": "2026-08-10T12:00:00.000Z",
+            "type": "event_msg",
+            "payload": ["type": "task_started"].merging(cwdPayload) { _, new in new },
+        ]
+        let approval: JSONObject = [
+            "timestamp": "2026-08-10T12:00:05.000Z",
+            "type": "event_msg",
+            "payload": ["type": "exec_approval_request"],
+        ]
+        let now = parseISO8601ToMs("2026-08-10T12:00:06.000Z")!
+
+        let assessment = assessCodexTurn([started, approval], mtimeMs: now, now: now)
+        XCTAssertFalse(assessment.active)
+        XCTAssertEqual(assessment.reason, "waiting for approval")
+        XCTAssertEqual(assessment.label, "Codex Boundary Project")
+    }
+
+    // MARK: - Cursor SQL recency vs. assessor-derived recency parity (mirrors
+    // tests/agent-detection-parity.test.mjs's "Cursor SQL recency vs.
+    // assessor-derived recency parity" section)
+    //
+    // `cursorRecencySqlExpression` (in `SessionSnapshotSource.swift`) computes
+    // a `cursorDiskKV` composer row's recency directly in SQLite so a bounded
+    // query can `ORDER BY` real last-activity time instead of `rowid`. These
+    // cases execute that *exact* SQL expression through a real SQLite
+    // connection and assert it agrees with `assessCursorComposerRecord`'s own
+    // `lastActivityAt` for every timestamp shape the assessor can turn into
+    // an *active* composer. That agreement is exactly what lets the row-limit
+    // sentinel (see `SessionSnapshotSourceTests.swift`'s "row limit
+    // recovers"/"still throws" tests) safely treat an unrankable (SQL `NULL`)
+    // row as provably never a lost active composer.
+
+    /// Computes `cursorRecencySqlExpression` against a single real, in-memory
+    /// SQLite row holding `valueJSON` as `cursorDiskKV.value`. `:memory:` is
+    /// enough: this proves a pure SQL-evaluation property, independent of the
+    /// filesystem/WAL/symlink hardening `SessionSnapshotSourceTests.swift`
+    /// already covers.
+    private func sqlRecency(forValueJSON valueJSON: String) -> Int64? {
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(":memory:", &db), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        // cursorRecencySqlExpression's generated SQL calls this scalar
+        // function by name (see cursorCanonicalIsoToEpochMsXFunc's own doc
+        // comment) — must be registered on every connection that executes
+        // the expression, exactly like queryCursorComposers registers it on
+        // its own real connection.
+        XCTAssertEqual(
+            sqlite3_create_function_v2(
+                db,
+                cursorTimestampSqlFunctionName,
+                4,
+                SQLITE_UTF8 | SQLITE_DETERMINISTIC,
+                nil,
+                cursorCanonicalIsoToEpochMsXFunc,
+                nil,
+                nil,
+                nil
+            ),
+            SQLITE_OK
+        )
+        XCTAssertEqual(
+            sqlite3_exec(db, "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)", nil, nil, nil),
+            SQLITE_OK
+        )
+        var insert: OpaquePointer?
+        XCTAssertEqual(
+            sqlite3_prepare_v2(db, "INSERT INTO cursorDiskKV (key, value) VALUES ('row', ?)", -1, &insert, nil),
+            SQLITE_OK
+        )
+        sqlite3_bind_text(insert, 1, valueJSON, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        XCTAssertEqual(sqlite3_step(insert), SQLITE_DONE)
+        sqlite3_finalize(insert)
+
+        var query: OpaquePointer?
+        XCTAssertEqual(
+            sqlite3_prepare_v2(db, "SELECT (\(cursorRecencySqlExpression)) AS recencyMs FROM cursorDiskKV", -1, &query, nil),
+            SQLITE_OK
+        )
+        defer { sqlite3_finalize(query) }
+        XCTAssertEqual(sqlite3_step(query), SQLITE_ROW)
+        guard sqlite3_column_type(query, 0) != SQLITE_NULL else { return nil }
+        return sqlite3_column_int64(query, 0)
+    }
+
+    /// `assessCursorComposerRecord`'s own `lastActivityAt`, parsed from the
+    /// *exact same* JSON text `sqlRecency(forValueJSON:)` receives — parsing
+    /// once from text (rather than authoring a Swift dictionary literal and a
+    /// JSON string separately) guarantees both sides see byte-identical
+    /// input.
+    private func assessedLastActivityAt(forValueJSON valueJSON: String, now: Int64) throws -> Int64 {
+        let record = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(valueJSON.utf8), options: [.fragmentsAllowed]) as? JSONObject
+        )
+        return assessCursorComposerRecord(record, now: now).lastActivityAt
+    }
+
+    /// Mirrors the TS parity suite's "numeric root timestamp (milliseconds
+    /// and seconds)" case.
+    func testCursorSQLRecencyMatchesAssessorForNumericRootTimestamp() throws {
+        let now: Int64 = 1_786_449_620_000
+        for valueJSON in [
+            #"{"status":"generating","lastUpdatedAt":\#(now)}"#,
+            #"{"status":"generating","lastUpdatedAt":\#(now / 1_000)}"#,
+        ] {
+            let assessed = try assessedLastActivityAt(forValueJSON: valueJSON, now: now)
+            XCTAssertEqual(sqlRecency(forValueJSON: valueJSON), assessed, valueJSON)
+            XCTAssertEqual(assessed, now, valueJSON)
+        }
+    }
+
+    /// Mirrors the TS parity suite's ISO-8601 string root timestamp case:
+    /// `toISOString()`'s exact millisecond+`Z` shape is what
+    /// `cursorRecencySqlExpression`'s `GLOB` guard requires and what Swift's
+    /// `ISO8601FormatStyle` parses to the identical millisecond value.
+    func testCursorSQLRecencyMatchesAssessorForISOStringRootTimestamp() throws {
+        let now: Int64 = 1_786_449_620_000
+        let isoNow = "2026-08-11T12:00:20.000Z"
+        XCTAssertEqual(parseISO8601ToMs(isoNow), now, "fixture ISO string must itself parse to `now`")
+        let valueJSON = #"{"status":"generating","lastUpdatedAt":"\#(isoNow)"}"#
+        let assessed = try assessedLastActivityAt(forValueJSON: valueJSON, now: now)
+        XCTAssertEqual(sqlRecency(forValueJSON: valueJSON), assessed)
+        XCTAssertEqual(assessed, now)
+    }
+
+    /// Mirrors the TS parity suite's "header-only composer" case: no root
+    /// `lastUpdatedAt`/`createdAt`/`conversationCheckpointLastUpdatedAt`
+    /// field at all — the composer's only recency signal is a conversation
+    /// header's own `createdAt`, in both the numeric and ISO-string shapes.
+    func testCursorSQLRecencyMatchesAssessorForHeaderOnlyComposer() throws {
+        let now: Int64 = 1_786_449_620_000
+        let isoNow = "2026-08-11T12:00:20.000Z"
+        for createdAtJSON in ["\(now)", "\"\(isoNow)\""] {
+            let valueJSON = #"{"fullConversationHeadersOnly":[{"type":1,"createdAt":\#(createdAtJSON)}]}"#
+            let assessed = try assessedLastActivityAt(forValueJSON: valueJSON, now: now)
+            XCTAssertEqual(sqlRecency(forValueJSON: valueJSON), assessed, valueJSON)
+            XCTAssertEqual(assessed, now, valueJSON)
+        }
+    }
+
+    /// Mirrors the TS parity suite's field-priority-order case: a
+    /// higher-priority defined field must win over a numerically-later but
+    /// lower-priority one, in SQL exactly as in the assessor's own
+    /// `firstNonNull` chain — a `COALESCE`, never a flat `MAX` across all
+    /// three fields.
+    func testCursorSQLRecencyMatchesAssessorFieldPriorityOrderForUpdatedOldRow() throws {
+        let now: Int64 = 1_786_449_620_000
+        let oldCreatedAt = now - 86_400_000
+        for valueJSON in [
+            #"{"status":"completed","createdAt":\#(oldCreatedAt),"lastUpdatedAt":\#(now)}"#,
+            #"{"status":"completed","createdAt":\#(oldCreatedAt),"lastUpdatedAt":\#(oldCreatedAt),"conversationCheckpointLastUpdatedAt":\#(now)}"#,
+        ] {
+            let assessed = try assessedLastActivityAt(forValueJSON: valueJSON, now: now)
+            XCTAssertEqual(sqlRecency(forValueJSON: valueJSON), assessed, valueJSON)
+            XCTAssertEqual(assessed, now, valueJSON)
+        }
+
+        // A lower-priority field's numerically *larger* raw value must never
+        // outrank a defined higher-priority field.
+        let prioritized = #"{"status":"completed","conversationCheckpointLastUpdatedAt":\#(now / 1_000),"lastUpdatedAt":\#(now + 999_000_000)}"#
+        let assessedPrioritized = try assessedLastActivityAt(forValueJSON: prioritized, now: now)
+        XCTAssertEqual(sqlRecency(forValueJSON: prioritized), assessedPrioritized)
+        XCTAssertEqual(assessedPrioritized, now)
+    }
+
+    /// Mirrors the TS parity suite's malformed/unparseable case: each of
+    /// these records is assessable but every field that would otherwise
+    /// contribute a root/header recency signal is either absent or fails
+    /// the SQL shape guard (an unparseable string, or non-object header
+    /// entries). `cursorRecencySqlExpression`'s `rootRecency`/
+    /// `headerRecency` no longer default an unrankable set of candidates to
+    /// `COALESCE(..., 0)`, so SQL now correctly reports `NULL` ("cannot
+    /// rank this row") instead of a numeric `0` for every one of these —
+    /// even though the assessor's own `lastActivityAt` still separately
+    /// falls back to its in-memory `0` seed (see
+    /// `assessCursorComposerRecord`'s own comment on that seed; it is never
+    /// surfaced through this SQL expression). This is the intentional
+    /// divergence that lets the row-limit sentinel treat such a row as
+    /// inconclusive rather than definitively old. Genuinely invalid JSON
+    /// syntax never even reaches the assessor in production — the scan
+    /// Worker's own parse fails first and the row is skipped — so only
+    /// SQL's `NULL` unrankable verdict is asserted for those.
+    func testCursorSQLRecencyMatchesAssessorForMalformedOrUnparseableRecords() throws {
+        let now: Int64 = 1_786_449_620_000
+        for valueJSON in [
+            #"{"lastUpdatedAt":"not-a-timestamp"}"#,
+            #"{"fullConversationHeadersOnly":[42,null,"x"]}"#,
+        ] {
+            let assessed = try assessedLastActivityAt(forValueJSON: valueJSON, now: now)
+            XCTAssertNil(sqlRecency(forValueJSON: valueJSON), valueJSON)
+            XCTAssertEqual(assessed, 0, valueJSON)
+        }
+
+        XCTAssertNil(sqlRecency(forValueJSON: #"{"status":"#))
+        XCTAssertNil(sqlRecency(forValueJSON: ""))
+    }
+
+    /// Mirrors the TS parity suite's future-skew case: `lastActivityAt`
+    /// itself is never clamped by "is this in the future" — only the
+    /// separate active/inactive boolean is — so recency ranking must track
+    /// the assessor's raw value exactly, future or not, up to (and rejecting
+    /// identically beyond) `maxSupportedTimestampMs`.
+    func testCursorSQLRecencyMatchesAssessorForFutureSkewedAndOutOfRangeTimestamps() throws {
+        let now: Int64 = 1_786_449_620_000
+        // `TurnAssessors.swift`'s own `maxSupportedTimestampMs` is
+        // file-private, so this mirrors it verbatim — exactly as
+        // `cursorRecencySqlExpression` itself already must, for the same
+        // reason (see its doc comment in `SessionSnapshotSource.swift`).
+        let maxSupportedTimestampMs: Int64 = 8_640_000_000_000_000
+        for futureMs in [now + 60_000, now + 86_400_000, maxSupportedTimestampMs - 1] {
+            let valueJSON = #"{"status":"generating","lastUpdatedAt":\#(futureMs)}"#
+            let assessed = try assessedLastActivityAt(forValueJSON: valueJSON, now: now)
+            XCTAssertEqual(sqlRecency(forValueJSON: valueJSON), assessed, valueJSON)
+            XCTAssertEqual(assessed, futureMs, valueJSON)
+        }
+
+        // Beyond maxSupportedTimestampMs: the assessor rejects the whole
+        // record as malformed (`validateCursorRecordFields` already rejects
+        // any defined priority field that fails `parseCursorTimestamp`'s
+        // own bound check), falling back to its in-memory `0` seed. SQL
+        // independently rejects the same out-of-range numeric value via its
+        // own `ABS(ms) <= maxSupportedTimestampMs` guard, yielding `NULL`
+        // (unrankable) rather than a `COALESCE(..., 0)`-defaulted `0` — an
+        // out-of-range value must never poison the row's rank with a
+        // nonsensical magnitude OR silently masquerade as "provably
+        // epoch-zero old".
+        let outOfRange = #"{"status":"generating","lastUpdatedAt":\#(maxSupportedTimestampMs + 1)}"#
+        let assessedOutOfRange = try assessedLastActivityAt(forValueJSON: outOfRange, now: now)
+        XCTAssertNil(sqlRecency(forValueJSON: outOfRange))
+        XCTAssertEqual(assessedOutOfRange, 0)
+    }
+
+    /// Swift's `Date.ISO8601FormatStyle` flatly rejects `"2024-01-15"`
+    /// (confirmed empirically: both the fractional- and
+    /// non-fractional-seconds style variants fail to parse it). TS's
+    /// isCanonicalCursorIsoTimestamp grammar guard (see
+    /// agent-detection-policy.ts and agent-detection-parity.test.mjs) now
+    /// enforces the identical canonical-ISO-8601 grammar ahead of
+    /// parseCursorTimestamp, so on both platforms SQL and the assessor agree
+    /// with no exception needed: both treat a date-only string as
+    /// unrankable/non-activity-bearing. SQL now represents "unrankable" as a
+    /// real `NULL` (never a `COALESCE(..., 0)`-defaulted `0`), while the
+    /// assessor represents it as its own in-memory `0` fallback.
+    func testCursorSQLRecencyAndAssessorAgreeDateOnlyStringsAreUnrankable() throws {
+        let now: Int64 = 1_786_449_620_000
+        XCTAssertNil(parseISO8601ToMs("2024-01-15"), "Swift's ISO8601FormatStyle must reject a date-only string")
+        let valueJSON = #"{"fullConversationHeadersOnly":[{"type":1,"createdAt":"2024-01-15"}]}"#
+        let assessed = try assessedLastActivityAt(forValueJSON: valueJSON, now: now)
+        XCTAssertNil(sqlRecency(forValueJSON: valueJSON))
+        XCTAssertEqual(assessed, 0)
+    }
+
+    /// Mirrors the TS parity suite's "no blessed divergence" test: every
+    /// lenient header `createdAt` string shape (lower-case `t`/`z`, a space
+    /// instead of `T`, RFC-2822, minute-only, zone-less) must be rejected
+    /// identically by SQL's shape guard and by `parseCursorTimestamp`'s new
+    /// `isCanonicalCursorIsoTimestamp` gate — the two representations of
+    /// "unrankable" (SQL `NULL` vs. the assessor's in-memory `0` fallback)
+    /// are allowed to differ, but WHICH shapes are unrankable must never
+    /// differ between engines.
+    func testCursorSQLRecencyAndAssessorAgreeEveryLenientHeaderShapeIsUnrankable() throws {
+        let now: Int64 = 1_786_449_620_000
+        for createdAt in [
+            "2024-01-15",
+            "2024-01-15t10:20:30Z",
+            "2024-01-15T10:20:30z",
+            "2024-01-15 10:20:30Z",
+            "Mon, 15 Jan 2024 10:20:30 GMT",
+            "2024-01-15T10:20Z",
+            "2024-01-15T10:20:30",
+        ] {
+            let valueJSON = #"{"fullConversationHeadersOnly":[{"type":1,"createdAt":"\#(createdAt)"}]}"#
+            let assessed = try assessedLastActivityAt(forValueJSON: valueJSON, now: now)
+            XCTAssertNil(sqlRecency(forValueJSON: valueJSON), createdAt)
+            XCTAssertEqual(assessed, 0, createdAt)
+        }
+    }
+
+    // MARK: - Cursor canonical ISO grammar: fractional-second digit-count
+    // boundary. GLOB has no `{1,3}`-style repetition operator, so
+    // `cursorRecencySqlExpression`'s shape guard has to spell out each digit
+    // count (1, 2, 3) as its own alternative rather than reach for an
+    // unrestricted `.*` wildcard — `.*` would also match a 4-or-more-digit
+    // (sub-millisecond) fraction, which `julianday()`, `Date.parse`, and
+    // Swift's `Date.ISO8601FormatStyle`/`parseCursorTimestamp`'s own gate are
+    // each free to treat differently, silently breaking the cross-engine
+    // recency parity this whole grammar exists to guarantee.
+
+    /// Mirrors the TS parity suite's fractional-second digit-count boundary
+    /// test: 1, 2, and 3-digit fractions must be accepted (and agree with
+    /// `parseISO8601ToMs`'s own millisecond value) across `Z` and numeric
+    /// offset zones, while the 0-digit (bare `.`) and 4+-digit boundary
+    /// cutoffs must both be rejected identically by SQL and the assessor.
+    func testCursorCanonicalIsoGrammarAcceptsExactlyOneToThreeFractionalDigits() throws {
+        let now: Int64 = 1_786_449_620_000
+        let acceptedFractionDigits = ["1", "12", "123", "000", "007", "999"]
+        for fraction in acceptedFractionDigits {
+            for zone in ["Z", "+00:00", "-05:30"] {
+                let value = "2024-01-15T10:20:30.\(fraction)\(zone)"
+                let parsedMs = try XCTUnwrap(parseISO8601ToMs(value), value)
+                let valueJSON = #"{"status":"generating","lastUpdatedAt":"\#(value)"}"#
+                let assessed = try assessedLastActivityAt(forValueJSON: valueJSON, now: now)
+                XCTAssertEqual(sqlRecency(forValueJSON: valueJSON), parsedMs, value)
+                XCTAssertEqual(assessed, parsedMs, value)
+            }
+        }
+
+        // Lower-bound cutoff: a bare `.` with ZERO fractional digits (one
+        // digit short of the 1-3 range) must be rejected exactly like the
+        // upper-bound cutoff, a 4-(or-more)-digit fraction (one digit over).
+        // Since the field is DEFINED but fails the shape guard, SQL
+        // recency is now unrankable (`NULL`) rather than a
+        // `COALESCE(..., 0)`-defaulted `0`.
+        for fraction in ["", "1234", "12345", "123456"] {
+            let value = "2024-01-15T10:20:30.\(fraction)Z"
+            let valueJSON = #"{"status":"generating","lastUpdatedAt":"\#(value)"}"#
+            let assessed = try assessedLastActivityAt(forValueJSON: valueJSON, now: now)
+            XCTAssertNil(sqlRecency(forValueJSON: valueJSON), value)
+            XCTAssertEqual(assessed, 0, value)
+        }
+    }
+
+    // MARK: - Cursor SQL recency: no COALESCE(..., 0) default for a
+    // composer with no rankable root or header timestamp at all.
+    //
+    // `rootRecency` used to default an entirely absent/unrankable set of
+    // root fields to `COALESCE(..., 0)`, so a composer with NEITHER a root
+    // timestamp NOR a valid header timestamp got a definite, rankable SQL
+    // recency of exactly `0` instead of the correct `NULL` ("unrankable").
+    // `isDefinitelyOlderThanWindowLowerBound(0, ...)` reports literal
+    // epoch-zero as definitively old, so the row-limit sentinel
+    // (`SessionSnapshotSourceTests.swift`'s "no root or header timestamp at
+    // all" case) would have wrongly treated hitting the cap on such a row
+    // as "safe to truncate". A header-only composer must still rank
+    // correctly — only a composer with no signal anywhere becomes
+    // unrankable.
+    func testCursorSQLRecencyIsNullNeverZeroForComposerWithNoRootOrHeaderTimestamp() throws {
+        let now: Int64 = 1_786_449_620_000
+
+        let noSignalAtAll = #"{"status":"completed"}"#
+        XCTAssertNil(sqlRecency(forValueJSON: noSignalAtAll))
+        // The assessor's own in-memory `lastActivityAt` still separately
+        // seeds `0` as a JS/Swift fallback — that in-memory fallback is
+        // never surfaced by this SQL expression, which is exactly the
+        // point: the two are allowed to diverge (SQL NULL vs. assessor 0)
+        // so the row-limit sentinel treats this row as inconclusive rather
+        // than definitively old.
+        let assessedNoSignal = try assessedLastActivityAt(forValueJSON: noSignalAtAll, now: now)
+        XCTAssertEqual(assessedNoSignal, 0)
+        XCTAssertTrue(isDefinitelyOlderThanWindowLowerBound(0, now: now, within: sessionCandidateWindowMs))
+
+        // A record with only malformed/unrankable headers (no root fields
+        // either) must likewise stay NULL, not fall back to a rankable 0.
+        let onlyMalformedHeaders = #"{"fullConversationHeadersOnly":[42,null,"x"]}"#
+        XCTAssertNil(sqlRecency(forValueJSON: onlyMalformedHeaders))
+
+        // Header-only recency must still work when a header genuinely IS
+        // valid, even though the root fields remain entirely absent.
+        let headerOnlyValid = #"{"fullConversationHeadersOnly":[{"type":2,"createdAt":\#(now)}]}"#
+        XCTAssertEqual(sqlRecency(forValueJSON: headerOnlyValid), now)
+        let assessedHeaderOnly = try assessedLastActivityAt(forValueJSON: headerOnlyValid, now: now)
+        XCTAssertEqual(assessedHeaderOnly, now)
+    }
+
+    // MARK: - Cursor canonical ISO grammar: exhaustive component/range
+    // validation matrix (the divergence this whole rewrite fixes). The OLD
+    // implementation validated shape with an `NSRegularExpression` (whose
+    // `\d` matches any Unicode decimal-digit code point, not just ASCII
+    // 0-9, and whose `$` matches before a trailing newline) and then handed
+    // the surviving string to `Date.ISO8601FormatStyle`/`julianday()`,
+    // which SILENTLY NORMALIZE several genuinely-invalid calendar shapes
+    // (minute 60, leap second 60, hour 24, day-of-month overflow, non-leap
+    // Feb 29, offsets beyond the documented maximum, a trailing newline)
+    // instead of rejecting them — confirmed empirically below via
+    // `parseISO8601ToMs` (the untouched, still-Foundation-backed general
+    // ISO-8601 parser used elsewhere in this file), which is exactly why
+    // `parseCanonicalCursorIsoComponents` validates every component
+    // explicitly and computes the epoch millisecond value via
+    // `daysFromCivil` integer arithmetic, never
+    // `Date.ISO8601FormatStyle`/`julianday()`. Every case here is mirrored
+    // in `tests/agent-detection-parity.test.mjs`'s TS counterpart — a
+    // string may never be assessor-valid yet SQL-NULL (or vice versa), and
+    // every engine that accepts a string must compute the identical
+    // millisecond value.
+
+    /// Direct unit coverage of the calendar/constant building blocks
+    /// `parseCanonicalCursorIsoComponents` is built from, so a regression in
+    /// any one of them is caught here rather than only surfacing as an
+    /// opaque parity mismatch.
+    func testCursorTimestampDomainConstantsAndGregorianCalendarHelpersAreInternallyConsistent() throws {
+        XCTAssertEqual(cursorTimestampMinYear, 1970)
+        XCTAssertEqual(cursorTimestampMaxYear, 9999)
+        XCTAssertEqual(cursorTimestampMaxOffsetMinutes, 14 * 60)
+
+        // isGregorianLeapYear: the standard rule — divisible by 4 and not by
+        // 100, UNLESS also divisible by 400.
+        XCTAssertTrue(isGregorianLeapYear(2024))
+        XCTAssertFalse(isGregorianLeapYear(2023))
+        XCTAssertFalse(isGregorianLeapYear(1900)) // divisible by 100, not 400
+        XCTAssertTrue(isGregorianLeapYear(2000)) // divisible by 400
+        XCTAssertFalse(isGregorianLeapYear(1970))
+
+        // daysInGregorianMonth: February must track isGregorianLeapYear
+        // exactly; every other month is fixed regardless of year.
+        XCTAssertEqual(daysInGregorianMonth(2024, 2), 29)
+        XCTAssertEqual(daysInGregorianMonth(2023, 2), 28)
+        XCTAssertEqual(daysInGregorianMonth(1900, 2), 28)
+        XCTAssertEqual(daysInGregorianMonth(2000, 2), 29)
+        XCTAssertEqual(daysInGregorianMonth(2024, 4), 30)
+        XCTAssertEqual(daysInGregorianMonth(2024, 1), 31)
+
+        // daysFromCivil(1970, 1, 1) must be the Unix epoch's own day zero,
+        // and epochMsFromCanonicalCursorIsoComponents must agree with
+        // isCanonicalCursorIsoTimestamp/parseCanonicalCursorIsoComponents
+        // end-to-end on a valid component set.
+        XCTAssertEqual(daysFromCivil(1970, 1, 1), 0)
+        let components = try XCTUnwrap(parseCanonicalCursorIsoComponents("2024-02-29T10:20:30.500Z"))
+        let valueJSON = #"{"status":"generating","lastUpdatedAt":"2024-02-29T10:20:30.500Z"}"#
+        let assessed = try assessedLastActivityAt(forValueJSON: valueJSON, now: 1_786_449_620_000)
+        XCTAssertEqual(epochMsFromCanonicalCursorIsoComponents(components), assessed)
+    }
+
+    /// Every shape below is either a real calendar/range violation the OLD
+    /// `NSRegularExpression`+`Date.ISO8601FormatStyle`/`julianday()` combo
+    /// would have silently normalized instead of rejecting, or a
+    /// case-sensitivity/whitespace/digit-encoding shape that combo also
+    /// accidentally accepted. `parseISO8601ToMs` (Foundation-backed, still
+    /// untouched) is used as the concrete "old lenient engine" ground
+    /// truth wherever it genuinely accepts the shape — proving these are
+    /// real, not hypothetical, divergences — while `isCanonicalCursorIsoTimestamp`,
+    /// `parseCanonicalCursorIsoComponents`, and `sqlRecency` must reject
+    /// every one of them without exception.
+    func testCursorCanonicalIsoGrammarRejectsInvalidComponentsAcceptedByLenientEngines() throws {
+        // Foundation's Date.ISO8601FormatStyle silently NORMALIZES each of
+        // these instead of rejecting them (confirmed empirically via
+        // parseISO8601ToMs): leap seconds are dropped/rolled, minute 60 and
+        // hour 24 roll into the next unit, day-of-month overflow rolls into
+        // the next month, non-leap Feb 29 rolls into March, offsets beyond
+        // +-14:00 are accepted with no bound at all, lowercase "z" is
+        // tolerated, and a trailing newline/space is silently ignored.
+        let acceptedByFoundationAlone = [
+            "2024-01-15T23:59:60Z", // leap second
+            "2024-06-30T23:59:60Z", // leap second, real leap-second-eligible date
+            "2024-01-15T10:60:30Z", // minute 60
+            "2024-01-15T24:00:00Z", // hour 24
+            "2024-02-30T10:20:30Z", // Feb 30
+            "2024-02-31T10:20:30Z", // Feb 31
+            "2024-04-31T10:20:30Z", // April has 30 days
+            "2023-02-29T10:20:30Z", // non-leap year (ordinary)
+            "1900-02-29T10:20:30Z", // non-leap year (divisible by 100, not 400)
+            "2024-01-15T10:20:30+15:00", // offset beyond +-14:00 maximum
+            "2024-01-15T10:20:30+14:01", // one minute past the 14:00 boundary
+            "2024-01-15T10:20:30-15:00",
+            "2024-01-15T10:20:30+05:60", // offset minute itself out of range
+            "2024-01-15T10:20:30z", // lower-case z
+            "2024-01-15T10:20:30Z\n", // trailing newline
+            "2024-01-15T10:20:30Z ", // trailing space
+            "1969-12-31T23:59:59Z", // pre-1970
+            "0001-01-01T00:00:00Z", // pre-1970
+            "10000-01-01T00:00:00Z", // 5-digit year
+        ]
+        for value in acceptedByFoundationAlone {
+            XCTAssertNotNil(parseISO8601ToMs(value), "fixture assumption: Foundation alone must accept \(value)")
+        }
+
+        // These specific shapes happen to already be rejected by
+        // Foundation/the old NSRegularExpression gate too (invalid
+        // month/day shape, the pre-existing lower-case "t" rejection, and
+        // leading whitespace) — included for completeness/non-regression,
+        // not because they demonstrate a NEW divergence.
+        let alreadyRejectedByFoundation = [
+            "2024-13-01T10:20:30Z", // invalid month 13
+            "2024-00-01T10:20:30Z", // invalid month 00
+            "2024-01-00T10:20:30Z", // invalid day 00
+            "2024-01-15t10:20:30Z", // lower-case t
+            " 2024-01-15T10:20:30Z", // leading space
+        ]
+        for value in alreadyRejectedByFoundation {
+            XCTAssertNil(parseISO8601ToMs(value), "fixture assumption: Foundation alone must reject \(value)")
+        }
+
+        // The OLD `NSRegularExpression`'s `\d` matches the full Unicode
+        // `Nd` category, not ASCII-only digits — a genuine gate-level bug —
+        // but Foundation's own downstream parse happens to still reject
+        // this particular shape, so it is listed separately rather than
+        // asserted as "Foundation accepts this".
+        // Mirrors `tests/agent-detection-parity.test.mjs`'s exact two
+        // Unicode-decimal-digit fixtures (fullwidth and Devanagari) byte
+        // for byte, so both suites test the identical `\d`-vs-`Nd` gate
+        // divergence rather than each asserting a differently-shaped
+        // "some Unicode digit" case that could pass here while a
+        // genuinely-differently-behaving codepoint slipped through on the
+        // other platform.
+        let unicodeDigitYear = "\u{FF12}\u{FF10}\u{FF12}\u{FF14}-01-15T10:20:30Z" // fullwidth "2024"
+        let devanagariDigitYear = "\u{0966}\u{0968}\u{0969}\u{096A}-01-15T10:20:30Z" // Devanagari digits
+
+        let allInvalidCases =
+            acceptedByFoundationAlone + alreadyRejectedByFoundation + [unicodeDigitYear, devanagariDigitYear]
+        for value in allInvalidCases {
+            XCTAssertFalse(isCanonicalCursorIsoTimestamp(value), value)
+            XCTAssertNil(parseCanonicalCursorIsoComponents(value), value)
+            let valueJSON = #"{"status":"generating","lastUpdatedAt":"\#(value)"}"#
+            XCTAssertNil(sqlRecency(forValueJSON: valueJSON), value)
+        }
+    }
+
+    /// Every valid Z/offset/leap-day/year boundary must be accepted, and
+    /// every engine (the byte-level parser, SQL via the registered scalar
+    /// function, and the assessor) must compute the IDENTICAL millisecond
+    /// value. Ground truth for each case was independently cross-checked
+    /// against `parseISO8601ToMs` (trustworthy across this entire
+    /// 1970-9999 domain for real calendar dates) and, for the offset
+    /// cases, against manual `zTimeMs -+ offsetMinutes * 60_000`
+    /// arithmetic — never generated FROM `parseCanonicalCursorIsoComponents`
+    /// itself, so this test cannot pass by merely being self-consistent
+    /// with a broken implementation.
+    func testCursorCanonicalIsoGrammarAcceptsEveryValidBoundaryWithMatchingMilliseconds() throws {
+        let validCases: [(label: String, value: String, expectedMs: Int64)] = [
+            ("ordinary Z timestamp", "2024-01-15T10:20:30Z", 1_705_314_030_000),
+            ("leap day, ordinary leap year (divisible by 4, not 100)", "2024-02-29T00:00:00Z", 1_709_164_800_000),
+            ("leap day, divisible-by-400 leap year", "2000-02-29T00:00:00Z", 951_782_400_000),
+            ("leap day, divisible-by-400 leap year (2400)", "2400-02-29T00:00:00Z", 13_574_563_200_000),
+            ("min supported year: exact epoch", "1970-01-01T00:00:00Z", 0),
+            ("max supported year boundary", "9999-12-31T23:59:59Z", 253_402_300_799_000),
+            ("max positive offset boundary +14:00", "2024-01-15T10:20:30+14:00", 1_705_263_630_000),
+            ("max negative offset boundary -14:00", "2024-01-15T10:20:30-14:00", 1_705_364_430_000),
+            ("explicit zero offset, equivalent to Z", "2024-01-15T10:20:30+00:00", 1_705_314_030_000),
+        ]
+
+        for testCase in validCases {
+            XCTAssertTrue(isCanonicalCursorIsoTimestamp(testCase.value), testCase.label)
+            let components = try XCTUnwrap(parseCanonicalCursorIsoComponents(testCase.value), testCase.label)
+            XCTAssertEqual(epochMsFromCanonicalCursorIsoComponents(components), testCase.expectedMs, testCase.label)
+            let valueJSON = #"{"status":"generating","lastUpdatedAt":"\#(testCase.value)"}"#
+            XCTAssertEqual(sqlRecency(forValueJSON: valueJSON), testCase.expectedMs, testCase.label)
+            let assessed = try assessedLastActivityAt(forValueJSON: valueJSON, now: testCase.expectedMs)
+            XCTAssertEqual(assessed, testCase.expectedMs, testCase.label)
+        }
+    }
+
+    /// Mirrors `tests/agent-detection-parity.test.mjs`'s "Cursor SQL recency
+    /// and the assessor both reject a timestamp string carrying an embedded
+    /// NUL (JSON's escaped `\u0000`) suffix" case. A JS/JSON `\u0000`
+    /// escape always denotes a real embedded NUL *codepoint*, never a
+    /// literal 6-character sequence in the parsed string, so `valueJSON`
+    /// below spells that escape out literally (`\u0000`, not Swift's own
+    /// `\u{0000}` interpolation) — exactly the bytes `JSON.stringify` would
+    /// have produced on the wire — while `embeddedNulValue` (fed directly
+    /// to the Swift-native parser functions) uses Swift's own `\u{0000}`
+    /// escape to construct the equivalent in-memory `String` with a real
+    /// embedded NUL, the twin of the TS test's JS string literal.
+    ///
+    /// This is the exact case `cursorCanonicalIsoToEpochMsXFunc` must get
+    /// right by decoding via `sqlite3_value_bytes`'s explicit length into
+    /// `Data`/`String` rather than `String(cString:)`: after `json_extract`
+    /// unescapes `\u0000` back into a real NUL byte, a `strlen`-based
+    /// decode would silently truncate to the valid-looking prefix
+    /// "2024-01-15T10:20:30Z" and accept it, instead of seeing the full,
+    /// ungrammatical value (with "malicious-suffix" trailing the NUL) the
+    /// byte-level parser and TS/SQL both correctly reject.
+    func testCursorCanonicalIsoGrammarRejectsEmbeddedNulSuffix() throws {
+        let embeddedNulValue = "2024-01-15T10:20:30Z\u{0000}malicious-suffix"
+        XCTAssertFalse(isCanonicalCursorIsoTimestamp(embeddedNulValue))
+        XCTAssertNil(parseCanonicalCursorIsoComponents(embeddedNulValue))
+
+        let valueJSON =
+            #"{"status":"generating","lastUpdatedAt":"2024-01-15T10:20:30Z\u0000malicious-suffix"}"#
+        XCTAssertNil(sqlRecency(forValueJSON: valueJSON))
+        let assessed = try assessedLastActivityAt(forValueJSON: valueJSON, now: 1_705_314_030_000)
+        XCTAssertEqual(assessed, 0)
+    }
+
+    // MARK: - Cursor row-limit truncation safety at the exact window
+    // cutoff, exercised through a canonical ISO *string* timestamp rather
+    // than a raw numeric one. This is the safety-critical case the whole
+    // rewrite exists to protect: if the string parser lost even one
+    // millisecond of precision relative to the numeric path, a composer
+    // sitting exactly at `sessionCandidateWindowMs`'s lower bound could be
+    // mis-classified as "definitely old" (safe to truncate) when it is
+    // not, or vice versa.
+
+    /// Mirrors the TS parity suite's window-cutoff test: at `cutoff - 1`,
+    /// `cutoff`, and `cutoff + 1` (`cutoff = now - sessionCandidateWindowMs`),
+    /// the ISO-string encoding of that millisecond value must produce the
+    /// exact same SQL recency and truncation-safety verdict as the raw
+    /// numeric value.
+    func testCursorSQLRecencyForISOStringTimestampMatchesNumericPathAtWindowCutoff() throws {
+        let now: Int64 = 1_786_449_620_000
+        let cutoff = now - sessionCandidateWindowMs
+
+        for offset: Int64 in [-1, 0, 1] {
+            let ms = cutoff + offset
+            let iso = isoStringWithMilliseconds(ms)
+            XCTAssertTrue(isCanonicalCursorIsoTimestamp(iso), iso)
+
+            let numericJSON = #"{"status":"generating","lastUpdatedAt":\#(ms)}"#
+            let stringJSON = #"{"status":"generating","lastUpdatedAt":"\#(iso)"}"#
+
+            let assessedNumeric = try assessedLastActivityAt(forValueJSON: numericJSON, now: now)
+            let assessedString = try assessedLastActivityAt(forValueJSON: stringJSON, now: now)
+            XCTAssertEqual(assessedString, assessedNumeric, iso)
+            XCTAssertEqual(assessedString, ms, iso)
+
+            let sqlNumeric = sqlRecency(forValueJSON: numericJSON)
+            let sqlString = sqlRecency(forValueJSON: stringJSON)
+            XCTAssertEqual(sqlString, sqlNumeric, iso)
+            XCTAssertEqual(sqlString, ms, iso)
+
+            let expectedVerdict = offset < 0
+            XCTAssertEqual(isDefinitelyOlderThanWindowLowerBound(ms, now: now, within: sessionCandidateWindowMs), expectedVerdict, "\(offset)")
+            XCTAssertEqual(
+                isDefinitelyOlderThanWindowLowerBound(sqlString ?? Int64.max, now: now, within: sessionCandidateWindowMs),
+                expectedVerdict,
+                "\(offset)"
+            )
+        }
+    }
+
+    /// Formats `ms` as the exact canonical grammar
+    /// `parseCanonicalCursorIsoComponents` accepts
+    /// (`YYYY-MM-DDTHH:MM:SS.mmmZ`), independent of `Date.ISO8601FormatStyle`
+    /// or any other platform date formatter — this test's own fixture
+    /// generator must not share an implementation with the parser under
+    /// test.
+    private func isoStringWithMilliseconds(_ ms: Int64) -> String {
+        let totalSeconds = ms.quotientAndRemainder(dividingBy: 1000)
+        let epochSeconds = totalSeconds.quotient
+        let milliseconds = totalSeconds.remainder
+        let date = Date(timeIntervalSince1970: TimeInterval(epochSeconds))
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "UTC")!
+        let components = calendar.dateComponents([.year, .month, .day, .hour, .minute, .second], from: date)
+        return String(
+            format: "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
+            components.year!, components.month!, components.day!,
+            components.hour!, components.minute!, components.second!,
+            milliseconds
+        )
+    }
+}

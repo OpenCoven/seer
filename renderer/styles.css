@@ -1,10 +1,81 @@
 /*
- * Glaze framework styles (@import "@glaze/core/..." and @import "tailwindcss")
- * are automatically injected before this file during build and dev.
- * Add your custom styles and @source directives below.
+ * Shared renderer styles for both the Glaze panel and the standalone macOS
+ * window. This file is self-contained on purpose: it explicitly imports
+ * Tailwind and the small set of Seer-owned design tokens both builds need,
+ * rather than depending on the Glaze host's build pipeline to auto-inject
+ * anything (no styles from the Glaze package are imported here).
  */
+@import "tailwindcss" source(none);
+@import "@radix-ui/colors/gray.css";
+@import "@radix-ui/colors/gray-dark.css";
+@import "@radix-ui/colors/gray-alpha.css";
+@import "@radix-ui/colors/gray-dark-alpha.css";
+@import "@radix-ui/colors/green.css";
+@import "@radix-ui/colors/green-dark.css";
 
-/* Tell Tailwind to scan all local renderer window files for class names */
-@source "./**/*.{ts,tsx}";
-@source not "./preload.ts";
-@source not "./dev/**/*";
+/* Keep Tailwind's scanner inside the renderer build-identity input scope. */
+@source "./**/*.{ts,tsx,html}";
+@source "../standalone-window.html";
+
+/*
+ * Seer's small semantic token set, mapped into Tailwind's `--color-*`
+ * namespace so `bg-control`, `bg-control-subtle`, `text-secondary`,
+ * `text-tertiary`, and `text-green` utilities exist in both builds. `inline`
+ * keeps each utility referencing the underlying Radix variable directly (see
+ * https://tailwindcss.com/docs/theme#referencing-other-variables) so the
+ * `.dark` overrides supplied by the Radix dark stylesheets above keep working.
+ */
+@theme inline {
+  --color-control-subtle: var(--gray-a3);
+  --color-control: var(--gray-a5);
+  --color-secondary: var(--gray-11);
+  --color-tertiary: var(--gray-9);
+  --color-green: var(--green-9);
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    background: transparent;
+  }
+
+  :root {
+    color-scheme: light;
+  }
+
+  .dark {
+    color-scheme: dark;
+  }
+}
+
+/* Reserves space for the native window's draggable title bar region. */
+.drag-region {
+  -webkit-app-region: drag;
+}
+
+/*
+ * Interactive controls nested inside a draggable region or toolbar must stay
+ * clickable — without this, the OS/WebView treats a click on them as a
+ * window-drag gesture and the click never reaches the control. `[data-toolbar]`
+ * is included alongside `.drag-region` so any toolbar-shaped container keeps
+ * this invariant even if it does not itself carry the `drag-region` class.
+ */
+.drag-region button,
+.drag-region [role="radio"],
+.drag-region [role="button"],
+.drag-region a[href],
+.drag-region input,
+.drag-region select,
+.drag-region textarea,
+.drag-region [tabindex],
+[data-toolbar] button,
+[data-toolbar] [role="radio"],
+[data-toolbar] [role="button"],
+[data-toolbar] a[href],
+[data-toolbar] input,
+[data-toolbar] select,
+[data-toolbar] textarea,
+[data-toolbar] [tabindex] {
+  -webkit-app-region: no-drag;
+}

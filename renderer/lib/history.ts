@@ -1,28 +1,6 @@
-export type KeepAwakeMode = "system" | "display";
+import type { AwakeSession, HistoryStats } from "../bridge/types";
 
-export type AgentUsage = {
-  id: string;
-  name: string;
-  durationMs: number;
-};
-
-export type AwakeSession = {
-  id: string;
-  startedAt: number;
-  endedAt: number | null;
-  durationMs: number;
-  mode: KeepAwakeMode;
-  agents: AgentUsage[];
-};
-
-export type HistoryStats = {
-  totalAwakeMs: number;
-  todayAwakeMs: number;
-  sessionCount: number;
-  perAgent: AgentUsage[];
-  currentSession: AwakeSession | null;
-  recentSessions: AwakeSession[];
-};
+export type { AgentUsage, AwakeSession, HistoryStats, KeepAwakeMode } from "../bridge/types";
 
 export const EMPTY_STATS: HistoryStats = {
   totalAwakeMs: 0,
@@ -32,14 +10,6 @@ export const EMPTY_STATS: HistoryStats = {
   currentSession: null,
   recentSessions: [],
 };
-
-export async function fetchHistoryStats(): Promise<HistoryStats> {
-  return await window.glazeAPI.glaze.ipc.invoke<HistoryStats>("history:getStats");
-}
-
-export async function clearHistory(): Promise<HistoryStats> {
-  return await window.glazeAPI.glaze.ipc.invoke<HistoryStats>("history:clear");
-}
 
 /** "38s", "12m", "2h 14m" — compact, at most two units. */
 export function formatDuration(ms: number): string {
