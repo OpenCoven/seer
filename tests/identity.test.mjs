@@ -200,6 +200,15 @@ for (const { name, path } of ciWorkflows) {
   });
 }
 
+test("standalone-ci.yml stays on the standard Apple Silicon macOS 14 hosted runner", () => {
+  const workflow = yaml.load(readText(".github/workflows/standalone-ci.yml"));
+  assert.equal(
+    workflow.jobs.standalone["runs-on"],
+    "macos-14",
+    "standalone-ci.yml must use the standard macos-14 Apple Silicon hosted runner so pull_request jobs can start",
+  );
+});
+
 test("scripts/run-standalone-tests.mjs still registers tests/standalone-build-gate-serialization.test.mjs", () => {
   // tests/standalone-build-gate-serialization.test.mjs used to assert its
   // own registration in each workflow's explicit "node --test" file list,

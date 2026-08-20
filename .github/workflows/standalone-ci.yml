@@ -21,7 +21,12 @@ permissions:
 jobs:
   standalone:
     name: standalone
-    runs-on: macos-14-xlarge
+    # Pull requests run in a GitHub-hosted context where the standard Apple
+    # Silicon macOS 14 image is available, but the larger-runner-only
+    # `macos-14-xlarge` label can fail before any job step starts. Keep this on
+    # the normal hosted arm64 image and assert the architecture in the first
+    # step below.
+    runs-on: macos-14
     steps:
       - name: Assert Apple Silicon runner
         run: |
